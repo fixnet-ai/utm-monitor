@@ -574,6 +574,16 @@ utmm --host --upload ./local_file linuxvm
 utmm --host --download linuxvm remote_file ./local_file
 ```
 
+> **Important**: Both `--upload` and `--download` are limited to the Guest's `/opt/utmm/` directory (`C:\opt\utmm\` on Windows). The filename must be a **simple name without path separators** (`/` or `\`). For example:
+> - ✅ `utmm --host --download linuxvm app.log ./app.log`
+> - ❌ `utmm --host --download linuxvm /var/log/app.log ./app.log` (full path — returns error)
+>
+> To get files from outside `/opt/utmm/`, use `--exec` to copy them first:
+> ```bash
+> utmm --host --exec linuxvm "cp /var/log/syslog /opt/utmm/syslog.log"
+> utmm --host --download linuxvm syslog.log ./syslog.log
+> ```
+>
 > **Under the hood**: `--upload` uses HTTP POST `/upload` with multipart/form-data; `--download` uses HTTP GET `/bin/:filename`. Both use `std.http.Client` — zero external dependencies.
 
 #### Automatic Upgrade (Host-Push)

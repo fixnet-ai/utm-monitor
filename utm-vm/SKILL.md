@@ -185,6 +185,16 @@ chmod +x /opt/utmm/utmm
 - VM IPs can change on reboot — always check `vm_status` first, don't cache IPs
 - Windows cmd.exe has different escaping rules than bash — test simple commands first
 
+### Q: `--download` fails with "Guest not found" or "HttpStatusNotOk" but the Guest is online
+**A**: This happens when you use a full path like `/opt/utmm/file.txt` instead of just the filename `file.txt`. The `/bin/` endpoint only accepts simple filenames (no `/` or `\`) and only reads from `/opt/utmm/` on the Guest. Use just the basename:
+```
+# Wrong:
+utmm --host --download linuxvm /opt/utmm/app.log ./app.log
+# Correct:
+utmm --host --download linuxvm app.log ./app.log
+```
+To download files from other directories, use `--exec` to copy them to `/opt/utmm/` first.
+
 ## Deployment FAQs (from bare-metal validation)
 
 ### Q: Guest broadcasts with wrong hostname (OS default instead of specified name)
