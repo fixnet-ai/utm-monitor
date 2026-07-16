@@ -93,6 +93,30 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
             .last_seen = now,
         };
 
+        // ── IP reuse detection ─────────────────────────────────────────
+        // If a DIFFERENT guest previously used this IP, evict it.
+        // IPs are unique at any moment; when a new guest picks up an IP
+        // that belonged to a different guest, the old entry is stale.
+        {
+            var it = guests.iterator();
+            while (it.next()) |entry| {
+                if (!std.mem.eql(u8, entry.key_ptr.*, info.hostname) and
+                    std.mem.eql(u8, entry.value_ptr.ip, actual_ip))
+                {
+                    const old_key = entry.key_ptr.*;
+                    if (guests.fetchRemove(old_key)) |kv| {
+                        std.debug.print("[listener] 🗑 IP {s} reused: {s} → {s}\n", .{ actual_ip, old_key, info.hostname });
+                        allocator.free(kv.value.hostname);
+                        allocator.free(kv.value.ip);
+                        allocator.free(kv.value.target);
+                        allocator.free(kv.value.mac);
+                        allocator.free(kv.value.version);
+                    }
+                    break;
+                }
+            }
+        }
+
         if (guests.getPtr(info.hostname)) |existing| {
             if (!std.mem.eql(u8, existing.ip, actual_ip)) {
                 const old_state = GuestState{

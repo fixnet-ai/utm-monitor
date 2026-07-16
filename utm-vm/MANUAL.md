@@ -224,69 +224,46 @@ sudo utmm --host             # Start immediately
 
 ### 2.4 Bare-Metal Bootstrapping (First-time Guest VM Deployment)
 
-A brand-new VM has no utmm running. After the Host starts `utmm --host`, it automatically provides a read-only HTTP server on port 2121 (serving the cross-compiled binaries from `/opt/utmm/`). Therefore, bare-metal bootstrapping requires only one command:
+A brand-new VM has no utmm running. After the Host starts `utmm --host`, it automatically provides a read-only HTTP server on port 2121 (serving the cross-compiled binaries from `/opt/utmm/`). The unified `install.sh` handles both Host and Guest deployment.
 
-**Linux Guest**:
+**Deployment order is always: Host first, then Guests.**
 
-```bash
-# After Host starts, execute in the VM (gateway IP is usually the Host's bridge address)
-GATEWAY=$(ip route | grep default | awk '{print $3}')
-curl -s "http://$GATEWAY:2121/update?name=linuxvm" | sh
-```
-
-**macOS Guest**:
+**Linux / macOS Guest** — one command:
 
 ```bash
-# macOS uses a different command to find the gateway
-GATEWAY=$(route -n get default 2>/dev/null | grep gateway | awk '{print $2}')
-curl -s "http://$GATEWAY:2121/update?name=macvm" | sh
+curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh -s -- --guest --hostname myvm
 ```
 
-> **Note**: The `?name=HOSTNAME` query parameter sets the Guest hostname (e.g., `linuxvm`, `macvm`). Without it, the Guest will broadcast with the OS hostname (e.g., `ubuntu`, `dasis-Virtual-Machine`), which may not match the expected name.
-
-`/update` is a virtual endpoint on the Host HTTP server that auto-detects the Guest architecture and downloads the corresponding binary (e.g., `utmm-aarch64-linux`, `utmm-x86_64-windows.exe`). The script:
-- Creates `/opt/utmm/` (or `C:\opt\utmm\` on Windows) automatically — no manual `mkdir` needed
-- Detects the Guest architecture (aarch64 / x86_64 / x86) and OS
-- Downloads the correct binary from `http://<HOST>:2121/bin/utmm-{arch}-{os}[.exe]`
-- Starts the binary with `--hostname NAME` if a `?name=` parameter was provided
-
-**Windows Guest** (PowerShell):
+**Windows Guest** (PowerShell as Administrator):
 
 ```powershell
-# Determine gateway IP
-$gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop
+# Option 1: Download and execute (if internet is available)
+irm https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.ps1 | iex
+# Then call the function:
+Install-UtmmGuest -Hostname windowsvm
 
-# Detect CPU architecture (ARM64 / x86_64 / x86)
-$cpuArch = (Get-CimInstance Win32_Processor).Architecture
-switch ($cpuArch) {
-    12 { $arch = "aarch64" }   # ARM64
-     9 { $arch = "x86_64" }    # AMD64 / Intel 64-bit
-     0 { $arch = "x86" }       # Intel 32-bit
-     5 { $arch = "x86" }       # ARM 32-bit (use x86 binary)
-    default { $arch = "x86_64" }
-}
-
-# Build OS suffix and download URL
-$os = "windows"
-$bin = "utmm-${arch}-${os}.exe"
-
-# Download and install
-New-Item -ItemType Directory -Force -Path C:\opt\utmm | Out-Null
-curl "http://${gw}:2121/bin/$bin" -o C:\opt\utmm\utmm.exe
-C:\opt\utmm\utmm.exe --install
-C:\opt\utmm\utmm.exe --hostname windowsvm
+# Option 2: Download from Host HTTP (no internet needed on Guest)
+$gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop | Select -First 1
+iwr "http://${gw}:2121/bin/install.ps1" -OutFile install.ps1
+.\install.ps1 -Guest -Hostname windowsvm
 ```
 
-> **Windows CWD**: When started via Scheduled Task, `utmm.exe` automatically changes its working directory to `C:\opt\` at startup — no special configuration needed. Previously files would land in `C:\Windows\System32\` due to the Task Scheduler default CWD.
->
-> **CPU Architecture Codes**: `Get-CimInstance Win32_Processor` returns `.Architecture` as a numeric code: `12` = ARM64, `9` = x86_64 (AMD64), `0` = x86 (32-bit), `5` = ARM (32-bit). Modern Windows 10/11 use `Get-CimInstance` instead of the deprecated `Get-WmiObject`.
+**What the script does automatically:**
+1. Detects CPU architecture (`aarch64` / `x86_64` / `x86`) — no manual `uname -m` needed
+2. Detects OS and finds the default gateway (the Host's bridge IP)
+3. Downloads the correct binary from `http://<gateway>:2121/bin/utmm-{arch}-{os}[.exe]`
+4. Creates `/opt/utmm/` (or `C:\opt\utmm\` on Windows) and installs the binary
+5. Creates convenience symlinks (`/usr/local/bin/utmm` on Unix)
+6. Installs auto-start service via `utmm --install`
+7. Starts the Guest immediately with the given `--hostname`
 
-> **Core Principle**: When the Host starts `--host`, it automatically starts a read-only HTTP server on port 2121, serving the cross-compiled binaries from `/opt/utmm/` by default. Guest and Host use the exact same port (2121), fully symmetric. See `curl http://<host>:2121/update` for the dynamic bootstrap script returned.
+> **Prerequisite**: The Host must be running `sudo utmm --host` and the gateway must be reachable from the Guest. If the gateway detection fails, the script probes common UTM bridge IPs (192.168.64.1, 192.168.65.1, 192.168.66.1).
 
 **Other Alternative Methods** (if Host HTTP is unreachable):
 
 - UTM shared folder mount `zig-out/bin/` → manual copy
 - One-time SCP: `scp utmm-{target} root@<vm>:/opt/utmm/utmm`
+- Direct `/update` endpoint: `curl -s "http://<gateway>:2121/update?name=myvm" | sh` (returns a generated shell script)
 
 After the Guest starts, it begins UDP broadcast + HTTP server (2121). **From then on, Host-side `--deploy` is fully automatic.**
 

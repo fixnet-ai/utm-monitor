@@ -120,15 +120,25 @@ Done! Now talk to Claude: "Check the status of all VMs".
 ## Quick Start (CLI only)
 
 ```bash
-# Install (downloads utmm.zip, extracts to /opt/utmm/, creates symlinks)
+# ─── Host (your Mac) — always deploy Host first ───
+
+# One-command install (downloads utmm.zip, extracts to /opt/utmm/, creates symlinks)
 curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 
-# Guest: run inside a VM
-utmm --hostname linuxvm --install    # auto-start on boot
-utmm --hostname linuxvm &            # or run immediately
+# Start the Host (needs sudo for /etc/hosts sync)
+sudo utmm --host --install    # auto-start on boot
+sudo utmm --host              # or run immediately
 
-# Host: run on your Mac
-sudo utmm --host                     # start listener (auto-upgrades Guests on version mismatch)
+# ─── Guest (inside each VM) — one command per Guest ───
+
+# Linux / macOS Guest
+curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh -s -- --guest --hostname linuxvm
+
+# Windows Guest (PowerShell as Administrator)
+irm https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.ps1 | iex
+Install-UtmmGuest -Hostname windowsvm
+
+# ─── Verify ───
 utmm --host --status                 # check all VM status
 utmm --host --exec linuxvm "uname -a" # run command on VM
 utmm --host --deploy                 # build + deploy to all VMs

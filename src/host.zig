@@ -283,6 +283,30 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
                         ptr.guests.append(ptr.gpa_val, copy) catch return;
                     }
 
+                    // ── IP dedup ───────────────────────────────────────
+                    // Each IP belongs to at most one guest at a time.
+                    // If another guest (different hostname) shares this IP,
+                    // evict it — its IP was taken over by a new guest.
+                    {
+                        var j: usize = 0;
+                        while (j < ptr.guests.items.len) {
+                            const g = ptr.guests.items[j];
+                            if (!std.mem.eql(u8, g.hostname, new_state.hostname) and
+                                std.mem.eql(u8, g.ip, new_state.ip))
+                            {
+                                ptr.gpa_val.free(g.hostname);
+                                ptr.gpa_val.free(g.ip);
+                                ptr.gpa_val.free(g.target);
+                                ptr.gpa_val.free(g.mac);
+                                ptr.gpa_val.free(g.version);
+                                _ = ptr.guests.orderedRemove(j);
+                                // Don't increment — orderedRemove shifted elements down
+                            } else {
+                                j += 1;
+                            }
+                        }
+                    }
+
                     // Build HostEntry list → update /etc/hosts
                     var host_entries: std.ArrayList(hosts_file.HostEntry) = .empty;
                     defer {

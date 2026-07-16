@@ -110,13 +110,20 @@ vm_status → see which VMs are online, their versions, IPs
 ```
 
 ### Workflow D: Initial setup (first time or after VM rebuild)
+
+**Deploy Host first, then Guests.**
+
 ```
-1. vm_status → see which VMs are missing
-2. For each missing VM, tell user to:
-   - Copy utmm binary to /opt/ via UTM shared folder
-   - Run: utmm --install && utmm --hostname <name> &
-3. Once all VMs appear in vm_status, proceed
+1. Host: curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
+2. Host: sudo utmm --host --install && sudo utmm --host
+3. For each Guest VM, run ONE command:
+   - Linux/macOS: curl -fsSL https://.../install.sh | sh -s -- --guest --hostname <name>
+   - Windows (PS): irm https://.../install.ps1 | iex; Install-UtmmGuest -Hostname <name>
+4. vm_status → verify all VMs appear online
 ```
+
+The Guest script auto-detects arch/OS, downloads the correct binary from the Host, creates
+symlinks, installs the auto-start service, and starts the Guest — all in one command.
 
 ### Workflow E: Multi-VM network test
 ```
