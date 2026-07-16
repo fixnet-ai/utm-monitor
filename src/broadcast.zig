@@ -442,6 +442,10 @@ pub fn broadcastLoop(
     const msg = msg_writer.buffered();
 
     while (true) {
+        // ── Self-upgrade check ──────────────────────────────────────
+        // Host uploads utmm.new; Guest auto-detects and self-upgrades
+        try checkSelfUpgrade(io, &info);
+
         socket.send(io, &broadcast_addr, msg) catch |err| {
             std.debug.print("[broadcast] Send failed: {}\n", .{err});
         };
@@ -475,10 +479,76 @@ fn broadcastLoopFallback(
     const msg = msg_writer.buffered();
 
     while (true) {
+        // ── Self-upgrade check ──────────────────────────────────────
+        try checkSelfUpgrade(io, &info);
+
         socket.send(io, &broadcast_addr, msg) catch |err| {
             std.debug.print("[broadcast] Send failed: {}\n", .{err});
         };
         std.debug.print("[broadcast] Broadcast: {s} ({s}) → {s}\n", .{ info.hostname, info.target, info.ip });
         try std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .real);
     }
+}
+
+/// Check for staged upgrade binary (utmm.new) and self-upgrade if found.
+/// The Host uploads the new binary as "utmm.new"; the Guest detects it
+/// on its next broadcast cycle, swaps it in, and restarts itself.
+/// This decouples the HTTP upload (which completes cleanly) from the
+/// restart (which happens asynchronously), avoiding the connection-break
+/// problem of the old "upload + kill-self" pattern.
+fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
+    const new_name: []const u8 = if (builtin.os.tag == .windows) "utmm.new.exe" else "utmm.new";
+    const final_name: []const u8 = if (builtin.os.tag == .windows) "utmm.exe" else "utmm";
+    const install_dir: []const u8 = if (builtin.os.tag == .windows) "C:\\opt\\utmm" else "/opt/utmm";
+
+    // Build full paths: Host HTTP uploads to /opt/utmm/utmm.new (not CWD)
+    const new_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, new_name }) catch return;
+    defer std.heap.page_allocator.free(new_path);
+    const final_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, final_name }) catch return;
+    defer std.heap.page_allocator.free(final_path);
+
+    // Check if staged file exists
+    const file = std.Io.Dir.cwd().openFile(io, new_path, .{}) catch return;
+    const file_size = file.length(io) catch 0;
+    file.close(io);
+
+    // Sanity check: file must be at least 100KB (not a partial upload)
+    if (file_size < 100 * 1024) return;
+
+    std.debug.print("[broadcast] 🔄 Self-upgrade: staged {s} ({d} bytes)\n", .{ new_path, file_size });
+
+    // Atomic rename on same filesystem (overwrite existing binary)
+    std.Io.Dir.cwd().rename(new_path, std.Io.Dir.cwd(), final_path, io) catch |err| {
+        std.debug.print("[broadcast] Self-upgrade rename failed: {}\n", .{err});
+        return;
+    };
+
+    // Make executable (Unix)
+    if (builtin.os.tag != .windows) {
+        if (std.process.run(std.heap.page_allocator, io, .{
+            .argv = &.{ "chmod", "+x", final_path },
+        })) |_| {} else |_| {}
+    }
+
+    // Spawn restart script (detached, survives our exit)
+    if (builtin.os.tag == .windows) {
+        const restart_cmd = std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "cmd /c \"ping -n 3 127.0.0.1 >nul & cd /d {s} & start \"\" {s} --hostname {s}\"",
+            .{ install_dir, final_path, info.hostname },
+        ) catch return;
+        defer std.heap.page_allocator.free(restart_cmd);
+        if (std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "cmd", "/c", restart_cmd } })) |_| {} else |_| {}
+    } else {
+        const restart_cmd = std.fmt.allocPrint(
+            std.heap.page_allocator,
+            "nohup sh -c 'sleep 1; {s} --hostname {s} &' >/dev/null 2>&1 &",
+            .{ final_path, info.hostname },
+        ) catch return;
+        defer std.heap.page_allocator.free(restart_cmd);
+        if (std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "sh", "-c", restart_cmd } })) |_| {} else |_| {}
+    }
+
+    std.debug.print("[broadcast] Self-upgrade complete — restarting with new binary\n", .{});
+    std.process.exit(0);
 }

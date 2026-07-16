@@ -614,7 +614,9 @@ fn ipcHandler(ctx: *anyopaque, cmd: []const u8) anyerror![]const u8 {
 }
 
 /// Auto-upgrade a Guest whose version doesn't match Host's version.
-/// Finds the correct binary in serve_dir, uploads via HTTP, and sends restart command.
+/// Host uploads the new binary as utmm.new; the Guest detects it in its
+/// broadcast loop (checkSelfUpgrade) and self-upgrades. No restart command
+/// needed — the Guest handles its own lifecycle.
 fn autoUpgrade(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -642,36 +644,11 @@ fn autoUpgrade(
         return;
     }
 
-    // Step 1: Upload new binary as .new
+    // Upload new binary as utmm.new — Guest's broadcast loop will detect it
+    // and self-upgrade via checkSelfUpgrade() within 1 second
     const new_name: []const u8 = if (is_windows) "utmm.new.exe" else "utmm.new";
-    std.debug.print("[host] Uploading {s} → {s}:{d}\n", .{ bin_path, ip, http_port });
+    std.debug.print("[host] Auto-upgrade {s}: uploading {s} → {s}:{d}\n", .{ hostname, bin_path, ip, http_port });
     _ = try http_client.uploadFile(io, gpa, ip, http_port, bin_path, new_name);
 
-    // Step 2: Build and send restart command
-    const remote_path: []const u8 = if (is_windows) "C:\\opt\\utmm" else "/opt/utmm";
-    const final_name: []const u8 = if (is_windows) "utmm.exe" else "utmm";
-
-    const restart_cmd = if (is_windows)
-        try std.fmt.allocPrint(gpa,
-            \\cmd /c "ping -n 2 127.0.0.1 >nul & move /Y {s}\\{s} {s}\\{s} >nul 2>&1 & taskkill /f /im utmm.exe >nul 2>&1 & ping -n 2 127.0.0.1 >nul & start "" {s}\\{s} --hostname {s}"
-        , .{ remote_path, new_name, remote_path, final_name, remote_path, final_name, hostname })
-    else
-        try std.fmt.allocPrint(gpa,
-            \\nohup sh -c 'sleep 1; mv {s}/{s} {s}/{s}; chmod +x {s}/{s}; pkill utmm; sleep 1; {s}/{s} --hostname {s} &' >/dev/null 2>&1 &
-        , .{ remote_path, new_name, remote_path, final_name, remote_path, final_name, remote_path, final_name, hostname });
-    defer gpa.free(restart_cmd);
-
-    std.debug.print("[host] Restarting {s}...\n", .{hostname});
-    const restart_result = http_client.execRemote(io, gpa, ip, http_port, restart_cmd);
-    if (restart_result) |output| {
-        gpa.free(output);
-        std.debug.print("[host] Auto-upgrade {s}: binary pushed, restart acknowledged ✓\n", .{hostname});
-    } else |err| {
-        // Connection drop during restart is expected
-        if (err == error.ConnectionRefused or err == error.ConnectionTimedOut) {
-            std.debug.print("[host] Auto-upgrade {s}: restart connection closed (expected) ✓\n", .{hostname});
-        } else {
-            std.debug.print("[host] Auto-upgrade {s}: restart connection error: {}\n", .{ hostname, err });
-        }
-    }
+    std.debug.print("[host] Auto-upgrade {s}: binary uploaded as {s} ✓ (Guest will self-upgrade)\n", .{ hostname, new_name });
 }
