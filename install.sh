@@ -273,19 +273,20 @@ sudo ln -sf "$INSTALL_DIR/utmm" /usr/local/bin/utmm
 echo "==> Symlink: /usr/local/bin/utmm -> $INSTALL_DIR/utmm"
 
 # 9. Install as system service (auto-start on boot)
+#    --install also starts the service immediately, so no separate start needed
 echo "==> Installing auto-start service..."
-if ! sudo "$INSTALL_DIR/utmm" --install; then
-    echo "Warning: Service installation failed. Guest will still run but won't auto-start on boot."
-fi
-
-# 10. Start Guest
-echo "==> Starting Guest..."
 if [ -n "$HOSTNAME_OVERRIDE" ]; then
-    sudo nohup "$INSTALL_DIR/utmm" --hostname "$HOSTNAME_OVERRIDE" > /var/log/utmm.log 2>&1 &
-    echo "    hostname: $HOSTNAME_OVERRIDE"
+    if ! sudo "$INSTALL_DIR/utmm" --install --hostname "$HOSTNAME_OVERRIDE"; then
+        echo "Warning: Service installation failed. Trying manual start..."
+        sudo nohup "$INSTALL_DIR/utmm" --hostname "$HOSTNAME_OVERRIDE" > /var/log/utmm.log 2>&1 &
+        echo "    hostname: $HOSTNAME_OVERRIDE (manual)"
+    fi
 else
-    sudo nohup "$INSTALL_DIR/utmm" > /var/log/utmm.log 2>&1 &
-    echo "    (using OS hostname)"
+    if ! sudo "$INSTALL_DIR/utmm" --install; then
+        echo "Warning: Service installation failed. Trying manual start..."
+        sudo nohup "$INSTALL_DIR/utmm" > /var/log/utmm.log 2>&1 &
+        echo "    (using OS hostname, manual)"
+    fi
 fi
 
 echo ""

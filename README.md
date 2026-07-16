@@ -129,11 +129,14 @@ sudo utmm --host --install    # auto-start on boot
 sudo utmm --host              # or run immediately
 
 # ─── Guest (inside each VM) — one command per Guest ───
-# No internet needed — everything comes from Host HTTP at gateway IP
+# No internet needed — install.sh auto-detects the Host via default gateway
 
-# Linux / macOS Guest (find gateway first, then curl from Host HTTP)
-GATEWAY=$(ip route | grep default | awk '{print $3}')
-curl "http://$GATEWAY:2121/bin/install.sh" | sh -s -- --guest --hostname linuxvm
+# Linux Guest (as root)
+curl http://$(ip route | grep default | awk '{print $3}'):2121/bin/install.sh | sh -s -- --guest --hostname linuxvm
+
+# macOS Guest (as root — note: macOS uses 'route', not 'ip route')
+GW=$(route -n get default 2>/dev/null | awk '/gateway/{print $2}')
+curl "http://$GW:2121/bin/install.sh" | sh -s -- --guest --hostname macvm
 
 # Windows Guest (PowerShell as Administrator)
 $gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop | Select -First 1

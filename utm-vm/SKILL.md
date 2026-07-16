@@ -185,6 +185,30 @@ chmod +x /opt/utmm/utmm
 - VM IPs can change on reboot — always check `vm_status` first, don't cache IPs
 - Windows cmd.exe has different escaping rules than bash — test simple commands first
 
+## Deployment FAQs (from bare-metal validation)
+
+### Q: Guest broadcasts with wrong hostname (OS default instead of specified name)
+**A**: This was a bug in install.sh — `--install` was called without `--hostname`. Fixed in v0.1.5. The install script now passes `--hostname` to `--install`. If affected, restart the Guest: `pkill utmm && /opt/utmm/utmm --hostname <name> &`
+
+### Q: `--download` returns "0 bytes saved" but file exists on Guest
+**A**: Known bug in versions before v0.1.5. The HTTP client's `take(n)` requires exactly `n` bytes and discards buffered data on EndOfStream. Fixed by using `readVec()` instead. Upgrade to v0.1.5+.
+
+### Q: HTTP upload fails with "Bad Request" or truncated file
+**A**: Required CRLF (`\r\n`) line endings in multipart/form-data headers. Zig's `\\` line continuation only produces LF (`\n`). Fixed in v0.1.5 by using `++` string concatenation with explicit `\r\n`. Ensure version >= v0.1.5.
+
+### Q: macOS Guest: `ip route` command not found
+**A**: macOS uses `route -n get default`, not `ip route`. The install.sh auto-detects the correct command per OS. The README Quick Start now shows platform-specific commands.
+
+### Q: Windows: SSH+PowerShell quoting is complex
+**A**: When running PowerShell commands over SSH, `$` variables may be interpolated by bash before reaching PowerShell. Write commands to a `.ps1` file first, then execute it. Example:
+```powershell
+iwr "http://<gateway>:2121/bin/install.ps1" -OutFile install.ps1
+.\install.ps1 -Guest -Hostname windowsvm
+```
+
+### Q: `zig-out/bin/utmm` is the wrong architecture after cross-compilation
+**A**: `zig build` always overwrites `zig-out/bin/utmm` with the LAST target built. After cross-compiling all targets, rebuild native last: `zig build -Doptimize=ReleaseSafe`. Or use the specifically-named output file (e.g., `zig-out/bin/utmm-aarch64-macos`) for the correct architecture.
+
 ## Reference Manual
 
 See [MANUAL.md](MANUAL.md) for the complete reference: build & install, architecture design, protocol specification, CLI reference, auto-upgrade workflow, MCP integration, platform-specific notes, and troubleshooting.

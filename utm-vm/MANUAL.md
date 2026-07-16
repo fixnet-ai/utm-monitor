@@ -771,7 +771,25 @@ utmm --host --exec linuxvm "/opt/utmm/utmm &"
 bump ver.zig && zig build  # auto-upgrade handles the rest
 ```
 
-### 5.8 Port Conflict
+### 5.8 Download Returns 0 Bytes
+
+**Symptom**: `--download` reports "OK — 0 bytes saved" but the file exists and is readable on the Guest.
+
+**Diagnosis**:
+```bash
+# Verify the file exists and has content on the Guest
+utmm --host --exec linuxvm "ls -la /opt/utmm/myfile.txt"
+utmm --host --exec linuxvm "cat /opt/utmm/myfile.txt"
+
+# Verify Guest HTTP server serves it correctly (from Host)
+curl -s "http://192.168.64.2:2121/bin/myfile.txt"
+```
+
+**Cause**: This is a known bug in utmm versions before v0.1.5. The HTTP client's `downloadFile` function uses `std.Io.Reader.take(n)` which requires exactly `n` bytes. When the file is smaller than the read buffer (65536 bytes), the partially-buffered data is discarded on EndOfStream.
+
+**Solution**: Upgrade to utmm v0.1.5 or later. The fix replaces `take()` with `readVec()`, which correctly handles partial reads.
+
+### 5.9 Port Conflict
 
 **Management commands (--status/--exec) no longer conflict with the Host UDP port**. Since Phase 9, management commands are forwarded to the persistent Host process via IPC (127.0.0.1:12347 TCP), and the CLI process no longer directly binds the UDP port.
 
@@ -940,6 +958,8 @@ sudo killall -HUP mDNSResponder
 | Tunnel IP detected | VPN interface interference | utun/tun added to exclusion list |
 | Windows process disappears | Direct launch without background daemon | Use --install to install as service |
 | HTTP upload file locked | Target file mmap'd by process | Kill process and retry |
+| Download returns 0 bytes | Known bug < v0.1.5 (take vs readVec) | Upgrade to v0.1.5+ |
+| `zig-out/bin/utmm` is wrong arch | `zig build` overwrites with last target | Use named file e.g. `utmm-aarch64-macos` |
 
 ---
 

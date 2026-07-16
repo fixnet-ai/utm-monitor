@@ -72,7 +72,10 @@ pub fn downloadFile(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: 
         return error.HttpStatusNotOk;
     }
 
-    // Read body and write to file
+    // Read body and write to file.
+    // IMPORTANT: we use readVec (not take) because take(n) requires exactly n bytes
+    // and will error.EndOfStream without returning partially-buffered data when
+    // the stream ends with fewer than n bytes remaining.
     var transfer_buf: [65536]u8 = undefined;
     var body_reader = response.reader(&transfer_buf);
 
@@ -84,12 +87,15 @@ pub fn downloadFile(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: 
     var total: usize = 0;
 
     while (true) {
-        const chunk = body_reader.take(transfer_buf.len) catch |err| switch (err) {
+        var fbuf: [65536]u8 = undefined;
+        var bufs: [1][]u8 = .{&fbuf};
+        const n = body_reader.readVec(&bufs) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
-        _ = try fw.interface.write(chunk);
-        total += chunk.len;
+        if (n == 0) break;
+        _ = try fw.interface.write(fbuf[0..n]);
+        total += n;
     }
     try fw.interface.flush();
 
@@ -144,15 +150,14 @@ pub fn uploadFile(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: u1
 
     _ = try file.readPositional(io, &.{file_data}, 0);
 
-    // Build multipart body
+    // Build multipart body (CRLF line endings required by HTTP multipart spec)
     const boundary = "utmBOUNDARY12345678901234567890abcdef";
     const part_header = try std.fmt.allocPrint(gpa,
-        \\--{s}
-        \\Content-Disposition: form-data; name="file"; filename="{s}"
-        \\Content-Type: application/octet-stream
-        \\
-        \\
-    , .{ boundary, remote_filename });
+        "--{s}\r\n" ++
+        "Content-Disposition: form-data; name=\"file\"; filename=\"{s}\"\r\n" ++
+        "Content-Type: application/octet-stream\r\n" ++
+        "\r\n",
+    .{ boundary, remote_filename });
     defer gpa.free(part_header);
 
     const part_footer = try std.fmt.allocPrint(gpa, "\r\n--{s}--\r\n", .{boundary});
