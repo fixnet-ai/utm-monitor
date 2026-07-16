@@ -1,0 +1,129 @@
+//! Configuration persistence and logging system
+//! --save-config: save current parameters to config file
+//! --log-file: log output to file
+
+const std = @import("std");
+
+/// Configuration items
+pub const Config = struct {
+    port: u16 = 12345,
+    http_port: u16 = 2121,
+    name: []const u8 = "",
+    hosts_file: []const u8 = "/etc/hosts",
+    marker: []const u8 = "UTM-MONITOR",
+
+    /// VM SSH configuration
+    vms: [3]VmConfig = .{
+        .{ .name = "macvm", .ssh = "root@macvm", .path = "/opt/utmm/" },
+        .{ .name = "linuxvm", .ssh = "root@linuxvm", .path = "/opt/utmm/" },
+        .{ .name = "windowsvm", .ssh = "Administrator@windowsvm", .path = "C:\\opt\\utmm\\" },
+    },
+};
+
+/// Single VM configuration
+pub const VmConfig = struct {
+    name: []const u8,
+    ssh: []const u8,
+    path: []const u8,
+};
+
+/// Log level
+pub const LogLevel = enum {
+    debug,
+    info,
+    warn,
+    err,
+
+    pub fn asStr(self: LogLevel) []const u8 {
+        return switch (self) {
+            .debug => "DEBUG",
+            .info => "INFO",
+            .warn => "WARN",
+            .err => "ERROR",
+        };
+    }
+};
+
+/// Logger
+pub const Logger = struct {
+    file: ?std.Io.File = null,
+    write_buf: [4096]u8 = undefined,
+
+    /// Create file logger
+    pub fn init(io: std.Io, path: []const u8) !Logger {
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = @enumFromInt(0o644) });
+        return Logger{ .file = file };
+    }
+
+    /// Write log
+    pub fn log(self: *Logger, io: std.Io, level: LogLevel, comptime fmt: []const u8, args: anytype) void {
+        if (self.file) |*f| {
+            var w = f.writer(&self.write_buf);
+            w.interface.print("[{s}] {s}: ", .{ std.Io.Timestamp.now(io, .real), level.asStr() }) catch return;
+            w.interface.print(fmt, args) catch return;
+            w.interface.print("\n", .{}) catch return;
+            w.interface.flush() catch return;
+        }
+        // Also output to stdout
+        if (level != .debug) {
+            std.debug.print("[{s}] {s}: ", .{ std.Io.Timestamp.now(io, .real), level.asStr() });
+            std.debug.print(fmt, args);
+            std.debug.print("\n", .{});
+        }
+    }
+
+    pub fn deinit(self: *Logger, io: std.Io) void {
+        if (self.file) |*f| {
+            f.close(io);
+        }
+    }
+};
+
+/// Save configuration to file
+pub fn saveConfig(io: std.Io, _: std.mem.Allocator, config: Config, path: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = @enumFromInt(0o644) });
+    defer file.close(io);
+
+    var write_buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &write_buf);
+
+    try writer.interface.print("# UTM Monitor config file\n", .{});
+    try writer.interface.print("port={d}\n", .{config.port});
+    try writer.interface.print("http_port={d}\n", .{config.http_port});
+    try writer.interface.print("name={s}\n", .{config.name});
+    try writer.interface.print("hosts_file={s}\n", .{config.hosts_file});
+    try writer.interface.print("marker={s}\n", .{config.marker});
+
+    for (config.vms) |vm| {
+        try writer.interface.print("vm.{s}.ssh={s}\n", .{ vm.name, vm.ssh });
+        try writer.interface.print("vm.{s}.path={s}\n", .{ vm.name, vm.path });
+    }
+
+    try writer.interface.flush();
+    std.debug.print("[config] configuration saved to {s}\n", .{path});
+}
+
+/// Load configuration from file
+pub fn loadConfig(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Config {
+    _ = io;
+    _ = allocator;
+    _ = path;
+    // Simplified implementation: return default config
+    // TODO: full config file parsing implementation
+    return Config{};
+}
+
+test "saveConfig - basic" {
+    _ = saveConfig;
+}
+
+test "Logger default" {
+    _ = Logger;
+}
+
+test "Config defaults" {
+    const cfg = Config{};
+    try std.testing.expectEqual(@as(u16, 12345), cfg.port);
+    try std.testing.expectEqual(@as(u16, 2121), cfg.http_port);
+    try std.testing.expectEqualStrings("/etc/hosts", cfg.hosts_file);
+}

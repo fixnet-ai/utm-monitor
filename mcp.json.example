@@ -1,0 +1,16 @@
+# MCP config reference — the preferred method is `claude mcp add`:
+#
+#   claude mcp add utm-monitor -- utm-monitor --mcp
+#
+# The --mcp flag is built into the utm-monitor binary. Zero external dependencies.
+# `claude mcp add` writes to ~/.claude.json which Claude Code recognizes automatically.
+# The manual JSON file below is kept as a reference for alternative setups.
+
+{
+  "mcpServers": {
+    "utm-monitor": {
+      "command": "utm-monitor",
+      "args": ["--mcp"]
+    }
+  }
+}

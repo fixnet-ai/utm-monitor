@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.16.0'
+
+      - name: Run tests
+        run: zig build test --summary all
+
+      - name: Build all targets
+        run: |
+          mkdir -p release
+          # 5 binaries covering all VM scenarios (see MANUAL.md §6.x compatibility matrix)
+          targets="x86-windows x86_64-macos aarch64-macos x86_64-linux-musl aarch64-linux-musl"
+          for target in $targets; do
+            echo "==> Building $target ..."
+            zig build -Dtarget=$target -Doptimize=ReleaseSafe
+            # build.zig outputs deployment filenames directly (e.g. utmm.exe, utmm.macos, utmm, utmm_arm64, utmm_arm64.macos)
+            case "$target" in
+              x86-windows)         bin="utmm.exe" ;;
+              x86_64-macos)        bin="utmm.macos" ;;
+              aarch64-macos)       bin="utmm_arm64.macos" ;;
+              x86_64-linux-musl)   bin="utmm" ;;
+              aarch64-linux-musl)  bin="utmm_arm64" ;;
+            esac
+            cp "zig-out/bin/$bin" "release/"
+          done
+          echo "==> Release artifacts:"
+          ls -lh release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

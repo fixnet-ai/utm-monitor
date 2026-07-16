@@ -1,0 +1,26 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config
+utm-monitor.conf
+
+# Local Claude Code config (mcp.json + skills symlinks)
+.claude/
+
+gw.txt
+mcp.json
+.playwright-mcp/
+test_write.o
+test_report.txt
+http-migration-plan.md
