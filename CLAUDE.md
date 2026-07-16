@@ -61,24 +61,24 @@ zig build test                                   # All tests (currently 51)
 
 ### Guest End Runtime
 ```bash
-utm-monitor                                      # Default Guest
-utm-monitor --hostname myvm --port 12345         # Custom parameters
-utm-monitor --http-port 2122                     # Custom HTTP port
+utmm                                      # Default Guest
+utmm --hostname myvm --port 12345         # Custom parameters
+utmm --http-port 2122                     # Custom HTTP port
 ```
 
 ### Host End Runtime
 ```bash
-sudo utm-monitor --host                          # Continuous listener (needs sudo for /etc/hosts)
-utm-monitor --host --status                      # Query all Guest status
-utm-monitor --host --exec linuxvm "uname -a"     # Remote command execution
-utm-monitor --host --deploy                      # Compile+deploy to all VMs
-utm-monitor --host --upload file.txt linuxvm     # Upload file to Guest (no curl)
-utm-monitor --host --download linuxvm f.txt ./f.txt  # Download file from Guest (no curl)
-utm-monitor --host --install                     # Install as system service (Host mode: use --host --install)
-utm-monitor --host --uninstall                   # Remove system service
-utm-monitor --host --serve-dir /path/to/binaries # Custom HTTP serve directory
-utm-monitor --host --mcp                         # Integrated mode: Host + MCP in one process
-utm-monitor --mcp                                # Adapter mode: MCP stdio → Host IPC bridge
+sudo utmm --host                          # Continuous listener (needs sudo for /etc/hosts)
+utmm --host --status                      # Query all Guest status
+utmm --host --exec linuxvm "uname -a"     # Remote command execution
+utmm --host --deploy                      # Compile+deploy to all VMs
+utmm --host --upload file.txt linuxvm     # Upload file to Guest (no curl)
+utmm --host --download linuxvm f.txt ./f.txt  # Download file from Guest (no curl)
+utmm --host --install                     # Install as system service (Host mode: use --host --install)
+utmm --host --uninstall                   # Remove system service
+utmm --host --serve-dir /path/to/binaries # Custom HTTP serve directory
+utmm --host --mcp                         # Integrated mode: Host + MCP in one process
+utmm --mcp                                # Adapter mode: MCP stdio → Host IPC bridge
 ```
 
 ## Project File Structure

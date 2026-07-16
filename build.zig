@@ -7,21 +7,21 @@ fn deploymentFilename(target: std.Target) []const u8 {
         .x86 => switch (target.os.tag) {
             .windows => "utmm.exe",
             .linux => "utmm",
-            else => "utm-monitor",
+            else => "utmm",
         },
         .x86_64 => switch (target.os.tag) {
             .macos => "utmm.macos",
             .linux => "utmm",
             .windows => "utmm.exe",
-            else => "utm-monitor",
+            else => "utmm",
         },
         .aarch64 => switch (target.os.tag) {
             .macos => "utmm_arm64.macos",
             .linux => "utmm_arm64",
             .windows => "utmm.exe",
-            else => "utm-monitor",
+            else => "utmm",
         },
-        else => "utm-monitor",
+        else => "utmm",
     };
 }
 
@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
-        .name = "utm-monitor",
+        .name = "utmm",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // Deployment binary with simplified filename (e.g. utmm.bin, utmm.exe, utmm_arm64)
+    // Deployment binary with simplified filename (e.g. utmm.macos, utmm.exe, utmm_arm64)
     // Host reads serve-dir by these names; protocol.deploymentFilename() does the mapping at runtime
     {
         const target_filename = deploymentFilename(target.result);
@@ -56,7 +56,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run", "Run utm-monitor");
+    const run_step = b.step("run", "Run utmm");
     run_step.dependOn(&run_cmd.step);
 
     // Tests

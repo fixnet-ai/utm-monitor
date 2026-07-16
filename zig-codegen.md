@@ -1,6 +1,6 @@
 # Zig 0.16.0 Coding Experience/Knowledge
 
-This file records compilation issues and solutions encountered while using Zig 0.16.0 in the utm-monitor project.
+This file records compilation issues and solutions encountered while using Zig 0.16.0 in the utmm project.
 
 ## Build System
 

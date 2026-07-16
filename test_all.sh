@@ -11,7 +11,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPORT_FILE="$PROJECT_DIR/test_report.txt"
 ZIG_OUT="$PROJECT_DIR/zig-out/bin"
-HOST_BIN="$ZIG_OUT/utm-monitor"
+HOST_BIN="$ZIG_OUT/utmm"
 SERVE_DIR="/opt/utmm"
 TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 VMS="linuxvm macvm windowsvm"
@@ -122,9 +122,9 @@ done
 # Native fallback for Host commands
 zig build -Doptimize=ReleaseSafe 2>&1 | tail -1
 if [ -f "$HOST_BIN" ]; then
-    pass "Native build → utm-monitor ($(file_size "$HOST_BIN") bytes)"
+    pass "Native build → utmm ($(file_size "$HOST_BIN") bytes)"
 else
-    fail "Native build" "utm-monitor not found"
+    fail "Native build" "utmm not found"
 fi
 report ""
 
@@ -168,11 +168,11 @@ sudo chmod +x "$SERVE_DIR"/* 2>/dev/null || true
 report "    Serve-dir populated: $(ls "$SERVE_DIR" | tr '\n' ' ')"
 
 # Kill previous host
-sudo pkill -9 utm-monitor 2>/dev/null || true
+sudo pkill -9 utmm 2>/dev/null || true
 sleep 1
 
 # Start host
-sudo nohup "$HOST_BIN" --host --serve-dir "$SERVE_DIR" > /tmp/utm-monitor-host.log 2>&1 &
+sudo nohup "$HOST_BIN" --host --serve-dir "$SERVE_DIR" > /tmp/utmm-host.log 2>&1 &
 HOST_PID=$!
 report "    Host started (PID: $HOST_PID, serve-dir: $SERVE_DIR)"
 
@@ -182,7 +182,7 @@ sleep 8
 if ps -p "$HOST_PID" > /dev/null 2>&1; then
     pass "Host process running"
 else
-    fail "Host process" "not running — check /tmp/utm-monitor-host.log"
+    fail "Host process" "not running — check /tmp/utmm-host.log"
 fi
 report ""
 
@@ -484,7 +484,7 @@ if is_cmd sshpass && is_cmd ssh; then
     if [ "$(uname -s)" = "Darwin" ]; then
         report "14.x Host --install..."
         sudo "$HOST_BIN" --host --install 2>&1 || true
-        if [ -f /Library/LaunchDaemons/com.utm-monitor.plist ]; then
+        if [ -f /Library/LaunchDaemons/com.utmm.plist ]; then
             pass "Host --install (LaunchDaemons plist)"
         else
             fail "Host --install" "plist not created"
@@ -492,7 +492,7 @@ if is_cmd sshpass && is_cmd ssh; then
 
         report "14.x Host --uninstall..."
         sudo "$HOST_BIN" --host --uninstall 2>&1 || true
-        if [ ! -f /Library/LaunchDaemons/com.utm-monitor.plist ]; then
+        if [ ! -f /Library/LaunchDaemons/com.utmm.plist ]; then
             pass "Host --uninstall (plist removed)"
         else
             fail "Host --uninstall" "plist still present"
@@ -530,8 +530,8 @@ report ""
 report "=============================================="
 
 # Cleanup
-sudo pkill -9 utm-monitor 2>/dev/null || true
-rm -f /tmp/utm-monitor-host.log
+sudo pkill -9 utmm 2>/dev/null || true
+rm -f /tmp/utmm-host.log
 
 echo ""
 echo "Test report → $REPORT_FILE"

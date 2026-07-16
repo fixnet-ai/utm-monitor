@@ -48,11 +48,11 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     }
     if (cli.cmd_exec) {
         const target_name = cli.exec_target orelse {
-            std.debug.print("Usage: utm-monitor --host --exec <hostname> <command>\n", .{});
+            std.debug.print("Usage: utmm --host --exec <hostname> <command>\n", .{});
             return;
         };
         const exec_cmd = cli.exec_cmd orelse {
-            std.debug.print("Usage: utm-monitor --host --exec <hostname> <command>\n", .{});
+            std.debug.print("Usage: utmm --host --exec <hostname> <command>\n", .{});
             return;
         };
 
@@ -106,11 +106,11 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     }
     if (cli.cmd_upload) {
         const local_file = cli.upload_file orelse {
-            std.debug.print("Usage: utm-monitor --host --upload <file> <vm>\n", .{});
+            std.debug.print("Usage: utmm --host --upload <file> <vm>\n", .{});
             return;
         };
         const target_name = cli.upload_target orelse {
-            std.debug.print("Usage: utm-monitor --host --upload <file> <vm>\n", .{});
+            std.debug.print("Usage: utmm --host --upload <file> <vm>\n", .{});
             return;
         };
 
@@ -144,11 +144,11 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     }
     if (cli.cmd_download) {
         const target_name = cli.download_target orelse {
-            std.debug.print("Usage: utm-monitor --host --download <vm> <remote_file> [local_path]\n", .{});
+            std.debug.print("Usage: utmm --host --download <vm> <remote_file> [local_path]\n", .{});
             return;
         };
         const remote_file = cli.download_remote orelse {
-            std.debug.print("Usage: utm-monitor --host --download <vm> <remote_file> [local_path]\n", .{});
+            std.debug.print("Usage: utmm --host --download <vm> <remote_file> [local_path]\n", .{});
             return;
         };
         const local_path = cli.download_local orelse remote_file;
@@ -181,7 +181,7 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
         return;
     }
     if (cli.save_config) {
-        const config_path = cli.config_path orelse "./utm-monitor.conf";
+        const config_path = cli.config_path orelse "./utmm.conf";
         try config_mod.saveConfig(io, gpa, config_mod.Config{}, config_path);
         return;
     }
@@ -382,7 +382,7 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     }, .{ .permissions = @enumFromInt(0o644) })) |f| {
         var wb: [32]u8 = undefined;
         var fw = f.writer(io, &wb);
-        fw.interface.print("utm-monitor v{s}\n", .{protocol.VERSION}) catch {};
+        fw.interface.print("utmm v{s}\n", .{protocol.VERSION}) catch {};
         fw.interface.flush() catch {};
         f.close(io);
     } else |_| {
@@ -635,7 +635,7 @@ fn autoUpgrade(
         , .{ remote_path, new_name, remote_path, final_name, remote_path, final_name, hostname })
     else
         try std.fmt.allocPrint(gpa,
-            \\nohup sh -c 'sleep 1; mv {s}/{s} {s}/{s}; chmod +x {s}/{s}; pkill utm-monitor; sleep 1; {s}/{s} --hostname {s} &' >/dev/null 2>&1 &
+            \\nohup sh -c 'sleep 1; mv {s}/{s} {s}/{s}; chmod +x {s}/{s}; pkill utmm; sleep 1; {s}/{s} --hostname {s} &' >/dev/null 2>&1 &
         , .{ remote_path, new_name, remote_path, final_name, remote_path, final_name, remote_path, final_name, hostname });
     defer gpa.free(restart_cmd);
 

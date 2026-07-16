@@ -4,16 +4,16 @@ description: >
   Use this skill whenever the user needs to interact with UTM virtual machines —
   checking VM status, running commands on VMs, testing code cross-platform,
   deploying binaries to VMs, debugging issues inside a VM, or any cross-VM
-  coordination. This skill gives you structured access via the utm-monitor MCP
+  coordination. This skill gives you structured access via the utmm MCP
   server. Trigger on ANY mention of: VM names (linuxvm, macvm, windowsvm, ubuntu),
   "VM", "UTM", "virtual machine", "guest", "cross-platform", "deploy to", "test on
   Linux/Windows", "run on the VM", "check the VM", "/etc/hosts", IP changes,
   or remote execution on a local VM.
 ---
 
-# UTM VM Management via utm-monitor
+# UTM VM Management via utmm
 
-You have structured access to three UTM virtual machines through the `utm-monitor`
+You have structured access to three UTM virtual machines through the `utmm`
 MCP server. This lets you run commands, deploy code, and check status on Linux,
 macOS, and Windows VMs — without needing to know their IP addresses. The Host
 auto-syncs VM IPs to `/etc/hosts`, so hostnames like `linuxvm` always resolve.
@@ -32,7 +32,7 @@ auto-syncs VM IPs to `/etc/hosts`, so hostnames like `linuxvm` always resolve.
 
 **Always call this FIRST** in any VM workflow. It tells you:
 - Which VMs are online, their IP, OS/arch, MAC address
-- Whether the utm-monitor version on the VM is current or upgradable
+- Whether the utmm version on the VM is current or upgradable
 
 If `vm_status` returns "No VMs currently online", the other tools cannot work.
 Ask the user whether the VMs are booted and the Host is running.
@@ -50,9 +50,9 @@ The command runs in the VM's native shell:
 | OS info | `vm_exec("linuxvm", "uname -a")` |
 | List files | `vm_exec("linuxvm", "ls -la /opt/")` |
 | Check process | `vm_exec("linuxvm", "ps aux \| grep utm")` |
-| Read logs | `vm_exec("linuxvm", "tail -50 /var/log/utm-monitor.log")` |
+| Read logs | `vm_exec("linuxvm", "tail -50 /var/log/utmm.log")` |
 | Install packages | `vm_exec("linuxvm", "apt-get install -y htop")` |
-| Restart service | `vm_exec("linuxvm", "systemctl restart utm-monitor")` |
+| Restart service | `vm_exec("linuxvm", "systemctl restart utmm")` |
 | Run a script | `vm_exec("linuxvm", "cd /opt && bash -c '...'")` |
 | Write a file | `vm_exec("linuxvm", "cat > /opt/test.sh << 'EOF'\n...\nEOF")` |
 | Check connectivity | `vm_exec("linuxvm", "ping -c 2 macvm")` |
@@ -113,8 +113,8 @@ vm_status → see which VMs are online, their versions, IPs
 ```
 1. vm_status → see which VMs are missing
 2. For each missing VM, tell user to:
-   - Copy utm-monitor binary to /opt/ via UTM shared folder
-   - Run: utm-monitor --install && utm-monitor --hostname <name> &
+   - Copy utmm binary to /opt/ via UTM shared folder
+   - Run: utmm --install && utmm --hostname <name> &
 3. Once all VMs appear in vm_status, proceed
 ```
 
@@ -128,31 +128,31 @@ vm_status → see which VMs are online, their versions, IPs
 
 **The Host must be running before any MCP tool works:**
 ```bash
-sudo utm-monitor --host
+sudo utmm --host
 ```
 
 | Symptom | Likely cause | Action |
 |---------|-------------|--------|
-| "Host is not running" | Host process died or never started | `sudo utm-monitor --host` |
+| "Host is not running" | Host process died or never started | `sudo utmm --host` |
 | "GuestNotFound" for a VM | VM is offline or name mismatch | Run `vm_status` to see which VMs are actually online |
-| "No VMs currently online" | VMs not booted, or guest utm-monitor not running | Check VMs are booted; verify `utm-monitor` is running inside each |
+| "No VMs currently online" | VMs not booted, or guest utmm not running | Check VMs are booted; verify `utmm` is running inside each |
 | VM marked "upgradable" | Guest binary is older than Host | `vm_deploy("that-vm")` — or Host will auto-upgrade within seconds |
-| vm_status returns empty but CLI --status shows VMs | MCP IPC issue | Use `utm-monitor --host --mcp` for integrated mode (bypasses IPC) |
+| vm_status returns empty but CLI --status shows VMs | MCP IPC issue | Use `utmm --host --mcp` for integrated mode (bypasses IPC) |
 
 **Fallback:** If MCP tools are unavailable, you can use the CLI directly:
 ```bash
-utm-monitor --host --status
-utm-monitor --host --exec linuxvm "uname -a"
-utm-monitor --host --deploy linuxvm
+utmm --host --status
+utmm --host --exec linuxvm "uname -a"
+utmm --host --deploy linuxvm
 ```
 
 ## Host Paths
 
 | Item | Path |
 |------|------|
-| Host binary | `/usr/local/bin/utm-monitor` |
-| Host service plist | `/Library/LaunchDaemons/com.utm-monitor.plist` |
-| Host log | `/var/log/utm-monitor-host.log` |
+| Host binary | `/usr/local/bin/utmm` |
+| Host service plist | `/Library/LaunchDaemons/com.utmm.plist` |
+| Host log | `/var/log/utmm-host.log` |
 | Serve directory (HTTP) | Same directory as Host binary (or `--serve-dir`) |
 
 ## Limitations

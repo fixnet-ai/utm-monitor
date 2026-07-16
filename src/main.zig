@@ -185,7 +185,7 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
 /// Print usage help
 pub fn printHelp() void {
     const help =
-        \\Usage: utm-monitor [options]
+        \\Usage: utmm [options]
         \\
         \\Mode selection:
         \\  --host              Run in Host mode (UDP listener + hosts management)
@@ -202,7 +202,7 @@ pub fn printHelp() void {
         \\  --hosts-file PATH   hosts file path (default /etc/hosts)
         \\  --serve-dir PATH    HTTP serve directory (default: exe directory)
         \\  --marker TAG        Marker comment text (default "UTM-MONITOR")
-        \\  --config PATH       Config file path (default ./utm-monitor.conf)
+        \\  --config PATH       Config file path (default ./utmm.conf)
         \\  --log-file PATH     Log file path
         \\  --watch [PATH]      Watch source directory for auto-deploy (default off)
         \\  --save-config       Save current parameters to config file
@@ -230,7 +230,7 @@ pub fn main(init: std.process.Init) !void {
 
     // --version (single-line machine-readable format, for version sync script parsing)
     if (cli.cmd_version) {
-        std.debug.print("utm-monitor v{s}\n", .{protocol.VERSION});
+        std.debug.print("utmm v{s}\n", .{protocol.VERSION});
         return;
     }
 
@@ -259,33 +259,33 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "parseArgs - default guest mode" {
-    const args = &[_][:0]const u8{"utm-monitor"};
+    const args = &[_][:0]const u8{"utmm"};
     const cli = try parseArgs(args);
     try std.testing.expect(!cli.is_host);
     try std.testing.expectEqual(protocol.DEFAULT_PORT, cli.port);
 }
 
 test "parseArgs - host mode" {
-    const args = &[_][:0]const u8{ "utm-monitor", "--host" };
+    const args = &[_][:0]const u8{ "utmm", "--host" };
     const cli = try parseArgs(args);
     try std.testing.expect(cli.is_host);
 }
 
 test "parseArgs - custom ports" {
-    const args = &[_][:0]const u8{ "utm-monitor", "--port", "9999", "--http-port", "2122" };
+    const args = &[_][:0]const u8{ "utmm", "--port", "9999", "--http-port", "2122" };
     const cli = try parseArgs(args);
     try std.testing.expectEqual(@as(u16, 9999), cli.port);
     try std.testing.expectEqual(@as(u16, 2122), cli.http_port);
 }
 
 test "parseArgs - management commands" {
-    const args = &[_][:0]const u8{ "utm-monitor", "--status" };
+    const args = &[_][:0]const u8{ "utmm", "--status" };
     const cli = try parseArgs(args);
     try std.testing.expect(cli.cmd_status);
 }
 
 test "parseArgs - exec command" {
-    const args = &[_][:0]const u8{ "utm-monitor", "--exec", "mybox", "uptime" };
+    const args = &[_][:0]const u8{ "utmm", "--exec", "mybox", "uptime" };
     const cli = try parseArgs(args);
     try std.testing.expect(cli.cmd_exec);
     try std.testing.expectEqualStrings("mybox", cli.exec_target.?);
@@ -293,25 +293,25 @@ test "parseArgs - exec command" {
 }
 
 test "parseArgs - hostname" {
-    const args = &[_][:0]const u8{ "utm-monitor", "--hostname", "my-custom-box" };
+    const args = &[_][:0]const u8{ "utmm", "--hostname", "my-custom-box" };
     const cli = try parseArgs(args);
     try std.testing.expectEqualStrings("my-custom-box", cli.hostname.?);
 }
 
 test "parseArgs - watch default path" {
-    const args = &[_][:0]const u8{ "utm-monitor", "--host", "--watch" };
+    const args = &[_][:0]const u8{ "utmm", "--host", "--watch" };
     const cli = try parseArgs(args);
     try std.testing.expectEqualStrings(".", cli.watch_path.?);
 }
 
 test "parseArgs - watch custom path" {
-    const args = &[_][:0]const u8{ "utm-monitor", "--host", "--watch", "./src" };
+    const args = &[_][:0]const u8{ "utmm", "--host", "--watch", "./src" };
     const cli = try parseArgs(args);
     try std.testing.expectEqualStrings("./src", cli.watch_path.?);
 }
 
 test "parseArgs - version" {
-    const args = &[_][:0]const u8{ "utm-monitor", "--version" };
+    const args = &[_][:0]const u8{ "utmm", "--version" };
     const cli = try parseArgs(args);
     try std.testing.expect(cli.cmd_version);
 }

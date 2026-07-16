@@ -38,7 +38,7 @@ pub fn genInit(platform: Platform) []const u8 {
         \\<plist version="1.0">
         \\<dict>
         \\    <key>Label</key>
-        \\    <string>com.utm-monitor</string>
+        \\    <string>com.utmm</string>
         \\    <key>ProgramArguments</key>
         \\    <array>
         \\        <string>/opt/utmm/utmm</string>
@@ -48,11 +48,11 @@ pub fn genInit(platform: Platform) []const u8 {
         \\    <key>KeepAlive</key>
         \\    <true/>
         \\    <key>StandardOutPath</key>
-        \\    <string>/var/log/utm-monitor.log</string>
+        \\    <string>/var/log/utmm.log</string>
         \\</dict>
         \\</plist>
-        \\<!-- Install to: /Library/LaunchDaemons/com.utm-monitor.plist -->
-        \\<!-- Load with: sudo launchctl load /Library/LaunchDaemons/com.utm-monitor.plist -->
+        \\<!-- Install to: /Library/LaunchDaemons/com.utmm.plist -->
+        \\<!-- Load with: sudo launchctl load /Library/LaunchDaemons/com.utmm.plist -->
         ,
         .linux =>
         \\[Unit]
@@ -94,7 +94,7 @@ pub fn installSelf(io: std.Io, allocator: std.mem.Allocator, is_host: bool) !voi
     switch (platform) {
         .macos => {
             const plist_dir = "/Library/LaunchDaemons";
-            const plist_path = "/Library/LaunchDaemons/com.utm-monitor.plist";
+            const plist_path = "/Library/LaunchDaemons/com.utmm.plist";
 
             // Create LaunchDaemons directory if needed
             std.Io.Dir.cwd().createDir(io, plist_dir, @enumFromInt(0o755)) catch |err| {
@@ -116,7 +116,7 @@ pub fn installSelf(io: std.Io, allocator: std.mem.Allocator, is_host: bool) !voi
                     \\<plist version="1.0">
                     \\<dict>
                     \\    <key>Label</key>
-                    \\    <string>com.utm-monitor</string>
+                    \\    <string>com.utmm</string>
                     \\    <key>ProgramArguments</key>
                     \\    <array>
                     \\        <string>{s}</string>
@@ -127,7 +127,7 @@ pub fn installSelf(io: std.Io, allocator: std.mem.Allocator, is_host: bool) !voi
                     \\    <key>KeepAlive</key>
                     \\    <true/>
                     \\    <key>StandardOutPath</key>
-                    \\    <string>/var/log/utm-monitor-host.log</string>
+                    \\    <string>/var/log/utmm-host.log</string>
                     \\</dict>
                     \\</plist>
                 , .{exe_path});
@@ -140,7 +140,7 @@ pub fn installSelf(io: std.Io, allocator: std.mem.Allocator, is_host: bool) !voi
             std.debug.print("[install] run: sudo launchctl load {s}\n", .{plist_path});
         },
         .linux => {
-            const service_path = "/etc/systemd/system/utm-monitor.service";
+            const service_path = "/etc/systemd/system/utmm.service";
             const desc: []const u8 = if (is_host) "UTM Monitor Host Service" else "UTM Monitor Guest Service";
 
             const content = if (is_host) blk: {
@@ -190,7 +190,7 @@ pub fn installSelf(io: std.Io, allocator: std.mem.Allocator, is_host: bool) !voi
             try writer.interface.flush();
 
             std.debug.print("[install] Linux: systemd unit written to {s}\n", .{service_path});
-            std.debug.print("[install] run: systemctl enable utm-monitor && systemctl start utm-monitor\n", .{});
+            std.debug.print("[install] run: systemctl enable utmm && systemctl start utmm\n", .{});
         },
         .windows => {
             const args: []const u8 = if (is_host) " --host" else "";
@@ -209,7 +209,7 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator) !void {
 
     switch (platform) {
         .macos => {
-            const plist_path = "/Library/LaunchDaemons/com.utm-monitor.plist";
+            const plist_path = "/Library/LaunchDaemons/com.utmm.plist";
 
             // Unload the service (needs sudo)
             if (std.process.run(allocator, io, .{ .argv = &.{ "/bin/sh", "-c", "launchctl unload " ++ plist_path } })) |_| {} else |_| {}
@@ -223,8 +223,8 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator) !void {
             std.debug.print("[uninstall] macOS: service unloaded, plist removed from {s}\n", .{plist_path});
         },
         .linux => {
-            const service_name = "utm-monitor.service";
-            const service_path = "/etc/systemd/system/utm-monitor.service";
+            const service_name = "utmm.service";
+            const service_path = "/etc/systemd/system/utmm.service";
 
             // Stop and disable the service
             if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "stop", service_name } })) |_| {} else |_| {}
@@ -256,11 +256,11 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator) !void {
     std.debug.print("[uninstall] uninstall complete!\n", .{});
 }
 
-/// Kill running utm-monitor processes (best-effort)
+/// Kill running utmm processes (best-effort)
 fn killRunning(io: std.Io, allocator: std.mem.Allocator, platform: Platform) !void {
     switch (platform) {
         .macos, .linux => {
-            if (std.process.run(allocator, io, .{ .argv = &.{ "pkill", "-9", "utm-monitor" } })) |_| {} else |_| {}
+            if (std.process.run(allocator, io, .{ .argv = &.{ "pkill", "-9", "utmm" } })) |_| {} else |_| {}
         },
         .windows => {
             if (std.process.run(allocator, io, .{ .argv = &.{ "taskkill", "/f", "/im", "utmm.exe" } })) |_| {} else |_| {}
@@ -280,7 +280,7 @@ test "genInit - linux" {
 
 test "genInit - macos" {
     const script = genInit(.macos);
-    try std.testing.expect(std.mem.indexOf(u8, script, "com.utm-monitor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "com.utmm") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "plist") != null);
 }
 

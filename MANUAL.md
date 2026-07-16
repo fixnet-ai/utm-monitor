@@ -23,8 +23,8 @@ UTM virtual machines obtain IP addresses via DHCP, and the IP may change after e
 A single binary supports two modes, distinguished by startup arguments:
 
 ```
-utm-monitor              # Guest mode (default)
-utm-monitor --host       # Host mode
+utmm              # Guest mode (default)
+utmm --host       # Host mode
 ```
 
 | Dimension | Guest Mode | Host Mode |
@@ -206,7 +206,7 @@ Install on the Host side (the Mac running UTM) with a single command:
 curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 ```
 
-The script auto-detects the architecture (arm64/x86_64) and downloads the corresponding binary from GitHub Releases to `/usr/local/bin/utm-monitor`.
+The script auto-detects the architecture (arm64/x86_64) and downloads the corresponding binary from GitHub Releases to `/usr/local/bin/utmm`.
 
 Specify a version:
 
@@ -229,14 +229,14 @@ sudo chmod +x /usr/local/bin/utmm*
 > sudo mkdir -p /opt/utm-binaries
 > sudo curl -fsSL "..." -o /opt/utm-binaries/utmm_arm64
 > # ... download other targets ...
-> sudo utm-monitor --host --serve-dir /opt/utm-binaries
+> sudo utmm --host --serve-dir /opt/utm-binaries
 > ```
 
 Start the Host:
 
 ```bash
-sudo utm-monitor --host --install   # Install as Host system service, auto-start on boot
-sudo utm-monitor --host             # Start immediately
+sudo utmm --host --install   # Install as Host system service, auto-start on boot
+sudo utmm --host             # Start immediately
 ```
 
 > **Note**: Use `--host --install` to generate a Host-mode service config (with `--host` flag included). Use just `--install` (without `--host`) on Guest VMs to self-install as a Guest-mode service. The same binary auto-detects the correct mode based on the presence of `--host`.
@@ -245,7 +245,7 @@ sudo utm-monitor --host             # Start immediately
 
 ### 2.4 Bare-Metal Bootstrapping (First-time Guest VM Deployment)
 
-A brand-new VM has no utm-monitor running. After the Host starts `utm-monitor --host`, it automatically provides a read-only HTTP server on port 2121 (serving the cross-compiled binaries from the serve directory). Therefore, bare-metal bootstrapping requires only one command:
+A brand-new VM has no utmm running. After the Host starts `utmm --host`, it automatically provides a read-only HTTP server on port 2121 (serving the cross-compiled binaries from the serve directory). Therefore, bare-metal bootstrapping requires only one command:
 
 **Linux / macOS Guest**:
 
@@ -269,14 +269,14 @@ curl "http://$gw`:2121/bin/utmm.exe" -o C:\opt\utmm\utmm.exe
 C:\opt\utmm\utmm.exe --install
 ```
 
-> **Windows CWD**: When started via Scheduled Task, `utm-monitor.exe` automatically changes its working directory to `C:\opt\` at startup — no special configuration needed. Previously files would land in `C:\Windows\System32\` due to the Task Scheduler default CWD.
+> **Windows CWD**: When started via Scheduled Task, `utmm.exe` automatically changes its working directory to `C:\opt\` at startup — no special configuration needed. Previously files would land in `C:\Windows\System32\` due to the Task Scheduler default CWD.
 
 > **Core Principle**: When the Host starts `--host`, it automatically starts a read-only HTTP server on port 2121, serving the cross-compiled binaries from the serve directory (default: exe directory, configurable via `--serve-dir`). Guest and Host use the exact same port (2121), fully symmetric. See `curl http://<host>:2121/update` for the dynamic bootstrap script returned.
 
 **Other Alternative Methods** (if Host HTTP is unreachable):
 
 - UTM shared folder mount `zig-out/bin/` → manual copy
-- One-time SCP: `scp utm-monitor-{target} root@<vm>:/opt/utmm/utmm`
+- One-time SCP: `scp utmm-{target} root@<vm>:/opt/utmm/utmm`
 
 After the Guest starts, it begins UDP broadcast + HTTP server (2121). **From then on, Host-side `--deploy` is fully automatic.**
 
@@ -301,11 +301,11 @@ The target architecture depends on your VM's actual architecture. How to query:
 
 ```bash
 # After Guest is online, query with --exec
-utm-monitor --host --exec ubuntu "uname -m"      # aarch64 → aarch64-linux-musl
-utm-monitor --host --exec macvm "uname -m"        # arm64  → aarch64-macos
+utmm --host --exec ubuntu "uname -m"      # aarch64 → aarch64-linux-musl
+utmm --host --exec macvm "uname -m"        # arm64  → aarch64-macos
 
 # Or check the target field in --status output
-utm-monitor --host --status
+utmm --host --status
 ```
 
 ### 3.3 Obtain the Binary
@@ -332,7 +332,7 @@ For the Host side, using `install.sh` (§2.3) is recommended; for the Guest side
 
 ```bash
 git clone https://github.com/fixnet-ai/utm-monitor.git
-cd utm-monitor
+cd utmm
 
 # Native build
 zig build -Doptimize=ReleaseSafe
@@ -346,7 +346,7 @@ zig build -Dtarget=x86-windows        -Doptimize=ReleaseSafe
 ```
 
 Build artifacts:
-- `zig-out/bin/utm-monitor` — binary for the current (native) target
+- `zig-out/bin/utmm` — binary for the current (native) target
 - `zig-out/bin/utmm` — Linux x86_64 musl (also covers x86 Linux)
 - `zig-out/bin/utmm_arm64` — Linux aarch64 musl
 - `zig-out/bin/utmm.macos` — macOS x86_64 (Intel + Apple Silicon via Rosetta 2)
@@ -371,10 +371,10 @@ Once the Guest is running, use `--deploy` for subsequent updates -- **no SSH req
 
 ```bash
 # One-click compile + deploy to all online Guests
-utm-monitor --host --deploy
+utmm --host --deploy
 
 # Deploy only to a specific VM
-utm-monitor --host --deploy ubuntu
+utmm --host --deploy ubuntu
 ```
 
 Internal flow: compile → create directory via HTTP exec → HTTP upload → HTTP exec restart command. Entirely uses built-in channels with zero external dependencies.
@@ -399,10 +399,10 @@ Once the Guest starts, the Host can manage it remotely:
 
 ```bash
 # Background start via --exec
-utm-monitor --host --exec ubuntu "nohup /opt/utmm/utmm &"
+utmm --host --exec ubuntu "nohup /opt/utmm/utmm &"
 
 # Install auto-start on boot via --exec
-utm-monitor --host --exec ubuntu "/opt/utmm/utmm --install"
+utmm --host --exec ubuntu "/opt/utmm/utmm --install"
 ```
 
 #### Auto-Start on Boot Reference
@@ -411,43 +411,43 @@ utm-monitor --host --exec ubuntu "/opt/utmm/utmm --install"
 
 ```bash
 # Execute in VM or via --exec
-utm-monitor --host --gen-init macos
-# Generates plist content; place it in the VM's /Library/LaunchDaemons/com.utm-monitor.plist
-# Then launchctl load /Library/LaunchDaemons/com.utm-monitor.plist
+utmm --host --gen-init macos
+# Generates plist content; place it in the VM's /Library/LaunchDaemons/com.utmm.plist
+# Then launchctl load /Library/LaunchDaemons/com.utmm.plist
 ```
 
 **Linux — systemd**:
 
 ```bash
 # Execute in VM or via --exec
-utm-monitor --host --gen-init linux
-# Generates unit file; place it in the VM's /etc/systemd/system/utm-monitor.service
-# Then systemctl daemon-reload && systemctl enable --now utm-monitor
+utmm --host --gen-init linux
+# Generates unit file; place it in the VM's /etc/systemd/system/utmm.service
+# Then systemctl daemon-reload && systemctl enable --now utmm
 ```
 
 **Windows — Task Scheduler**:
 
 ```bash
 # Execute in VM or via --exec
-utm-monitor --host --gen-init windows
+utmm --host --gen-init windows
 # Generates script; use with schtasks to create a scheduled task:
-# schtasks /create /tn utm-monitor /tr "C:\opt\utmm\utmm.exe" /sc ONSTART /ru SYSTEM /f
-# schtasks /run /tn utm-monitor
+# schtasks /create /tn utmm /tr "C:\opt\utmm\utmm.exe" /sc ONSTART /ru SYSTEM /f
+# schtasks /run /tn utmm
 ```
 
 ### 3.7 Start Host Service
 
-The Host HTTP server serves cross-compiled binaries from a configurable directory (defaults to the directory containing the `utm-monitor` executable). This directory must contain the deployment binaries (e.g., `utmm`, `utmm_arm64`, `utmm.macos`, `utmm.exe`) produced by `zig build -Dtarget=...`.
+The Host HTTP server serves cross-compiled binaries from a configurable directory (defaults to the directory containing the `utmm` executable). This directory must contain the deployment binaries (e.g., `utmm`, `utmm_arm64`, `utmm.macos`, `utmm.exe`) produced by `zig build -Dtarget=...`.
 
 ```bash
 # Foreground (observe logs)
-sudo utm-monitor --host
+sudo utmm --host
 
 # Custom serve directory (if binaries are not next to the executable)
-sudo utm-monitor --host --serve-dir /opt/utm-binaries
+sudo utmm --host --serve-dir /opt/utm-binaries
 
 # Background
-sudo nohup utm-monitor --host > /var/log/utm-monitor-host.log 2>&1 & disown
+sudo nohup utmm --host > /var/log/utmm-host.log 2>&1 & disown
 ```
 
 After starting, the following output indicates normal operation:
@@ -470,11 +470,11 @@ grep -A 10 "UTM-MONITOR" /etc/hosts
 
 | # | Check Item | Command | Expected Result |
 |---|------------|---------|-----------------|
-| 1 | Guest process running | `utm-monitor --host --exec ubuntu "ps aux \| grep utm-monitor"` | Shows `/opt/utmm/utmm` process |
-| 2 | Host receiving broadcasts | `utm-monitor --host --status` | Shows all Guests |
+| 1 | Guest process running | `utmm --host --exec ubuntu "ps aux \| grep utmm"` | Shows `/opt/utmm/utmm` process |
+| 2 | Host receiving broadcasts | `utmm --host --status` | Shows all Guests |
 | 3 | /etc/hosts synced | `grep "UTM-MONITOR" /etc/hosts` | Contains entries for 3 VMs |
-| 4 | Remote command channel | `utm-monitor --host --exec ubuntu "uptime"` | Returns uptime |
-| 5 | HTTP service | `utm-monitor --host --status` (shows all VMs online) | Returns guest list with versions |
+| 4 | Remote command channel | `utmm --host --exec ubuntu "uptime"` | Returns uptime |
+| 5 | HTTP service | `utmm --host --status` (shows all VMs online) | Returns guest list with versions |
 
 ---
 
@@ -483,7 +483,7 @@ grep -A 10 "UTM-MONITOR" /etc/hosts
 ### 4.1 CLI Parameter Quick Reference
 
 ```
-Usage: utm-monitor [options]
+Usage: utmm [options]
 
 Mode Selection:
   (no arguments)         Guest mode (default)
@@ -522,7 +522,7 @@ Host Management Commands:
 #### View All VM Status
 
 ```bash
-utm-monitor --host --status
+utmm --host --status
 ```
 
 Example output:
@@ -541,28 +541,28 @@ If versions differ, it displays `⚠ Upgradable`, prompting you to redeploy.
 
 ```bash
 # View system info
-utm-monitor --host --exec linuxvm "uname -a"
-utm-monitor --host --exec macvm "sw_vers"
-utm-monitor --host --exec windowsvm "ver"
+utmm --host --exec linuxvm "uname -a"
+utmm --host --exec macvm "sw_vers"
+utmm --host --exec windowsvm "ver"
 
 # View load
-utm-monitor --host --exec linuxvm "uptime"
+utmm --host --exec linuxvm "uptime"
 
 # View processes
-utm-monitor --host --exec macvm "ps aux | head -5"
+utmm --host --exec macvm "ps aux | head -5"
 
 # Execute complex commands
-utm-monitor --host --exec linuxvm "df -h && free -m"
+utmm --host --exec linuxvm "df -h && free -m"
 ```
 
 #### Transfer Files via HTTP
 
 ```bash
 # Upload a file to Guest (built-in, no curl required)
-utm-monitor --host --upload ./local_file linuxvm
+utmm --host --upload ./local_file linuxvm
 
 # Download a file from Guest
-utm-monitor --host --download linuxvm remote_file ./local_file
+utmm --host --download linuxvm remote_file ./local_file
 ```
 
 > **Under the hood**: `--upload` uses HTTP POST `/upload` with multipart/form-data; `--download` uses HTTP GET `/bin/:filename`. Both use `std.http.Client` — zero external dependencies.
@@ -571,10 +571,10 @@ utm-monitor --host --download linuxvm remote_file ./local_file
 
 ```bash
 # One-click compile + deploy (recommended, zero SSH dependencies)
-utm-monitor --host --deploy
+utmm --host --deploy
 
 # Update only a specific VM
-utm-monitor --host --deploy ubuntu
+utmm --host --deploy ubuntu
 ```
 
 #### Automatic Upgrade (Host-Push)
@@ -594,7 +594,7 @@ The Host automatically upgrades any Guest whose version doesn't match. No Guest 
 #### Check Guest Logs
 
 ```bash
-utm-monitor --host --exec ubuntu "tail -20 /opt/utmm/utmm.log"
+utmm --host --exec ubuntu "tail -20 /opt/utmm/utmm.log"
 ```
 
 #### Force Sync /etc/hosts
@@ -603,8 +603,8 @@ If you suspect the hosts file is out of sync:
 
 ```bash
 # Restart Host listener
-sudo pkill utm-monitor
-sudo utm-monitor --host
+sudo pkill utmm
+sudo utmm --host
 
 # Check after a few seconds
 grep -A 10 "UTM-MONITOR" /etc/hosts
@@ -615,10 +615,10 @@ grep -A 10 "UTM-MONITOR" /etc/hosts
 `--save-config` persists current parameters to a file, automatically loaded on next startup:
 
 ```bash
-utm-monitor --host --port 12345 --save-config
-# Saves to ./utm-monitor.conf
+utmm --host --port 12345 --save-config
+# Saves to ./utmm.conf
 
-cat utm-monitor.conf
+cat utmm.conf
 # port=12345
 ```
 
@@ -636,7 +636,7 @@ No Guest polling, no shell scripts with curl, no `/update` endpoint needed. The 
 **To release a new version:**
 1. Bump `src/ver.zig`
 2. `zig build -Doptimize=ReleaseSafe` (and cross-compile for all targets)
-3. Restart Host: `sudo pkill utm-monitor && sudo utm-monitor --host`
+3. Restart Host: `sudo pkill utmm && sudo utmm --host`
 4. All online Guests auto-upgrade within seconds
 
 #### Manual Upgrade
@@ -645,18 +645,18 @@ No Guest polling, no shell scripts with curl, no `/update` endpoint needed. The 
 ```bash
 # Method 1: Re-run install.sh (recommended — downloads from GitHub Releases)
 curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
-sudo pkill utm-monitor
-sudo utm-monitor --host &
+sudo pkill utmm
+sudo utmm --host &
 
 # Method 2: Build from source
-cd utm-monitor && git pull && zig build -Doptimize=ReleaseSafe
-sudo cp zig-out/bin/utm-monitor /usr/local/bin/utm-monitor
+cd utmm && git pull && zig build -Doptimize=ReleaseSafe
+sudo cp zig-out/bin/utmm /usr/local/bin/utmm
 ```
 
 **Guest Side** (manual intervention — Host auto-push is preferred):
 ```bash
 # Host-side one-click deployment (builds + uploads + restarts)
-utm-monitor --host --deploy
+utmm --host --deploy
 
 # Or bootstrap: download from Host HTTP and pipe to shell (one-time, needs curl)
 curl -s "http://<host-ip>:2121/update" | sh
@@ -686,10 +686,10 @@ git push origin v0.1.0
 
 ```bash
 # 1. Check if Guest process is running
-utm-monitor --host --exec ubuntu "ps aux | grep utm-monitor"
+utmm --host --exec ubuntu "ps aux | grep utmm"
 
 # 2. Check Guest logs to confirm broadcasts are being sent
-utm-monitor --host --exec ubuntu "tail -5 /opt/utmm/utmm.log"
+utmm --host --exec ubuntu "tail -5 /opt/utmm/utmm.log"
 # Normal log line: [broadcast] Broadcast: linuxvm → 192.168.64.2
 
 # 3. Check if the Guest's displayed IP is the correct physical NIC IP
@@ -742,13 +742,13 @@ C:\opt\utmm\utmm.exe --install
 
 ```bash
 # 1. Confirm Host is running as sudo
-ps aux | grep "utm-monitor --host" | grep root
+ps aux | grep "utmm --host" | grep root
 
 # 2. Check file permissions
 ls -la /etc/hosts
 
 # 3. Manually test write
-sudo utm-monitor --host &
+sudo utmm --host &
 sleep 5
 grep "UTM-MONITOR" /etc/hosts
 ```
@@ -778,16 +778,16 @@ grep link_libc build.zig
 **Solution**:
 ```bash
 # 1. Use --exec to terminate the locking process
-utm-monitor --host --exec linuxvm "pkill utm-monitor"
+utmm --host --exec linuxvm "pkill utmm"
 
 # 2. Re-upload and restart
-utm-monitor --host --upload ./new_binary linuxvm
-utm-monitor --host --exec linuxvm "/opt/utmm/utmm &"
+utmm --host --upload ./new_binary linuxvm
+utmm --host --exec linuxvm "/opt/utmm/utmm &"
 ```
 
 **Advanced**: Using `--deploy` is recommended. It uploads via HTTP as a `.new` temporary file, then performs an atomic replacement + restart via HTTP exec, automatically handling file locking issues:
 ```bash
-utm-monitor --host --deploy ubuntu
+utmm --host --deploy ubuntu
 ```
 
 ### 5.8 Port Conflict
@@ -798,10 +798,10 @@ If ports 12345/2121 are occupied by other programs, they can be changed via para
 
 ```bash
 # Guest side
-utm-monitor --port 12348 --http-port 2122
+utmm --port 12348 --http-port 2122
 
 # Host side (ports must match Guest)
-utm-monitor --host --port 12348
+utmm --host --port 12348
 ```
 
 ---
@@ -811,7 +811,7 @@ utm-monitor --host --port 12348
 ### 6.1 Project File Structure
 
 ```
-utm-monitor/
+utmm/
 ├── build.zig              # Build script (includes link_libc)
 ├── build.zig.zon          # Package manifest
 ├── install.sh             # Host one-click installation script
@@ -850,7 +850,7 @@ utm-monitor/
 │   └── config.zig         # Configuration persistence + logging
 └── zig-out/
     └── bin/
-        └── utm-monitor    # Build artifact
+        └── utmm    # Build artifact
 ```
 
 ### 6.2 Technology Stack
@@ -909,22 +909,22 @@ All Linux binaries are statically linked against musl — no glibc version depen
 
 ```bash
 # View VM architecture
-utm-monitor --host --exec ubuntu "uname -m"
+utmm --host --exec ubuntu "uname -m"
 
 # View all network interfaces on VM
-utm-monitor --host --exec ubuntu "ip addr show"
+utmm --host --exec ubuntu "ip addr show"
 
 # View Guest broadcast logs
-utm-monitor --host --exec ubuntu "head -5 /opt/utmm/utmm.log"
+utmm --host --exec ubuntu "head -5 /opt/utmm/utmm.log"
 
 # Capture packets to verify broadcasts
 sudo tcpdump -i any port 12345 -n -c 10
 
 # Verify Guest is online (via Host status)
-utm-monitor --host --status
+utmm --host --status
 
 # View Host listener
-ps aux | grep "utm-monitor --host"
+ps aux | grep "utmm --host"
 
 # Reload /etc/hosts (macOS)
 sudo dscacheutil -flushcache
@@ -946,7 +946,7 @@ sudo killall -HUP mDNSResponder
 | Problem | Cause | Command |
 |---------|-------|---------|
 | `error.Unexpected` | Guest cannot obtain local IP | Check if VM has a valid network interface |
-| `error.AccessDenied` | Host not running with sudo | `sudo utm-monitor --host` |
+| `error.AccessDenied` | Host not running with sudo | `sudo utmm --host` |
 | `error.ConnectionRefused` | Guest cmd_server not started | Check if Guest process is running |
 | `GuestNotFound` | UDP broadcast not reaching | Check if network is on same broadcast domain |
 | Tunnel IP detected | VPN interface interference | utun/tun added to exclusion list |
@@ -957,7 +957,7 @@ sudo killall -HUP mDNSResponder
 
 ## 7. Claude Code Integration (MCP Server)
 
-utm-monitor can be used as a Claude Code plugin via the Model Context Protocol (MCP). This lets Claude automatically discover, execute commands on, and deploy to your UTM VMs — without you typing CLI commands.
+utmm can be used as a Claude Code plugin via the Model Context Protocol (MCP). This lets Claude automatically discover, execute commands on, and deploy to your UTM VMs — without you typing CLI commands.
 
 ### 7.1 Architecture
 
@@ -965,34 +965,34 @@ utm-monitor can be used as a Claude Code plugin via the Model Context Protocol (
 Claude Code
   │ MCP (JSON-RPC over stdio)
   ▼
-utm-monitor --mcp      ← built into the binary (adapter mode)
+utmm --mcp      ← built into the binary (adapter mode)
   │ STATUS_JSON / EXEC / DEPLOY (127.0.0.1:12347 TCP)
   ▼
-utm-monitor --host     ← persistent Host process
+utmm --host     ← persistent Host process
   │
   ├─ UDP ──→ linuxvm
   ├─ UDP ──→ macvm
   └─ UDP ──→ windowsvm
 ```
 
-The `--mcp` flag translates between MCP's JSON-RPC protocol and utm-monitor's text IPC. All real work happens in the Host process (which must be running). No Node.js or any external dependencies needed.
+The `--mcp` flag translates between MCP's JSON-RPC protocol and utmm's text IPC. All real work happens in the Host process (which must be running). No Node.js or any external dependencies needed.
 
 For a simpler all-in-one setup, use `--host --mcp` together: the Host services (UDP/HTTP/IPC) run in background threads while the main thread serves MCP on stdio.
 
 ### 7.2 Full Setup Walkthrough (from zero to working)
 
 **Prerequisites:**
-- UTM VMs must be booted with `utm-monitor` running inside each guest
-- The Host binary must be running: `sudo utm-monitor --host`
-- No extra dependencies — the MCP server is built into the `utm-monitor` binary
+- UTM VMs must be booted with `utmm` running inside each guest
+- The Host binary must be running: `sudo utmm --host`
+- No extra dependencies — the MCP server is built into the `utmm` binary
 - No Zig toolchain needed — binaries are precompiled
 
 **Step 1: Download Host binary**
 
 ```bash
 sudo curl -fsSL https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.macos \
-  -o /usr/local/bin/utm-monitor
-sudo chmod +x /usr/local/bin/utm-monitor
+  -o /usr/local/bin/utmm
+sudo chmod +x /usr/local/bin/utmm
 ```
 
 > Alternative: use the install script which auto-detects your architecture:
@@ -1016,7 +1016,7 @@ sudo chmod +x /opt/utmm/*
 **Step 3: Download Skill**
 
 ```bash
-cd ~/utm-monitor
+cd ~/utmm
 
 # Download Skill (canonical location: utm-vm/SKILL.md)
 curl -o utm-vm/SKILL.md \
@@ -1027,25 +1027,25 @@ mkdir -p .claude/skills
 ln -sf ../../utm-vm .claude/skills/utm-vm
 ```
 
-> No extra files needed — the MCP server is built into the `utm-monitor` binary via `--mcp`. Zero external dependencies.
+> No extra files needed — the MCP server is built into the `utmm` binary via `--mcp`. Zero external dependencies.
 
 **Step 4: Register MCP server with Claude Code**
 
 ```bash
-claude mcp add utm-monitor -- utm-monitor --mcp
+claude mcp add utmm -- utmm --mcp
 ```
 
 > This writes to `~/.claude.json`, which is the recognized MCP config file.
 >
-> Restart Claude Code (or run `/mcp` to reload). You should see `utm-monitor` in the MCP servers list.
+> Restart Claude Code (or run `/mcp` to reload). You should see `utmm` in the MCP servers list.
 >
-> **Integrated mode (all-in-one):** `claude mcp add utm-monitor -- utm-monitor --host --mcp`
+> **Integrated mode (all-in-one):** `claude mcp add utmm -- utmm --host --mcp`
 > This runs the full Host + MCP in a single process — no separate Host daemon needed.
 
 **Step 5: Start the Host**
 
 ```bash
-sudo utm-monitor --host --serve-dir /opt/utmm
+sudo utmm --host --serve-dir /opt/utmm
 ```
 
 Expected output:
@@ -1061,21 +1061,21 @@ Expected output:
 Keep this terminal open — the Host runs in the foreground. To auto-start on boot:
 
 ```bash
-sudo utm-monitor --install
+sudo utmm --install
 ```
 
 **Step 6: Verify the MCP connection**
 
 ```bash
 # Ping the MCP server via proper LSP-style framing
-printf 'Content-Length: 50\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}\n' | utm-monitor --mcp
+printf 'Content-Length: 50\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}\n' | utmm --mcp
 # → Content-Length: 47
 # → {"jsonrpc":"2.0","id":1,"result":{}}
 ```
 
 **Step 7: First conversation** — see next section.
 
-> **Alternative: build from source** — requires Zig 0.16.0. Clone the repo and run `zig build -Doptimize=ReleaseSafe`. The binary lands at `zig-out/bin/utm-monitor`. Use that path in the steps above instead of `/usr/local/bin/utm-monitor`.
+> **Alternative: build from source** — requires Zig 0.16.0. Clone the repo and run `zig build -Doptimize=ReleaseSafe`. The binary lands at `zig-out/bin/utmm`. Use that path in the steps above instead of `/usr/local/bin/utmm`.
 
 **Step 7: First conversation**
 
@@ -1122,9 +1122,9 @@ Claude will call `vm_status()` and return a summary of which VMs are online, the
 ```
 👤 "I just changed the broadcast module. Test it on all platforms."
 🤖 → vm_deploy()                              # build + deploy to all 3 VMs
-    → vm_exec("linuxvm", "cd /opt && ./utm-monitor --version")
-    → vm_exec("macvm", "cd /opt && ./utm-monitor --version")
-    → vm_exec("windowsvm", "C:\\opt\\utm-monitor.exe --version")
+    → vm_exec("linuxvm", "cd /opt && ./utmm --version")
+    → vm_exec("macvm", "cd /opt && ./utmm --version")
+    → vm_exec("windowsvm", "C:\\opt\\utmm.exe --version")
     All three return v0.1.0 ✓
 ```
 
@@ -1143,14 +1143,14 @@ Claude will call `vm_status()` and return a summary of which VMs are online, the
 #### Reading logs and restarting services
 
 ```
-👤 "Check the utm-monitor logs on all VMs for errors"
-🤖 → vm_exec("linuxvm", "tail -30 /var/log/utm-monitor.log")
-    → vm_exec("macvm", "tail -30 /var/log/utm-monitor.log")
-    → vm_exec("windowsvm", "type C:\\opt\\utm-monitor.log")
+👤 "Check the utmm logs on all VMs for errors"
+🤖 → vm_exec("linuxvm", "tail -30 /var/log/utmm.log")
+    → vm_exec("macvm", "tail -30 /var/log/utmm.log")
+    → vm_exec("windowsvm", "type C:\\opt\\utmm.log")
     All clean, no errors.
 
 👤 "Restart the guest on linuxvm"
-🤖 → vm_exec("linuxvm", "pkill utm-monitor; sleep 1; /opt/utmm/utmm --hostname linuxvm &")
+🤖 → vm_exec("linuxvm", "pkill utmm; sleep 1; /opt/utmm/utmm --hostname linuxvm &")
     Restarted. vm_status confirms it's back online.
 ```
 
@@ -1211,8 +1211,8 @@ chmod +x /tmp/test.sh && /tmp/test.sh")
 
 | Scenario | Use |
 |----------|-----|
-| Quick status check | `utm-monitor --host --status` |
-| One-shot command | `utm-monitor --host --exec linuxvm "..."` |
+| Quick status check | `utmm --host --status` |
+| One-shot command | `utmm --host --exec linuxvm "..."` |
 | Interactive debugging | Claude Code with MCP tools |
 | Multi-step testing across VMs | Claude Code with MCP tools |
 | Deploy-test-verify loop | Claude Code with MCP tools |
@@ -1223,12 +1223,12 @@ chmod +x /tmp/test.sh && /tmp/test.sh")
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| MCP tools don't appear in Claude | MCP server not registered or wrong path | Run `claude mcp add utm-monitor -- utm-monitor --mcp`, then `/mcp` to reload |
-| "Host is not running" | Host process died or not started | `sudo utm-monitor --host` |
+| MCP tools don't appear in Claude | MCP server not registered or wrong path | Run `claude mcp add utmm -- utmm --mcp`, then `/mcp` to reload |
+| "Host is not running" | Host process died or not started | `sudo utmm --host` |
 | "GuestNotFound" for a VM | VM offline or hostname typo | `vm_status` to see online VMs |
-| "No VMs online" | VMs not booted, guest not running | Boot VMs, verify `utm-monitor` running inside each |
+| "No VMs online" | VMs not booted, guest not running | Boot VMs, verify `utmm` running inside each |
 | VM marked "upgradable" | Guest binary older than Host | `vm_deploy("that-vm")` |
-| MCP tools can't reach Host | IPC port blocked or Host not running | Try `utm-monitor --host --mcp` for integrated mode (bypasses IPC entirely) |
+| MCP tools can't reach Host | IPC port blocked or Host not running | Try `utmm --host --mcp` for integrated mode (bypasses IPC entirely) |
 
 ### 7.7 Skill (Bundled)
 

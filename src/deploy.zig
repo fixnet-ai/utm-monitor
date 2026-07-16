@@ -106,14 +106,14 @@ pub fn buildBinary(io: std.Io, allocator: std.mem.Allocator, target: []const u8)
     const src_name = if (protocol.deploymentFilename(target)) |name|
         name
     else blk: {
-        // Unknown target: fall back to old convention utm-monitor-{target}
-        break :blk try std.fmt.allocPrint(allocator, "utm-monitor-{s}", .{target});
+        // Unknown target: fall back to old convention utmm-{target}
+        break :blk try std.fmt.allocPrint(allocator, "utmm-{s}", .{target});
     };
     defer if (protocol.deploymentFilename(target) == null) allocator.free(src_name);
 
     const src_path = try std.fmt.allocPrint(allocator, "zig-out/bin/{s}", .{src_name});
     // Copy to temp path to avoid overwrite by subsequent builds
-    const tmp_path = try std.fmt.allocPrint(allocator, "zig-out/bin/utm-monitor-{s}{s}", .{ target, dst_ext });
+    const tmp_path = try std.fmt.allocPrint(allocator, "zig-out/bin/utmm-{s}{s}", .{ target, dst_ext });
     var cp_cmd: std.ArrayList(u8) = .empty;
     defer cp_cmd.deinit(allocator);
     try cp_cmd.print(allocator, "cp {s} {s}", .{ src_path, tmp_path });
@@ -142,7 +142,7 @@ fn buildRestartCommand(allocator: std.mem.Allocator, is_windows: bool, remote_pa
         // The service manager (systemd/launchd) will restart the new binary automatically.
         // The --hostname flag ensures the new process keeps the correct identity.
         return try std.fmt.allocPrint(allocator,
-            \\nohup sh -c 'sleep 1; mv {s}/{s} {s}/{s}; chmod +x {s}/{s}; pkill utm-monitor; sleep 1; {s}/{s} --hostname {s} &' >/dev/null 2>&1 &
+            \\nohup sh -c 'sleep 1; mv {s}/{s} {s}/{s}; chmod +x {s}/{s}; pkill utmm; sleep 1; {s}/{s} --hostname {s} &' >/dev/null 2>&1 &
         , .{ remote_path, new_name, remote_path, final_name, remote_path, final_name, remote_path, final_name, hostname });
     }
 }

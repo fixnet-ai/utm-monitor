@@ -50,8 +50,8 @@ The headline feature. After a quick one-time setup, you talk to Claude and it ma
 ```bash
 # Download the Host binary from GitHub Releases
 sudo curl -fsSL https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.macos \
-  -o /usr/local/bin/utm-monitor
-sudo chmod +x /usr/local/bin/utm-monitor
+  -o /usr/local/bin/utmm
+sudo chmod +x /usr/local/bin/utmm
 
 # Or use the install script (auto-detects architecture):
 # curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
@@ -73,7 +73,7 @@ sudo chmod +x /opt/utmm/*
 ### 3. Download Skill
 
 ```bash
-cd ~/utm-monitor
+cd ~/utmm
 
 # Download Skill (canonical location: utm-vm/SKILL.md)
 curl -o utm-vm/SKILL.md \
@@ -84,39 +84,39 @@ mkdir -p .claude/skills
 ln -sf ../../utm-vm .claude/skills/utm-vm
 ```
 
-> No extra files needed — the MCP server is built into the `utm-monitor` binary via `--mcp`. Zero external dependencies.
+> No extra files needed — the MCP server is built into the `utmm` binary via `--mcp`. Zero external dependencies.
 
 ### 4. Register MCP server with Claude Code
 
 ```bash
-claude mcp add utm-monitor -- utm-monitor --mcp
+claude mcp add utmm -- utmm --mcp
 ```
 
 Then restart Claude Code (or run `/mcp` to reload).
 
-> **Integrated mode (all-in-one):** `claude mcp add utm-monitor -- utm-monitor --host --mcp`
+> **Integrated mode (all-in-one):** `claude mcp add utmm -- utmm --host --mcp`
 > This runs the full Host + MCP in a single process — no separate Host daemon needed.
 
 ### 5. Start the Host
 
 ```bash
-sudo utm-monitor --host --serve-dir /opt/utmm
+sudo utmm --host --serve-dir /opt/utmm
 ```
 
 Keep this running. To auto-start on boot:
 
 ```bash
-sudo utm-monitor --install
+sudo utmm --install
 ```
 
 ### 6. Verify
 
 ```bash
 # CLI test
-utm-monitor --host --status
+utmm --host --status
 
 # MCP is built in — test with a ping
-printf 'Content-Length: 50\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}\n' | utm-monitor --mcp
+printf 'Content-Length: 50\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}\n' | utmm --mcp
 # → Content-Length: 47
 # → {"jsonrpc":"2.0","id":1,"result":{}}
 ```
@@ -131,19 +131,19 @@ Done! Now talk to Claude: "Check the status of all VMs".
 ```bash
 # Download binary
 sudo curl -fsSL https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.macos \
-  -o /usr/local/bin/utm-monitor && sudo chmod +x /usr/local/bin/utm-monitor
+  -o /usr/local/bin/utmm && sudo chmod +x /usr/local/bin/utmm
 
 # Guest: run inside a VM
-utm-monitor --hostname linuxvm --install    # auto-start on boot
-utm-monitor --hostname linuxvm &            # or run immediately
+utmm --hostname linuxvm --install    # auto-start on boot
+utmm --hostname linuxvm &            # or run immediately
 
 # Host: run on your Mac
-sudo utm-monitor --host                     # start listener (auto-upgrades Guests on version mismatch)
-utm-monitor --host --status                 # check all VM status
-utm-monitor --host --exec linuxvm "uname -a" # run command on VM
-utm-monitor --host --deploy                 # build + deploy to all VMs
-utm-monitor --host --upload ./f.txt linuxvm  # upload file to VM (no curl)
-utm-monitor --host --download linuxvm f.txt ./f.txt  # download file from VM (no curl)
+sudo utmm --host                     # start listener (auto-upgrades Guests on version mismatch)
+utmm --host --status                 # check all VM status
+utmm --host --exec linuxvm "uname -a" # run command on VM
+utmm --host --deploy                 # build + deploy to all VMs
+utmm --host --upload ./f.txt linuxvm  # upload file to VM (no curl)
+utmm --host --download linuxvm f.txt ./f.txt  # download file from VM (no curl)
 ```
 
 ## Documentation

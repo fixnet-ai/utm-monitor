@@ -2,7 +2,7 @@
 # UTM Monitor — one-click installation script
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
-#   curl -fsSL ... | sh -s -- --with-guests /opt/utm-monitor
+#   curl -fsSL ... | sh -s -- --with-guests /opt/utmm
 #
 # Options:
 #   --with-guests DIR    Also download all Guest binaries into DIR (for Host /update endpoint)
@@ -13,7 +13,7 @@
 set -e
 
 REPO="fixnet-ai/utm-monitor"
-BIN="/usr/local/bin/utm-monitor"
+BIN="/usr/local/bin/utmm"
 VERSION="${VERSION:-latest}"
 WITH_GUESTS=""
 GUEST_DIR=""
@@ -23,7 +23,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --with-guests)
             WITH_GUESTS=1
-            GUEST_DIR="${2:-/opt/utm-monitor}"
+            GUEST_DIR="${2:-/opt/utmm}"
             shift 2 2>/dev/null || shift
             ;;
         *) shift ;;
@@ -55,7 +55,7 @@ else
 fi
 
 # Download Host binary
-URL="$BASE_URL/utm-monitor-$TARGET"
+URL="$BASE_URL/utmm-$TARGET"
 echo "==> Downloading $URL ..."
 if sudo curl -fsSL --progress-bar "$URL" -o "$BIN"; then
     sudo chmod +x "$BIN"
@@ -67,9 +67,9 @@ else
     echo "==> Download failed — no GitHub Release found for $VERSION."
     echo "    Build from source instead:"
     echo "      git clone https://github.com/$REPO.git"
-    echo "      cd utm-monitor"
+    echo "      cd utmm"
     echo "      zig build -Doptimize=ReleaseSafe"
-    echo "      sudo cp zig-out/bin/utm-monitor $BIN"
+    echo "      sudo cp zig-out/bin/utmm $BIN"
     exit 1
 fi
 
@@ -84,8 +84,8 @@ if [ -n "$WITH_GUESTS" ]; then
         case "$t" in
             *windows*) ext=".exe" ;;
         esac
-        gurl="$BASE_URL/utm-monitor-$t$ext"
-        gdest="$GUEST_DIR/utm-monitor-$t$ext"
+        gurl="$BASE_URL/utmm-$t$ext"
+        gdest="$GUEST_DIR/utmm-$t$ext"
         echo "    $gurl"
         if sudo curl -fsSL --progress-bar "$gurl" -o "$gdest"; then
             sudo chmod +x "$gdest"
@@ -98,11 +98,11 @@ fi
 
 echo ""
 echo "==> To enable auto-start on boot:"
-echo "    sudo utm-monitor --install"
+echo "    sudo utmm --install"
 echo ""
 echo "==> To start Host now:"
 if [ -n "$WITH_GUESTS" ]; then
-    echo "    sudo utm-monitor --host --serve-dir $GUEST_DIR"
+    echo "    sudo utmm --host --serve-dir $GUEST_DIR"
 else
-    echo "    sudo utm-monitor --host"
+    echo "    sudo utmm --host"
 fi

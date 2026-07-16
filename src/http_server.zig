@@ -132,7 +132,7 @@ fn handleUpdate(request: *http.Server.Request, gpa: std.mem.Allocator) !void {
         "ARCH=$(uname -m)\n" ++
         "OS=$(uname -s | tr '[:upper:]' '[:lower:]')\n" ++
         "case \"$OS\" in darwin) OS=\"macos\" ;; mingw*|msys*|cygwin*) OS=\"windows\" ;; esac\n" ++
-        "BIN=\"utm-monitor-${ARCH}-${OS}\"\n" ++
+        "BIN=\"utmm-${ARCH}-${OS}\"\n" ++
         "case \"$OS\" in windows) BIN=\"${BIN}.exe\" ;; esac\n" ++
         "DEST=\"/opt/utmm/utmm\"\n" ++
         "case \"$OS\" in windows) DEST=\"C:\\\\opt\\\\utmm\\\\utmm.exe\" ;; esac\n" ++
@@ -230,7 +230,7 @@ fn handleUpload(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocato
         return;
     }
 
-    // Extract filename from query string: /upload?filename=utm-monitor-aarch64-linux
+    // Extract filename from query string: /upload?filename=utmm-aarch64-linux
     const target = request.head.target;
     const query_start = std.mem.indexOfScalar(u8, target, '?');
     const filename: []const u8 = if (query_start) |qs| blk: {

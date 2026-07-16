@@ -18,14 +18,14 @@ const IPC_PORT = ipc.IPC_PORT;
 
 const SERVER_INFO =
     \\{"protocolVersion":"2024-11-05",
-    \\"serverInfo":{"name":"utm-monitor","version":"__VERSION__"},
+    \\"serverInfo":{"name":"utmm","version":"__VERSION__"},
     \\"capabilities":{"tools":{}}}
 ;
 
 const TOOLS_JSON =
     \\[{"name":"vm_status","description":"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and whether an upgrade is available for each VM.","inputSchema":{"type":"object","properties":{},"required":[]}},
     \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. Use this to run tests, check files, install packages, or debug on any VM (Linux/macOS/Windows). The VM name is the hostname (e.g. 'linuxvm', 'macvm', 'windowsvm').","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command to execute on the VM"}},"required":["vm","command"]}},
-    \\{"name":"vm_deploy","description":"Build and deploy the utm-monitor binary to one or all UTM VMs. Compiles from source and uploads via HTTP. Use this after making code changes that need testing on VMs.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname, or omit to deploy to all online VMs"}},"required":[]}}]
+    \\{"name":"vm_deploy","description":"Build and deploy the utmm binary to one or all UTM VMs. Compiles from source and uploads via HTTP. Use this after making code changes that need testing on VMs.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname, or omit to deploy to all online VMs"}},"required":[]}}]
 ;
 
 // ── JSON value helpers ─────────────────────────────────────────────────────
