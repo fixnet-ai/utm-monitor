@@ -150,10 +150,45 @@ utmm --host --deploy linuxvm
 
 | Item | Path |
 |------|------|
-| Host binary | `/usr/local/bin/utmm` |
+| Host binary (symlink) | `/usr/local/bin/utmm` → `/opt/utmm/utmm` |
+| Host binary (actual) | `/opt/utmm/utmm` → `/opt/utmm/utmm-aarch64-macos` |
+| All platform binaries | `/opt/utmm/utmm-*` (8 binaries from utmm.zip) |
 | Host service plist | `/Library/LaunchDaemons/com.utmm.plist` |
 | Host log | `/var/log/utmm-host.log` |
-| Serve directory (HTTP) | Same directory as Host binary (or `--serve-dir`) |
+| Serve directory (HTTP) | `/opt/utmm/` by default (configurable via `--serve-dir`) |
+
+## Bootstrap Troubleshooting
+
+### Guest can't download from Host HTTP (curl error 28/timeout)
+
+**Symptom**: The `/update` script fetches successfully but the download within the script fails with a connection timeout.
+
+**Cause**: The `/update` script uses the Host IP from the HTTP `Host` header. If the Guest is on a UTM bridge network that can't route to the Host's physical NIC IP, the download fails. Example: macvm on bridge100 (192.168.64.0/24) cannot reach the Host's en0 IP (192.168.3.130).
+
+**Solution**: The `/update` endpoint now auto-detects the correct IP from the HTTP Host header. Ensure you're using the latest version. If the issue persists, download the binary directly:
+```bash
+# Use the bridge gateway IP (192.168.64.1, 192.168.65.1, etc.) directly:
+GATEWAY=$(ip route | grep default | awk '{print $3}')
+curl -fsSL "http://$GATEWAY:2121/bin/utmm-aarch64-linux" -o /opt/utmm/utmm
+chmod +x /opt/utmm/utmm
+/opt/utmm/utmm --hostname linuxvm &
+```
+
+### `--status` shows stale/duplicate entries after Guest restarts
+
+**Symptom**: After restarting a Guest with a new hostname, both the old and new names appear in `--status`.
+
+**Cause**: The Host's UDP listener caches Guest entries. Old entries remain until they expire. There's currently no active cleanup for renamed guests.
+
+**Workaround**: Restart the Host process (`sudo pkill utmm && sudo utmm --host`). The stale entry will be gone after restart.
+
+### `/update` script fails: directory not found
+
+**Symptom**: `curl: (23) client returned ERROR on write` when executing `/update`.
+
+**Cause**: Older versions of the `/update` script did not create `/opt/utmm/` before downloading.
+
+**Solution**: The latest `/update` script includes `mkdir -p`. If you're using an older Host, create the directory manually first: `sudo mkdir -p /opt/utmm`.
 
 ## Limitations
 

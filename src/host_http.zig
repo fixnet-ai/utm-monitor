@@ -66,7 +66,12 @@ fn handleClient(io: std.Io, gpa: std.mem.Allocator, stream: std.Io.net.Stream, c
 }
 
 fn dispatch(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocator, config: Config) !void {
-    const path = request.head.target;
+    const raw_path = request.head.target;
+    // Strip query string for routing (e.g., "/update?name=foo" → "/update")
+    const path = if (std.mem.indexOfScalar(u8, raw_path, '?')) |qpos|
+        raw_path[0..qpos]
+    else
+        raw_path;
 
     // GET /version
     if (request.head.method == .GET and std.mem.eql(u8, path, "/version")) {
@@ -123,11 +128,49 @@ fn handleVersion(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocat
 }
 
 /// GET /update — return the bootstrap shell script
+/// Query params:
+///   ?name=HOSTNAME — set the Guest hostname (e.g., curl .../update?name=linuxvm | sh)
 fn handleUpdate(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocator, config: Config) !void {
     _ = io;
 
-    const host_ip = config.host_ip orelse "127.0.0.1";
+    // Determine Host IP: parse the Host header from the raw request buffer
+    // (the IP the Guest actually used to reach us). This ensures the download
+    // URL is reachable even when the Guest is on a bridge network with a
+    // different subnet than the Host's physical NIC.
+    var host_ip_buf: [64]u8 = undefined;
+    var host_ip: []const u8 = config.host_ip orelse "127.0.0.1";
+    {
+        // Parse "Host: <value>" from the raw head buffer (case-insensitive search)
+        const buf = request.head_buffer;
+        const host_start = std.mem.indexOf(u8, buf, "Host:") orelse
+            std.mem.indexOf(u8, buf, "host:");
+        if (host_start) |start| {
+            const val_start = start + "host:".len; // same length as "Host:"
+            const val_end = std.mem.indexOfScalarPos(u8, buf, val_start, '\r') orelse buf.len;
+            var host_val = std.mem.trim(u8, buf[val_start..val_end], " \t");
+            // Strip port suffix (e.g., "192.168.64.1:2121" → "192.168.64.1")
+            if (std.mem.indexOfScalar(u8, host_val, ':')) |colon_pos| {
+                host_val = host_val[0..colon_pos];
+            }
+            if (host_val.len > 0 and host_val.len <= host_ip_buf.len) {
+                @memcpy(host_ip_buf[0..host_val.len], host_val);
+                host_ip = host_ip_buf[0..host_val.len];
+            }
+        }
+    }
     const port = config.port;
+
+    // Parse ?name= query param for hostname
+    var hostname_arg: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, request.head.target, '?')) |qpos| {
+        const qs = request.head.target[qpos + 1 ..];
+        var it = std.mem.splitScalar(u8, qs, '&');
+        while (it.next()) |pair| {
+            if (std.mem.startsWith(u8, pair, "name=")) {
+                hostname_arg = pair["name=".len..];
+            }
+        }
+    }
 
     const script = try std.fmt.allocPrint(
         gpa,
@@ -136,6 +179,7 @@ fn handleUpdate(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocato
         \\set -e
         \\HOST="{s}"
         \\PORT="{d}"
+        \\NAME="{s}"
         \\ARCH=$(uname -m)
         \\case "$ARCH" in
         \\  arm64|aarch64) ARCH="aarch64" ;;
@@ -149,8 +193,16 @@ fn handleUpdate(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocato
         \\esac
         \\BIN="utmm-$ARCH-$OS"
         \\case "$OS" in windows) BIN="$BIN.exe" ;; esac
+        \\DEST_DIR="/opt/utmm"
         \\DEST="/opt/utmm/utmm"
-        \\case "$OS" in windows) DEST="C:\\\\opt\\\\utmm\\\\utmm.exe" ;; esac
+        \\case "$OS" in
+        \\  windows)
+        \\    DEST_DIR="C:\\opt\\utmm"
+        \\    DEST="C:\\opt\\utmm\\utmm.exe"
+        \\    ;;
+        \\esac
+        \\echo "[update] Creating $DEST_DIR ..."
+        \\mkdir -p "$DEST_DIR"
         \\echo "[update] Downloading http://$HOST:$PORT/bin/$BIN ..."
         \\if command -v curl >/dev/null 2>&1; then
         \\  curl -fsSL "http://$HOST:$PORT/bin/$BIN" -o "$DEST.new"
@@ -165,9 +217,13 @@ fn handleUpdate(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocato
         \\echo "[update] Done. Restarting..."
         \\pkill utmm || true
         \\sleep 1
-        \\"$DEST" &
+        \\if [ -n "$NAME" ]; then
+        \\  "$DEST" --hostname "$NAME" &
+        \\else
+        \\  "$DEST" &
+        \\fi
         \\
-    , .{ host_ip, port });
+    , .{ host_ip, port, hostname_arg });
     defer gpa.free(script);
 
     try request.respond(script, .{

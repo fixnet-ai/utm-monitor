@@ -226,33 +226,62 @@ sudo utmm --host             # Start immediately
 
 A brand-new VM has no utmm running. After the Host starts `utmm --host`, it automatically provides a read-only HTTP server on port 2121 (serving the cross-compiled binaries from `/opt/utmm/`). Therefore, bare-metal bootstrapping requires only one command:
 
-**Linux / macOS Guest**:
+**Linux Guest**:
 
 ```bash
-# After Host starts, execute in the VM (Host IP is usually the gateway address):
-sudo mkdir -p /opt
+# After Host starts, execute in the VM (gateway IP is usually the Host's bridge address)
 GATEWAY=$(ip route | grep default | awk '{print $3}')
-curl -s "http://$GATEWAY:2121/update" | sh
+curl -s "http://$GATEWAY:2121/update?name=linuxvm" | sh
 ```
 
-> **Prerequisite**: The target directory `/opt/utmm/` must exist before running `/update`. The script installs the binary to `/opt/utmm/utmm`.
+**macOS Guest**:
 
-`/update` is a virtual endpoint on the Host HTTP server that auto-detects the Guest architecture and downloads the corresponding binary (e.g., `utmm-aarch64-linux`, `utmm-x86_64-windows.exe`), installing it as a system service. The script has built-in version checking: if the Guest is already installed and its version matches the Host, the download is skipped.
+```bash
+# macOS uses a different command to find the gateway
+GATEWAY=$(route -n get default 2>/dev/null | grep gateway | awk '{print $2}')
+curl -s "http://$GATEWAY:2121/update?name=macvm" | sh
+```
 
-**Windows Guest**:
+> **Note**: The `?name=HOSTNAME` query parameter sets the Guest hostname (e.g., `linuxvm`, `macvm`). Without it, the Guest will broadcast with the OS hostname (e.g., `ubuntu`, `dasis-Virtual-Machine`), which may not match the expected name.
+
+`/update` is a virtual endpoint on the Host HTTP server that auto-detects the Guest architecture and downloads the corresponding binary (e.g., `utmm-aarch64-linux`, `utmm-x86_64-windows.exe`). The script:
+- Creates `/opt/utmm/` (or `C:\opt\utmm\` on Windows) automatically — no manual `mkdir` needed
+- Detects the Guest architecture (aarch64 / x86_64 / x86) and OS
+- Downloads the correct binary from `http://<HOST>:2121/bin/utmm-{arch}-{os}[.exe]`
+- Starts the binary with `--hostname NAME` if a `?name=` parameter was provided
+
+**Windows Guest** (PowerShell):
 
 ```powershell
-# Get gateway IP, then download the appropriate binary for your Windows architecture
+# Determine gateway IP
 $gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop
-$arch = (Get-WmiObject Win32_Processor).AddressWidth  # 32 or 64
-if ($arch -eq 64) { $bin = "utmm-x86_64-windows.exe" } else { $bin = "utmm-x86-windows.exe" }
+
+# Detect CPU architecture (ARM64 / x86_64 / x86)
+$cpuArch = (Get-CimInstance Win32_Processor).Architecture
+switch ($cpuArch) {
+    12 { $arch = "aarch64" }   # ARM64
+     9 { $arch = "x86_64" }    # AMD64 / Intel 64-bit
+     0 { $arch = "x86" }       # Intel 32-bit
+     5 { $arch = "x86" }       # ARM 32-bit (use x86 binary)
+    default { $arch = "x86_64" }
+}
+
+# Build OS suffix and download URL
+$os = "windows"
+$bin = "utmm-${arch}-${os}.exe"
+
+# Download and install
+New-Item -ItemType Directory -Force -Path C:\opt\utmm | Out-Null
 curl "http://${gw}:2121/bin/$bin" -o C:\opt\utmm\utmm.exe
 C:\opt\utmm\utmm.exe --install
+C:\opt\utmm\utmm.exe --hostname windowsvm
 ```
 
 > **Windows CWD**: When started via Scheduled Task, `utmm.exe` automatically changes its working directory to `C:\opt\` at startup — no special configuration needed. Previously files would land in `C:\Windows\System32\` due to the Task Scheduler default CWD.
+>
+> **CPU Architecture Codes**: `Get-CimInstance Win32_Processor` returns `.Architecture` as a numeric code: `12` = ARM64, `9` = x86_64 (AMD64), `0` = x86 (32-bit), `5` = ARM (32-bit). Modern Windows 10/11 use `Get-CimInstance` instead of the deprecated `Get-WmiObject`.
 
-> **Core Principle**: When the Host starts `--host`, it automatically starts a read-only HTTP server on port 2121, serving the cross-compiled binaries from the serve directory (default: exe directory, configurable via `--serve-dir`). Guest and Host use the exact same port (2121), fully symmetric. See `curl http://<host>:2121/update` for the dynamic bootstrap script returned.
+> **Core Principle**: When the Host starts `--host`, it automatically starts a read-only HTTP server on port 2121, serving the cross-compiled binaries from `/opt/utmm/` by default. Guest and Host use the exact same port (2121), fully symmetric. See `curl http://<host>:2121/update` for the dynamic bootstrap script returned.
 
 **Other Alternative Methods** (if Host HTTP is unreachable):
 
@@ -1232,8 +1261,62 @@ chmod +x /tmp/test.sh && /tmp/test.sh")
 | "No VMs online" | VMs not booted, guest not running | Boot VMs, verify `utmm` running inside each |
 | VM marked "upgradable" | Guest binary older than Host | `vm_deploy("that-vm")` |
 | MCP tools can't reach Host | IPC port blocked or Host not running | Try `utmm --host --mcp` for integrated mode (bypasses IPC entirely) |
+| Port 12345 AddressInUse at Host start | Old `utm-monitor` process still running | `sudo pkill -f utm-monitor && sudo utmm --host` |
+| `/update` script fails: directory not found | Old `/update` script without `mkdir -p` | `sudo mkdir -p /opt/utmm` before running, or update Host binary |
+| Guest shows wrong hostname (OS hostname) | `/update` ran without `?name=` parameter | Restart Guest: `/opt/utmm/utmm --hostname desired-name &` |
+| `--status` shows stale/duplicate entries | Guest renamed but old entry cached | Restart Host: `sudo pkill utmm && sudo utmm --host` |
+| Windows bootstrap: `Get-WmiObject` not found | `wmic` deprecated in modern Windows | Use `Get-CimInstance Win32_Processor` instead (see §2.4) |
+| Guest can't download binary from Host (timeout) | Guest on isolated bridge can't reach Host physical NIC IP | Use bridge gateway IP directly; latest Host auto-detects via Host header |
 
-### 7.7 Skill (Bundled)
+### 7.7 Complete Uninstall / Cleanup
+
+To remove utmm entirely and return to bare-metal state:
+
+**Host side**:
+```bash
+# Stop all processes
+sudo pkill -f utmm 2>/dev/null
+sudo pkill -f utm-monitor 2>/dev/null
+
+# Remove auto-start service
+sudo launchctl bootout system /Library/LaunchDaemons/com.utmm.plist 2>/dev/null
+sudo rm -f /Library/LaunchDaemons/com.utmm.plist
+
+# Remove binaries
+sudo rm -rf /opt/utmm
+sudo rm -f /usr/local/bin/utmm
+
+# Clean /etc/hosts
+sudo sed -i '' '/# UTM-MONITOR-BEGIN/,/# UTM-MONITOR-END/d' /etc/hosts
+```
+
+**Linux Guest** (run inside VM or via SSH):
+```bash
+pkill -f utmm 2>/dev/null
+systemctl stop utmm 2>/dev/null; systemctl disable utmm 2>/dev/null
+rm -f /etc/systemd/system/utmm.service
+rm -rf /opt/utmm /opt/utm-monitor /opt/utmm_*
+rm -f /var/log/utmm*.log /opt/utmm*.log
+```
+
+**macOS Guest** (run inside VM or via SSH):
+```bash
+pkill -f utmm 2>/dev/null
+launchctl bootout system /Library/LaunchDaemons/com.utmm.plist 2>/dev/null
+rm -f /Library/LaunchDaemons/com.utmm.plist
+rm -rf /opt/utmm /opt/utm-monitor /opt/utmm_*
+rm -f /var/log/utmm*.log /opt/utmm*.log
+```
+
+**Windows Guest** (run inside VM or via SSH):
+```cmd
+taskkill /f /im utmm.exe
+schtasks /delete /tn utmm /f
+rmdir /s /q C:\opt\utmm C:\opt\utmm_win
+del C:\opt\utmm*.log C:\opt\utm-monitor*
+```
+
+### 7.8 Skill (Bundled)
 
 The `utm-vm/SKILL.md` file (at project root, symlinked into `.claude/skills/`) provides Claude with detailed knowledge about:
 - When to use each tool in different debugging scenarios
