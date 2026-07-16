@@ -31,6 +31,11 @@ build_target x86_64-linux-musl    utmm-x86_64-linux
 build_target aarch64-linux-musl   utmm-aarch64-linux
 
 echo ""
+echo "==> Copying install scripts..."
+cp install.sh release/
+cp install.ps1 release/
+
+echo ""
 echo "==> Creating utmm.zip..."
 rm -f utmm.zip
 cd release && zip "../utmm.zip" * && cd ..

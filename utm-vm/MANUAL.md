@@ -228,21 +228,21 @@ A brand-new VM has no utmm running. After the Host starts `utmm --host`, it auto
 
 **Deployment order is always: Host first, then Guests.**
 
-**Linux / macOS Guest** — one command:
+**Linux / macOS Guest** — one command (no internet needed, everything from Host HTTP):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh -s -- --guest --hostname myvm
+# Find the gateway IP (Host's bridge address), then:
+curl "http://<gateway>:2121/bin/install.sh" | sh -s -- --guest --hostname myvm
+
+# Or detect gateway automatically:
+GATEWAY=$(ip route | grep default | awk '{print $3}')
+curl "http://$GATEWAY:2121/bin/install.sh" | sh -s -- --guest --hostname linuxvm
 ```
 
 **Windows Guest** (PowerShell as Administrator):
 
 ```powershell
-# Option 1: Download and execute (if internet is available)
-irm https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.ps1 | iex
-# Then call the function:
-Install-UtmmGuest -Hostname windowsvm
-
-# Option 2: Download from Host HTTP (no internet needed on Guest)
+# Find the gateway IP (Host's bridge address), then:
 $gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop | Select -First 1
 iwr "http://${gw}:2121/bin/install.ps1" -OutFile install.ps1
 .\install.ps1 -Guest -Hostname windowsvm

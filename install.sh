@@ -6,8 +6,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 #   → Downloads utmm.zip from GitHub Releases, extracts to /opt/utmm/, creates symlinks
 #
-# Guest mode:
-#   curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh -s -- --guest --hostname myvm
+# Guest mode (no internet needed — everything from Host HTTP at gateway IP):
+#   curl http://<gateway>:2121/bin/install.sh | sh -s -- --guest --hostname myvm
 #   → Auto-detects arch/OS, downloads correct binary from Host HTTP (gateway:2121),
 #     creates symlinks, installs service, starts Guest
 #

@@ -2,6 +2,10 @@
 .zig-cache/
 zig-out/
 
+# Release artifacts (built locally or by CI)
+release/
+utmm.zip
+
 # IDE
 .vscode/
 .idea/

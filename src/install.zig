@@ -194,8 +194,28 @@ pub fn installSelf(io: std.Io, allocator: std.mem.Allocator, is_host: bool) !voi
         },
         .windows => {
             const args: []const u8 = if (is_host) " --host" else "";
-            std.debug.print("[install] Windows: please manually create scheduled task:\n", .{});
-            std.debug.print("[install]   schtasks /create /tn \"UTM-Monitor\" /tr \"{s}{s}\" /sc onstart /rl highest\n", .{ exe_path, args });
+
+            // Build the full command line for the scheduled task
+            const tr_cmd = try std.fmt.allocPrint(allocator, "\"{s}\"{s}", .{ exe_path, args });
+            defer allocator.free(tr_cmd);
+
+            // Remove existing task first (ignore errors)
+            if (std.process.run(allocator, io, .{
+                .argv = &.{ "schtasks", "/delete", "/tn", "UTM-Monitor", "/f" },
+            })) |_| {} else |_| {}
+
+            // Create the scheduled task
+            const result = std.process.run(allocator, io, .{
+                .argv = &.{ "schtasks", "/create", "/tn", "UTM-Monitor", "/tr", tr_cmd, "/sc", "onstart", "/rl", "highest" },
+            });
+            if (result) |r| {
+                std.debug.print("[install] Windows: scheduled task created (UTM-Monitor)\n", .{});
+                std.debug.print("[install]   tr: {s}\n", .{tr_cmd});
+                _ = r;
+            } else |_| {
+                std.debug.print("[install] Windows: failed to create scheduled task — create manually:\n", .{});
+                std.debug.print("[install]   schtasks /create /tn \"UTM-Monitor\" /tr {s} /sc onstart /rl highest\n", .{tr_cmd});
+            }
         },
     }
 

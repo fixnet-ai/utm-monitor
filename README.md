@@ -1,6 +1,6 @@
 # UTM Monitor
 
-**AI-powered UTM virtual machine management** — auto IP discovery, remote execution, and one-click deploy. Claude Code MCP + Skill integration lets your AI manage VMs through natural language.
+**AI-powered UTM virtual machine management** — auto IP discovery, remote execution, remote debug..., and one-click deploy. Claude Code MCP + Skill integration lets your AI manage VMs through natural language.
 
 Written in Zig 0.16.0. Single binary, dual mode. Zero external dependencies.
 
@@ -130,13 +130,16 @@ sudo utmm --host --install    # auto-start on boot
 sudo utmm --host              # or run immediately
 
 # ─── Guest (inside each VM) — one command per Guest ───
+# No internet needed — everything comes from Host HTTP at gateway IP
 
-# Linux / macOS Guest
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh -s -- --guest --hostname linuxvm
+# Linux / macOS Guest (find gateway first, then curl from Host HTTP)
+GATEWAY=$(ip route | grep default | awk '{print $3}')
+curl "http://$GATEWAY:2121/bin/install.sh" | sh -s -- --guest --hostname linuxvm
 
 # Windows Guest (PowerShell as Administrator)
-irm https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.ps1 | iex
-Install-UtmmGuest -Hostname windowsvm
+$gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop | Select -First 1
+iwr "http://${gw}:2121/bin/install.ps1" -OutFile install.ps1
+.\install.ps1 -Guest -Hostname windowsvm
 
 # ─── Verify ───
 utmm --host --status                 # check all VM status
