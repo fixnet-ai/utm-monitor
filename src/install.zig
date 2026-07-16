@@ -1,5 +1,10 @@
 //! System service installation and auto-start script generation
-//! Supports three platforms: macOS (launchd), Linux (systemd), Windows (Registry)
+//! Supports three platforms: macOS (launchd), Linux (systemd), Windows (sc)
+//!
+//! Design: --install/--uninstall are the SINGLE source of truth for service
+//! management on ALL platforms. Install scripts (install.sh/install.ps1) only
+//! create the runtime environment (download, mkdir, symlink) and delegate to
+//! --install for service creation.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -70,19 +75,23 @@ pub fn genInit(platform: Platform) []const u8 {
         \\WantedBy=multi-user.target
         ,
         .windows =>
-        \\:: UTM Monitor auto-start script
-        \\:: Save this script as C:\opt\utmm\startup.bat
-        \\:: and create a "run at system startup" task in Task Scheduler:
-        \\::   schtasks /create /tn "UTM-Monitor" /tr "C:\opt\utmm\utmm.exe" /sc onstart /rl highest
-        \\@echo off
-        \\cd /d C:\opt\utmm\
-        \\start /b utmm.exe
+        \\:: UTM Monitor auto-start service
+        \\:: Install with: sc create "UTM-Monitor" binPath= "\"C:\opt\utmm\utmm.exe\" --svc" start= auto
+        \\::              sc start "UTM-Monitor"
+        \\:: Remove with:  sc stop "UTM-Monitor" & sc delete "UTM-Monitor"
         ,
     };
 }
 
-/// Self-install as system service (auto-detect platform)
-pub fn installSelf(io: std.Io, allocator: std.mem.Allocator, is_host: bool) !void {
+/// Self-install as system service (auto-detect platform).
+/// hostname_override: if provided, baked into the service command line so
+/// the process starts with the correct --hostname on every boot.
+pub fn installSelf(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    is_host: bool,
+    hostname_override: ?[]const u8,
+) !void {
     const platform = Platform.detect();
     std.debug.print("[install] detected platform: {s}, mode: {s}\n", .{ platform.asStr(), if (is_host) "host" else "guest" });
 
@@ -101,7 +110,10 @@ pub fn installSelf(io: std.Io, allocator: std.mem.Allocator, is_host: bool) !voi
                 if (err != error.PathAlreadyExists) return err;
             };
 
-            // Write plist (remove existing first)
+            // Unload existing service first (ignore errors)
+            if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", "system", plist_path } })) |_| {} else |_| {}
+
+            // Write plist
             std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
             const file = try std.Io.Dir.cwd().createFile(io, plist_path, .{ .permissions = @enumFromInt(0o644) });
             defer file.close(io);
@@ -132,53 +144,70 @@ pub fn installSelf(io: std.Io, allocator: std.mem.Allocator, is_host: bool) !voi
                     \\</plist>
                 , .{exe_path});
             } else {
-                try writer.interface.print(genInit(.macos), .{});
+                try writer.interface.print(
+                    \\<?xml version="1.0" encoding="UTF-8"?>
+                    \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+                    \\  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                    \\<plist version="1.0">
+                    \\<dict>
+                    \\    <key>Label</key>
+                    \\    <string>com.utmm</string>
+                    \\    <key>ProgramArguments</key>
+                    \\    <array>
+                    \\        <string>{s}</string>
+                , .{exe_path});
+                try writer.interface.flush();
+                if (hostname_override) |h| {
+                    try writer.interface.print("        <string>--hostname</string>\n        <string>{s}</string>\n", .{h});
+                }
+                try writer.interface.print(
+                    \\    </array>
+                    \\    <key>RunAtLoad</key>
+                    \\    <true/>
+                    \\    <key>KeepAlive</key>
+                    \\    <true/>
+                    \\    <key>StandardOutPath</key>
+                    \\    <string>/var/log/utmm.log</string>
+                    \\</dict>
+                    \\</plist>
+                , .{});
             }
             try writer.interface.flush();
 
-            std.debug.print("[install] macOS: plist written to {s}\n", .{plist_path});
-            std.debug.print("[install] run: sudo launchctl load {s}\n", .{plist_path});
+            // Load the service immediately
+            if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "load", plist_path } })) |_| {
+                std.debug.print("[install] macOS: plist written + loaded: {s}\n", .{plist_path});
+            } else |_| {
+                std.debug.print("[install] macOS: plist written to {s}\n", .{plist_path});
+                std.debug.print("[install] run: sudo launchctl load {s}\n", .{plist_path});
+            }
         },
         .linux => {
             const service_path = "/etc/systemd/system/utmm.service";
             const desc: []const u8 = if (is_host) "UTM Monitor Host Service" else "UTM Monitor Guest Service";
+            const extra_args: []const u8 = if (is_host) " --host" else if (hostname_override) |h|
+                try std.fmt.allocPrint(allocator, " --hostname {s}", .{h})
+            else
+                "";
 
-            const content = if (is_host) blk: {
-                // Compute working directory from exe path for Host mode
-                const exe_dir = std.fs.path.dirname(exe_path) orelse "/opt/utmm";
-                break :blk try std.fmt.allocPrint(allocator,
-                    \\[Unit]
-                    \\Description={s}
-                    \\After=network.target
-                    \\
-                    \\[Service]
-                    \\Type=simple
-                    \\ExecStart={s} --host
-                    \\WorkingDirectory={s}
-                    \\Restart=always
-                    \\RestartSec=5
-                    \\StandardOutput=journal
-                    \\
-                    \\[Install]
-                    \\WantedBy=multi-user.target
-                , .{ desc, exe_path, exe_dir });
-            } else blk: {
-                break :blk try std.fmt.allocPrint(allocator,
-                    \\[Unit]
-                    \\Description={s}
-                    \\After=network.target
-                    \\
-                    \\[Service]
-                    \\Type=simple
-                    \\ExecStart={s}
-                    \\Restart=always
-                    \\RestartSec=5
-                    \\StandardOutput=journal
-                    \\
-                    \\[Install]
-                    \\WantedBy=multi-user.target
-                , .{ desc, exe_path });
-            };
+            const exe_dir = std.fs.path.dirname(exe_path) orelse "/opt/utmm";
+
+            const content = try std.fmt.allocPrint(allocator,
+                \\[Unit]
+                \\Description={s}
+                \\After=network.target
+                \\
+                \\[Service]
+                \\Type=simple
+                \\ExecStart={s}{s}
+                \\WorkingDirectory={s}
+                \\Restart=always
+                \\RestartSec=5
+                \\StandardOutput=journal
+                \\
+                \\[Install]
+                \\WantedBy=multi-user.target
+            , .{ desc, exe_path, extra_args, exe_dir });
             defer allocator.free(content);
 
             std.Io.Dir.cwd().deleteFile(io, service_path) catch {};
@@ -190,31 +219,60 @@ pub fn installSelf(io: std.Io, allocator: std.mem.Allocator, is_host: bool) !voi
             try writer.interface.flush();
 
             std.debug.print("[install] Linux: systemd unit written to {s}\n", .{service_path});
-            std.debug.print("[install] run: systemctl enable utmm && systemctl start utmm\n", .{});
+
+            // Reload, enable, and start
+            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "daemon-reload" } })) |_| {} else |_| {}
+            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "enable", "utmm.service" } })) |_| {
+                std.debug.print("[install] Linux: service enabled\n", .{});
+            } else |_| {}
+            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "start", "utmm.service" } })) |_| {
+                std.debug.print("[install] Linux: service started\n", .{});
+            } else |_| {
+                std.debug.print("[install] Linux: run manually: systemctl enable --now utmm\n", .{});
+            }
         },
         .windows => {
-            const args: []const u8 = if (is_host) " --host" else "";
+            // Build binPath for sc create
+            // sc has quirky syntax: "binPath= value" — the space after '=' is REQUIRED
+            const svc_name = "UTM-Monitor";
+            const extra_args: []const u8 = if (is_host) " --host" else if (hostname_override) |h|
+                try std.fmt.allocPrint(allocator, " --hostname {s}", .{h})
+            else
+                "";
 
-            // Build the full command line for the scheduled task
-            const tr_cmd = try std.fmt.allocPrint(allocator, "\"{s}\"{s}", .{ exe_path, args });
-            defer allocator.free(tr_cmd);
+            const bin_path = try std.fmt.allocPrint(allocator, "\"{s}\" --svc{s}", .{ exe_path, extra_args });
+            defer allocator.free(bin_path);
 
-            // Remove existing task first (ignore errors)
+            // Stop and delete existing service (ignore errors)
             if (std.process.run(allocator, io, .{
-                .argv = &.{ "schtasks", "/delete", "/tn", "UTM-Monitor", "/f" },
+                .argv = &.{ "sc", "stop", svc_name },
+            })) |_| {} else |_| {}
+            if (std.process.run(allocator, io, .{
+                .argv = &.{ "sc", "delete", svc_name },
             })) |_| {} else |_| {}
 
-            // Create the scheduled task
-            const result = std.process.run(allocator, io, .{
-                .argv = &.{ "schtasks", "/create", "/tn", "UTM-Monitor", "/tr", tr_cmd, "/sc", "onstart", "/rl", "highest" },
-            });
-            if (result) |r| {
-                std.debug.print("[install] Windows: scheduled task created (UTM-Monitor)\n", .{});
-                std.debug.print("[install]   tr: {s}\n", .{tr_cmd});
+            // Create service: auto-start, runs in its own session (survives SSH disconnect)
+            std.debug.print("[install] Windows: creating service '{s}'...\n", .{svc_name});
+            std.debug.print("[install]   binPath= {s}\n", .{bin_path});
+
+            if (std.process.run(allocator, io, .{
+                .argv = &.{ "sc", "create", svc_name, "binPath=", bin_path, "start=", "auto" },
+            })) |r| {
+                std.debug.print("[install] Windows: service created\n", .{});
                 _ = r;
             } else |_| {
-                std.debug.print("[install] Windows: failed to create scheduled task — create manually:\n", .{});
-                std.debug.print("[install]   schtasks /create /tn \"UTM-Monitor\" /tr {s} /sc onstart /rl highest\n", .{tr_cmd});
+                std.debug.print("[install] Windows: failed to create service — create manually:\n", .{});
+                std.debug.print("[install]   sc create \"{s}\" binPath= \"{s}\" start= auto\n", .{ svc_name, bin_path });
+                return;
+            }
+
+            // Start the service immediately
+            if (std.process.run(allocator, io, .{
+                .argv = &.{ "sc", "start", svc_name },
+            })) |_| {
+                std.debug.print("[install] Windows: service started\n", .{});
+            } else |_| {
+                std.debug.print("[install] Windows: start manually: sc start \"{s}\"\n", .{svc_name});
             }
         },
     }
@@ -231,8 +289,8 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator) !void {
         .macos => {
             const plist_path = "/Library/LaunchDaemons/com.utmm.plist";
 
-            // Unload the service (needs sudo)
-            if (std.process.run(allocator, io, .{ .argv = &.{ "/bin/sh", "-c", "launchctl unload " ++ plist_path } })) |_| {} else |_| {}
+            // Unload the service
+            if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", "system", plist_path } })) |_| {} else |_| {}
 
             // Remove the plist file
             std.Io.Dir.cwd().deleteFile(io, plist_path) catch |err| {
@@ -240,18 +298,15 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator) !void {
                     std.debug.print("[uninstall] failed to remove plist: {}\n", .{err});
                 }
             };
-            std.debug.print("[uninstall] macOS: service unloaded, plist removed from {s}\n", .{plist_path});
+            std.debug.print("[uninstall] macOS: service unloaded, plist removed\n", .{});
         },
         .linux => {
             const service_name = "utmm.service";
             const service_path = "/etc/systemd/system/utmm.service";
 
-            // Stop and disable the service
+            // Stop and disable
             if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "stop", service_name } })) |_| {} else |_| {}
             if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "disable", service_name } })) |_| {} else |_| {}
-
-            // Reload systemd
-            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "daemon-reload" } })) |_| {} else |_| {}
 
             // Remove the unit file
             std.Io.Dir.cwd().deleteFile(io, service_path) catch |err| {
@@ -259,14 +314,24 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator) !void {
                     std.debug.print("[uninstall] failed to remove unit file: {}\n", .{err});
                 }
             };
+
+            // Reload systemd
+            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "daemon-reload" } })) |_| {} else |_| {}
+
             std.debug.print("[uninstall] Linux: service stopped, unit file removed\n", .{});
         },
         .windows => {
-            // Delete the scheduled task
+            const svc_name = "UTM-Monitor";
+
+            // Stop and delete the service
             if (std.process.run(allocator, io, .{
-                .argv = &.{ "schtasks", "/delete", "/tn", "UTM-Monitor", "/f" },
+                .argv = &.{ "sc", "stop", svc_name },
             })) |_| {} else |_| {}
-            std.debug.print("[uninstall] Windows: scheduled task removed\n", .{});
+            if (std.process.run(allocator, io, .{
+                .argv = &.{ "sc", "delete", svc_name },
+            })) |_| {} else |_| {}
+
+            std.debug.print("[uninstall] Windows: service stopped and removed\n", .{});
         },
     }
 
@@ -306,7 +371,7 @@ test "genInit - macos" {
 
 test "genInit - windows" {
     const script = genInit(.windows);
-    try std.testing.expect(std.mem.indexOf(u8, script, "utmm.exe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "sc create") != null);
 }
 
 test "uninstallSelf - signature" { _ = uninstallSelf; }

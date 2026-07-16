@@ -17,10 +17,13 @@ const ipc = @import("ipc.zig");
 const mcp = @import("mcp.zig");
 const http_client = @import("http_client.zig");
 
-/// Host mode entry point
+/// Host mode entry point (from std.process.Init)
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
-    const io = init.io;
-    const gpa = init.gpa;
+    return runWithIo(init.io, init.gpa, cli);
+}
+
+/// Host mode entry point (called from Windows service or direct process start)
+pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs) !void {
 
     // ── Management commands: forward via IPC to running Host ────
     if (cli.cmd_status) {
@@ -97,7 +100,7 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
         return;
     }
     if (cli.cmd_install) {
-        try install_mod.installSelf(io, gpa, cli.is_host);
+        try install_mod.installSelf(io, gpa, cli.is_host, cli.hostname);
         return;
     }
     if (cli.cmd_uninstall) {

@@ -6,11 +6,13 @@ const broadcast = @import("broadcast.zig");
 const http_server = @import("http_server.zig");
 const protocol = @import("protocol.zig");
 
-/// Guest mode entry point
-/// Start three background threads: broadcast, HTTP server, version check
+/// Guest mode entry point (from std.process.Init)
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
-    const io = init.io;
-    const gpa = init.gpa;
+    return runWithIo(init.io, init.gpa, cli);
+}
+
+/// Guest mode entry point (called from Windows service or direct process start)
+pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs) !void {
 
     // Collect system information
     var sysinfo = try broadcast.getSystemInfo(io, gpa);

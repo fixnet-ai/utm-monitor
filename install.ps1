@@ -119,26 +119,13 @@ function Install-UtmmGuest {
     # Move temp file to install dir
     Move-Item -Force $tmpFile "$installDir\utmm.exe"
 
-    # 7. Install as system service
+    # 7. Install as system service (delegates to utmm.exe --install)
     Write-Host "==> Installing auto-start service..."
-    try {
-        & "$installDir\utmm.exe" --install
-    } catch {
-        Write-Host "Warning: Service installation failed: $_"
-        Write-Host "  Guest will still run but won't auto-start on boot."
-    }
-
-    # 8. Start Guest
-    Write-Host "==> Starting Guest..."
-    $args = @()
     if ($Hostname) {
-        $args = @("--hostname", $Hostname)
-        Write-Host "    hostname: $Hostname"
+        & "$installDir\utmm.exe" --install --hostname $Hostname
     } else {
-        Write-Host "    (using OS hostname)"
+        & "$installDir\utmm.exe" --install
     }
-
-    Start-Process -NoNewWindow -FilePath "$installDir\utmm.exe" -ArgumentList $args
 
     Start-Sleep -Seconds 1
     Write-Host ""

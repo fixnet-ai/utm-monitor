@@ -4,9 +4,45 @@
 //! Host mode (--host): UDP listener + update /etc/hosts + management commands
 
 const std = @import("std");
+const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const guest = @import("guest.zig");
 const host_mod = @import("host.zig");
+
+// ── Windows Service integration types and externs (only compiled on Windows) ──
+const windows = if (builtin.os.tag == .windows) std.os.windows else struct {
+    pub const DWORD = u32;
+    pub const BOOL = u32;
+};
+
+const SERVICE_WIN32_OWN_PROCESS = 0x00000010;
+const SERVICE_RUNNING = 0x00000004;
+const SERVICE_STOPPED = 0x00000001;
+const SERVICE_ACCEPT_STOP = 0x00000001;
+const SERVICE_CONTROL_STOP = 0x00000001;
+
+const SERVICE_STATUS = extern struct {
+    dwServiceType: u32,
+    dwCurrentState: u32,
+    dwControlsAccepted: u32,
+    dwWin32ExitCode: u32,
+    dwServiceSpecificExitCode: u32,
+    dwCheckPoint: u32,
+    dwWaitHint: u32,
+};
+
+const SERVICE_STATUS_HANDLE = *anyopaque;
+
+const SvcMainFn = *const fn (dwNumServiceArgs: u32, lpServiceArgVectors: [*]?[*:0]const u16) callconv(.winapi) void;
+
+const SERVICE_TABLE_ENTRYW = extern struct {
+    lpServiceName: ?[*:0]const u16,
+    lpServiceProc: ?SvcMainFn,
+};
+
+extern "advapi32" fn StartServiceCtrlDispatcherW(lpServiceStartTable: [*]const SERVICE_TABLE_ENTRYW) callconv(.winapi) u32;
+extern "advapi32" fn RegisterServiceCtrlHandlerExW(lpServiceName: [*:0]const u16, lpHandlerProc: ?*const fn (dwControl: u32, dwEventType: u32, lpEventData: ?*anyopaque, lpContext: ?*anyopaque) callconv(.winapi) u32, lpContext: ?*anyopaque) callconv(.winapi) ?SERVICE_STATUS_HANDLE;
+extern "advapi32" fn SetServiceStatus(hServiceStatus: ?SERVICE_STATUS_HANDLE, lpServiceStatus: *SERVICE_STATUS) callconv(.winapi) u32;
 
 comptime {
     _ = @import("hosts_file.zig");
@@ -48,6 +84,8 @@ pub const CliArgs = struct {
     serve_dir: ?[]const u8 = null,
     /// Whether to save config
     save_config: bool = false,
+    /// Internal: run as Windows service (--svc, added by sc create)
+    is_svc: bool = false,
 
     // Management commands
     cmd_status: bool = false,
@@ -102,6 +140,8 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             }
         } else if (std.mem.eql(u8, arg, "--install")) {
             cli.cmd_install = true;
+        } else if (std.mem.eql(u8, arg, "--svc")) {
+            cli.is_svc = true;
         } else if (std.mem.eql(u8, arg, "--uninstall")) {
             cli.cmd_uninstall = true;
         } else if (std.mem.eql(u8, arg, "--upload")) {
@@ -224,9 +264,111 @@ pub fn printHelp() void {
     std.debug.print("{s}", .{help});
 }
 
+/// Windows service globals — shared between service handler and service main
+const SvcGlobals = struct {
+    var status_handle: ?SERVICE_STATUS_HANDLE = null;
+    var io_ptr: ?std.Io = null;
+    var gpa_ptr: ?std.mem.Allocator = null;
+    var cli_ptr: ?CliArgs = null;
+};
+
+fn svcCtrlHandler(dwControl: u32, _: u32, _: ?*anyopaque, _: ?*anyopaque) callconv(.winapi) u32 {
+    if (dwControl == SERVICE_CONTROL_STOP) {
+        if (SvcGlobals.status_handle) |h| {
+            var status = SERVICE_STATUS{
+                .dwServiceType = SERVICE_WIN32_OWN_PROCESS,
+                .dwCurrentState = SERVICE_STOPPED,
+                .dwControlsAccepted = 0,
+                .dwWin32ExitCode = 0,
+                .dwServiceSpecificExitCode = 0,
+                .dwCheckPoint = 0,
+                .dwWaitHint = 0,
+            };
+            _ = SetServiceStatus(h, &status);
+        }
+        std.process.exit(0);
+    }
+    return 1;
+}
+
+fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
+    const svc_name_utf16 = [_:0]u16{ 'U', 'T', 'M', '-', 'M', 'o', 'n', 'i', 't', 'o', 'r', 0 };
+    const h = RegisterServiceCtrlHandlerExW(&svc_name_utf16, svcCtrlHandler, null);
+    SvcGlobals.status_handle = h;
+
+    if (h) |handle| {
+        var status = SERVICE_STATUS{
+            .dwServiceType = SERVICE_WIN32_OWN_PROCESS,
+            .dwCurrentState = SERVICE_RUNNING,
+            .dwControlsAccepted = SERVICE_ACCEPT_STOP,
+            .dwWin32ExitCode = 0,
+            .dwServiceSpecificExitCode = 0,
+            .dwCheckPoint = 0,
+            .dwWaitHint = 0,
+        };
+        _ = SetServiceStatus(handle, &status);
+    }
+
+    const svc_io = SvcGlobals.io_ptr orelse @panic("io_ptr not set");
+    const svc_gpa = SvcGlobals.gpa_ptr orelse @panic("gpa_ptr not set");
+    const svc_cli = SvcGlobals.cli_ptr orelse @panic("cli_ptr not set");
+
+    if (svc_cli.is_host) {
+        host_mod.runWithIo(svc_io, svc_gpa, svc_cli) catch |err| {
+            std.debug.print("[svc] host run failed: {}\n", .{err});
+        };
+    } else {
+        guest.runWithIo(svc_io, svc_gpa, svc_cli) catch |err| {
+            std.debug.print("[svc] guest run failed: {}\n", .{err});
+        };
+    }
+
+    if (h) |handle| {
+        var status = SERVICE_STATUS{
+            .dwServiceType = SERVICE_WIN32_OWN_PROCESS,
+            .dwCurrentState = SERVICE_STOPPED,
+            .dwControlsAccepted = 0,
+            .dwWin32ExitCode = 0,
+            .dwServiceSpecificExitCode = 0,
+            .dwCheckPoint = 0,
+            .dwWaitHint = 0,
+        };
+        _ = SetServiceStatus(handle, &status);
+    }
+}
+
+/// Windows service entry point — runs Guest/Host loop as a proper Windows service.
+/// Called when binary is started with --svc flag (added by sc create on --install).
+fn winServiceRun(io: std.Io, gpa: std.mem.Allocator, cli: CliArgs) !void {
+    SvcGlobals.io_ptr = io;
+    SvcGlobals.gpa_ptr = gpa;
+    SvcGlobals.cli_ptr = cli;
+
+    const svc_name_utf16 = [_:0]u16{ 'U', 'T', 'M', '-', 'M', 'o', 'n', 'i', 't', 'o', 'r', 0 };
+    var svc_table = [2]SERVICE_TABLE_ENTRYW{
+        .{ .lpServiceName = &svc_name_utf16, .lpServiceProc = svcMain },
+        .{ .lpServiceName = null, .lpServiceProc = null },
+    };
+
+    const ok = StartServiceCtrlDispatcherW(&svc_table);
+    if (ok == 0) {
+        std.debug.print("[svc] StartServiceCtrlDispatcher failed (error: {})\n", .{std.os.windows.GetLastError()});
+        return error.ServiceStartFailed;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const cli = try parseArgs(args);
+
+    // --svc (internal): run as Windows service — must be checked before anything else
+    if (cli.is_svc) {
+        if (builtin.os.tag == .windows) {
+            return winServiceRun(init.io, init.gpa, cli);
+        }
+        std.debug.print("[svc] --svc is only valid on Windows\n", .{});
+        return;
+    }
 
     // --version (single-line machine-readable format, for version sync script parsing)
     if (cli.cmd_version) {

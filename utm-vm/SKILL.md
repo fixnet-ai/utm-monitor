@@ -78,7 +78,7 @@ vm_deploy("linuxvm")     → deploy only to linuxvm
 
 The deploy workflow: `zig build -Dtarget=...` → HTTP upload → remote restart.
 
-> **Auto-upgrade**: The Host automatically pushes new binaries to any Guest whose version doesn't match. Bump `src/ver.zig` and rebuild — all online Guests upgrade within seconds. No Guest polling, no curl scripts.
+> **Auto-upgrade**: The Host uploads `utmm.new` to any Guest whose version doesn't match. The Guest detects it in its 1-second broadcast loop and self-upgrades (atomic rename + detached restart). Bump `src/ver.zig` and rebuild — all online Guests upgrade within seconds.
 
 **When to deploy:**
 - After making code changes that need testing

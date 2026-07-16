@@ -234,9 +234,13 @@ A brand-new VM has no utmm running. After the Host starts `utmm --host`, it auto
 # Find the gateway IP (Host's bridge address), then:
 curl "http://<gateway>:2121/bin/install.sh" | sh -s -- --guest --hostname myvm
 
-# Or detect gateway automatically:
+# Linux: detect gateway automatically:
 GATEWAY=$(ip route | grep default | awk '{print $3}')
 curl "http://$GATEWAY:2121/bin/install.sh" | sh -s -- --guest --hostname linuxvm
+
+# macOS: detect gateway automatically:
+GATEWAY=$(route -n get default 2>/dev/null | awk '/gateway:/ {print $2}')
+curl "http://$GATEWAY:2121/bin/install.sh" | sh -s -- --guest --hostname macvm
 ```
 
 **Windows Guest** (PowerShell as Administrator):
@@ -447,8 +451,8 @@ sudo utmm --host
 # Custom serve directory (if binaries are not next to the executable)
 sudo utmm --host --serve-dir /opt/utm-binaries
 
-# Background
-sudo nohup utmm --host > /var/log/utmm-host.log 2>&1 & disown
+# Background (note: redirect must be inside sudo, else Permission denied)
+sudo sh -c 'nohup utmm --host > /var/log/utmm-host.log 2>&1 & disown'
 ```
 
 After starting, the following output indicates normal operation:
@@ -627,12 +631,14 @@ cat utmm.conf
 
 #### Fully Automatic Upgrade (Host-Push)
 
-The **Host** drives all upgrades. When a Guest broadcasts ANNOUNCE with a version that doesn't match the Host's (`src/ver.zig`), the Host immediately:
-1. Finds the correct binary in the serve directory by mapping the Guest's target triple to the deployment filename (e.g., `utmm-x86_64-linux` for x86_64-linux-musl, `utmm-aarch64-windows.exe` for aarch64-windows)
-2. HTTP-uploads it to Guest `/upload` as `.new`
-3. HTTP-executes a background restart command on Guest
+The **Host** detects version mismatches and pushes upgrades. When a Guest broadcasts ANNOUNCE with a version that doesn't match the Host's (`src/ver.zig`), the Host:
+1. Finds the correct binary in the serve directory by mapping the Guest's target triple to the deployment filename
+2. HTTP-uploads it to Guest `/upload` as `utmm.new` (or `utmm.new.exe` on Windows)
+3. Returns — the Guest detects `utmm.new` in its next broadcast cycle (within 1 second), atomically renames it to the final binary, spawns a detached restart, and exits
 
-No Guest polling, no shell scripts with curl, no `/update` endpoint needed. The Guest just broadcasts — the Host does the rest.
+**Design rationale**: The old approach had the Host send a `pkill utmm` restart command via HTTP, which killed the HTTP response handler before it could respond. The new design decouples upload from restart — the upload completes cleanly, and the Guest manages its own lifecycle.
+
+No Guest polling needed. The Guest just broadcasts — the Host uploads, the Guest self-upgrades.
 
 **To release a new version:**
 1. Bump `src/ver.zig`
@@ -1269,11 +1275,14 @@ sudo sed -i '' '/# UTM-MONITOR-BEGIN/,/# UTM-MONITOR-END/d' /etc/hosts
 
 **Linux Guest** (run inside VM or via SSH):
 ```bash
-pkill -f utmm 2>/dev/null
+# IMPORTANT: When running via SSH, do systemctl stop BEFORE pkill.
+# pkill -f utmm will kill the SSH shell itself (because the command
+# arguments contain "utmm"), severing the connection mid-cleanup.
 systemctl stop utmm 2>/dev/null; systemctl disable utmm 2>/dev/null
 rm -f /etc/systemd/system/utmm.service
 rm -rf /opt/utmm /opt/utm-monitor /opt/utmm_*
 rm -f /var/log/utmm*.log /opt/utmm*.log
+pkill -f utmm 2>/dev/null   # do this LAST
 ```
 
 **macOS Guest** (run inside VM or via SSH):
