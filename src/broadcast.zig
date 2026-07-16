@@ -443,7 +443,7 @@ pub fn broadcastLoop(
 
     while (true) {
         // ── Self-upgrade check ──────────────────────────────────────
-        // Host uploads utmm.new; Guest auto-detects and self-upgrades
+        // Host uploads utmm.next; Guest auto-detects and self-upgrades
         try checkSelfUpgrade(io, &info);
 
         socket.send(io, &broadcast_addr, msg) catch |err| {
@@ -490,22 +490,34 @@ fn broadcastLoopFallback(
     }
 }
 
-/// Check for staged upgrade binary (utmm.new) and self-upgrade if found.
-/// The Host uploads the new binary as "utmm.new"; the Guest detects it
-/// on its next broadcast cycle, swaps it in, and restarts itself.
-/// This decouples the HTTP upload (which completes cleanly) from the
-/// restart (which happens asynchronously), avoiding the connection-break
-/// problem of the old "upload + kill-self" pattern.
+/// Check for staged upgrade binary (utmm.next) and self-upgrade if found.
+/// The Host uploads the new binary as "utmm.next"; the Guest detects it
+/// on its next broadcast cycle, swaps it in safely, and restarts itself.
+///
+/// Cross-platform safe rename strategy:
+///   1. Rename old binary out of the way   (utmm → utmm.old)
+///   2. Rename new binary into place       (utmm.next → utmm)
+///   3. Spawn restart script (cleans up .old after old process exits)
+///   4. exit(0) — supervisor (launchd/systemd/sc) restarts us
+///
+/// This works on all platforms because:
+///   Linux:   rename() is a directory op — old inode stays alive
+///   macOS:   same as Linux; SIP won't SIGKILL new binary (different inode)
+///   Windows: renaming a running .exe within the same dir succeeds;
+///            the old name is then free for the new binary
 fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
-    const new_name: []const u8 = if (builtin.os.tag == .windows) "utmm.new.exe" else "utmm.new";
+    const new_name: []const u8 = if (builtin.os.tag == .windows) "utmm.next.exe" else "utmm.next";
     const final_name: []const u8 = if (builtin.os.tag == .windows) "utmm.exe" else "utmm";
+    const old_name: []const u8 = if (builtin.os.tag == .windows) "utmm.old.exe" else "utmm.old";
     const install_dir: []const u8 = if (builtin.os.tag == .windows) "C:\\opt\\utmm" else "/opt/utmm";
 
-    // Build full paths: Host HTTP uploads to /opt/utmm/utmm.new (not CWD)
+    // Build full paths
     const new_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, new_name }) catch return;
     defer std.heap.page_allocator.free(new_path);
     const final_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, final_name }) catch return;
     defer std.heap.page_allocator.free(final_path);
+    const old_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, old_name }) catch return;
+    defer std.heap.page_allocator.free(old_path);
 
     // Check if staged file exists
     const file = std.Io.Dir.cwd().openFile(io, new_path, .{}) catch return;
@@ -517,9 +529,19 @@ fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
 
     std.debug.print("[broadcast] 🔄 Self-upgrade: staged {s} ({d} bytes)\n", .{ new_path, file_size });
 
-    // Atomic rename on same filesystem (overwrite existing binary)
+    // Step 1: Move old binary out of the way (utmm → utmm.old)
+    // Remove any stale .old from a previous upgrade first
+    std.Io.Dir.cwd().deleteFile(io, old_path) catch {};
+    std.Io.Dir.cwd().rename(final_path, std.Io.Dir.cwd(), old_path, io) catch |err| {
+        std.debug.print("[broadcast] Self-upgrade: rename {s} → {s} failed: {}\n", .{ final_path, old_path, err });
+        return;
+    };
+
+    // Step 2: Place new binary at the target name (utmm.next → utmm)
     std.Io.Dir.cwd().rename(new_path, std.Io.Dir.cwd(), final_path, io) catch |err| {
-        std.debug.print("[broadcast] Self-upgrade rename failed: {}\n", .{err});
+        std.debug.print("[broadcast] Self-upgrade: rename {s} → {s} failed: {}\n", .{ new_path, final_path, err });
+        // Rollback: put old binary back so the service can still run
+        std.Io.Dir.cwd().rename(old_path, std.Io.Dir.cwd(), final_path, io) catch {};
         return;
     };
 
@@ -528,25 +550,35 @@ fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
         if (std.process.run(std.heap.page_allocator, io, .{
             .argv = &.{ "chmod", "+x", final_path },
         })) |_| {} else |_| {}
+
+        // macOS: clear quarantine attribute so Gatekeeper doesn't block
+        if (builtin.os.tag == .macos) {
+            if (std.process.run(std.heap.page_allocator, io, .{
+                .argv = &.{ "xattr", "-d", "com.apple.quarantine", final_path },
+            })) |_| {} else |_| {}
+        }
     }
 
-    // Spawn restart script (detached, survives our exit)
+    // Step 3: Spawn restart script (detached, survives our exit).
+    // The script waits for old process to die, cleans up .old, then starts new binary.
+    // Note: the OS supervisor (launchd/systemd/sc) will ALSO restart us after exit(0).
+    // The restart script provides a safety net if no supervisor is configured.
     if (builtin.os.tag == .windows) {
         const restart_cmd = std.fmt.allocPrint(
             std.heap.page_allocator,
-            "cmd /c \"ping -n 3 127.0.0.1 >nul & cd /d {s} & start \"\" {s} --hostname {s}\"",
-            .{ install_dir, final_path, info.hostname },
+            "cmd /c \"ping -n 3 127.0.0.1 >nul & del /f \"{s}\" 2>nul & cd /d {s} & start \"utmm\" {s} --hostname {s}\"",
+            .{ old_path, install_dir, final_path, info.hostname },
         ) catch return;
         defer std.heap.page_allocator.free(restart_cmd);
-        if (std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "cmd", "/c", restart_cmd } })) |_| {} else |_| {}
+        _ = std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "cmd", "/c", restart_cmd } }) catch {};
     } else {
         const restart_cmd = std.fmt.allocPrint(
             std.heap.page_allocator,
-            "nohup sh -c 'sleep 1; {s} --hostname {s} &' >/dev/null 2>&1 &",
-            .{ final_path, info.hostname },
+            "nohup sh -c 'sleep 2; rm -f \"{s}\"; {s} --hostname {s} &' >/dev/null 2>&1 &",
+            .{ old_path, final_path, info.hostname },
         ) catch return;
         defer std.heap.page_allocator.free(restart_cmd);
-        if (std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "sh", "-c", restart_cmd } })) |_| {} else |_| {}
+        _ = std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "sh", "-c", restart_cmd } }) catch {};
     }
 
     std.debug.print("[broadcast] Self-upgrade complete — restarting with new binary\n", .{});

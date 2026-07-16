@@ -559,9 +559,10 @@ fn ipcHandler(ctx: *anyopaque, cmd: []const u8) anyerror![]const u8 {
 }
 
 /// Auto-upgrade a Guest whose version doesn't match Host's version.
-/// Host uploads the new binary as utmm.new; the Guest detects it in its
-/// broadcast loop (checkSelfUpgrade) and self-upgrades. No restart command
-/// needed — the Guest handles its own lifecycle.
+/// Host uploads the new binary as utmm.next; the Guest detects it in its
+/// broadcast loop (checkSelfUpgrade) and self-upgrades via the
+/// rename-old-out-of-the-way → rename-new-in-place → restart pattern.
+/// No restart command needed — the Guest handles its own lifecycle.
 fn autoUpgrade(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -589,9 +590,10 @@ fn autoUpgrade(
         return;
     }
 
-    // Upload new binary as utmm.new — Guest's broadcast loop will detect it
-    // and self-upgrade via checkSelfUpgrade() within 1 second
-    const new_name: []const u8 = if (is_windows) "utmm.new.exe" else "utmm.new";
+    // Upload new binary as utmm.next — Guest's broadcast loop will detect it
+    // and self-upgrade via checkSelfUpgrade() within 1 second.
+    // Using utmm.next (not utmm) avoids the "overwrite running binary" problem.
+    const new_name: []const u8 = if (is_windows) "utmm.next.exe" else "utmm.next";
     std.debug.print("[host] Auto-upgrade {s}: uploading {s} → {s}:{d}\n", .{ hostname, bin_path, ip, http_port });
     _ = try http_client.uploadFile(io, gpa, ip, http_port, bin_path, new_name);
 

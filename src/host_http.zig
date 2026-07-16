@@ -6,6 +6,55 @@ const std = @import("std");
 const http = std.http;
 const protocol = @import("protocol.zig");
 
+const Md5 = std.crypto.hash.Md5;
+
+/// Compute MD5 hex digest of a file. Returns hex string (caller owns).
+fn computeFileMd5Hex(gpa: std.mem.Allocator, io: std.Io, file_path: []const u8) ![]const u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+    defer file.close(io);
+
+    const file_len = file.length(io) catch 0;
+
+    var md5 = Md5.init(.{});
+    var fbuf: [65536]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < file_len) {
+        const to_read = @min(fbuf.len, file_len - offset);
+        const n = file.readPositional(io, &.{fbuf[0..to_read]}, offset) catch break;
+        if (n == 0) break;
+        md5.update(fbuf[0..n]);
+        offset += n;
+    }
+
+    var hash: [Md5.digest_length]u8 = undefined;
+    md5.final(&hash);
+    const hex_bytes = std.fmt.bytesToHex(&hash, .lower);
+    return gpa.dupe(u8, &hex_bytes);
+}
+
+/// Resolve a filename relative to base_dir, rejecting path traversal attempts.
+/// `filename` may contain `/` for subdirectories (e.g., "subdir/file.txt").
+/// Rejects: "..", ".", empty components, leading "/" or "\".
+/// Returns: allocated full path like "/opt/utmm/subdir/file.txt" (caller owns).
+fn resolveSafePath(gpa: std.mem.Allocator, base_dir: []const u8, filename: []const u8) ![]const u8 {
+    if (filename.len == 0) return error.InvalidPath;
+
+    // Reject absolute paths
+    if (filename[0] == '/' or filename[0] == '\\') return error.InvalidPath;
+
+    // Split by / or \ — reject traversal components
+    var it = std.mem.tokenizeAny(u8, filename, "/\\");
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return error.InvalidPath;
+        if (std.mem.eql(u8, component, ".")) return error.InvalidPath;
+    }
+
+    // Build full path: base_dir/filename
+    // Strip trailing slash from base_dir for clean join
+    const base = if (base_dir[base_dir.len - 1] == '/') base_dir[0 .. base_dir.len - 1] else base_dir;
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, filename });
+}
+
 /// Configuration for the Host HTTP file server
 pub const Config = struct {
     port: u16 = protocol.DEFAULT_HTTP_PORT,
@@ -90,7 +139,7 @@ fn dispatch(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocator, c
             try request.respond("Not Found\n", .{ .status = .not_found });
             return;
         }
-        return handleBinDownload(request, io, config, filename);
+        return handleBinDownload(request, io, gpa, config, filename);
     }
 
     // 404 for everything else
@@ -235,17 +284,13 @@ fn handleUpdate(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocato
 }
 
 /// GET /bin/:filename — serve a binary file from serve_dir
-fn handleBinDownload(request: *http.Server.Request, io: std.Io, config: Config, filename: []const u8) !void {
-    // Prevent path traversal
-    if (std.mem.indexOfScalar(u8, filename, '/') != null or
-        std.mem.indexOfScalar(u8, filename, '\\') != null)
-    {
+fn handleBinDownload(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocator, config: Config, filename: []const u8) !void {
+    // Security: resolve path relative to serve_dir, reject traversal
+    const full_path = resolveSafePath(gpa, config.serve_dir, filename) catch {
         try request.respond("Forbidden\n", .{ .status = .forbidden });
         return;
-    }
-
-    var path_buf: [512]u8 = undefined;
-    const full_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ config.serve_dir, filename });
+    };
+    defer gpa.free(full_path);
 
     const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch {
         try request.respond("Not Found\n", .{ .status = .not_found });
@@ -255,14 +300,27 @@ fn handleBinDownload(request: *http.Server.Request, io: std.Io, config: Config, 
 
     const file_len = file.length(io) catch 0;
 
+    // Compute MD5 for ETag (must be done before respondStreaming since headers are sent first)
+    const etag_hex = computeFileMd5Hex(gpa, io, full_path) catch null;
+    defer if (etag_hex) |h| gpa.free(h);
+
+    // Build extra_headers with ETag if available
+    var etag_header: http.Header = undefined;
+    var extra_headers: [4]http.Header = undefined;
+    var header_count: usize = 2; // content-type + cache-control
+    extra_headers[0] = .{ .name = "content-type", .value = "application/octet-stream" };
+    extra_headers[1] = .{ .name = "cache-control", .value = "no-cache" };
+    if (etag_hex) |h| {
+        etag_header = .{ .name = "etag", .value = h };
+        extra_headers[2] = etag_header;
+        header_count = 3;
+    }
+
     var resp_buf: [4096]u8 = undefined;
     var response = try request.respondStreaming(&resp_buf, .{
         .respond_options = .{
             .status = .ok,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/octet-stream" },
-                .{ .name = "cache-control", .value = "no-cache" },
-            },
+            .extra_headers = extra_headers[0..header_count],
         },
     });
 
@@ -276,5 +334,5 @@ fn handleBinDownload(request: *http.Server.Request, io: std.Io, config: Config, 
         offset += n;
     }
     try response.end();
-    std.debug.print("[host-http] Served {s}: {} bytes\n", .{ filename, offset });
+    std.debug.print("[host-http] Served {s}: {} bytes (etag={s})\n", .{ filename, offset, if (etag_hex) |h| @as([]const u8, h) else @as([]const u8, "none") });
 }

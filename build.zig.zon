@@ -1,6 +1,6 @@
 .{
     .name = .utm_monitor,
-    .version = "0.1.6",
+    .version = "0.1.7",
     .fingerprint = 0x4603abddd607a737,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

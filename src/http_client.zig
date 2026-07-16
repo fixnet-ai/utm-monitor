@@ -5,6 +5,43 @@
 const std = @import("std");
 const http = std.http;
 
+const Md5 = std.crypto.hash.Md5;
+
+/// Compute MD5 hex digest of a file. Returns hex string (caller owns).
+fn computeFileMd5Hex(gpa: std.mem.Allocator, io: std.Io, file_path: []const u8) ![]const u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+    defer file.close(io);
+
+    const file_len = file.length(io) catch 0;
+
+    var md5 = Md5.init(.{});
+    var fbuf: [65536]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < file_len) {
+        const to_read = @min(fbuf.len, file_len - offset);
+        const n = file.readPositional(io, &.{fbuf[0..to_read]}, offset) catch break;
+        if (n == 0) break;
+        md5.update(fbuf[0..n]);
+        offset += n;
+    }
+
+    var hash: [Md5.digest_length]u8 = undefined;
+    md5.final(&hash);
+    const hex_bytes = std.fmt.bytesToHex(&hash, .lower);
+    return gpa.dupe(u8, &hex_bytes);
+}
+
+/// Get a header value by name (case-insensitive), or null if not found.
+fn getHeaderValue(head: anytype, name: []const u8) ?[]const u8 {
+    var it = head.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) {
+            return h.value;
+        }
+    }
+    return null;
+}
+
 /// GET a text resource from an HTTP server (returns heap-allocated string, caller frees)
 pub fn getText(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: u16, path: []const u8) ![]const u8 {
     const url = try std.fmt.allocPrint(gpa, "http://{s}:{d}{s}", .{ host, port, path });
@@ -72,6 +109,9 @@ pub fn downloadFile(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: 
         return error.HttpStatusNotOk;
     }
 
+    // Capture ETag before reading body (headers available now)
+    const etag_expected = getHeaderValue(response.head, "etag");
+
     // Read body and write to file.
     // IMPORTANT: we use readVec (not take) because take(n) requires exactly n bytes
     // and will error.EndOfStream without returning partially-buffered data when
@@ -98,6 +138,20 @@ pub fn downloadFile(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: 
         total += n;
     }
     try fw.interface.flush();
+
+    // Verify MD5 checksum if server provided ETag
+    if (etag_expected) |expected| {
+        const actual = computeFileMd5Hex(gpa, io, dest_path) catch null;
+        if (actual) |a| {
+            defer gpa.free(a);
+            if (!std.mem.eql(u8, a, expected)) {
+                std.debug.print("[http-client] Download checksum mismatch for {s}: expected={s}, got={s}\n", .{ dest_path, expected, a });
+                std.Io.Dir.cwd().deleteFile(io, dest_path) catch {};
+                return error.ChecksumMismatch;
+            }
+            std.debug.print("[http-client] Download checksum verified for {s}: {s}\n", .{ dest_path, a });
+        }
+    }
 
     return total;
 }
@@ -134,8 +188,13 @@ pub fn execRemote(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: u1
 }
 
 /// POST /upload with multipart/form-data body → returns response text (heap-allocated, caller frees)
-/// Returns the server response which includes "OK\n<bytes>\n" on success
+/// Returns the server response which includes "OK\n<bytes>\n" on success.
+/// Sends ETag header with file MD5 for integrity verification.
 pub fn uploadFile(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: u16, local_path: []const u8, remote_filename: []const u8) !usize {
+    // Compute MD5 before reading file data
+    const etag_hex = computeFileMd5Hex(gpa, io, local_path) catch null;
+    defer if (etag_hex) |h| gpa.free(h);
+
     // Read local file
     const file = try std.Io.Dir.cwd().openFile(io, local_path, .{});
     defer file.close(io);
@@ -179,10 +238,19 @@ pub fn uploadFile(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: u1
     var client: http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
+    // Build extra_headers with ETag if available
+    var etag_header: http.Header = undefined;
+    var extra_headers_buf: [2]http.Header = undefined;
+    var header_count: usize = 1; // content-type
+    extra_headers_buf[0] = .{ .name = "content-type", .value = "multipart/form-data; boundary=" ++ boundary };
+    if (etag_hex) |h| {
+        etag_header = .{ .name = "etag", .value = h };
+        extra_headers_buf[1] = etag_header;
+        header_count = 2;
+    }
+
     var req = try client.request(.POST, uri, .{
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "multipart/form-data; boundary=" ++ boundary },
-        },
+        .extra_headers = extra_headers_buf[0..header_count],
     });
     defer req.deinit();
 
@@ -205,6 +273,11 @@ pub fn uploadFile(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: u1
             return std.fmt.parseInt(usize, std.mem.trim(u8, trimmed[nl + 1 ..], " \n\r"), 10) catch file_len;
         }
         return file_len;
+    }
+
+    if (std.mem.startsWith(u8, trimmed, "Checksum mismatch")) {
+        std.debug.print("[http-client] Upload checksum mismatch: {s}\n", .{resp_body});
+        return error.ChecksumMismatch;
     }
 
     std.debug.print("[http-client] Upload response: {s}\n", .{resp_body});

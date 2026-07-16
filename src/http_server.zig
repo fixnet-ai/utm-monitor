@@ -6,6 +6,66 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const http = std.http;
 
+const Md5 = std.crypto.hash.Md5;
+
+/// Compute MD5 hex digest of a file. Returns hex string (caller owns).
+fn computeFileMd5Hex(gpa: std.mem.Allocator, io: std.Io, file_path: []const u8) ![]const u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, file_path, .{});
+    defer file.close(io);
+
+    const file_len = file.length(io) catch 0;
+
+    var md5 = Md5.init(.{});
+    var fbuf: [65536]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < file_len) {
+        const to_read = @min(fbuf.len, file_len - offset);
+        const n = file.readPositional(io, &.{fbuf[0..to_read]}, offset) catch break;
+        if (n == 0) break;
+        md5.update(fbuf[0..n]);
+        offset += n;
+    }
+
+    var hash: [Md5.digest_length]u8 = undefined;
+    md5.final(&hash);
+    const hex_bytes = std.fmt.bytesToHex(&hash, .lower);
+    return gpa.dupe(u8, &hex_bytes);
+}
+
+/// Get a header value by name (case-insensitive), or null if not found.
+fn getHeaderValue(req: *const http.Server.Request, name: []const u8) ?[]const u8 {
+    var it = req.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) {
+            return h.value;
+        }
+    }
+    return null;
+}
+
+/// Resolve a filename relative to base_dir, rejecting path traversal attempts.
+/// `filename` may contain `/` for subdirectories (e.g., "subdir/file.txt").
+/// Rejects: "..", ".", empty components, leading "/" or "\".
+/// Returns: allocated full path like "/opt/utmm/subdir/file.txt" (caller owns).
+fn resolveSafePath(gpa: std.mem.Allocator, base_dir: []const u8, filename: []const u8) ![]const u8 {
+    if (filename.len == 0) return error.InvalidPath;
+
+    // Reject absolute paths
+    if (filename[0] == '/' or filename[0] == '\\') return error.InvalidPath;
+
+    // Split by / or \ — reject traversal components
+    var it = std.mem.tokenizeAny(u8, filename, "/\\");
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return error.InvalidPath;
+        if (std.mem.eql(u8, component, ".")) return error.InvalidPath;
+    }
+
+    // Build full path: base_dir/filename
+    // Strip trailing slash from base_dir for clean join
+    const base = if (base_dir[base_dir.len - 1] == '/') base_dir[0 .. base_dir.len - 1] else base_dir;
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, filename });
+}
+
 /// Start the Guest HTTP server accept loop (runs in a dedicated thread)
 pub fn startServer(io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
     const addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
@@ -163,11 +223,8 @@ fn handleUpdate(request: *http.Server.Request, gpa: std.mem.Allocator) !void {
 // ═══════════════════════════════════════════════════════════════════
 
 fn handleBinDownload(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocator, filename: []const u8) !void {
-    // Security: prevent path traversal
-    if (std.mem.indexOfScalar(u8, filename, '/') != null or
-        std.mem.indexOfScalar(u8, filename, '\\') != null or
-        std.mem.startsWith(u8, filename, "."))
-    {
+    // Security: resolve path relative to /opt/utmm, reject traversal
+    const file_path = resolveSafePath(gpa, "/opt/utmm", filename) catch {
         try request.respond("Forbidden\n", .{
             .status = .forbidden,
             .extra_headers = &.{
@@ -175,9 +232,7 @@ fn handleBinDownload(request: *http.Server.Request, io: std.Io, gpa: std.mem.All
             },
         });
         return;
-    }
-
-    const file_path = try std.fmt.allocPrint(gpa, "/opt/utmm/{s}", .{filename});
+    };
     defer gpa.free(file_path);
 
     const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch {
@@ -193,15 +248,28 @@ fn handleBinDownload(request: *http.Server.Request, io: std.Io, gpa: std.mem.All
 
     const file_len = file.length(io) catch 0;
 
+    // Compute MD5 for ETag (must be done before respondStreaming since headers are sent first)
+    const etag_hex = computeFileMd5Hex(gpa, io, file_path) catch null;
+    defer if (etag_hex) |h| gpa.free(h);
+
+    // Build extra_headers with ETag if available
+    var etag_header: http.Header = undefined;
+    var extra_headers: [4]http.Header = undefined;
+    var header_count: usize = 2; // content-type + cache-control
+    extra_headers[0] = .{ .name = "content-type", .value = "application/octet-stream" };
+    extra_headers[1] = .{ .name = "cache-control", .value = "no-cache" };
+    if (etag_hex) |h| {
+        etag_header = .{ .name = "etag", .value = h };
+        extra_headers[2] = etag_header;
+        header_count = 3;
+    }
+
     // Use respondStreaming for large files — avoids buffering entire file in memory
     var resp_buf: [4096]u8 = undefined;
     var response = try request.respondStreaming(&resp_buf, .{
         .respond_options = .{
             .status = .ok,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/octet-stream" },
-                .{ .name = "cache-control", .value = "no-cache" },
-            },
+            .extra_headers = extra_headers[0..header_count],
         },
     });
 
@@ -217,7 +285,7 @@ fn handleBinDownload(request: *http.Server.Request, io: std.Io, gpa: std.mem.All
         offset += n;
     }
     try response.end();
-    std.debug.print("[http-guest] Served {s}: {} bytes\n", .{ filename, total });
+    std.debug.print("[http-guest] Served {s}: {} bytes (etag={s})\n", .{ filename, total, if (etag_hex) |h| @as([]const u8, h) else @as([]const u8, "none") });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -246,12 +314,8 @@ fn handleUpload(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocato
         break :blk "uploaded.bin";
     } else "uploaded.bin";
 
-    // Security check
-    if (filename.len == 0 or
-        std.mem.indexOfScalar(u8, filename, '/') != null or
-        std.mem.indexOfScalar(u8, filename, '\\') != null or
-        std.mem.startsWith(u8, filename, "."))
-    {
+    // Security: resolve path relative to /opt/utmm, reject traversal
+    const file_path = resolveSafePath(gpa, "/opt/utmm", filename) catch {
         try request.respond("Invalid filename\n", .{
             .status = .bad_request,
             .extra_headers = &.{
@@ -259,6 +323,25 @@ fn handleUpload(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocato
             },
         });
         return;
+    };
+    defer gpa.free(file_path);
+
+    // Extract expected MD5 from ETag header (before reading body)
+    const expected_md5 = getHeaderValue(request, "etag");
+
+    // IMPORTANT: Both `filename` and `expected_md5` are slices into the request's
+    // internal buffer (`read_buf` in handleClient). The Zig stdlib Stream.Reader's
+    // writableVector() adds the entire `read_buf` as a fallback iovec, so netRead()
+    // may write excess body data into it, corrupting these slices. Copy them to
+    // heap NOW before allocRemaining() triggers any reads.
+    const filename_owned = try gpa.dupe(u8, filename);
+    defer gpa.free(filename_owned);
+    const expected_md5_owned: ?[]const u8 = if (expected_md5) |e| try gpa.dupe(u8, e) else null;
+    defer if (expected_md5_owned) |e| gpa.free(e);
+
+    // Create parent directories if needed (e.g., filename = "subdir/file.txt")
+    if (std.fs.path.dirname(file_path)) |parent| {
+        std.Io.Dir.cwd().createDirPath(io, parent) catch {};
     }
 
     // Read the request body
@@ -276,13 +359,13 @@ fn handleUpload(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocato
     };
     defer gpa.free(body);
 
-    // Parse multipart: find boundary, extract file content
-    // Content-Type: multipart/form-data; boundary=----boundaryString
-    const boundary = extractBoundary(request.head.target, body) orelse {
-        // No multipart boundary found — treat entire body as file content
-        const file_path = try std.fmt.allocPrint(gpa, "/opt/utmm/{s}", .{filename});
-        defer gpa.free(file_path);
+    var written_bytes: usize = 0;
 
+    // Parse multipart: find boundary, extract file content
+    const boundary = extractBoundary(request.head.target, body);
+
+    if (boundary == null) {
+        // No multipart boundary found — treat entire body as file content
         var file = try std.Io.Dir.cwd().createFile(io, file_path, .{ .permissions = @enumFromInt(0o755) });
         defer file.close(io);
 
@@ -291,48 +374,55 @@ fn handleUpload(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocato
         _ = try fw.interface.write(body);
         try fw.interface.flush();
 
-        const file_len = file.length(io) catch body.len;
-        std.debug.print("[http-guest] Uploaded {s}: {} bytes (raw body)\n", .{ filename, file_len });
+        written_bytes = @intCast(file.length(io) catch body.len);
+        std.debug.print("[http-guest] Uploaded {s}: {} bytes (raw body)\n", .{ filename_owned, written_bytes });
+    } else {
+        // Extract file portion from multipart body
+        const file_data = extractMultipartFile(gpa, body, boundary.?) catch |err| {
+            std.debug.print("[http-guest] Multipart parse error: {}\n", .{err});
+            try request.respond("Bad multipart format\n", .{
+                .status = .bad_request,
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "text/plain" },
+                },
+            });
+            return;
+        };
 
-        var resp_buf: [128]u8 = undefined;
-        const resp = try std.fmt.bufPrint(&resp_buf, "OK\n{d}\n", .{file_len});
-        try request.respond(resp, .{
-            .status = .ok,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/plain" },
-            },
-        });
-        return;
-    };
+        var file = try std.Io.Dir.cwd().createFile(io, file_path, .{ .permissions = @enumFromInt(0o755) });
+        defer file.close(io);
 
-    // Extract file portion from multipart body
-    const file_data = extractMultipartFile(gpa, body, boundary) catch |err| {
-        std.debug.print("[http-guest] Multipart parse error: {}\n", .{err});
-        try request.respond("Bad multipart format\n", .{
-            .status = .bad_request,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/plain" },
-            },
-        });
-        return;
-    };
+        var wb: [4096]u8 = undefined;
+        var fw = file.writer(io, &wb);
+        _ = try fw.interface.write(file_data);
+        try fw.interface.flush();
 
-    const file_path = try std.fmt.allocPrint(gpa, "/opt/utmm/{s}", .{filename});
-    defer gpa.free(file_path);
+        written_bytes = @intCast(file.length(io) catch file_data.len);
+        std.debug.print("[http-guest] Uploaded {s}: {} bytes\n", .{ filename_owned, written_bytes });
+    }
 
-    const file = try std.Io.Dir.cwd().createFile(io, file_path, .{ .permissions = @enumFromInt(0o755) });
-    defer file.close(io);
-
-    var wb: [4096]u8 = undefined;
-    var fw = file.writer(io, &wb);
-    _ = try fw.interface.write(file_data);
-    try fw.interface.flush();
-
-    const file_len = file.length(io) catch file_data.len;
-    std.debug.print("[http-guest] Uploaded {s}: {} bytes\n", .{ filename, file_len });
+    // Verify MD5 checksum if ETag was provided
+    if (expected_md5_owned) |expected| {
+        const actual = computeFileMd5Hex(gpa, io, file_path) catch null;
+        if (actual) |a| {
+            defer gpa.free(a);
+            if (!std.mem.eql(u8, a, expected)) {
+                std.debug.print("[http-guest] Upload checksum mismatch for {s}: expected={s}, got={s}\n", .{ filename_owned, expected, a });
+                std.Io.Dir.cwd().deleteFile(io, file_path) catch {};
+                try request.respond("Checksum mismatch\n", .{
+                    .status = .bad_request,
+                    .extra_headers = &.{
+                        .{ .name = "content-type", .value = "text/plain" },
+                    },
+                });
+                return;
+            }
+            std.debug.print("[http-guest] Upload checksum verified for {s}: {s}\n", .{ filename_owned, a });
+        }
+    }
 
     var resp_buf: [128]u8 = undefined;
-    const resp = try std.fmt.bufPrint(&resp_buf, "OK\n{d}\n", .{file_len});
+    const resp = try std.fmt.bufPrint(&resp_buf, "OK\n{d}\n", .{written_bytes});
     try request.respond(resp, .{
         .status = .ok,
         .extra_headers = &.{
@@ -374,8 +464,10 @@ fn extractMultipartFile(gpa: std.mem.Allocator, body: []const u8, boundary: []co
     const headers_end = std.mem.indexOf(u8, after_boundary[pos..], "\r\n\r\n") orelse return error.BadMultipart;
     pos += headers_end + 4; // skip past \r\n\r\n
 
-    // Find the ending boundary (next boundary or closing boundary)
-    const next_boundary = std.mem.indexOf(u8, after_boundary[pos..], "\r\n--") orelse return error.BadMultipart;
+    // Find the ending boundary (search for \r\n--<boundary>, not just \r\n-- to avoid false matches in binary file content)
+    const boundary_sep = try std.fmt.allocPrint(gpa, "\r\n--{s}", .{boundary});
+    defer gpa.free(boundary_sep);
+    const next_boundary = std.mem.indexOf(u8, after_boundary[pos..], boundary_sep) orelse return error.BadMultipart;
     const file_data = after_boundary[pos .. pos + next_boundary];
 
     // Handle trailing \r\n before boundary
@@ -542,7 +634,7 @@ test "extractBoundary" {
 
 test "extractMultipartFile" {
     const allocator = std.testing.allocator;
-    const body = "--utmbound\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.exe\"\r\nContent-Type: application/octet-stream\r\n\r\nbinary data here\r\n----utmbound--\r\n";
+    const body = "--utmbound\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.exe\"\r\nContent-Type: application/octet-stream\r\n\r\nbinary data here\r\n--utmbound--\r\n";
     const file_data = try extractMultipartFile(allocator, body, "utmbound");
     defer allocator.free(file_data);
     try std.testing.expectEqualStrings("binary data here", file_data);
