@@ -60,5 +60,4 @@ jobs:
           files: |
             utmm.zip
             utmm-*.zip
-            release/*
           generate_release_notes: true
