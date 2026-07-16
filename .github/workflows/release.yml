@@ -48,16 +48,12 @@ jobs:
 
       - name: Package zip
         run: |
-          VERSION="${{ github.ref_name }}"
           cd release
           zip "../utmm.zip" *
-          cp "../utmm.zip" "../utmm-${VERSION}.zip"
-          ls -lh ../utmm*.zip
+          ls -lh ../utmm.zip
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            utmm.zip
-            utmm-*.zip
+          files: utmm.zip
           generate_release_notes: true

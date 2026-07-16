@@ -213,12 +213,6 @@ The script downloads `utmm.zip` from GitHub Releases, extracts all 8 platform bi
 
 All Guest binaries are already in `/opt/utmm/` after extraction — the Host's `serve_dir` defaults to this directory, so auto-upgrade works for all Guest architectures immediately.
 
-Specify a version:
-
-```bash
-VERSION=v1.0.0 curl -fsSL https://raw.githubusercontent.com/.../install.sh | sh
-```
-
 Start the Host:
 
 ```bash
@@ -299,7 +293,7 @@ utmm --host --status
 
 **Method 1: GitHub Releases (Recommended, no local compilation needed)**
 
-Each release automatically builds 8 binaries for all VM scenarios, packaged as `utmm.zip` (and `utmm-vX.X.X.zip`):
+Each release automatically builds 8 binaries for all VM scenarios, packaged as `utmm.zip`:
 
 | File | Covers | Zig Target |
 |------|--------|------------|

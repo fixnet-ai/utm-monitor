@@ -5,28 +5,18 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
-#   VERSION=v1.0.0 curl -fsSL ... | sh
 #
 # Environment:
 #   INSTALL_DIR   installation directory (default /opt/utmm)
-#   VERSION       specific version tag, or "latest" (default)
 
 set -e
 
 REPO="fixnet-ai/utm-monitor"
 INSTALL_DIR="${INSTALL_DIR:-/opt/utmm}"
-VERSION="${VERSION:-latest}"
-
-# Build download URL
-if [ "$VERSION" = "latest" ]; then
-    ZIP_URL="https://github.com/$REPO/releases/latest/download/utmm.zip"
-else
-    ZIP_URL="https://github.com/$REPO/releases/download/$VERSION/utmm.zip"
-fi
+ZIP_URL="https://github.com/$REPO/releases/latest/download/utmm.zip"
 
 echo "==> UTM Monitor installer"
 echo "    install:  $INSTALL_DIR"
-echo "    version:  $VERSION"
 echo ""
 
 # Download zip

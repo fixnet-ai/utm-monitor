@@ -50,9 +50,6 @@ The headline feature. After a quick one-time setup, you talk to Claude and it ma
 ```bash
 # One-command install: downloads utmm.zip, extracts to /opt/utmm/, creates symlinks
 curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
-
-# Or specify a version:
-# VERSION=v0.1.0 curl -fsSL ... | sh
 ```
 
 The install script:
