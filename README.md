@@ -66,9 +66,12 @@ The install script:
 ```bash
 cd ~/utmm
 
-# Download Skill (canonical location: utm-vm/SKILL.md)
+# Download Skill files (SKILL.md + MANUAL.md reference)
+mkdir -p utm-vm
 curl -o utm-vm/SKILL.md \
   https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/utm-vm/SKILL.md
+curl -o utm-vm/MANUAL.md \
+  https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/utm-vm/MANUAL.md
 
 # Create symlink so Claude can find it
 mkdir -p .claude/skills
@@ -114,7 +117,7 @@ printf 'Content-Length: 50\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"ping","param
 
 Done! Now talk to Claude: "Check the status of all VMs".
 
-> **Alternative: source build** — if you prefer building from source, see [MANUAL.md §2](./MANUAL.md#2-installation) for Zig build instructions.
+> **Alternative: source build** — if you prefer building from source, see [MANUAL.md §2](./utm-vm/MANUAL.md#2-installation) for Zig build instructions.
 
 
 ## Quick Start (CLI only)
@@ -140,7 +143,7 @@ utmm --host --download linuxvm f.txt ./f.txt  # download file from VM (no curl)
 
 | Document | For |
 |----------|-----|
-| **[MANUAL.md](./MANUAL.md)** | Full manual: install, deploy, daily usage, troubleshooting, MCP setup |
+| **[MANUAL.md](./utm-vm/MANUAL.md)** | Full manual: install, deploy, daily usage, troubleshooting, MCP setup |
 | **[CLAUDE.md](./CLAUDE.md)** | Development guide (build commands, architecture, code style) |
 | **[zig-codegen.md](./zig-codegen.md)** | Zig 0.16.0 coding knowledge base |
 

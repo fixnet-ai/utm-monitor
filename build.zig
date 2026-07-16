@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// Map build target to simplified deployment filename
-/// See MANUAL.md §6.x for the full compatibility matrix
+/// See utm-vm/MANUAL.md §6.x for the full compatibility matrix
 fn deploymentFilename(target: std.Target) []const u8 {
     return switch (target.cpu.arch) {
         .x86 => switch (target.os.tag) {

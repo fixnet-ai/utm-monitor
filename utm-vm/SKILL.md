@@ -161,3 +161,7 @@ utmm --host --deploy linuxvm
 - `vm_deploy` builds from source — the Zig project must be at the MCP server's cwd
 - VM IPs can change on reboot — always check `vm_status` first, don't cache IPs
 - Windows cmd.exe has different escaping rules than bash — test simple commands first
+
+## Reference Manual
+
+See [MANUAL.md](MANUAL.md) for the complete reference: build & install, architecture design, protocol specification, CLI reference, deploy & auto-upgrade workflow, MCP integration, platform-specific notes, and troubleshooting.
