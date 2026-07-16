@@ -46,6 +46,14 @@ jobs:
           echo "==> Release artifacts:"
           ls -lh release/
 
+      - name: Copy install scripts
+        run: |
+          echo "==> Adding install scripts..."
+          cp install.sh release/
+          cp install.ps1 release/
+          echo "==> Final release contents:"
+          ls -lh release/
+
       - name: Package zip
         run: |
           cd release
