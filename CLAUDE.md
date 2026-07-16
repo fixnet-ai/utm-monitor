@@ -48,15 +48,20 @@ Guest (windows)  ──UDP broadcast──┘                    └── hosts
 
 ### Build
 ```bash
-zig build                    # Native build
-zig build -Dtarget=aarch64-linux-musl    # Linux cross-compilation (musl, static)
-zig build -Dtarget=aarch64-macos   # macOS cross-compilation
-zig build -Dtarget=aarch64-windows  # Windows cross-compilation
+zig build                    # Native build → zig-out/bin/utmm
+zig build -Dtarget=aarch64-linux-musl    # → utmm-aarch64-linux
+zig build -Dtarget=aarch64-macos   # → utmm-aarch64-macos
+zig build -Dtarget=aarch64-windows  # → utmm-aarch64-windows.exe
+zig build -Dtarget=x86_64-linux-musl    # → utmm-x86_64-linux
+zig build -Dtarget=x86_64-macos   # → utmm-x86_64-macos
+zig build -Dtarget=x86_64-windows  # → utmm-x86_64-windows.exe
+zig build -Dtarget=x86-linux-musl    # → utmm-x86-linux
+zig build -Dtarget=x86-windows  # → utmm-x86-windows.exe
 ```
 
 ### Tests/Testing
 ```bash
-zig build test                                   # All tests (currently 51)
+zig build test                                   # All tests (currently 61)
 ```
 
 ### Guest End Runtime

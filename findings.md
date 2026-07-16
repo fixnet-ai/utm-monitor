@@ -358,5 +358,38 @@ utm-monitor --host --upload ./f.txt linuxvm     # Upload file to VM
 utm-monitor --host --download linuxvm f.txt ./f.txt  # Download file from VM
 ```
 
+## Binary Naming & Zip Packaging (Phase 13) — 2026-07-16
+
+### Naming Convention
+Unified `utmm-{arch}-{os}[.exe]` convention across all code, CI, scripts, and docs:
+- `utmm-x86-linux`, `utmm-x86_64-linux`, `utmm-aarch64-linux`
+- `utmm-x86_64-macos`, `utmm-aarch64-macos`
+- `utmm-x86-windows.exe`, `utmm-x86_64-windows.exe`, `utmm-aarch64-windows.exe`
+
+### Build Targets (5 → 8)
+Added x86_64-linux-musl, x86_64-windows, aarch64-windows for full coverage.
+
+### Zip Packaging
+CI produces `utmm.zip` (stable latest URL) + `utmm-vX.X.X.zip` (versioned archival) containing all 8 platform binaries.
+
+### Install Flow
+1. `install.sh` downloads `utmm.zip` from GitHub Releases
+2. Extracts to `/opt/utmm/` (all 8 binaries)
+3. Detects Host arch (`uname -m` normalized: arm64→aarch64, x86_64→x86_64, i*86→x86)
+4. Creates symlink: `/opt/utmm/utmm` → `utmm-{host-arch}-{host-os}[.exe]`
+5. Creates convenience symlink: `/usr/local/bin/utmm` → `/opt/utmm/utmm`
+
+### serve_dir Default
+Changed from exe directory to `/opt/utmm/` (or `C:\opt\utmm\` on Windows). Host can now auto-upgrade any Guest architecture without `--serve-dir` flag.
+
+### Key Files Changed
+- `build.zig`, `src/protocol.zig` — core naming (two `deploymentFilename()` functions)
+- `src/host.zig` — serve_dir default
+- `src/host_http.zig`, `src/http_server.zig` — `/update` arch normalization
+- `.github/workflows/release.yml` — 8 targets + zip packaging
+- `install.sh` — complete rewrite
+- `test_all.sh` — updated targets and binary names
+- `CLAUDE.md`, `README.md`, `MANUAL.md` — all docs updated
+
 ---
 *Update this file after every 2 view/browser/search operations*

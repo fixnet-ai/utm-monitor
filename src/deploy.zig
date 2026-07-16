@@ -100,7 +100,7 @@ pub fn buildBinary(io: std.Io, allocator: std.mem.Allocator, target: []const u8)
 
     // Find the built binary in zig-out/bin/
     // After build.zig changes, the target-specific binary uses deployment filenames
-    // (e.g. utmm, utmm.bin, utmm.exe, utmm_arm64, utmm_arm64.bin)
+    // (e.g. utmm-x86_64-linux, utmm-aarch64-macos, utmm-x86-windows.exe)
     const is_windows_target = std.mem.indexOf(u8, target, "windows") != null;
     const dst_ext: []const u8 = if (is_windows_target) ".exe" else "";
     const src_name = if (protocol.deploymentFilename(target)) |name|

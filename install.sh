@@ -1,108 +1,96 @@
 #!/bin/sh
 # UTM Monitor — one-click installation script
+# Downloads utmm.zip from GitHub Releases, extracts to /opt/utmm/
+# Creates /opt/utmm/utmm -> utmm-{arch}-{os}[.exe] symlink for the Host
+#
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
-#   curl -fsSL ... | sh -s -- --with-guests /opt/utmm
+#   VERSION=v1.0.0 curl -fsSL ... | sh
 #
-# Options:
-#   --with-guests DIR    Also download all Guest binaries into DIR (for Host /update endpoint)
-#
-# Specify a version:
-#   VERSION=v1.1.1 curl -fsSL https://raw.githubusercontent.com/.../install.sh | sh
+# Environment:
+#   INSTALL_DIR   installation directory (default /opt/utmm)
+#   VERSION       specific version tag, or "latest" (default)
 
 set -e
 
 REPO="fixnet-ai/utm-monitor"
-BIN="/usr/local/bin/utmm"
+INSTALL_DIR="${INSTALL_DIR:-/opt/utmm}"
 VERSION="${VERSION:-latest}"
-WITH_GUESTS=""
-GUEST_DIR=""
-
-# Parse args
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --with-guests)
-            WITH_GUESTS=1
-            GUEST_DIR="${2:-/opt/utmm}"
-            shift 2 2>/dev/null || shift
-            ;;
-        *) shift ;;
-    esac
-done
-
-# Detect architecture (Host runs on macOS only for now)
-ARCH=$(uname -m)
-case "$ARCH" in
-    arm64)  TARGET="aarch64-macos" ;;
-    x86_64) TARGET="x86_64-macos" ;;
-    *)      echo "Error: unsupported architecture: $ARCH"; exit 1 ;;
-esac
-
-echo "==> UTM Monitor installer"
-echo "    arch:     $ARCH ($TARGET)"
-echo "    version:  $VERSION"
-echo "    dest:     $BIN"
-if [ -n "$WITH_GUESTS" ]; then
-    echo "    guests:   $GUEST_DIR"
-fi
-echo ""
 
 # Build download URL
 if [ "$VERSION" = "latest" ]; then
-    BASE_URL="https://github.com/$REPO/releases/latest/download"
+    ZIP_URL="https://github.com/$REPO/releases/latest/download/utmm.zip"
 else
-    BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
+    ZIP_URL="https://github.com/$REPO/releases/download/$VERSION/utmm.zip"
 fi
 
-# Download Host binary
-URL="$BASE_URL/utmm-$TARGET"
-echo "==> Downloading $URL ..."
-if sudo curl -fsSL --progress-bar "$URL" -o "$BIN"; then
-    sudo chmod +x "$BIN"
+echo "==> UTM Monitor installer"
+echo "    install:  $INSTALL_DIR"
+echo "    version:  $VERSION"
+echo ""
+
+# Download zip
+TMP_ZIP="$(mktemp /tmp/utmm.XXXXXX.zip)"
+echo "==> Downloading $ZIP_URL ..."
+if ! curl -fsSL --progress-bar "$ZIP_URL" -o "$TMP_ZIP"; then
     echo ""
-    echo "==> Installed: $BIN"
-    "$BIN" --version
-else
-    echo ""
-    echo "==> Download failed — no GitHub Release found for $VERSION."
-    echo "    Build from source instead:"
+    echo "==> Download failed. Build from source:"
     echo "      git clone https://github.com/$REPO.git"
-    echo "      cd utmm"
+    echo "      cd utm-monitor"
     echo "      zig build -Doptimize=ReleaseSafe"
-    echo "      sudo cp zig-out/bin/utmm $BIN"
+    rm -f "$TMP_ZIP"
     exit 1
 fi
 
-# Optionally download Guest binaries for /update auto-deploy
-if [ -n "$WITH_GUESTS" ]; then
-    sudo mkdir -p "$GUEST_DIR"
-    GUEST_TARGETS="aarch64-linux x86_64-linux aarch64-macos x86_64-macos aarch64-windows x86_64-windows"
-    echo ""
-    echo "==> Downloading Guest binaries to $GUEST_DIR ..."
-    for t in $GUEST_TARGETS; do
-        ext=""
-        case "$t" in
-            *windows*) ext=".exe" ;;
-        esac
-        gurl="$BASE_URL/utmm-$t$ext"
-        gdest="$GUEST_DIR/utmm-$t$ext"
-        echo "    $gurl"
-        if sudo curl -fsSL --progress-bar "$gurl" -o "$gdest"; then
-            sudo chmod +x "$gdest"
-        else
-            echo "    WARNING: failed to download $t (may not exist for this release)"
-        fi
-    done
-    echo "==> Guest binaries ready, Host can serve /update from: $GUEST_DIR"
+# Extract
+echo "==> Extracting to $INSTALL_DIR ..."
+sudo mkdir -p "$INSTALL_DIR"
+sudo unzip -o "$TMP_ZIP" -d "$INSTALL_DIR"
+rm -f "$TMP_ZIP"
+sudo chmod +x "$INSTALL_DIR"/utmm-* 2>/dev/null || true
+
+# Detect Host architecture (normalize uname -m -> our arch names)
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+    arm64|aarch64) HOST_ARCH="aarch64" ;;
+    x86_64|amd64)  HOST_ARCH="x86_64" ;;
+    i386|i486|i586|i686) HOST_ARCH="x86" ;;
+    *) echo "Error: unsupported architecture: $HOST_ARCH"; exit 1 ;;
+esac
+
+HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+case "$HOST_OS" in
+    darwin) HOST_OS="macos" ;;
+    linux)  HOST_OS="linux" ;;
+    mingw*|msys*|cygwin*) HOST_OS="windows" ;;
+    *) echo "Error: unsupported OS: $HOST_OS"; exit 1 ;;
+esac
+
+HOST_BIN="utmm-${HOST_ARCH}-${HOST_OS}"
+if [ "$HOST_OS" = "windows" ]; then
+    HOST_BIN="${HOST_BIN}.exe"
+fi
+
+# Create symlink: /opt/utmm/utmm -> utmm-{arch}-{os}
+echo "==> Creating symlink: $INSTALL_DIR/utmm -> $INSTALL_DIR/$HOST_BIN"
+sudo ln -sf "$INSTALL_DIR/$HOST_BIN" "$INSTALL_DIR/utmm"
+if [ "$HOST_OS" = "windows" ]; then
+    sudo ln -sf "$INSTALL_DIR/$HOST_BIN" "$INSTALL_DIR/utmm.exe"
+fi
+
+# Convenience symlink to /usr/local/bin (macOS/Linux only)
+if [ "$HOST_OS" != "windows" ]; then
+    sudo mkdir -p /usr/local/bin
+    sudo ln -sf "$INSTALL_DIR/utmm" /usr/local/bin/utmm
+    echo "==> Symlink: /usr/local/bin/utmm -> $INSTALL_DIR/utmm"
 fi
 
 echo ""
+echo "==> Installation complete!"
+"$INSTALL_DIR/utmm" --version 2>/dev/null || true
+echo ""
 echo "==> To enable auto-start on boot:"
-echo "    sudo utmm --install"
+echo "    sudo utmm --host --install"
 echo ""
 echo "==> To start Host now:"
-if [ -n "$WITH_GUESTS" ]; then
-    echo "    sudo utmm --host --serve-dir $GUEST_DIR"
-else
-    echo "    sudo utmm --host"
-fi
+echo "    sudo utmm --host"

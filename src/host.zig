@@ -206,12 +206,10 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
 
     // ── Determine serve directory (needed by callback for auto-upgrade) ──
     const serve_dir: []const u8 = if (cli.serve_dir) |sd| sd else blk: {
-        var exe_buf: [4096]u8 = undefined;
-        if (std.process.executablePath(io, &exe_buf)) |exe_len| {
-            const exe_path = exe_buf[0..exe_len];
-            break :blk gpa.dupe(u8, std.fs.path.dirname(exe_path) orelse ".") catch ".";
-        } else |_| {
-            break :blk ".";
+        if (@import("builtin").os.tag == .windows) {
+            break :blk gpa.dupe(u8, "C:\\opt\\utmm") catch ".";
+        } else {
+            break :blk gpa.dupe(u8, "/opt/utmm") catch ".";
         }
     };
     // NOTE: serve_dir is intentionally never freed — used by the detached HTTP thread and callback

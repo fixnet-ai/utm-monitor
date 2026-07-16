@@ -206,31 +206,18 @@ Install on the Host side (the Mac running UTM) with a single command:
 curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 ```
 
-The script auto-detects the architecture (arm64/x86_64) and downloads the corresponding binary from GitHub Releases to `/usr/local/bin/utmm`.
+The script downloads `utmm.zip` from GitHub Releases, extracts all 8 platform binaries to `/opt/utmm/`, auto-detects the Host architecture, and creates symlinks:
+
+- `/opt/utmm/utmm` → `/opt/utmm/utmm-{arch}-{os}` (Host binary)
+- `/usr/local/bin/utmm` → `/opt/utmm/utmm` (convenience)
+
+All Guest binaries are already in `/opt/utmm/` after extraction — the Host's `serve_dir` defaults to this directory, so auto-upgrade works for all Guest architectures immediately.
 
 Specify a version:
 
 ```bash
-VERSION=v1.1.0 curl -fsSL https://raw.githubusercontent.com/.../install.sh | sh
+VERSION=v1.0.0 curl -fsSL https://raw.githubusercontent.com/.../install.sh | sh
 ```
-
-After installation, download the cross-compiled Guest binaries for your VMs from GitHub Releases into the serve directory (default: `/usr/local/bin/`, same as the Host binary):
-
-```bash
-# Download the Guest binaries you need (5 binaries cover all scenarios, see §6.4)
-sudo curl -fsSL "https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm_arm64" -o /usr/local/bin/utmm_arm64
-sudo curl -fsSL "https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.macos" -o /usr/local/bin/utmm.macos
-sudo curl -fsSL "https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.exe" -o /usr/local/bin/utmm.exe
-sudo chmod +x /usr/local/bin/utmm*
-```
-
-> Alternatively, use `--serve-dir` to keep Guest binaries in a separate directory:
-> ```bash
-> sudo mkdir -p /opt/utm-binaries
-> sudo curl -fsSL "..." -o /opt/utm-binaries/utmm_arm64
-> # ... download other targets ...
-> sudo utmm --host --serve-dir /opt/utm-binaries
-> ```
 
 Start the Host:
 
@@ -240,12 +227,10 @@ sudo utmm --host             # Start immediately
 ```
 
 > **Note**: Use `--host --install` to generate a Host-mode service config (with `--host` flag included). Use just `--install` (without `--host`) on Guest VMs to self-install as a Guest-mode service. The same binary auto-detects the correct mode based on the presence of `--host`.
-> 
-> If using a custom `--serve-dir`, add it to the generated plist or unit file manually, or pass `--serve-dir` each time when starting the Host manually.
 
 ### 2.4 Bare-Metal Bootstrapping (First-time Guest VM Deployment)
 
-A brand-new VM has no utmm running. After the Host starts `utmm --host`, it automatically provides a read-only HTTP server on port 2121 (serving the cross-compiled binaries from the serve directory). Therefore, bare-metal bootstrapping requires only one command:
+A brand-new VM has no utmm running. After the Host starts `utmm --host`, it automatically provides a read-only HTTP server on port 2121 (serving the cross-compiled binaries from `/opt/utmm/`). Therefore, bare-metal bootstrapping requires only one command:
 
 **Linux / macOS Guest**:
 
@@ -258,14 +243,16 @@ curl -s "http://$GATEWAY:2121/update" | sh
 
 > **Prerequisite**: The target directory `/opt/utmm/` must exist before running `/update`. The script installs the binary to `/opt/utmm/utmm`.
 
-`/update` is a virtual endpoint on the Host HTTP server that auto-detects the Guest architecture and downloads the corresponding binary, installing it as a system service. The script has built-in version checking: if the Guest is already installed and its version matches the Host, the download is skipped.
+`/update` is a virtual endpoint on the Host HTTP server that auto-detects the Guest architecture and downloads the corresponding binary (e.g., `utmm-aarch64-linux`, `utmm-x86_64-windows.exe`), installing it as a system service. The script has built-in version checking: if the Guest is already installed and its version matches the Host, the download is skipped.
 
 **Windows Guest**:
 
 ```powershell
-# Get gateway IP, manually download the corresponding binary
+# Get gateway IP, then download the appropriate binary for your Windows architecture
 $gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop
-curl "http://$gw`:2121/bin/utmm.exe" -o C:\opt\utmm\utmm.exe
+$arch = (Get-WmiObject Win32_Processor).AddressWidth  # 32 or 64
+if ($arch -eq 64) { $bin = "utmm-x86_64-windows.exe" } else { $bin = "utmm-x86-windows.exe" }
+curl "http://${gw}:2121/bin/$bin" -o C:\opt\utmm\utmm.exe
 C:\opt\utmm\utmm.exe --install
 ```
 
@@ -312,19 +299,22 @@ utmm --host --status
 
 **Method 1: GitHub Releases (Recommended, no local compilation needed)**
 
-Each release automatically builds 5 binaries covering all VM scenarios via CI:
+Each release automatically builds 8 binaries for all VM scenarios, packaged as `utmm.zip` (and `utmm-vX.X.X.zip`):
 
-| File | Covers | How |
-|------|--------|-----|
-| `utmm.exe` | All Windows VMs (x86, x86_64, ARM64) | 32-bit x86 binary; ARM64 Windows has built-in x86 emulation |
-| `utmm.macos` | Intel Mac + Apple Silicon Mac (physical) | x86_64 binary; Apple Silicon runs via Rosetta 2 |
-| `utmm_arm64.macos` | ARM macOS VMs (UTM guests, no Rosetta 2) | Native aarch64 binary for VMs without Rosetta 2 |
-| `utmm` | All x86 Linux VMs (x86, x86_64) | x86_64 musl static binary; compatible with x86_64 and x86 kernels |
-| `utmm_arm64` | ARM64 Linux VMs | aarch64 musl static binary |
+| File | Covers | Zig Target |
+|------|--------|------------|
+| `utmm-x86-linux` | 32-bit x86 Linux VMs | x86-linux-musl |
+| `utmm-x86_64-linux` | 64-bit x86 Linux VMs | x86_64-linux-musl |
+| `utmm-aarch64-linux` | ARM64 Linux VMs | aarch64-linux-musl |
+| `utmm-x86_64-macos` | Intel Mac + Apple Silicon Mac (physical) | x86_64-macos |
+| `utmm-aarch64-macos` | ARM macOS VMs (UTM guests, no Rosetta 2) | aarch64-macos |
+| `utmm-x86-windows.exe` | 32-bit x86 Windows VMs | x86-windows |
+| `utmm-x86_64-windows.exe` | 64-bit x86 Windows VMs | x86_64-windows |
+| `utmm-aarch64-windows.exe` | ARM64 Windows VMs | aarch64-windows |
 
-> **macOS Rosetta 2 note**: Apple Silicon **physical** Macs can run `utmm.macos` (x86_64) via Rosetta 2. However, UTM ARM macOS **VMs** lack Rosetta 2, so they need `utmm_arm64.macos` (native aarch64). If you need Rosetta 2 on a physical Mac: `softwareupdate --install-rosetta`.
+> **macOS Rosetta 2 note**: Apple Silicon **physical** Macs can run `utmm-x86_64-macos` (x86_64) via Rosetta 2. However, UTM ARM macOS **VMs** lack Rosetta 2, so they need `utmm-aarch64-macos` (native aarch64). If you need Rosetta 2 on a physical Mac: `softwareupdate --install-rosetta`.
 
-Download URL: `https://github.com/fixnet-ai/utm-monitor/releases/latest`
+Download URL: `https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.zip`
 
 For the Host side, using `install.sh` (§2.3) is recommended; for the Guest side, using the `/update` virtual endpoint (§2.4) is recommended.
 
@@ -337,20 +327,31 @@ cd utmm
 # Native build
 zig build -Doptimize=ReleaseSafe
 
-# Cross-compile for each platform (5 targets cover all scenarios)
-zig build -Dtarget=x86_64-linux-musl  -Doptimize=ReleaseSafe
-zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe
-zig build -Dtarget=x86_64-macos       -Doptimize=ReleaseSafe
-zig build -Dtarget=aarch64-macos      -Doptimize=ReleaseSafe
-zig build -Dtarget=x86-windows        -Doptimize=ReleaseSafe
+# Cross-compile for each platform (8 targets cover all scenarios)
+zig build -Dtarget=x86-linux-musl       -Doptimize=ReleaseSafe
+zig build -Dtarget=x86_64-linux-musl   -Doptimize=ReleaseSafe
+zig build -Dtarget=aarch64-linux-musl  -Doptimize=ReleaseSafe
+zig build -Dtarget=x86_64-macos        -Doptimize=ReleaseSafe
+zig build -Dtarget=aarch64-macos       -Doptimize=ReleaseSafe
+zig build -Dtarget=x86-windows         -Doptimize=ReleaseSafe
+zig build -Dtarget=x86_64-windows      -Doptimize=ReleaseSafe
+zig build -Dtarget=aarch64-windows     -Doptimize=ReleaseSafe
 ```
 
 Build artifacts:
-- `zig-out/bin/utmm` — binary for the current (native) target
+- `zig-out/bin/utmm` — native binary (current platform)
+- `zig-out/bin/utmm-x86-linux` — Linux 32-bit x86 musl static
+- `zig-out/bin/utmm-x86_64-linux` — Linux 64-bit x86 musl static
+- `zig-out/bin/utmm-aarch64-linux` — Linux aarch64 musl static
+- `zig-out/bin/utmm-x86_64-macos` — macOS x86_64 (Intel + Apple Silicon via Rosetta 2)
+- `zig-out/bin/utmm-aarch64-macos` — macOS aarch64 (ARM VMs without Rosetta 2)
+- `zig-out/bin/utmm-x86-windows.exe` — Windows 32-bit x86
+- `zig-out/bin/utmm-x86_64-windows.exe` — Windows 64-bit x86
+- `zig-out/bin/utmm-aarch64-windows.exe` — Windows ARM64
 - `zig-out/bin/utmm` — Linux x86_64 musl (also covers x86 Linux)
-- `zig-out/bin/utmm_arm64` — Linux aarch64 musl
-- `zig-out/bin/utmm.macos` — macOS x86_64 (Intel + Apple Silicon via Rosetta 2)
-- `zig-out/bin/utmm_arm64.macos` — macOS aarch64 (ARM VMs without Rosetta 2)
+- `zig-out/bin/utmm-aarch64-linux` — Linux aarch64 musl
+- `zig-out/bin/utmm-x86_64-macos` — macOS x86_64 (Intel + Apple Silicon via Rosetta 2)
+- `zig-out/bin/utmm-aarch64-macos` — macOS aarch64 (ARM VMs without Rosetta 2)
 - `zig-out/bin/utmm.exe` — Windows 32-bit x86 (covers all Windows via emulation)
 
 > **Note**: The build system (`build.zig`) automatically produces deployment filenames alongside the main binary.
@@ -437,7 +438,7 @@ utmm --host --gen-init windows
 
 ### 3.7 Start Host Service
 
-The Host HTTP server serves cross-compiled binaries from a configurable directory (defaults to the directory containing the `utmm` executable). This directory must contain the deployment binaries (e.g., `utmm`, `utmm_arm64`, `utmm.macos`, `utmm.exe`) produced by `zig build -Dtarget=...`.
+The Host HTTP server serves cross-compiled binaries from a configurable directory (defaults to `/opt/utmm/`, or `C:\opt\utmm\` on Windows). This directory must contain the deployment binaries (e.g., `utmm-aarch64-linux`, `utmm-x86_64-macos`, `utmm-x86-windows.exe`) produced by `zig build -Dtarget=...` or extracted from `utmm.zip`.
 
 ```bash
 # Foreground (observe logs)
@@ -627,7 +628,7 @@ cat utmm.conf
 #### Fully Automatic Upgrade (Host-Push)
 
 The **Host** drives all upgrades. When a Guest broadcasts ANNOUNCE with a version that doesn't match the Host's (`src/ver.zig`), the Host immediately:
-1. Finds the correct binary in the serve directory by mapping the Guest's target triple to the deployment filename (e.g., `utmm` for x86_64-linux-musl, `utmm.exe` for Windows)
+1. Finds the correct binary in the serve directory by mapping the Guest's target triple to the deployment filename (e.g., `utmm-x86_64-linux` for x86_64-linux-musl, `utmm-aarch64-windows.exe` for aarch64-windows)
 2. HTTP-uploads it to Guest `/upload` as `.new`
 3. HTTP-executes a background restart command on Guest
 
@@ -864,44 +865,52 @@ utmm/
 | Task Scheduler | Windows system | Windows auto-start on boot |
 | HTTP+IPC | Built-in | Binary deployment + file transfer + remote execution + command forwarding |
 
-### 6.3 Simplified Binary Packaging (5 Binaries → All VMs)
+### 6.3 Binary Packaging (8 Binaries → All VMs)
 
-Instead of building a separate binary for every architecture+OS combination, we use architecture compatibility layers to cover all scenarios with just 5 binaries:
+Each release builds 8 binaries covering all architecture+OS combinations, packaged as `utmm.zip`:
 
-| # | Binary | Build Target | Covers | Mechanism |
-|---|--------|-------------|--------|-----------|
-| 1 | `utmm.exe` | `x86-windows` | Windows x86, x86_64, ARM64 | 32-bit x86 binary; ARM64 Windows has built-in x86 emulation |
-| 2 | `utmm.macos` | `x86_64-macos` | Intel Mac, Apple Silicon (physical) | Native x86_64; Apple Silicon physical Macs run via Rosetta 2 |
-| 3 | `utmm_arm64.macos` | `aarch64-macos` | ARM macOS VMs (UTM guests) | Native aarch64 for VMs that lack Rosetta 2 |
-| 4 | `utmm` | `x86_64-linux-musl` | Linux x86_64, x86 (32-bit kernel) | x86_64 musl static binary; compatible with x86 kernels |
-| 5 | `utmm_arm64` | `aarch64-linux-musl` | Linux aarch64 | aarch64 musl static binary |
+| # | Binary | Build Target | Covers |
+|---|--------|-------------|--------|
+| 1 | `utmm-x86-linux` | `x86-linux-musl` | 32-bit x86 Linux VMs |
+| 2 | `utmm-x86_64-linux` | `x86_64-linux-musl` | 64-bit x86 Linux VMs |
+| 3 | `utmm-aarch64-linux` | `aarch64-linux-musl` | ARM64 Linux VMs |
+| 4 | `utmm-x86_64-macos` | `x86_64-macos` | Intel Mac, Apple Silicon (physical, via Rosetta 2) |
+| 5 | `utmm-aarch64-macos` | `aarch64-macos` | ARM macOS VMs (UTM guests, no Rosetta 2) |
+| 6 | `utmm-x86-windows.exe` | `x86-windows` | 32-bit x86 Windows VMs |
+| 7 | `utmm-x86_64-windows.exe` | `x86_64-windows` | 64-bit x86 Windows VMs |
+| 8 | `utmm-aarch64-windows.exe` | `aarch64-windows` | ARM64 Windows VMs |
 
 **Compatibility matrix** — which binary to use for each VM scenario:
 
 | VM Scenario | Binary to Use | Notes |
 |-------------|---------------|-------|
-| Windows VM (any arch) | `utmm.exe` | 32-bit x86 PE runs on all Windows via emulation |
-| macOS VM on Intel Mac (UTM) | `utmm.macos` | Native x86_64 |
-| macOS VM on Apple Silicon (UTM) | `utmm_arm64.macos` | UTM ARM VMs lack Rosetta 2; need native aarch64 |
-| Physical Apple Silicon Mac (Host) | `utmm.macos` | Rosetta 2 handles x86_64 → aarch64 translation |
-| Physical Intel Mac (Host) | `utmm.macos` | Native x86_64 |
-| Linux VM (x86_64) | `utmm` | x86_64 musl static, no glibc dependency |
-| Linux VM (x86 / 32-bit) | `utmm` | x86_64 binary runs on x86 kernel (compatibility mode) |
-| Linux VM (aarch64) | `utmm_arm64` | aarch64 musl static |
+| Windows VM (x86) | `utmm-x86-windows.exe` | 32-bit x86 |
+| Windows VM (x86_64) | `utmm-x86_64-windows.exe` | 64-bit x86 |
+| Windows VM (ARM64) | `utmm-aarch64-windows.exe` | Native ARM64 |
+| macOS VM on Intel Mac (UTM) | `utmm-x86_64-macos` | Native x86_64 |
+| macOS VM on Apple Silicon (UTM) | `utmm-aarch64-macos` | UTM ARM VMs lack Rosetta 2; need native aarch64 |
+| Physical Apple Silicon Mac (Host) | `utmm-x86_64-macos` | Rosetta 2 handles x86_64 → aarch64 translation |
+| Physical Intel Mac (Host) | `utmm-x86_64-macos` | Native x86_64 |
+| Linux VM (x86 / 32-bit) | `utmm-x86-linux` | 32-bit musl static |
+| Linux VM (x86_64) | `utmm-x86_64-linux` | 64-bit musl static, no glibc dependency |
+| Linux VM (aarch64) | `utmm-aarch64-linux` | aarch64 musl static |
 
-> **Key insight**: We ship one binary per "ecosystem" — the platform's own compatibility mechanisms (Windows x86 emulation, macOS Rosetta 2, Linux x86_64-on-x86) handle the rest. The only exception is ARM macOS VMs (UTM doesn't virtualize Rosetta 2), which need a dedicated aarch64 binary.
+> **Install flow**: `install.sh` downloads `utmm.zip`, extracts all 8 binaries to `/opt/utmm/`, then creates a symlink `/opt/utmm/utmm` → the correct binary for the Host platform. The Host's `serve_dir` now contains all platform binaries, enabling auto-upgrade for any Guest architecture.
 
-**macOS Rosetta 2**: Available on physical Apple Silicon Macs by default; install manually if missing: `softwareupdate --install-rosetta`. NOT available inside UTM ARM macOS VMs — those must use `utmm_arm64.macos`.
+**macOS Rosetta 2**: Available on physical Apple Silicon Macs by default; install manually if missing: `softwareupdate --install-rosetta`. NOT available inside UTM ARM macOS VMs — those must use `utmm-aarch64-macos`.
 
 ### 6.4 Zig Cross-Compilation Target Reference
 
 | Zig Target | Output Binary | Guest Platform |
 |------------|---------------|----------------|
-| `x86-windows` | `utmm.exe` | All Windows (x86, x86_64, ARM64) |
-| `x86_64-macos` | `utmm.macos` | Intel Mac + Apple Silicon Mac (via Rosetta 2) |
-| `aarch64-macos` | `utmm_arm64.macos` | ARM macOS VMs (UTM guests, no Rosetta 2) |
-| `x86_64-linux-musl` | `utmm` | Linux x86_64 + x86 (musl static) |
-| `aarch64-linux-musl` | `utmm_arm64` | Linux aarch64 (musl static) |
+| `x86-linux-musl` | `utmm-x86-linux` | Linux 32-bit x86 (musl static) |
+| `x86_64-linux-musl` | `utmm-x86_64-linux` | Linux 64-bit x86 (musl static) |
+| `aarch64-linux-musl` | `utmm-aarch64-linux` | Linux aarch64 (musl static) |
+| `x86_64-macos` | `utmm-x86_64-macos` | Intel Mac + Apple Silicon Mac (via Rosetta 2) |
+| `aarch64-macos` | `utmm-aarch64-macos` | ARM macOS VMs (UTM guests, no Rosetta 2) |
+| `x86-windows` | `utmm-x86-windows.exe` | Windows 32-bit x86 |
+| `x86_64-windows` | `utmm-x86_64-windows.exe` | Windows 64-bit x86 |
+| `aarch64-windows` | `utmm-aarch64-windows.exe` | Windows ARM64 |
 
 All Linux binaries are statically linked against musl — no glibc version dependency, runs on any Linux distribution.
 
@@ -990,7 +999,7 @@ For a simpler all-in-one setup, use `--host --mcp` together: the Host services (
 **Step 1: Download Host binary**
 
 ```bash
-sudo curl -fsSL https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.macos \
+sudo curl -fsSL https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm-x86_64-macos \
   -o /usr/local/bin/utmm
 sudo chmod +x /usr/local/bin/utmm
 ```
@@ -1005,7 +1014,7 @@ sudo chmod +x /usr/local/bin/utmm
 ```bash
 sudo mkdir -p /opt/utmm
 # 5 binaries cover all scenarios (see §6.4)
-for bin in utmm utmm_arm64 utmm.macos utmm_arm64.macos utmm.exe; do
+for bin in utmm utmm-aarch64-linux utmm-x86_64-macos utmm-aarch64-macos utmm.exe; do
   sudo curl -fsSL \
     "https://github.com/fixnet-ai/utm-monitor/releases/latest/download/$bin" \
     -o "/opt/utmm/$bin"

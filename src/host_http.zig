@@ -136,22 +136,36 @@ fn handleUpdate(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocato
         \\set -e
         \\HOST="{s}"
         \\PORT="{d}"
-        \\TARGET="/opt/utmm/utmm"
-        \\echo "[update] Downloading from http://$HOST:$PORT/bin/utmm..."
+        \\ARCH=$(uname -m)
+        \\case "$ARCH" in
+        \\  arm64|aarch64) ARCH="aarch64" ;;
+        \\  x86_64|amd64)  ARCH="x86_64" ;;
+        \\  i386|i486|i586|i686) ARCH="x86" ;;
+        \\esac
+        \\OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        \\case "$OS" in
+        \\  darwin) OS="macos" ;;
+        \\  mingw*|msys*|cygwin*) OS="windows" ;;
+        \\esac
+        \\BIN="utmm-$ARCH-$OS"
+        \\case "$OS" in windows) BIN="$BIN.exe" ;; esac
+        \\DEST="/opt/utmm/utmm"
+        \\case "$OS" in windows) DEST="C:\\\\opt\\\\utmm\\\\utmm.exe" ;; esac
+        \\echo "[update] Downloading http://$HOST:$PORT/bin/$BIN ..."
         \\if command -v curl >/dev/null 2>&1; then
-        \\  curl -fsSL "http://$HOST:$PORT/bin/utmm" -o "$TARGET.new"
+        \\  curl -fsSL "http://$HOST:$PORT/bin/$BIN" -o "$DEST.new"
         \\elif command -v wget >/dev/null 2>&1; then
-        \\  wget -q "http://$HOST:$PORT/bin/utmm" -O "$TARGET.new"
+        \\  wget -q "http://$HOST:$PORT/bin/$BIN" -O "$DEST.new"
         \\else
         \\  echo "[update] No curl or wget, cannot download"
         \\  exit 1
         \\fi
-        \\chmod +x "$TARGET.new"
-        \\mv "$TARGET.new" "$TARGET"
+        \\chmod +x "$DEST.new"
+        \\mv "$DEST.new" "$DEST"
         \\echo "[update] Done. Restarting..."
         \\pkill utmm || true
         \\sleep 1
-        \\"$TARGET" &
+        \\"$DEST" &
         \\
     , .{ host_ip, port });
     defer gpa.free(script);

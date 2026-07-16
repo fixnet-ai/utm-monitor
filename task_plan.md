@@ -4,7 +4,7 @@
 Build a cross-platform UTM VM management tool with Zig 0.16.0: auto-sync guest IPs to host /etc/hosts, guest-side HTTP service (upload/download/exec), one-click build & deploy, automatic file-change deployment, remote command execution, system service self-installation, logging, and configuration persistence.
 
 ## Current Phase
-Phase 12 (completed) — Curl Audit + Auto-Upgrade v0.1.0
+Phase 13 (completed) — Standardize Binary Naming & Zip Packaging
 
 ## Phases
 
@@ -147,6 +147,19 @@ Phase 12 (completed) — Curl Audit + Auto-Upgrade v0.1.0
 - [x] Fix ReleaseSafe build errors (void{} syntax, openFile return value discard)
 - [x] Update all docs: CLAUDE.md, README.md, MANUAL.md, SKILL.md, findings.md, progress.md, task_plan.md
 - [x] `zig build`: success, `zig build test`: 51/51 tests pass
+- **Status:** complete
+
+### Phase 13: Standardize Binary Naming & Zip Packaging
+- [x] `build.zig`: `deploymentFilename()` → `utmm-{arch}-{os}[.exe]` convention
+- [x] `src/protocol.zig`: `deploymentFilename()` + tests → unified naming
+- [x] `src/host.zig`: serve_dir default changed from exe dir to `/opt/utmm/` (or `C:\opt\utmm\`)
+- [x] `src/host_http.zig`: `/update` endpoint arch auto-detection (normalize arm64→aarch64 etc.)
+- [x] `src/http_server.zig`: `/update` endpoint arch normalization
+- [x] `.github/workflows/release.yml`: 5→8 targets, zip packaging, upload both `utmm.zip` + `utmm-v*.zip`
+- [x] `install.sh`: rewrite — download zip → extract → detect arch → create symlinks
+- [x] `test_all.sh`: BUILD_TARGETS 5→8, updated binary names and HTTP test references
+- [x] `CLAUDE.md`, `README.md`, `MANUAL.md`: all binary names, install flow, target tables updated
+- [x] `zig build test`: 61/61 pass; all 8 cross-compilation targets build successfully
 - **Status:** complete
 
 ## Complete CLI Parameters

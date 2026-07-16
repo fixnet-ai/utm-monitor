@@ -130,6 +130,11 @@ fn handleUpdate(request: *http.Server.Request, gpa: std.mem.Allocator) !void {
         "  echo \"192.168.64.1\")\n" ++
         "HOST=\"http://${GW}:2121\"\n" ++
         "ARCH=$(uname -m)\n" ++
+        "case \"$ARCH\" in\n" ++
+        "  arm64|aarch64) ARCH=\"aarch64\" ;;\n" ++
+        "  x86_64|amd64)  ARCH=\"x86_64\" ;;\n" ++
+        "  i386|i486|i586|i686) ARCH=\"x86\" ;;\n" ++
+        "esac\n" ++
         "OS=$(uname -s | tr '[:upper:]' '[:lower:]')\n" ++
         "case \"$OS\" in darwin) OS=\"macos\" ;; mingw*|msys*|cygwin*) OS=\"windows\" ;; esac\n" ++
         "BIN=\"utmm-${ARCH}-${OS}\"\n" ++

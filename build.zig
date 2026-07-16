@@ -5,20 +5,20 @@ const std = @import("std");
 fn deploymentFilename(target: std.Target) []const u8 {
     return switch (target.cpu.arch) {
         .x86 => switch (target.os.tag) {
-            .windows => "utmm.exe",
-            .linux => "utmm",
+            .linux => "utmm-x86-linux",
+            .windows => "utmm-x86-windows.exe",
             else => "utmm",
         },
         .x86_64 => switch (target.os.tag) {
-            .macos => "utmm.macos",
-            .linux => "utmm",
-            .windows => "utmm.exe",
+            .linux => "utmm-x86_64-linux",
+            .macos => "utmm-x86_64-macos",
+            .windows => "utmm-x86_64-windows.exe",
             else => "utmm",
         },
         .aarch64 => switch (target.os.tag) {
-            .macos => "utmm_arm64.macos",
-            .linux => "utmm_arm64",
-            .windows => "utmm.exe",
+            .linux => "utmm-aarch64-linux",
+            .macos => "utmm-aarch64-macos",
+            .windows => "utmm-aarch64-windows.exe",
             else => "utmm",
         },
         else => "utmm",
@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // Deployment binary with simplified filename (e.g. utmm.macos, utmm.exe, utmm_arm64)
+    // Deployment binary with unified filename (e.g. utmm-aarch64-linux, utmm-x86_64-macos, utmm-x86-windows.exe)
     // Host reads serve-dir by these names; protocol.deploymentFilename() does the mapping at runtime
     {
         const target_filename = deploymentFilename(target.result);

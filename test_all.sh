@@ -2,7 +2,7 @@
 # =============================================================================
 # UTM Monitor — Comprehensive Cross-Platform Test Suite (v0.1.0+)
 # =============================================================================
-# Covers: build (5 targets), unit tests, --deploy, --status, --exec,
+# Covers: build (8 targets), unit tests, --deploy, --status, --exec,
 #         --upload/--download, HTTP API, Host/serve-dir, /etc/hosts,
 #         --install/--uninstall (SSH), --gen-init, --mcp, musl verify.
 # =============================================================================
@@ -24,11 +24,14 @@ VERSION=$(awk '/pub const VERSION/ { gsub(/"/,"",$4); print $4 }' "$PROJECT_DIR/
 # ── Build targets + deployment filenames ──
 #    Format: "zig-target:output-filename"
 BUILD_TARGETS=(
-    "x86-windows:utmm.exe"
-    "x86_64-macos:utmm.macos"
-    "aarch64-macos:utmm_arm64.macos"
-    "x86-linux-musl:utmm"
-    "aarch64-linux-musl:utmm_arm64"
+    "x86-windows:utmm-x86-windows.exe"
+    "x86_64-windows:utmm-x86_64-windows.exe"
+    "aarch64-windows:utmm-aarch64-windows.exe"
+    "x86_64-macos:utmm-x86_64-macos"
+    "aarch64-macos:utmm-aarch64-macos"
+    "x86-linux-musl:utmm-x86-linux"
+    "x86_64-linux-musl:utmm-x86_64-linux"
+    "aarch64-linux-musl:utmm-aarch64-linux"
 )
 
 # ── VM config (still needed for SCP bootstrap + install/uninstall via SSH) ──
@@ -88,7 +91,7 @@ report ""
 # =============================================================================
 # PHASE 2: CROSS-COMPILE ALL 5 TARGETS
 # =============================================================================
-report "━━━ PHASE 2: Cross-Compilation (5 targets) ━━━"
+report "━━━ PHASE 2: Cross-Compilation (8 targets) ━━━"
 report ""
 
 FAILED_TARGETS=""
@@ -330,9 +333,9 @@ else
 fi
 
 # Host /bin/:filename download
-HOST_DL_SZ=$(http_get "http://$HOST_IP:2121/bin/utmm_arm64" 2>/dev/null | wc -c | tr -d ' ')
+HOST_DL_SZ=$(http_get "http://$HOST_IP:2121/bin/utmm-aarch64-linux" 2>/dev/null | wc -c | tr -d ' ')
 if [ "${HOST_DL_SZ:-0}" -gt 100000 ]; then
-    pass "Host HTTP /bin/utmm_arm64 (${HOST_DL_SZ} bytes)"
+    pass "Host HTTP /bin/utmm-aarch64-linux (${HOST_DL_SZ} bytes)"
 else
     fail "Host HTTP /bin/:file" "download too small (${HOST_DL_SZ:-0} bytes)"
 fi

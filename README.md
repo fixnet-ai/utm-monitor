@@ -45,32 +45,23 @@ The headline feature. After a quick one-time setup, you talk to Claude and it ma
 
 ## One-Time Setup
 
-### 1. Download Host binary (macOS)
+### 1. Download & Install (macOS / Linux)
 
 ```bash
-# Download the Host binary from GitHub Releases
-sudo curl -fsSL https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.macos \
-  -o /usr/local/bin/utmm
-sudo chmod +x /usr/local/bin/utmm
+# One-command install: downloads utmm.zip, extracts to /opt/utmm/, creates symlinks
+curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 
-# Or use the install script (auto-detects architecture):
-# curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
+# Or specify a version:
+# VERSION=v0.1.0 curl -fsSL ... | sh
 ```
 
-### 2. Download Guest binaries (for auto-deploy)
+The install script:
+- Downloads `utmm.zip` from GitHub Releases (contains all 8 platform binaries)
+- Extracts to `/opt/utmm/` (configurable via `INSTALL_DIR`)
+- Creates `/opt/utmm/utmm` → `utmm-{arch}-{os}` symlink for the Host
+- Creates `/usr/local/bin/utmm` → `/opt/utmm/utmm` convenience symlink
 
-```bash
-sudo mkdir -p /opt/utmm
-# 5 binaries cover all scenarios (see MANUAL.md §6.4)
-for bin in utmm utmm_arm64 utmm.macos utmm_arm64.macos utmm.exe; do
-  sudo curl -fsSL \
-    "https://github.com/fixnet-ai/utm-monitor/releases/latest/download/$bin" \
-    -o "/opt/utmm/$bin"
-done
-sudo chmod +x /opt/utmm/*
-```
-
-### 3. Download Skill
+### 2. Download Skill
 
 ```bash
 cd ~/utmm
@@ -86,7 +77,7 @@ ln -sf ../../utm-vm .claude/skills/utm-vm
 
 > No extra files needed — the MCP server is built into the `utmm` binary via `--mcp`. Zero external dependencies.
 
-### 4. Register MCP server with Claude Code
+### 3. Register MCP server with Claude Code
 
 ```bash
 claude mcp add utmm -- utmm --mcp
@@ -97,19 +88,19 @@ Then restart Claude Code (or run `/mcp` to reload).
 > **Integrated mode (all-in-one):** `claude mcp add utmm -- utmm --host --mcp`
 > This runs the full Host + MCP in a single process — no separate Host daemon needed.
 
-### 5. Start the Host
+### 4. Start the Host
 
 ```bash
-sudo utmm --host --serve-dir /opt/utmm
+sudo utmm --host
 ```
 
-Keep this running. To auto-start on boot:
+Keep this running. The Host serves binaries from `/opt/utmm/` by default (all 8 platform binaries are already there from install). To auto-start on boot:
 
 ```bash
 sudo utmm --install
 ```
 
-### 6. Verify
+### 5. Verify
 
 ```bash
 # CLI test
@@ -129,9 +120,8 @@ Done! Now talk to Claude: "Check the status of all VMs".
 ## Quick Start (CLI only)
 
 ```bash
-# Download binary
-sudo curl -fsSL https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.macos \
-  -o /usr/local/bin/utmm && sudo chmod +x /usr/local/bin/utmm
+# Install (downloads utmm.zip, extracts to /opt/utmm/, creates symlinks)
+curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 
 # Guest: run inside a VM
 utmm --hostname linuxvm --install    # auto-start on boot
