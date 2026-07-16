@@ -584,7 +584,7 @@ utmm --host --download linuxvm remote_file ./local_file
 > utmm --host --download linuxvm syslog.log ./syslog.log
 > ```
 >
-> **Under the hood**: `--upload` uses HTTP POST `/upload` with multipart/form-data; `--download` uses HTTP GET `/bin/:filename`. Both use `std.http.Client` — zero external dependencies.
+> **Under the hood**: `--upload` uses HTTP POST `/upload` with multipart/form-data; `--download` uses HTTP GET `/bin/:filename`. Both use `std.http.Client` — zero external dependencies. All transfers include MD5 ETag headers for integrity verification; mismatched files are rejected and deleted.
 
 #### Automatic Upgrade (Host-Push)
 
@@ -637,10 +637,10 @@ cat utmm.conf
 
 The **Host** detects version mismatches and pushes upgrades. When a Guest broadcasts ANNOUNCE with a version that doesn't match the Host's (`src/ver.zig`), the Host:
 1. Finds the correct binary in the serve directory by mapping the Guest's target triple to the platform filename
-2. HTTP-uploads it to Guest `/upload` as `utmm.new` (or `utmm.new.exe` on Windows)
-3. Returns — the Guest detects `utmm.new` in its next broadcast cycle (within 1 second), atomically renames it to the final binary, spawns a detached restart, and exits
+2. HTTP-uploads it to Guest `/upload` as `utmm.next` (or `utmm.next.exe` on Windows)
+3. Returns — the Guest detects `utmm.next` in its next broadcast cycle (within 1 second), atomically renames it to the final binary, spawns a detached restart, and exits
 
-**Design rationale**: The old approach had the Host send a `pkill utmm` restart command via HTTP, which killed the HTTP response handler before it could respond. The new design decouples upload from restart — the upload completes cleanly, and the Guest manages its own lifecycle.
+**Design rationale**: The old approach had the Host send a `pkill utmm` restart command via HTTP, which killed the HTTP response handler before it could respond. The v0.1.7 design decouples upload from restart — the upload completes cleanly, and the Guest manages its own lifecycle with a cross-platform safe rename (old → .old, .next → final, spawn restart). All HTTP uploads are verified with MD5 ETag integrity checks.
 
 No Guest polling needed. The Guest just broadcasts — the Host uploads, the Guest self-upgrades.
 
@@ -796,7 +796,7 @@ utmm --host --upload ./new_binary linuxvm
 utmm --host --exec linuxvm "/opt/utmm/utmm &"
 ```
 
-**Advanced**: Auto-upgrade uploads via HTTP as a `.new` temporary file, then performs an atomic replacement + restart, automatically handling file locking issues:
+**Advanced**: Auto-upgrade uploads via HTTP as a `.next` temporary file. The Guest uses a cross-platform safe rename strategy: (1) rename old binary away (`utmm` → `utmm.old`), (2) rename new binary into place (`utmm.next` → `utmm`), (3) spawn restart script that cleans up `.old`, (4) macOS: clear quarantine xattr. Works on Linux (directory VFS op), macOS (new inode avoids SIP), Windows (rename but not overwrite of running exe):
 ```bash
 bump ver.zig && zig build  # auto-upgrade handles the rest
 ```

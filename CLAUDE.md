@@ -34,7 +34,7 @@ Guest (windows)  ──UDP broadcast──┘                    └── hosts
 - **UDP broadcast** (port 12345): Guest broadcasts `ANNOUNCE\nname: X\nip: Y\n...` every second, Host listens
 - **HTTP** (port 2121): Guest serves /health, /version, /update, /bin/:filename, /upload, /exec; Host serves /version, /bin/:filename for Guest bootstrap
 - **IPC** (port 12347): Host internal TCP channel for --status/--exec/--upload/--download command forwarding
-- **Auto-upgrade**: Host detects Guest version mismatch via ANNOUNCE → pushes new binary via HTTP upload + remote restart. No Guest polling.
+- **Auto-upgrade**: Host detects Guest version mismatch via ANNOUNCE → pushes new binary via HTTP upload (ETag MD5 verified) + remote restart. Guest uses cross-platform safe rename (old → .old, .next → final) compatible with Linux/macOS/Windows. No Guest polling.
 
 ### Key Design Decisions
 - Single binary, dual mode: reduces maintenance burden
@@ -42,7 +42,7 @@ Guest (windows)  ──UDP broadcast──┘                    └── hosts
 - IP change callback → auto-update /etc/hosts marked block
 - HTTP thread model: one thread per connection, `std.http.Server`/`Client` from standard library
 - Zero external dependencies: no Node.js, no Python, no SSH/SCP, no curl — everything via HTTP + UDP
-- Host-push auto-upgrade: version mismatch detected in ANNOUNCE → Host pushes binary + restarts Guest. No Guest polling, no shell scripts.
+- Host-push auto-upgrade: version mismatch detected in ANNOUNCE → Host pushes binary + restarts Guest. No Guest polling, no shell scripts. Cross-platform safe rename: old→.old, .next→final, spawn restart. ETag MD5 integrity verified on all uploads.
 
 ## Build & Run
 
