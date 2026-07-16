@@ -10,7 +10,6 @@ const host_http = @import("host_http.zig");
 const broadcast = @import("broadcast.zig");
 const status_mod = @import("status.zig");
 const executor = @import("executor.zig");
-const deploy_mod = @import("deploy.zig");
 const install_mod = @import("install.zig");
 const config_mod = @import("config.zig");
 const ipc = @import("ipc.zig");
@@ -34,19 +33,6 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
         return;
     }
     if (cli.cmd_version) {
-        return;
-    }
-    if (cli.cmd_deploy) {
-        const cmd = if (cli.deploy_target) |t|
-            try std.fmt.allocPrint(gpa, "DEPLOY\n{s}", .{t})
-        else
-            "DEPLOY";
-        defer if (cli.deploy_target != null) gpa.free(cmd);
-
-        ipc.sendCommand(io, gpa, cmd) catch {
-            // Host not running, fallback to direct mode
-            try deploy_mod.deployAll(io, gpa, cli.port, cli.deploy_target);
-        };
         return;
     }
     if (cli.cmd_exec) {
@@ -427,7 +413,7 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
     http_thread.detach();
     std.debug.print("[host] HTTP server started on port {d} (serving {s}/)\n", .{ cli.http_port, serve_dir });
 
-    // Start IPC service thread (handles --status/--exec/--deploy forwarding)
+    // Start IPC service thread (handles --status/--exec forwarding)
     const IpcCtx = struct {
         guests: *std.ArrayList(listener.GuestState),
         mutex: *std.Io.Mutex,
@@ -526,50 +512,6 @@ fn ipcHandler(ctx: *anyopaque, cmd: []const u8) anyerror![]const u8 {
 
         const result = try executor.execRemote(state.io, state.allocator, g.ip, g.http_port, exec_cmd);
         return std.fmt.allocPrint(state.allocator, "{s}\n", .{result});
-    }
-
-    if (std.mem.startsWith(u8, cmd, "DEPLOY")) {
-        const specific: ?[]const u8 = if (cmd.len > "DEPLOY".len and cmd["DEPLOY".len] == '\n')
-            blk: {
-                const name = cmd["DEPLOY\n".len..];
-                break :blk if (name.len > 0) name else null;
-            }
-        else
-            null;
-
-        // Build DeployTarget list from shared Guest list
-        state.mutex.lock(state.io) catch {};
-        var targets: std.ArrayList(deploy_mod.DeployTarget) = .empty;
-        defer {
-            for (targets.items) |t| {
-                state.allocator.free(t.hostname);
-                state.allocator.free(t.ip);
-                state.allocator.free(t.ssh);
-            }
-            targets.deinit(state.allocator);
-        }
-
-        for (state.guests.items) |g| {
-            if (specific != null and !std.mem.eql(u8, g.hostname, specific.?)) continue;
-            // Build ssh field (backward compatibility, not used in new deployments)
-            const ssh_user = if (std.mem.indexOf(u8, g.target, "windows") != null) "Administrator" else "root";
-            const ssh = try std.fmt.allocPrint(state.allocator, "{s}@{s}", .{ ssh_user, g.hostname });
-            try targets.append(state.allocator, .{
-                .hostname = try state.allocator.dupe(u8, g.hostname),
-                .target = g.target,
-                .ip = try state.allocator.dupe(u8, g.ip),
-                .http_port = g.http_port,
-                .ssh = ssh,
-            });
-        }
-        state.mutex.unlock(state.io);
-
-        if (targets.items.len == 0) {
-            return try state.allocator.dupe(u8, "No matching online Guest\n");
-        }
-
-        try deploy_mod.deployWithTargets(state.io, state.allocator, targets.items, specific);
-        return try state.allocator.dupe(u8, "Deploy complete\n");
     }
 
     if (std.mem.startsWith(u8, cmd, "UPLOAD\n")) {

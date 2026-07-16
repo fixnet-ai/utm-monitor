@@ -55,7 +55,6 @@ comptime {
     _ = @import("config.zig");
     _ = @import("status.zig");
     _ = @import("executor.zig");
-    _ = @import("deploy.zig");
     _ = @import("ipc.zig");
     _ = @import("mcp.zig");
 }
@@ -78,8 +77,6 @@ pub const CliArgs = struct {
     config_path: ?[]const u8 = null,
     /// Log file path
     log_file: ?[]const u8 = null,
-    /// Watch directory (--watch)
-    watch_path: ?[]const u8 = null,
     /// HTTP serve directory for Host (--serve-dir), default: exe directory
     serve_dir: ?[]const u8 = null,
     /// Whether to save config
@@ -90,7 +87,6 @@ pub const CliArgs = struct {
     // Management commands
     cmd_status: bool = false,
     cmd_version: bool = false,
-    cmd_deploy: bool = false,
     cmd_exec: bool = false,
     cmd_gen_init: bool = false,
     cmd_install: bool = false,
@@ -99,7 +95,6 @@ pub const CliArgs = struct {
     exec_target: ?[]const u8 = null,
     exec_cmd: ?[]const u8 = null,
     gen_init_platform: ?[]const u8 = null,
-    deploy_target: ?[]const u8 = null,
 
     // Upload/download commands (Host mode, no external curl needed)
     cmd_upload: bool = false,
@@ -125,13 +120,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             cli.cmd_status = true;
         } else if (std.mem.eql(u8, arg, "--version")) {
             cli.cmd_version = true;
-        } else if (std.mem.eql(u8, arg, "--deploy")) {
-            cli.cmd_deploy = true;
-            // Optional target parameter
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "--")) {
-                i += 1;
-                cli.deploy_target = args[i];
-            }
         } else if (std.mem.eql(u8, arg, "--gen-init")) {
             cli.cmd_gen_init = true;
             if (i + 1 < args.len) {
@@ -182,14 +170,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             }
         } else if (std.mem.eql(u8, arg, "--save-config")) {
             cli.save_config = true;
-        } else if (std.mem.eql(u8, arg, "--watch")) {
-            // --watch may take optional path
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "--")) {
-                i += 1;
-                cli.watch_path = args[i];
-            } else {
-                cli.watch_path = ".";
-            }
         } else if (std.mem.eql(u8, arg, "--port")) {
             i += 1;
             if (i < args.len) cli.port = try std.fmt.parseInt(u16, args[i], 10);
@@ -244,13 +224,11 @@ pub fn printHelp() void {
         \\  --marker TAG        Marker comment text (default "UTM-MONITOR")
         \\  --config PATH       Config file path (default ./utmm.conf)
         \\  --log-file PATH     Log file path
-        \\  --watch [PATH]      Watch source directory for auto-deploy (default off)
         \\  --save-config       Save current parameters to config file
         \\
         \\Host management commands:
         \\  --status            Query all online guest status (with target/arch/os)
         \\  --exec TARGET CMD   Execute command on target guest (TARGET=hostname or FQDN)
-        \\  --deploy [TARGET]   Auto compile+deploy to online guests (optional hostname)
         \\  --upload FILE VM    Upload a file to Guest VM (via HTTP, no curl needed)
         \\  --download VM REMOTE LOCAL  Download REMOTE from Guest VM → LOCAL file
         \\  --gen-init PLATFORM  Generate auto-start script (linux/macos/windows)
@@ -385,13 +363,13 @@ pub fn main(init: std.process.Init) !void {
     // Mode dispatch
     // --mcp alone: adapter mode (connect to Host IPC)
     const mcp = @import("mcp.zig");
-    if (cli.is_mcp and !cli.is_host and !cli.cmd_status and !cli.cmd_deploy and !cli.cmd_exec and !cli.cmd_upload and !cli.cmd_download and !cli.cmd_gen_init and !cli.save_config and !cli.cmd_install and !cli.cmd_uninstall) {
+    if (cli.is_mcp and !cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_upload and !cli.cmd_download and !cli.cmd_gen_init and !cli.save_config and !cli.cmd_install and !cli.cmd_uninstall) {
         try mcp.run(init.io, init.gpa);
         return;
     }
 
     // --install/--uninstall work in both host and guest mode (install.zig uses cli.is_host)
-    if (cli.is_host or cli.cmd_status or cli.cmd_deploy or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.is_mcp) {
+    if (cli.is_host or cli.cmd_status or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.is_mcp) {
         try host_mod.run(init, cli);
     } else if (cli.cmd_install or cli.cmd_uninstall) {
         try host_mod.run(init, cli);
@@ -438,18 +416,6 @@ test "parseArgs - hostname" {
     const args = &[_][:0]const u8{ "utmm", "--hostname", "my-custom-box" };
     const cli = try parseArgs(args);
     try std.testing.expectEqualStrings("my-custom-box", cli.hostname.?);
-}
-
-test "parseArgs - watch default path" {
-    const args = &[_][:0]const u8{ "utmm", "--host", "--watch" };
-    const cli = try parseArgs(args);
-    try std.testing.expectEqualStrings(".", cli.watch_path.?);
-}
-
-test "parseArgs - watch custom path" {
-    const args = &[_][:0]const u8{ "utmm", "--host", "--watch", "./src" };
-    const cli = try parseArgs(args);
-    try std.testing.expectEqualStrings("./src", cli.watch_path.?);
 }
 
 test "parseArgs - version" {

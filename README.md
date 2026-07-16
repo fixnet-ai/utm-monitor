@@ -1,21 +1,21 @@
 # UTM Monitor
 
-**AI-powered UTM virtual machine management** — auto IP discovery, remote execution, remote debug..., and one-click deploy. Claude Code MCP + Skill integration lets your AI manage VMs through natural language.
+**UTM virtual machine management** — auto IP discovery, remote execution, remote debug, and auto-upgrade. Built-in MCP server lets any AI agent (Claude Code, Codex, Gemini CLI, etc.) manage your VMs through natural language.
 
 Written in Zig 0.16.0. Single binary, dual mode. Zero external dependencies.
 
-## AI agents Integration (MCP + Skill)
+## AI Agent Integration (MCP + Skill)
 
-The headline feature. After a quick one-time setup, you talk to Claude and it manages your VMs:
-| Tool | What Claude can do |
-|------|-------------------|
+The headline feature. After a quick one-time setup, your AI agent manages your VMs via standard MCP protocol:
+| Tool | What your AI agent can do |
+|------|--------------------------|
 | `vm_status` | Discover all VMs: hostname, IP, OS/arch, version, upgradable? |
 | `vm_exec` | Run any shell command on Linux/macOS/Windows VMs |
-| `vm_deploy` | Cross-compile + HTTP deploy to VMs, then restart |
 
 ## Daily Usage Examples
 
 ```
+“Start lldb remote debug app“
 "Check the status of all VMs"
 "Run the test suite on linuxvm"
 "Deploy the latest build to all VMs"
@@ -30,11 +30,10 @@ The headline feature. After a quick one-time setup, you talk to Claude and it ma
 
 ## Features
 
-- **Claude Code MCP + Skill** — AI-driven VM management: discover, execute, deploy — all via natural language
+- **MCP Server + Skill** — AI-driven VM management: discover, execute — all via natural language. Works with any MCP-compatible agent
 - **Auto IP Discovery** — Guest UDP broadcasts hostname+IP every second; Host auto-listens, ignoring VPN/tunnel interfaces
 - **Automatic /etc/hosts Sync** — Host updates the hosts file marker block on IP change, so `linuxvm` always resolves
 - **Remote Command Execution** — `--exec` sends commands to any VM, auto-adapts macOS/Linux/Windows shell
-- **One-Click Build & Deploy** — `--deploy` cross-compiles + deploys via built-in HTTP, zero SSH dependency
 - **Auto Version Upgrade** — Host detects Guest version mismatch via UDP broadcast, auto-pushes new binary via HTTP — no Guest polling needed
 - **HTTP File Service** — Guest built-in HTTP server (thread-per-connection); file upload/download/exec all via HTTP
 - **File Upload/Download** — `--upload` and `--download` commands replace curl for manual file transfers
@@ -58,7 +57,7 @@ The install script:
 - Creates `/opt/utmm/utmm` → `utmm-{arch}-{os}` symlink for the Host
 - Creates `/usr/local/bin/utmm` → `/opt/utmm/utmm` convenience symlink
 
-### 2. Download Skill
+### 2. Download Skill (optional, for richer agent context)
 
 ```bash
 cd ~/utmm
@@ -69,24 +68,24 @@ curl -o utm-vm/SKILL.md \
   https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/utm-vm/SKILL.md
 curl -o utm-vm/MANUAL.md \
   https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/utm-vm/MANUAL.md
-
-# Create symlink so Claude can find it
-mkdir -p .claude/skills
-ln -sf ../../utm-vm .claude/skills/utm-vm
 ```
 
-> No extra files needed — the MCP server is built into the `utmm` binary via `--mcp`. Zero external dependencies.
+> The Skill files give your AI agent richer context about VM management workflows. Path conventions vary by agent — see your agent's docs for skill directory setup.
 
-### 3. Register MCP server with Claude Code
+### 3. Register MCP server
+
+The `utmm` binary has a built-in MCP server via `--mcp`. Registration command depends on your AI agent:
 
 ```bash
+# Claude Code
 claude mcp add utmm -- utmm --mcp
+
+# Codex / other MCP-compatible agents — configure as a stdio MCP server:
+# command: utmm
+# args: ["--mcp"]
 ```
 
-Then restart Claude Code (or run `/mcp` to reload).
-
-> **Integrated mode (all-in-one):** `claude mcp add utmm -- utmm --host --mcp`
-> This runs the full Host + MCP in a single process — no separate Host daemon needed.
+> **Integrated mode (all-in-one):** use `utmm --host --mcp` instead — runs the full Host + MCP in a single process, no separate Host daemon needed.
 
 ### 4. Start the Host
 
@@ -112,7 +111,7 @@ printf 'Content-Length: 50\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"ping","param
 # → {"jsonrpc":"2.0","id":1,"result":{}}
 ```
 
-Done! Now talk to Claude: "Check the status of all VMs".
+Done! Now ask your AI agent: "Check the status of all VMs".
 
 > **Alternative: source build** — if you prefer building from source, see [MANUAL.md §2](./utm-vm/MANUAL.md#2-installation) for Zig build instructions.
 
@@ -144,7 +143,6 @@ iwr "http://${gw}:2121/bin/install.ps1" -OutFile install.ps1
 # ─── Verify ───
 utmm --host --status                 # check all VM status
 utmm --host --exec linuxvm "uname -a" # run command on VM
-utmm --host --deploy                 # build + deploy to all VMs
 utmm --host --upload ./f.txt linuxvm  # upload file to VM (no curl)
 utmm --host --download linuxvm f.txt ./f.txt  # download file from VM (no curl)
 ```
@@ -153,9 +151,9 @@ utmm --host --download linuxvm f.txt ./f.txt  # download file from VM (no curl)
 
 | Document | For |
 |----------|-----|
-| **[MANUAL.md](./utm-vm/MANUAL.md)** | Full manual: install, deploy, daily usage, troubleshooting, MCP setup |
+| **[MANUAL.md](./utm-vm/MANUAL.md)** | Full manual: install, daily usage, troubleshooting, MCP setup |
 | **[CLAUDE.md](./CLAUDE.md)** | Development guide (build commands, architecture, code style) |
-| **[zig-codegen.md](./zig-codegen.md)** | Zig 0.16.0 coding knowledge base |
+
 
 ## Dependencies
 
@@ -175,7 +173,7 @@ Guest (windows)  ──UDP broadcast──┘         │
                                             │       ↑
                                             └─ MCP JSON-RPC (stdio)
                                                     ↑
-                                            Claude Code
+                                          AI Agent (Claude Code, Codex, ...)
 ```
 
 ## License

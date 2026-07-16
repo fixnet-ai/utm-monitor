@@ -21,7 +21,7 @@ windowsvm: user=Administrator, passwd=111, app_path=C:\opt\
 
 ### Two Run Modes (Same Binary)
 - **Guest mode (default)**: UDP broadcast hostname+IP + HTTP server (2121)
-- **Host mode (--host)**: UDP listener + HTTP file server + /etc/hosts sync + management commands (--status/--deploy/--exec etc.)
+- **Host mode (--host)**: UDP listener + HTTP file server + /etc/hosts sync + management commands (--status/--exec etc.)
 
 ### Complete Data Flow
 ```
@@ -33,7 +33,7 @@ Guest (windows)  ──UDP broadcast──┘                    └── hosts
 ### Communication Protocol
 - **UDP broadcast** (port 12345): Guest broadcasts `ANNOUNCE\nname: X\nip: Y\n...` every second, Host listens
 - **HTTP** (port 2121): Guest serves /health, /version, /update, /bin/:filename, /upload, /exec; Host serves /version, /bin/:filename for Guest bootstrap
-- **IPC** (port 12347): Host internal TCP channel for --status/--exec/--deploy/--upload/--download command forwarding
+- **IPC** (port 12347): Host internal TCP channel for --status/--exec/--upload/--download command forwarding
 - **Auto-upgrade**: Host detects Guest version mismatch via ANNOUNCE → pushes new binary via HTTP upload + remote restart. No Guest polling.
 
 ### Key Design Decisions
@@ -76,7 +76,6 @@ utmm --http-port 2122                     # Custom HTTP port
 sudo utmm --host                          # Continuous listener (needs sudo for /etc/hosts)
 utmm --host --status                      # Query all Guest status
 utmm --host --exec linuxvm "uname -a"     # Remote command execution
-utmm --host --deploy                      # Compile+deploy to all VMs
 utmm --host --upload file.txt linuxvm     # Upload file to Guest (no curl)
 utmm --host --download linuxvm f.txt ./f.txt  # Download file from Guest (no curl)
 utmm --host --install                     # Install as system service (Host mode: use --host --install)
@@ -102,7 +101,6 @@ src/
 ├── host_http.zig      # Host HTTP file server: /version, /bin/:filename (read-only bootstrap)
 ├── status.zig         # Host: --status query + formatStatusTable
 ├── executor.zig       # Host: --exec remote execution + resolveGuest + findGuest
-├── deploy.zig         # Host: --deploy build+deploy + --watch file monitoring
 ├── ipc.zig            # Host: IPC service (127.0.0.1:12347 TCP command forwarding)
 ├── mcp.zig            # MCP JSON-RPC server (--mcp flag, stdio transport)
 ├── install.zig        # --install/--uninstall system service + --gen-init script generation

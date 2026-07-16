@@ -2,7 +2,7 @@
 # =============================================================================
 # UTM Monitor — Comprehensive Cross-Platform Test Suite (v0.1.0+)
 # =============================================================================
-# Covers: build (8 targets), unit tests, --deploy, --status, --exec,
+# Covers: build (8 targets), unit tests, --status, --exec,
 #         --upload/--download, HTTP API, Host/serve-dir, /etc/hosts,
 #         --install/--uninstall (SSH), --gen-init, --mcp, musl verify.
 # =============================================================================
@@ -342,28 +342,9 @@ fi
 report ""
 
 # =============================================================================
-# PHASE 10: --deploy (if VMs online)
+# PHASE 10: --gen-init
 # =============================================================================
-report "━━━ PHASE 10: One-Click Deploy (--deploy) ━━━"
-report ""
-
-if [ -n "$ONLINE_VMS" ]; then
-    DEPLOY_OUT=$("$HOST_BIN" --host --deploy 2>&1 || true)
-    report "$(echo "$DEPLOY_OUT" | head -20)"
-    if echo "$DEPLOY_OUT" | grep -qi "complete"; then
-        pass "--deploy (all online VMs)"
-    else
-        fail "--deploy" "deploy did not complete"
-    fi
-else
-    skip "--deploy" "no VMs online"
-fi
-report ""
-
-# =============================================================================
-# PHASE 11: --gen-init
-# =============================================================================
-report "━━━ PHASE 11: Init Script Generation (--gen-init) ━━━"
+report "━━━ PHASE 10: Init Script Generation (--gen-init) ━━━"
 report ""
 
 for plat in linux macos windows; do
@@ -389,9 +370,9 @@ done
 report ""
 
 # =============================================================================
-# PHASE 12: MCP JSON-RPC (smoke test)
+# PHASE 11: MCP JSON-RPC (smoke test)
 # =============================================================================
-report "━━━ PHASE 12: MCP JSON-RPC (stdio) ━━━"
+report "━━━ PHASE 11: MCP JSON-RPC (stdio) ━━━"
 report ""
 
 # Build initialize request with LSP-style framing
@@ -423,9 +404,9 @@ fi
 report ""
 
 # =============================================================================
-# PHASE 13: MUSL STATIC LINKING (Linux targets)
+# PHASE 12: MUSL STATIC LINKING (Linux targets)
 # =============================================================================
-report "━━━ PHASE 13: Musl Static Linking ━━━"
+report "━━━ PHASE 12: Musl Static Linking ━━━"
 report ""
 
 for entry in "${BUILD_TARGETS[@]}"; do
@@ -446,9 +427,9 @@ done
 report ""
 
 # =============================================================================
-# PHASE 14: SSH-BASED GUEST TESTS (soft — skip if VMs unreachable)
+# PHASE 13: SSH-BASED GUEST TESTS (soft — skip if VMs unreachable)
 # =============================================================================
-report "━━━ PHASE 14: Guest Install/Uninstall (SSH required) ━━━"
+report "━━━ PHASE 13: Guest Install/Uninstall (SSH required) ━━━"
 report ""
 
 if is_cmd sshpass && is_cmd ssh; then

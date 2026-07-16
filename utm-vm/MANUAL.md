@@ -32,7 +32,7 @@ utmm --host       # Host mode
 | Runs on | Inside each VM | Host machine |
 | Count | One per VM | Only one |
 | Responsibility | UDP broadcast of its own info | Listen for broadcasts + sync /etc/hosts |
-| Ancillary Services | HTTP server (2121): file upload/download + exec | IPC service (12347) + management commands (--status/--exec/--deploy) |
+| Ancillary Services | HTTP server (2121): file upload/download + exec | IPC service (12347) + management commands (--status/--exec) |
 | Required Privileges | Regular user | `sudo` (to write /etc/hosts) |
 
 ### 1.3 Data Flow Overview
@@ -59,7 +59,7 @@ utmm --host       # Host mode
 │                                                                      │
 │  ┌──────────────────────────────────────────┐                        │
 │  │ IPC Service (127.0.0.1:12347 TCP)         │  ← Host internal       │
-│  │ --status / --exec / --deploy forwarding   │   CLI → persistent     │
+│  │ --status / --exec forwarding   │   CLI → persistent     │
 │  └──────────────────────────────────────────┘                        │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -128,11 +128,11 @@ The Host maintains a marker block in `/etc/hosts`, using FQDN format `{hostname}
 # UTM-MONITOR-END
 ```
 
-The `target` in the FQDN is the Zig cross-compilation target triple, directly usable for `zig build -Dtarget=` and the `--deploy` command.
+The `target` in the FQDN is the Zig cross-compilation target triple, directly usable for `zig build -Dtarget=` for cross-compilation.
 
 #### IPC Command Forwarding (Host Internal, Port 12347)
 
-The persistent Host process starts a TCP IPC service on `127.0.0.1:12347`, accepting local management command forwarding. When executing management commands such as `--status`/`--exec`/`--deploy`, the CLI process does not directly bind a UDP port; instead, it connects to the IPC port and forwards the command to the persistent Host for execution.
+The persistent Host process starts a TCP IPC service on `127.0.0.1:12347`, accepting local management command forwarding. When executing management commands such as `--status`/`--exec`, the CLI process does not directly bind a UDP port; instead, it connects to the IPC port and forwards the command to the persistent Host for execution.
 
 ```
 CLI Process                     Persistent Host Process
@@ -151,7 +151,7 @@ CLI Process                     Persistent Host Process
 - IPC binds only to `127.0.0.1` (localhost loopback), not accessible from external networks
 - Connection closed after response, providing a simple and reliable EOF marker
 - When the Host is not running, CLI automatically falls back to direct UDP mode (behavior unchanged)
-- IPC thread only performs read-only access to the shared Guest list (locked); formatting and deploy compilation execute outside the lock
+- IPC thread only performs read-only access to the shared Guest list (locked); formatting executes outside the lock
 
 ### 1.5 Physical NIC Detection
 
@@ -174,7 +174,7 @@ On **Windows**, the Guest self-reports its IP as `0.0.0.0` (fallback value), and
 | Port | Protocol | Direction | Purpose |
 |------|----------|-----------|---------|
 | 12345 | UDP | Guest → Host | Broadcast ANNOUNCE |
-| 12347 | TCP | Local (127.0.0.1) | IPC command forwarding (--status/--exec/--deploy) |
+| 12347 | TCP | Local (127.0.0.1) | IPC command forwarding (--status/--exec) |
 | 2121 | TCP | Bidirectional | HTTP: Guest file upload + exec / Host file serving (serve directory) |
 
 ### 2.2 Network Topology Requirements
@@ -269,7 +269,7 @@ iwr "http://${gw}:2121/bin/install.ps1" -OutFile install.ps1
 - One-time SCP: `scp utmm-{target} root@<vm>:/opt/utmm/utmm`
 - Direct `/update` endpoint: `curl -s "http://<gateway>:2121/update?name=myvm" | sh` (returns a generated shell script)
 
-After the Guest starts, it begins UDP broadcast + HTTP server (2121). **From then on, Host-side `--deploy` is fully automatic.**
+After the Guest starts, it begins UDP broadcast + HTTP server (2121). **From then on, auto-upgrade is fully automatic.**
 
 ---
 
@@ -284,7 +284,7 @@ After the Guest starts, it begins UDP broadcast + HTTP server (2121). **From the
 **Guest Side (VM):**
 - Target path must exist: `/opt/` (`C:\opt\` on Windows)
 - Bare-metal bootstrapping: Host HTTP `/update` endpoint (see §2.4), or UTM shared folder
-- After initial bootstrapping, fully managed by Host-side `--deploy` or automatic upgrade (Host auto-pushes new binary on version mismatch)
+- After initial bootstrapping, fully managed by automatic upgrade (Host auto-pushes new binary on version mismatch)
 
 ### 3.2 Confirm VM Architecture
 
@@ -370,21 +370,7 @@ zig build test --summary all
 
 For the first deployment on a brand-new VM, you need to manually transfer the binary into it. See [2.4 Bare-Metal Bootstrapping](#24-bare-metal-bootstrapping-first-time-guest-vm-deployment), choose any method to place the build artifact under `/opt/` on the VM and start it.
 
-### 3.5 --deploy One-Click Deployment (Subsequent Updates)
-
-Once the Guest is running, use `--deploy` for subsequent updates -- **no SSH required**:
-
-```bash
-# One-click compile + deploy to all online Guests
-utmm --host --deploy
-
-# Deploy only to a specific VM
-utmm --host --deploy ubuntu
-```
-
-Internal flow: compile → create directory via HTTP exec → HTTP upload → HTTP exec restart command. Entirely uses built-in channels with zero external dependencies.
-
-### 3.6 Start Guest Service
+### 3.5 Start Guest Service
 
 #### During Bare-Metal Bootstrapping (Execute Directly in VM)
 
@@ -440,9 +426,9 @@ utmm --host --gen-init windows
 # schtasks /run /tn utmm
 ```
 
-### 3.7 Start Host Service
+### 3.6 Start Host Service
 
-The Host HTTP server serves cross-compiled binaries from a configurable directory (defaults to `/opt/utmm/`, or `C:\opt\utmm\` on Windows). This directory must contain the deployment binaries (e.g., `utmm-aarch64-linux`, `utmm-x86_64-macos`, `utmm-x86-windows.exe`) produced by `zig build -Dtarget=...` or extracted from `utmm.zip`.
+The Host HTTP server serves cross-compiled binaries from a configurable directory (defaults to `/opt/utmm/`, or `C:\opt\utmm\` on Windows). This directory must contain the platform binaries (e.g., `utmm-aarch64-linux`, `utmm-x86_64-macos`, `utmm-x86-windows.exe`) produced by `zig build -Dtarget=...` or extracted from `utmm.zip`.
 
 ```bash
 # Foreground (observe logs)
@@ -471,7 +457,7 @@ Verify `/etc/hosts` has been updated:
 grep -A 10 "UTM-MONITOR" /etc/hosts
 ```
 
-### 3.8 Deployment Verification Checklist
+### 3.7 Verification Checklist
 
 | # | Check Item | Command | Expected Result |
 |---|------------|---------|-----------------|
@@ -511,13 +497,11 @@ Host Options:
 Host Management Commands:
   --status               Query online status of all Guests
   --exec TARGET CMD      Execute command on target Guest
-  --deploy [TARGET]      Compile and deploy to VM
   --upload FILE VM       Upload a file to Guest (via HTTP, no curl)
   --download VM R L      Download file from Guest (via HTTP GET /bin/...)
   --gen-init PLATFORM    Generate auto-start boot script (linux/macos/windows)
   --install              Install as system service (Guest mode auto-start; add --host for Host mode)
   --uninstall            Remove system service and stop running processes
-  --watch [PATH]         Watch directory for automatic deployment
   --save-config          Save current configuration
   --version              Display version
 ```
@@ -540,7 +524,7 @@ macvm            aarch64-macos      192.168.64.4     1a:97:6d:38:0c:6c  v0.1.0  
 WIN-PC           aarch64-windows    192.168.65.2     66:DC:DA:EC:A1:59  v0.1.0     ✓
 ```
 
-If versions differ, it displays `⚠ Upgradable`, prompting you to redeploy.
+If versions differ, it displays `⚠ Upgradable`, prompting you to bump ver.zig and rebuild.
 
 #### Execute Commands on a Specific VM
 
@@ -571,16 +555,6 @@ utmm --host --download linuxvm remote_file ./local_file
 ```
 
 > **Under the hood**: `--upload` uses HTTP POST `/upload` with multipart/form-data; `--download` uses HTTP GET `/bin/:filename`. Both use `std.http.Client` — zero external dependencies.
-
-#### Update the Binary
-
-```bash
-# One-click compile + deploy (recommended, zero SSH dependencies)
-utmm --host --deploy
-
-# Update only a specific VM
-utmm --host --deploy ubuntu
-```
 
 #### Automatic Upgrade (Host-Push)
 
@@ -632,7 +606,7 @@ cat utmm.conf
 #### Fully Automatic Upgrade (Host-Push)
 
 The **Host** detects version mismatches and pushes upgrades. When a Guest broadcasts ANNOUNCE with a version that doesn't match the Host's (`src/ver.zig`), the Host:
-1. Finds the correct binary in the serve directory by mapping the Guest's target triple to the deployment filename
+1. Finds the correct binary in the serve directory by mapping the Guest's target triple to the platform filename
 2. HTTP-uploads it to Guest `/upload` as `utmm.new` (or `utmm.new.exe` on Windows)
 3. Returns — the Guest detects `utmm.new` in its next broadcast cycle (within 1 second), atomically renames it to the final binary, spawns a detached restart, and exits
 
@@ -662,8 +636,8 @@ sudo cp zig-out/bin/utmm /usr/local/bin/utmm
 
 **Guest Side** (manual intervention — Host auto-push is preferred):
 ```bash
-# Host-side one-click deployment (builds + uploads + restarts)
-utmm --host --deploy
+# Auto-upgrade (builds + uploads + restarts)
+bump ver.zig && zig build  # then restart Host
 
 # Or bootstrap: download from Host HTTP and pipe to shell (one-time, needs curl)
 curl -s "http://<host-ip>:2121/update" | sh
@@ -721,7 +695,7 @@ lsof -i :12345
 1. Confirm that the `isPhysicalInterface()` function in the code has excluded that interface prefix
 2. View all interfaces on the Guest VM: `ifconfig -a` or `ip addr show`
 3. If a new tunnel interface prefix appears, add it to `exclude_prefixes` in `src/broadcast.zig`
-4. Recompile and redeploy
+4. Bump ver.zig and rebuild (auto-upgrade handles the rest)
 
 ### 5.3 --exec Command Execution Failed
 
@@ -792,14 +766,14 @@ utmm --host --upload ./new_binary linuxvm
 utmm --host --exec linuxvm "/opt/utmm/utmm &"
 ```
 
-**Advanced**: Using `--deploy` is recommended. It uploads via HTTP as a `.new` temporary file, then performs an atomic replacement + restart via HTTP exec, automatically handling file locking issues:
+**Advanced**: Auto-upgrade uploads via HTTP as a `.new` temporary file, then performs an atomic replacement + restart, automatically handling file locking issues:
 ```bash
-utmm --host --deploy ubuntu
+bump ver.zig && zig build  # auto-upgrade handles the rest
 ```
 
 ### 5.8 Port Conflict
 
-**Management commands (--status/--exec/--deploy) no longer conflict with the Host UDP port**. Since Phase 9, management commands are forwarded to the persistent Host process via IPC (127.0.0.1:12347 TCP), and the CLI process no longer directly binds the UDP port.
+**Management commands (--status/--exec) no longer conflict with the Host UDP port**. Since Phase 9, management commands are forwarded to the persistent Host process via IPC (127.0.0.1:12347 TCP), and the CLI process no longer directly binds the UDP port.
 
 If ports 12345/2121 are occupied by other programs, they can be changed via parameters:
 
@@ -850,7 +824,6 @@ utmm/
 │   ├── host_http.zig      # Host HTTP file server (read-only, serve directory)
 │   ├── status.zig         # --status query
 │   ├── executor.zig       # --exec remote execution
-│   ├── deploy.zig         # --deploy / --watch compilation and deployment (HTTP)
 │   ├── ipc.zig            # IPC module (127.0.0.1:12347 TCP command forwarding)
 │   ├── mcp.zig            # MCP JSON-RPC server (--mcp flag)
 │   ├── install.zig        # --install / --gen-init service installation
@@ -869,7 +842,7 @@ utmm/
 | launchd | macOS system | macOS auto-start on boot |
 | systemd | Linux system | Linux auto-start on boot |
 | Task Scheduler | Windows system | Windows auto-start on boot |
-| HTTP+IPC | Built-in | Binary deployment + file transfer + remote execution + command forwarding |
+| HTTP+IPC | Built-in | File transfer + remote execution + command forwarding |
 
 ### 6.3 Binary Packaging (8 Binaries → All VMs)
 
@@ -954,7 +927,7 @@ sudo killall -HUP mDNSResponder
 | linuxvm | root | 111 | `/opt/utmm/utmm` | UTM shared folder / one-time SCP |
 | windowsvm | Administrator | 111 | `C:\opt\utmm\utmm.exe` | UTM shared folder / one-time SCP |
 
-> After the Guest starts, it is fully auto-updated via `--deploy`; no further manual transfer is needed.
+> After the Guest starts, it is fully auto-updated; no further manual transfer is needed.
 
 ### 6.7 Troubleshooting Quick Reference
 
@@ -972,7 +945,7 @@ sudo killall -HUP mDNSResponder
 
 ## 7. Claude Code Integration (MCP Server)
 
-utmm can be used as a Claude Code plugin via the Model Context Protocol (MCP). This lets Claude automatically discover, execute commands on, and deploy to your UTM VMs — without you typing CLI commands.
+utmm can be used as a Claude Code plugin via the Model Context Protocol (MCP). This lets Claude automatically discover, execute commands on, your UTM VMs — without you typing CLI commands.
 
 ### 7.1 Architecture
 
@@ -1015,7 +988,7 @@ sudo chmod +x /usr/local/bin/utmm
 > curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 > ```
 
-**Step 2: Download Guest binaries (for VM auto-deploy)**
+**Step 2: Download Guest binaries (for Guest auto-upgrade)**
 
 ```bash
 sudo mkdir -p /opt/utmm
@@ -1108,7 +1081,6 @@ Claude will call `vm_status()` and return a summary of which VMs are online, the
 |------|-------------|---------|
 | `vm_status` | List all VMs: hostname, IP, OS/arch, MAC, version, upgradable? | `vm_status()` |
 | `vm_exec` | Execute a shell command on a VM | `vm_exec("linuxvm", "uname -a")` |
-| `vm_deploy` | Cross-compile + HTTP deploy to VM(s), then restart | `vm_deploy("linuxvm")` |
 
 ### 7.4 Daily Usage Examples
 
@@ -1122,10 +1094,7 @@ Claude will call `vm_status()` and return a summary of which VMs are online, the
     windowsvm:  aarch64-windows  192.168.65.2   ⚠ upgradable
 
 👤 "Update windowsvm to the latest version"
-🤖 → vm_deploy("windowsvm")
-    Building aarch64-windows... done
-    Uploading to windowsvm (192.168.65.2:2121)... OK
-    Deploy complete
+🤖 → bump ver.zig, rebuild, restart Host — auto-upgrade handles the rest
 
 👤 "Verify all VMs are now on the latest version"
 🤖 → vm_status()
@@ -1136,7 +1105,7 @@ Claude will call `vm_status()` and return a summary of which VMs are online, the
 
 ```
 👤 "I just changed the broadcast module. Test it on all platforms."
-🤖 → vm_deploy()                              # build + deploy to all 3 VMs
+🤖 → bump ver.zig, zig build, restart Host (auto-upgrade pushes to all VMs)
     → vm_exec("linuxvm", "cd /opt && ./utmm --version")
     → vm_exec("macvm", "cd /opt && ./utmm --version")
     → vm_exec("windowsvm", "C:\\opt\\utmm.exe --version")
@@ -1242,7 +1211,7 @@ chmod +x /tmp/test.sh && /tmp/test.sh")
 | "Host is not running" | Host process died or not started | `sudo utmm --host` |
 | "GuestNotFound" for a VM | VM offline or hostname typo | `vm_status` to see online VMs |
 | "No VMs online" | VMs not booted, guest not running | Boot VMs, verify `utmm` running inside each |
-| VM marked "upgradable" | Guest binary older than Host | `vm_deploy("that-vm")` |
+| VM marked "upgradable" | Guest binary older than Host | Host auto-upgrades within seconds — bump ver.zig and rebuild |
 | MCP tools can't reach Host | IPC port blocked or Host not running | Try `utmm --host --mcp` for integrated mode (bypasses IPC entirely) |
 | Port 12345 AddressInUse at Host start | Old `utm-monitor` process still running | `sudo pkill -f utm-monitor && sudo utmm --host` |
 | `/update` script fails: directory not found | Old `/update` script without `mkdir -p` | `sudo mkdir -p /opt/utmm` before running, or update Host binary |

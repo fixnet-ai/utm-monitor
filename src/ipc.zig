@@ -1,7 +1,7 @@
 //! IPC module — In-process command channel for Host
 //!
 //! Persistent Host process accepts local management commands via TCP 127.0.0.1:12347,
-//! eliminating --status/--exec/--deploy port conflicts with UDP listener.
+//! eliminating --status/--exec port conflicts with UDP listener.
 //!
 //! Protocol (text, request-response, close=EOF):
 //!   Client → Server: <COMMAND>\n\n

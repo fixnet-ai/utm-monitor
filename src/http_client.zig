@@ -1,4 +1,4 @@
-//! HTTP client — used by Guest (version check, update download) and Host (deploy upload, exec)
+//! HTTP client — used by Guest (version check, update download) and Host (auto-upgrade upload, exec)
 //! Uses std.http.Client from the Zig standard library.
 //! Zero external dependencies.
 

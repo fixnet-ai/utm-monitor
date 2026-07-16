@@ -26,7 +26,7 @@ auto-syncs VM IPs to `/etc/hosts`, so hostnames like `linuxvm` always resolve.
 | `macvm` | macOS | aarch64 | root / 111 | `/opt/` |
 | `windowsvm` | Windows | aarch64 | Administrator / 111 | `C:\opt\` |
 
-## Three MCP Tools
+## Two MCP Tools
 
 ### 1. `vm_status` — List all VMs and their state
 
@@ -66,24 +66,7 @@ The command runs in the VM's native shell:
 - Windows: backslashes in paths work, forward slashes also work in cmd.exe
 - Single quotes are safer than double quotes for shell commands
 
-### 3. `vm_deploy(vm?)` — Cross-compile and deploy to VMs
-
-Compiles the current project from source and deploys via HTTP to the target VM(s).
-Omit `vm` to deploy to all online VMs.
-
-```
-vm_deploy()              → deploy to ALL online VMs
-vm_deploy("linuxvm")     → deploy only to linuxvm
-```
-
-The deploy workflow: `zig build -Dtarget=...` → HTTP upload → remote restart.
-
 > **Auto-upgrade**: The Host uploads `utmm.new` to any Guest whose version doesn't match. The Guest detects it in its 1-second broadcast loop and self-upgrades (atomic rename + detached restart). Bump `src/ver.zig` and rebuild — all online Guests upgrade within seconds.
-
-**When to deploy:**
-- After making code changes that need testing
-- When `vm_status` shows a VM as "upgradable"
-- Before running tests on a VM with a fresh build
 
 ## Core Workflows
 
@@ -94,19 +77,18 @@ vm_status → see which VMs are online, their versions, IPs
 
 ### Workflow B: Cross-platform testing
 ```
-1. vm_status                         → confirm targets online
-2. vm_deploy("linuxvm")              → push latest build
-3. vm_exec("linuxvm", "./test.sh")   → run tests
-4. Repeat 2-3 for macvm, windowsvm
+1. vm_status                         → confirm targets online, check versions
+2. vm_exec("linuxvm", "./test.sh")   → run tests
+3. Repeat 2 for macvm, windowsvm
 ```
+> Bump `src/ver.zig` and rebuild before testing — Host auto-upgrades all Guests.
 
 ### Workflow C: Debugging a VM problem
 ```
 1. vm_status                            → confirm online, note version
 2. vm_exec("linuxvm", "ps aux")         → check running processes
 3. vm_exec("linuxvm", "cat /var/log/...") → read relevant logs
-4. vm_deploy("linuxvm")                 → update to latest if needed
-5. vm_exec("linuxvm", "...")            → verify the fix
+4. vm_exec("linuxvm", "...")            → verify the fix
 ```
 
 ### Workflow D: Initial setup (first time or after VM rebuild)
@@ -144,14 +126,13 @@ sudo utmm --host
 | "Host is not running" | Host process died or never started | `sudo utmm --host` |
 | "GuestNotFound" for a VM | VM is offline or name mismatch | Run `vm_status` to see which VMs are actually online |
 | "No VMs currently online" | VMs not booted, or guest utmm not running | Check VMs are booted; verify `utmm` is running inside each |
-| VM marked "upgradable" | Guest binary is older than Host | `vm_deploy("that-vm")` — or Host will auto-upgrade within seconds |
+| VM marked "upgradable" | Guest binary is older than Host | Host will auto-upgrade within seconds — bump ver.zig and rebuild |
 | vm_status returns empty but CLI --status shows VMs | MCP IPC issue | Use `utmm --host --mcp` for integrated mode (bypasses IPC) |
 
 **Fallback:** If MCP tools are unavailable, you can use the CLI directly:
 ```bash
 utmm --host --status
 utmm --host --exec linuxvm "uname -a"
-utmm --host --deploy linuxvm
 ```
 
 ## Host Paths
@@ -201,10 +182,9 @@ chmod +x /opt/utmm/utmm
 ## Limitations
 
 - `vm_exec` is non-interactive — you cannot run commands that require TTY input (nano, top, etc.)
-- `vm_deploy` builds from source — the Zig project must be at the MCP server's cwd
 - VM IPs can change on reboot — always check `vm_status` first, don't cache IPs
 - Windows cmd.exe has different escaping rules than bash — test simple commands first
 
 ## Reference Manual
 
-See [MANUAL.md](MANUAL.md) for the complete reference: build & install, architecture design, protocol specification, CLI reference, deploy & auto-upgrade workflow, MCP integration, platform-specific notes, and troubleshooting.
+See [MANUAL.md](MANUAL.md) for the complete reference: build & install, architecture design, protocol specification, CLI reference, auto-upgrade workflow, MCP integration, platform-specific notes, and troubleshooting.

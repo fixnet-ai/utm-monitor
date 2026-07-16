@@ -6,7 +6,7 @@
 //!
 //! Framing: LSP-style Content-Length: N\r\n\r\n<JSON>\n on stdin/stdout.
 //! Methods: initialize, notifications/initialized, ping, tools/list, tools/call.
-//! Tools:   vm_status, vm_exec, vm_deploy.
+//! Tools:   vm_status, vm_exec.
 
 const std = @import("std");
 const ipc = @import("ipc.zig");
@@ -24,8 +24,7 @@ const SERVER_INFO =
 
 const TOOLS_JSON =
     \\[{"name":"vm_status","description":"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and whether an upgrade is available for each VM.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. Use this to run tests, check files, install packages, or debug on any VM (Linux/macOS/Windows). The VM name is the hostname (e.g. 'linuxvm', 'macvm', 'windowsvm').","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command to execute on the VM"}},"required":["vm","command"]}},
-    \\{"name":"vm_deploy","description":"Build and deploy the utmm binary to one or all UTM VMs. Compiles from source and uploads via HTTP. Use this after making code changes that need testing on VMs.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname, or omit to deploy to all online VMs"}},"required":[]}}]
+    \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. Use this to run tests, check files, install packages, or debug on any VM (Linux/macOS/Windows). The VM name is the hostname (e.g. 'linuxvm', 'macvm', 'windowsvm').","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command to execute on the VM"}},"required":["vm","command"]}}]
 ;
 
 // ── JSON value helpers ─────────────────────────────────────────────────────
@@ -262,33 +261,6 @@ fn handleVmExec(
         "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** `$ {s}`:\\n```\\n{s}\\n```\"}}]}}",
         .{ esc_vm, esc_cmd, esc_out },
     );
-    return result.toOwnedSlice(allocator);
-}
-
-/// Handle vm_deploy: DEPLOY → output.
-fn handleVmDeploy(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    ctx: ?*anyopaque,
-    handler: ?ipc.Handler,
-    vm: ?[]const u8,
-) ![]const u8 {
-    const ipc_cmd = if (vm) |v|
-        try std.fmt.allocPrint(allocator, "DEPLOY\n{s}", .{v})
-    else
-        try allocator.dupe(u8, "DEPLOY");
-    defer allocator.free(ipc_cmd);
-
-    const raw = if (ctx) |c| try execToolDirect(allocator, c, handler.?, ipc_cmd)
-        else try execToolViaIpc(allocator, io, ipc_cmd);
-    defer allocator.free(raw);
-
-    const trimmed = std.mem.trim(u8, raw, " \n\r");
-    const esc = try jsonEscape(allocator, trimmed);
-    defer allocator.free(esc);
-
-    var result: std.ArrayList(u8) = .empty;
-    try result.print(allocator, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{esc});
     return result.toOwnedSlice(allocator);
 }
 
@@ -530,14 +502,6 @@ fn handleRequest(
                     return;
                 };
                 break :blk handleVmExec(allocator, io, ctx, handler, vm, command) catch |err| {
-                    if (!is_notification) {
-                        try sendError(io, req.id, -32603, @errorName(err));
-                    }
-                    return;
-                };
-            } else if (std.mem.eql(u8, tool_name, "vm_deploy")) {
-                const vm: ?[]const u8 = if (args) |a| getString(a, "vm") else null;
-                break :blk handleVmDeploy(allocator, io, ctx, handler, vm) catch |err| {
                     if (!is_notification) {
                         try sendError(io, req.id, -32603, @errorName(err));
                     }
