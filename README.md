@@ -141,7 +141,7 @@ curl "http://$GW:2121/bin/install.sh" | sh -s -- --guest --hostname macvm
 # Windows Guest (PowerShell as Administrator)
 $gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop | Select -First 1
 iwr "http://${gw}:2121/bin/install.ps1" -OutFile install.ps1
-.\install.ps1 -Guest -Hostname windowsvm
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Guest -Hostname windowsvm
 
 # ─── Verify ───
 utmm --host --status                 # check all VM status

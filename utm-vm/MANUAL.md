@@ -249,8 +249,10 @@ curl "http://$GATEWAY:2121/bin/install.sh" | sh -s -- --guest --hostname macvm
 # Find the gateway IP (Host's bridge address), then:
 $gw = (Get-NetRoute -DestinationPrefix "0.0.0.0/0").NextHop | Select -First 1
 iwr "http://${gw}:2121/bin/install.ps1" -OutFile install.ps1
-.\install.ps1 -Guest -Hostname windowsvm
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Guest -Hostname windowsvm
 ```
+
+> **Note**: Windows blocks PowerShell scripts by default. Use `-ExecutionPolicy Bypass` to allow the install script to run. If running commands over SSH from macOS/Linux, write the commands to a `.ps1` file first to avoid shell escaping issues — see [Deployment FAQs](#deployment-faqs-from-bare-metal-validation) in SKILL.md.
 
 **What the script does automatically:**
 1. Detects CPU architecture (`aarch64` / `x86_64` / `x86`) — no manual `uname -m` needed
@@ -365,6 +367,24 @@ Run tests to confirm correctness:
 ```bash
 zig build test --summary all
 ```
+
+**After building from source, set up the Host serve directory:**
+
+When building from source (Method 2), the `install.sh` and `install.ps1` files are **not** automatically copied to the serve directory. The Guest deployment commands in §2.4 download these files from the Host HTTP server. Copy them manually:
+
+```bash
+# From the project root:
+sudo cp install.sh install.ps1 zig-out/bin/utmm-* /opt/utmm/
+# The native binary (zig-out/bin/utmm) goes to the platform-specific name:
+sudo cp zig-out/bin/utmm /opt/utmm/utmm-aarch64-macos  # Apple Silicon
+# Or: sudo cp zig-out/bin/utmm /opt/utmm/utmm-x86_64-macos  # Intel Mac
+sudo chmod +x /opt/utmm/*
+sudo ln -sf /opt/utmm/utmm-aarch64-macos /opt/utmm/utmm
+sudo mkdir -p /usr/local/bin
+sudo ln -sf /opt/utmm/utmm /usr/local/bin/utmm
+```
+
+> **Note**: If you used `install.sh` (Method 1 — GitHub Release), this step is not needed — the zip file already contains `install.sh` and `install.ps1` alongside all platform binaries.
 
 ### 3.4 Bare-Metal Bootstrapping (First Time)
 
