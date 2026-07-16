@@ -27,7 +27,7 @@ BUILD_TARGETS=(
     "x86-windows:utmm.exe"
     "x86_64-macos:utmm.macos"
     "aarch64-macos:utmm_arm64.macos"
-    "x86_64-linux-musl:utmm"
+    "x86-linux-musl:utmm"
     "aarch64-linux-musl:utmm_arm64"
 )
 
