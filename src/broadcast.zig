@@ -495,63 +495,106 @@ fn broadcastLoopFallback(
 /// on its next broadcast cycle, swaps it in safely, and restarts itself.
 ///
 /// Cross-platform safe rename strategy:
-///   1. Rename old binary out of the way   (utmm → utmm.old)
-///   2. Rename new binary into place       (utmm.next → utmm)
-///   3. Spawn restart script (cleans up .old after old process exits)
-///   4. exit(0) — supervisor (launchd/systemd/sc) restarts us
+///   Linux/macOS:
+///     1. Rename old binary out of the way   (utmm → utmm.old)
+///     2. Rename new binary into place       (utmm.next → utmm)
+///     3. Spawn restart script (cleans up .old after old process exits)
+///     4. exit(0) — supervisor (launchd/systemd) restarts us
+///
+///   Windows (different strategy — .exe files are locked when running):
+///     1. Spawn batch script BEFORE we exit (so it outlives us)
+///     2. exit(0) — SCM marks service stopped, lock released
+///     3. Batch script: wait → delete old .exe → rename .next → start service
 ///
 /// This works on all platforms because:
 ///   Linux:   rename() is a directory op — old inode stays alive
 ///   macOS:   same as Linux; SIP won't SIGKILL new binary (different inode)
-///   Windows: renaming a running .exe within the same dir succeeds;
-///            the old name is then free for the new binary
+///   Windows: .exe is locked while running; script handles rename after exit
 fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
     const new_name: []const u8 = if (builtin.os.tag == .windows) "utmm.next.exe" else "utmm.next";
     const final_name: []const u8 = if (builtin.os.tag == .windows) "utmm.exe" else "utmm";
     const old_name: []const u8 = if (builtin.os.tag == .windows) "utmm.old.exe" else "utmm.old";
     const install_dir: []const u8 = if (builtin.os.tag == .windows) "C:\\opt\\utmm" else "/opt/utmm";
+    const bat_name: []const u8 = "_upgrade.bat";
 
-    // Build full paths
-    const new_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, new_name }) catch return;
-    defer std.heap.page_allocator.free(new_path);
-    const final_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, final_name }) catch return;
-    defer std.heap.page_allocator.free(final_path);
-    const old_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, old_name }) catch return;
-    defer std.heap.page_allocator.free(old_path);
+    // Open the install directory for relative-path operations.
+    // Using CWD with absolute paths breaks on Windows services (CWD is System32).
+    const dir = std.Io.Dir.cwd().openDir(io, install_dir, .{}) catch |err| {
+        std.debug.print("[broadcast] Self-upgrade: cannot open {s}: {}\n", .{ install_dir, err });
+        return;
+    };
+    defer dir.close(io);
 
     // Check if staged file exists
-    const file = std.Io.Dir.cwd().openFile(io, new_path, .{}) catch return;
+    const file = dir.openFile(io, new_name, .{}) catch return;
     const file_size = file.length(io) catch 0;
     file.close(io);
 
     // Sanity check: file must be at least 100KB (not a partial upload)
     if (file_size < 100 * 1024) return;
 
-    std.debug.print("[broadcast] 🔄 Self-upgrade: staged {s} ({d} bytes)\n", .{ new_path, file_size });
+    std.debug.print("[broadcast] 🔄 Self-upgrade: staged {s}/{s} ({d} bytes)\n", .{ install_dir, new_name, file_size });
 
     // Step 1: Move old binary out of the way (utmm → utmm.old)
-    // Remove any stale .old from a previous upgrade first
-    std.Io.Dir.cwd().deleteFile(io, old_path) catch {};
-    std.Io.Dir.cwd().rename(final_path, std.Io.Dir.cwd(), old_path, io) catch |err| {
-        std.debug.print("[broadcast] Self-upgrade: rename {s} → {s} failed: {}\n", .{ final_path, old_path, err });
-        return;
-    };
-
     // Step 2: Place new binary at the target name (utmm.next → utmm)
-    std.Io.Dir.cwd().rename(new_path, std.Io.Dir.cwd(), final_path, io) catch |err| {
-        std.debug.print("[broadcast] Self-upgrade: rename {s} → {s} failed: {}\n", .{ new_path, final_path, err });
-        // Rollback: put old binary back so the service can still run
-        std.Io.Dir.cwd().rename(old_path, std.Io.Dir.cwd(), final_path, io) catch {};
-        return;
-    };
+    if (builtin.os.tag == .windows) {
+        // On Windows, use cmd /c for rename operations. Io.Dir.rename
+        // fails in service context. Use "cd /d" to avoid quoting issues
+        // with argv-to-command-line conversion in CreateProcess.
 
-    // Make executable (Unix)
+        // Step 1: Remove stale .old, then rename current → .old
+        const ren1_cmd = try std.fmt.allocPrint(std.heap.page_allocator,
+            "cd /d {s} && del /f {s} 2>nul & ren {s} {s}",
+            .{ install_dir, old_name, final_name, old_name });
+        defer std.heap.page_allocator.free(ren1_cmd);
+        if (std.process.run(std.heap.page_allocator, io, .{
+            .argv = &.{ "cmd", "/c", ren1_cmd },
+        })) |_| {} else |err| {
+            std.debug.print("[broadcast] Self-upgrade: ren {s}->{s} failed: {}\n", .{ final_name, old_name, err });
+            return;
+        }
+
+        // Step 2: Place new binary at the target name (utmm.next → utmm)
+        const ren2_cmd = try std.fmt.allocPrint(std.heap.page_allocator,
+            "cd /d {s} && ren {s} {s}",
+            .{ install_dir, new_name, final_name });
+        defer std.heap.page_allocator.free(ren2_cmd);
+        if (std.process.run(std.heap.page_allocator, io, .{
+            .argv = &.{ "cmd", "/c", ren2_cmd },
+        })) |_| {} else |err| {
+            std.debug.print("[broadcast] Self-upgrade: ren .next failed: {}\n", .{err});
+            // Rollback: put old binary back
+            const rollback_cmd = try std.fmt.allocPrint(std.heap.page_allocator,
+                "cd /d {s} && ren {s} {s}",
+                .{ install_dir, old_name, final_name });
+            defer std.heap.page_allocator.free(rollback_cmd);
+            _ = std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "cmd", "/c", rollback_cmd } }) catch {};
+            return;
+        }
+    } else {
+        // Unix: rename() is always safe (directory entry operation)
+        dir.deleteFile(io, old_name) catch {};
+        dir.rename(final_name, dir, old_name, io) catch |err| {
+            std.debug.print("[broadcast] Self-upgrade: rename {s} → {s} failed: {}\n", .{ final_name, old_name, err });
+            return;
+        };
+        dir.rename(new_name, dir, final_name, io) catch |err| {
+            std.debug.print("[broadcast] Self-upgrade: rename {s} → {s} failed: {}\n", .{ new_name, final_name, err });
+            dir.rename(old_name, dir, final_name, io) catch {};
+            return;
+        };
+    }
+
+    // Make executable and clear quarantine (Unix only)
     if (builtin.os.tag != .windows) {
+        // Use full paths for chmod/xattr (they handle absolute paths fine)
+        const final_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, final_name }) catch return;
+        defer std.heap.page_allocator.free(final_path);
+
         if (std.process.run(std.heap.page_allocator, io, .{
             .argv = &.{ "chmod", "+x", final_path },
         })) |_| {} else |_| {}
 
-        // macOS: clear quarantine attribute so Gatekeeper doesn't block
         if (builtin.os.tag == .macos) {
             if (std.process.run(std.heap.page_allocator, io, .{
                 .argv = &.{ "xattr", "-d", "com.apple.quarantine", final_path },
@@ -560,22 +603,43 @@ fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
     }
 
     // Step 3: Spawn restart script (detached, survives our exit).
-    // The script waits for old process to die, cleans up .old, then starts new binary.
-    // Note: the OS supervisor (launchd/systemd/sc) will ALSO restart us after exit(0).
-    // The restart script provides a safety net if no supervisor is configured.
     if (builtin.os.tag == .windows) {
-        const restart_cmd = std.fmt.allocPrint(
-            std.heap.page_allocator,
-            "cmd /c \"ping -n 3 127.0.0.1 >nul & del /f \"{s}\" 2>nul & cd /d {s} & start \"utmm\" {s} --hostname {s}\"",
-            .{ old_path, install_dir, final_path, info.hostname },
-        ) catch return;
-        defer std.heap.page_allocator.free(restart_cmd);
-        _ = std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "cmd", "/c", restart_cmd } }) catch {};
+        // Write a .bat file that cleans up .old and restarts the service.
+        // Use std.process.spawn so it's non-blocking — our process exits
+        // immediately and the bat runs independently in the background.
+        const old_full_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}\\{s}", .{ install_dir, old_name }) catch return;
+        defer std.heap.page_allocator.free(old_full_path);
+        const bat_full_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}\\{s}", .{ install_dir, bat_name }) catch return;
+        defer std.heap.page_allocator.free(bat_full_path);
+
+        if (dir.createFile(io, bat_name, .{ .permissions = @enumFromInt(0o644) })) |bat_file| {
+            var wb: [512]u8 = undefined;
+            var bat_writer = bat_file.writer(io, &wb);
+            bat_writer.interface.print(
+                \\@echo off
+                \\ping -n 3 127.0.0.1 >nul
+                \\del /f "{0s}" 2>nul
+                \\sc start UTM-Monitor
+                \\del "%~f0" 2>nul
+                \\
+            , .{old_full_path}) catch {};
+            bat_writer.interface.flush() catch {};
+            bat_file.close(io);
+            // spawn() returns immediately — bat runs independently
+            _ = std.process.spawn(io, .{
+                .argv = &.{ "cmd", "/c", bat_full_path },
+            }) catch {};
+        } else |_| {}
     } else {
+        const old_full_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, old_name }) catch return;
+        defer std.heap.page_allocator.free(old_full_path);
+        const final_full_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, final_name }) catch return;
+        defer std.heap.page_allocator.free(final_full_path);
+
         const restart_cmd = std.fmt.allocPrint(
             std.heap.page_allocator,
             "nohup sh -c 'sleep 2; rm -f \"{s}\"; {s} --hostname {s} &' >/dev/null 2>&1 &",
-            .{ old_path, final_path, info.hostname },
+            .{ old_full_path, final_full_path, info.hostname },
         ) catch return;
         defer std.heap.page_allocator.free(restart_cmd);
         _ = std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "sh", "-c", restart_cmd } }) catch {};

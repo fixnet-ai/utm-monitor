@@ -7,6 +7,7 @@
 //! --install for service creation.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 
 /// Supported operating system platforms
@@ -95,10 +96,23 @@ pub fn installSelf(
     const platform = Platform.detect();
     std.debug.print("[install] detected platform: {s}, mode: {s}\n", .{ platform.asStr(), if (is_host) "host" else "guest" });
 
-    // Get current executable path
+    // Get current executable path to determine install directory.
+    // IMPORTANT: the OS resolves symlinks, so we extract the directory from the
+    // resolved path and construct the CANONICAL symlink path. Auto-upgrade
+    // replaces the symlink target, so the service MUST run via the symlink
+    // (e.g. /opt/utmm/utmm), NOT the architecture-specific binary name
+    // (e.g. /opt/utmm/utmm-aarch64-linux).
     var exe_buf: [4096]u8 = undefined;
     const exe_len = try std.process.executablePath(io, &exe_buf);
     const exe_path = exe_buf[0..exe_len];
+    const exe_dir = std.fs.path.dirname(exe_path) orelse "/opt/utmm";
+
+    // Canonical service binary path (the symlink, which auto-upgrade replaces)
+    const svc_exe: []const u8 = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(allocator, "{s}/utmm.exe", .{exe_dir})
+    else
+        try std.fmt.allocPrint(allocator, "{s}/utmm", .{exe_dir});
+    defer allocator.free(svc_exe);
 
     switch (platform) {
         .macos => {
@@ -142,7 +156,7 @@ pub fn installSelf(
                     \\    <string>/var/log/utmm-host.log</string>
                     \\</dict>
                     \\</plist>
-                , .{exe_path});
+                , .{svc_exe});
             } else {
                 try writer.interface.print(
                     \\<?xml version="1.0" encoding="UTF-8"?>
@@ -155,7 +169,7 @@ pub fn installSelf(
                     \\    <key>ProgramArguments</key>
                     \\    <array>
                     \\        <string>{s}</string>
-                , .{exe_path});
+                , .{svc_exe});
                 try writer.interface.flush();
                 if (hostname_override) |h| {
                     try writer.interface.print("        <string>--hostname</string>\n        <string>{s}</string>\n", .{h});
@@ -189,9 +203,6 @@ pub fn installSelf(
                 try std.fmt.allocPrint(allocator, " --hostname {s}", .{h})
             else
                 "";
-
-            const exe_dir = std.fs.path.dirname(exe_path) orelse "/opt/utmm";
-
             const content = try std.fmt.allocPrint(allocator,
                 \\[Unit]
                 \\Description={s}
@@ -207,7 +218,7 @@ pub fn installSelf(
                 \\
                 \\[Install]
                 \\WantedBy=multi-user.target
-            , .{ desc, exe_path, extra_args, exe_dir });
+            , .{ desc, svc_exe, extra_args, exe_dir });
             defer allocator.free(content);
 
             std.Io.Dir.cwd().deleteFile(io, service_path) catch {};
@@ -240,7 +251,7 @@ pub fn installSelf(
             else
                 "";
 
-            const bin_path = try std.fmt.allocPrint(allocator, "\"{s}\" --svc{s}", .{ exe_path, extra_args });
+            const bin_path = try std.fmt.allocPrint(allocator, "\"{s}\" --svc{s}", .{ svc_exe, extra_args });
             defer allocator.free(bin_path);
 
             // Stop and delete existing service (ignore errors)

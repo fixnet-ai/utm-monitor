@@ -148,7 +148,41 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
                 existing.* = owned;
                 on_ip_changed.call(old_state, state);
             } else {
+                // Same IP — update mutable fields that may have changed
+                // (version after auto-upgrade, target after reinstall, etc.)
+                var changed = false;
+                const old_state = GuestState{
+                    .hostname = existing.hostname,
+                    .ip = existing.ip,
+                    .target = existing.target,
+                    .mac = existing.mac,
+                    .http_port = existing.http_port,
+                    .version = existing.version,
+                    .last_seen = existing.last_seen,
+                };
+                if (!std.mem.eql(u8, existing.version, info.version)) {
+                    allocator.free(existing.version);
+                    existing.version = try allocator.dupe(u8, info.version);
+                    changed = true;
+                }
+                if (!std.mem.eql(u8, existing.target, info.target)) {
+                    allocator.free(existing.target);
+                    existing.target = try allocator.dupe(u8, info.target);
+                    changed = true;
+                }
+                if (!std.mem.eql(u8, existing.mac, info.mac)) {
+                    allocator.free(existing.mac);
+                    existing.mac = try allocator.dupe(u8, info.mac);
+                    changed = true;
+                }
+                if (existing.http_port != info.http_port) {
+                    existing.http_port = info.http_port;
+                    changed = true;
+                }
                 existing.last_seen = now;
+                if (changed) {
+                    on_ip_changed.call(old_state, state);
+                }
             }
         } else {
             std.debug.print("[listener] 🆕 New guest discovered: {s} ({s}) → {s}\n", .{ info.hostname, info.target, actual_ip });
