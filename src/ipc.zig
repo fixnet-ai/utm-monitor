@@ -117,7 +117,11 @@ pub fn startServer(io: std.Io, allocator: std.mem.Allocator, ctx: *anyopaque, ha
         };
         // Spawn a thread per connection — prevents a slow HTTP exec
         // from serializing all subsequent IPC commands.
-        const t = try std.Thread.spawn(.{}, handleConnectionThread, .{ io, allocator, stream, ctx, handler });
+        const t = std.Thread.spawn(.{}, handleConnectionThread, .{ io, allocator, stream, ctx, handler }) catch |err| {
+            std.debug.print("[ipc] Failed to spawn connection thread: {}\n", .{err});
+            stream.close(io);
+            continue;
+        };
         t.detach();
     }
 }
@@ -135,6 +139,25 @@ fn handleConnectionThread(
     };
 }
 
+/// Set receive timeout on a socket (cross-platform: POSIX timeval, Windows DWORD ms).
+/// Best-effort — failures are silently ignored (timeout is a safety net, not critical).
+fn setRecvTimeout(socket: std.Io.net.Socket, timeout_secs: u32) void {
+    if (@import("builtin").os.tag == .windows) {
+        const timeout_ms: u32 = timeout_secs * 1000;
+        if (std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout_ms))) |_| {} else |_| {}
+    } else {
+        const tv = std.posix.timeval{
+            .sec = timeout_secs,
+            .usec = 0,
+        };
+        if (std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv))) |_| {} else |_| {}
+    }
+}
+
+/// IPC connection read timeout (seconds). A dead client that never sends \n\n
+/// will be disconnected after this duration, preventing thread leaks.
+const IPC_RECV_TIMEOUT_SECS: u32 = 30;
+
 /// Handle single IPC connection: read command → call handler → return result → close
 fn handleConnection(
     io: std.Io,
@@ -144,6 +167,9 @@ fn handleConnection(
     handler: Handler,
 ) !void {
     defer stream.close(io);
+
+    // Set a read timeout so a dead/malicious client can't hold a thread forever.
+    setRecvTimeout(stream.socket, IPC_RECV_TIMEOUT_SECS);
 
     // Read command (until \n\n)
     var cmd_buf: [4096]u8 = undefined;

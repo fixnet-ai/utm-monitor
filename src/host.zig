@@ -461,7 +461,7 @@ fn ipcHandler(ctx: *anyopaque, cmd: []const u8) anyerror![]const u8 {
     const state: *IpcCtx = @ptrCast(@alignCast(ctx));
 
     if (std.mem.eql(u8, cmd, "STATUS")) {
-        state.mutex.lock(state.io) catch {};
+        state.mutex.lock(state.io) catch return error.IpcFailed;
         defer state.mutex.unlock(state.io);
 
         // Copy GuestState slice from ArrayList for formatting function
@@ -472,7 +472,7 @@ fn ipcHandler(ctx: *anyopaque, cmd: []const u8) anyerror![]const u8 {
     }
 
     if (std.mem.eql(u8, cmd, "STATUS_JSON")) {
-        state.mutex.lock(state.io) catch {};
+        state.mutex.lock(state.io) catch return error.IpcFailed;
         defer state.mutex.unlock(state.io);
 
         var buf: std.ArrayList(u8) = .empty;
@@ -500,17 +500,27 @@ fn ipcHandler(ctx: *anyopaque, cmd: []const u8) anyerror![]const u8 {
         const hostname = rest[0..nl];
         const exec_cmd = rest[nl + 1 ..];
 
-        // Look up from shared Guest list
-        state.mutex.lock(state.io) catch {};
+        // Lock and deep-copy Guest fields before unlock.
+        // GuestState string slices point into ArrayList memory;
+        // the listener thread may free them once the mutex is released.
+        state.mutex.lock(state.io) catch return error.IpcFailed;
         const guest = executor.findGuest(state.guests.items, hostname);
+        if (guest == null) {
+            state.mutex.unlock(state.io);
+            return error.GuestNotFound;
+        }
+        const g = guest.?;
+        const ip_owned = state.allocator.dupe(u8, g.ip) catch {
+            state.mutex.unlock(state.io);
+            return error.IpcFailed;
+        };
+        defer state.allocator.free(ip_owned);
+        const http_port = g.http_port;
         state.mutex.unlock(state.io);
 
-        if (guest == null) return error.GuestNotFound;
+        std.debug.print("[ipc] EXEC {s} → {s}:{d}: {s}\n", .{ hostname, ip_owned, http_port, exec_cmd });
 
-        const g = guest.?;
-        std.debug.print("[ipc] EXEC {s} → {s}:{d}: {s}\n", .{ hostname, g.ip, g.http_port, exec_cmd });
-
-        const result = try executor.execRemote(state.io, state.allocator, g.ip, g.http_port, exec_cmd);
+        const result = try executor.execRemote(state.io, state.allocator, ip_owned, http_port, exec_cmd);
         return std.fmt.allocPrint(state.allocator, "{s}\n", .{result});
     }
 
@@ -523,15 +533,25 @@ fn ipcHandler(ctx: *anyopaque, cmd: []const u8) anyerror![]const u8 {
         const remote_name = remainder[0..nl2];
         const local_file = remainder[nl2 + 1 ..];
 
-        state.mutex.lock(state.io) catch {};
+        // Lock and deep-copy Guest fields before unlock (avoid use-after-free)
+        state.mutex.lock(state.io) catch return error.IpcFailed;
         const guest = executor.findGuest(state.guests.items, hostname);
+        if (guest == null) {
+            state.mutex.unlock(state.io);
+            return error.GuestNotFound;
+        }
+        const g = guest.?;
+        const ip_owned = state.allocator.dupe(u8, g.ip) catch {
+            state.mutex.unlock(state.io);
+            return error.IpcFailed;
+        };
+        defer state.allocator.free(ip_owned);
+        const http_port = g.http_port;
         state.mutex.unlock(state.io);
 
-        if (guest == null) return error.GuestNotFound;
-        const g = guest.?;
-        std.debug.print("[ipc] UPLOAD {s} → {s}:{d}/upload?filename={s}\n", .{ local_file, g.ip, g.http_port, remote_name });
+        std.debug.print("[ipc] UPLOAD {s} → {s}:{d}/upload?filename={s}\n", .{ local_file, ip_owned, http_port, remote_name });
 
-        const bytes = try http_client.uploadFile(state.io, state.allocator, g.ip, g.http_port, local_file, remote_name);
+        const bytes = try http_client.uploadFile(state.io, state.allocator, ip_owned, http_port, local_file, remote_name);
         return std.fmt.allocPrint(state.allocator, "OK — {d} bytes written to /opt/utmm/{s} on {s}\n", .{ bytes, remote_name, hostname });
     }
     if (std.mem.startsWith(u8, cmd, "DOWNLOAD\n")) {
@@ -543,15 +563,25 @@ fn ipcHandler(ctx: *anyopaque, cmd: []const u8) anyerror![]const u8 {
         const remote_file = remainder[0..nl2];
         const local_path = remainder[nl2 + 1 ..];
 
-        state.mutex.lock(state.io) catch {};
+        // Lock and deep-copy Guest fields before unlock (avoid use-after-free)
+        state.mutex.lock(state.io) catch return error.IpcFailed;
         const guest = executor.findGuest(state.guests.items, hostname);
+        if (guest == null) {
+            state.mutex.unlock(state.io);
+            return error.GuestNotFound;
+        }
+        const g = guest.?;
+        const ip_owned = state.allocator.dupe(u8, g.ip) catch {
+            state.mutex.unlock(state.io);
+            return error.IpcFailed;
+        };
+        defer state.allocator.free(ip_owned);
+        const http_port = g.http_port;
         state.mutex.unlock(state.io);
 
-        if (guest == null) return error.GuestNotFound;
-        const g = guest.?;
-        std.debug.print("[ipc] DOWNLOAD {s}:{d}/bin/{s} → {s}\n", .{ g.ip, g.http_port, remote_file, local_path });
+        std.debug.print("[ipc] DOWNLOAD {s}:{d}/bin/{s} → {s}\n", .{ ip_owned, http_port, remote_file, local_path });
 
-        const bytes = try http_client.downloadFile(state.io, state.allocator, g.ip, g.http_port, remote_file, local_path);
+        const bytes = try http_client.downloadFile(state.io, state.allocator, ip_owned, http_port, remote_file, local_path);
         return std.fmt.allocPrint(state.allocator, "OK — {d} bytes saved to {s}\n", .{ bytes, local_path });
     }
 
