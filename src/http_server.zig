@@ -479,6 +479,27 @@ fn extractMultipartFile(gpa: std.mem.Allocator, body: []const u8, boundary: []co
     return gpa.dupe(u8, trimmed);
 }
 
+/// Parse the "cmd" value from {"cmd":"..."} JSON.
+/// Uses std.json for proper escape handling, with a simple fallback scanner
+/// for backward compatibility with old clients.
+fn parseExecCmd(gpa: std.mem.Allocator, json: []const u8) ![]const u8 {
+    const ExecRequest = struct {
+        cmd: []const u8,
+    };
+    // Primary: proper JSON parsing (handles \", \\, \n, \r, \t, \uXXXX)
+    if (std.json.parseFromSlice(ExecRequest, gpa, json, .{})) |parsed| {
+        defer parsed.deinit();
+        return gpa.dupe(u8, parsed.value.cmd);
+    } else |_| {}
+
+    // Fallback: simple string scan for old clients with malformed JSON
+    if (extractJsonCmdSimple(json)) |c| {
+        return gpa.dupe(u8, c);
+    }
+
+    return error.InvalidJson;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // POST /exec — JSON command execution
 // ═══════════════════════════════════════════════════════════════════
@@ -511,7 +532,7 @@ fn handleExec(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocator)
 
     // Parse JSON: {"cmd":"..."}
     const trimmed = std.mem.trim(u8, body, " \n\r\t");
-    const cmd = extractJsonCmd(trimmed) orelse {
+    const cmd = parseExecCmd(gpa, trimmed) catch {
         try request.respond("ERR\nInvalid JSON: missing cmd field\n\n", .{
             .status = .bad_request,
             .extra_headers = &.{
@@ -520,6 +541,7 @@ fn handleExec(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocator)
         });
         return;
     };
+    defer gpa.free(cmd);
 
     std.debug.print("[http-guest] EXEC: {s}\n", .{cmd});
 
@@ -608,26 +630,42 @@ const ExecResult = struct {
     stderr: []u8,
 };
 
-/// Execute a command on Windows using file-based stdout/stderr.
+/// Execute a command on Windows using file-based stdout/stderr and a temp
+/// .bat file for the command itself.
 ///
-/// std.process.run uses pipes for stdout/stderr, and Zig's CreateProcessW
-/// sets bInheritHandles=TRUE. This means any grandchild process inherits
-/// the pipe write-end, preventing EOF and causing a permanent hang in
-/// the read loop. By spawning directly with file handles instead of pipes,
-/// we avoid the inheritance deadlock entirely.
+/// Two problems are solved here:
+/// 1. Pipe inheritance: std.process.run creates pipes; grandchild processes
+///    inherit the write-end → no EOF → permanent hang. File-based I/O avoids this.
+/// 2. Argv-to-command-line: Zig's CreateProcessW reconstructs a command line
+///    from argv[], which mangles special chars (&, |, >, <, %, ^). Writing the
+///    command to a .bat file and executing that bypasses the reconstruction.
 fn execWindows(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8) !ExecResult {
     const tid: usize = @intCast(std.Thread.getCurrentId());
 
-    // Unique temp file names — thread ID is sufficient since each HTTP
-    // handler thread processes one request at a time.
+    // Temp file names — thread ID is unique per concurrent request
     const tmp_stdout = try std.fmt.allocPrint(gpa, "utmm_out_{d}.tmp", .{tid});
     defer gpa.free(tmp_stdout);
     const tmp_stderr = try std.fmt.allocPrint(gpa, "utmm_err_{d}.tmp", .{tid});
     defer gpa.free(tmp_stderr);
+    const tmp_bat = try std.fmt.allocPrint(gpa, "utmm_cmd_{d}.bat", .{tid});
+    defer gpa.free(tmp_bat);
 
-    // Create temp files and pass them as stdout/stderr to the child.
-    // On Windows, file handles passed this way do NOT create pipes —
-    // the child writes directly to the files.
+    // Write command to temp .bat file with output redirection.
+    // Using a .bat file avoids Zig's argv-to-command-line reconstruction,
+    // which would mangle &, |, >, <, %, ^ and other cmd.exe metacharacters.
+    // @echo off + CRLF line endings for robust Windows batch execution.
+    {
+        const bat_file = try std.Io.Dir.cwd().createFile(io, tmp_bat, .{ .permissions = @enumFromInt(0o644) });
+        defer bat_file.close(io);
+        var wb: [4096]u8 = undefined;
+        var writer = bat_file.writer(io, &wb);
+        _ = try writer.interface.write("@echo off\r\n");
+        _ = try writer.interface.write(cmd);
+        _ = try writer.interface.write("\r\n");
+        try writer.interface.flush();
+    }
+
+    // Create temp files for stdout/stderr
     const stdout_file = try std.Io.Dir.cwd().createFile(io, tmp_stdout, .{ .permissions = @enumFromInt(0o644) });
     errdefer {
         stdout_file.close(io);
@@ -639,21 +677,20 @@ fn execWindows(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8) !ExecResult 
         std.Io.Dir.cwd().deleteFile(io, tmp_stderr) catch {};
     }
 
+    // Spawn: run the .bat file with file-based stdout/stderr (no pipes)
     var child = try std.process.spawn(io, .{
-        .argv = &.{ "cmd.exe", "/c", cmd },
+        .argv = &.{ "cmd.exe", "/c", tmp_bat },
         .stdout = .{ .file = stdout_file },
         .stderr = .{ .file = stderr_file },
     });
 
-    // Close our file handles — the child has its own references via
-    // DuplicateHandle in CreateProcessW.
+    // Close our file handles — child has its own references
     stdout_file.close(io);
     stderr_file.close(io);
 
     const term = try child.wait(io);
 
-    // Read output from temp files. readFileAlloc returns heap-allocated
-    // slices that the caller (handleExec's defer block) will free.
+    // Read output from temp files
     var stdout: []u8 = &.{};
     var stderr: []u8 = &.{};
     if (std.Io.Dir.cwd().readFileAlloc(io, tmp_stdout, gpa, @enumFromInt(1024 * 1024))) |data| {
@@ -663,9 +700,10 @@ fn execWindows(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8) !ExecResult 
         stderr = data;
     } else |_| {}
 
-    // Cleanup temp files
+    // Cleanup all temp files
     std.Io.Dir.cwd().deleteFile(io, tmp_stdout) catch {};
     std.Io.Dir.cwd().deleteFile(io, tmp_stderr) catch {};
+    std.Io.Dir.cwd().deleteFile(io, tmp_bat) catch {};
 
     return .{
         .term = term,
@@ -674,44 +712,48 @@ fn execWindows(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8) !ExecResult 
     };
 }
 
-/// Extract "cmd" string from {"cmd":"..."} JSON — simple string scan
-fn extractJsonCmd(json: []const u8) ?[]const u8 {
-    // Find "cmd" key
+/// Fallback: extract "cmd" string from {"cmd":"..."} JSON.
+/// Simple string scan that handles basic \ escaping (\\, \").
+/// Used only when std.json.parseFromSlice fails (old/malformed clients).
+fn extractJsonCmdSimple(json: []const u8) ?[]const u8 {
     const key_pos = std.mem.indexOf(u8, json, "\"cmd\"") orelse return null;
     const after_key = json[key_pos + "\"cmd\"".len ..];
 
-    // Find ':' after key
     const colon = std.mem.indexOfScalar(u8, after_key, ':') orelse return null;
     const after_colon = std.mem.trim(u8, after_key[colon + 1 ..], " \t");
 
-    // Find opening '"'
     if (after_colon.len == 0 or after_colon[0] != '"') return null;
-    const after_open = after_colon[1..];
 
-    // Find closing '"' (handle escaping simply — no escaped quotes for exec commands)
-    const close = std.mem.indexOfScalar(u8, after_open, '"') orelse return null;
-
-    return after_open[0..close];
+    // Scan byte-by-byte, tracking escape state to find the unescaped closing quote
+    var i: usize = 1;
+    while (i < after_colon.len) : (i += 1) {
+        if (after_colon[i] == '\\') {
+            i += 1; // skip the escaped character
+        } else if (after_colon[i] == '"') {
+            return after_colon[1..i]; // content between opening and closing quotes
+        }
+    }
+    return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════
 
-test "extractJsonCmd - valid" {
-    const cmd = extractJsonCmd("{\"cmd\":\"uname -a\"}");
+test "extractJsonCmdSimple - valid" {
+    const cmd = extractJsonCmdSimple("{\"cmd\":\"uname -a\"}");
     try std.testing.expect(cmd != null);
     try std.testing.expectEqualStrings("uname -a", cmd.?);
 }
 
-test "extractJsonCmd - with whitespace" {
-    const cmd = extractJsonCmd("{ \"cmd\" : \"ls -la\" }");
+test "extractJsonCmdSimple - with whitespace" {
+    const cmd = extractJsonCmdSimple("{ \"cmd\" : \"ls -la\" }");
     try std.testing.expect(cmd != null);
     try std.testing.expectEqualStrings("ls -la", cmd.?);
 }
 
-test "extractJsonCmd - missing" {
-    const cmd = extractJsonCmd("{\"foo\":\"bar\"}");
+test "extractJsonCmdSimple - missing" {
+    const cmd = extractJsonCmdSimple("{\"foo\":\"bar\"}");
     try std.testing.expectEqual(@as(@TypeOf(cmd), null), cmd);
 }
 

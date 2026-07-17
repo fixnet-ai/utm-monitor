@@ -156,9 +156,29 @@ pub fn downloadFile(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: 
     return total;
 }
 
+/// Escape a string for safe embedding in a JSON string value.
+/// Escapes: \\, \", and control characters \n \r \t.
+/// Caller owns the returned string.
+fn escapeJsonString(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(gpa, "\\\""),
+            '\\' => try buf.appendSlice(gpa, "\\\\"),
+            '\n' => try buf.appendSlice(gpa, "\\n"),
+            '\r' => try buf.appendSlice(gpa, "\\r"),
+            '\t' => try buf.appendSlice(gpa, "\\t"),
+            else => try buf.append(gpa, c),
+        }
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
 /// POST /exec with JSON body → returns response text (heap-allocated, caller frees)
 pub fn execRemote(io: std.Io, gpa: std.mem.Allocator, host: []const u8, port: u16, command: []const u8) ![]const u8 {
-    const body = try std.fmt.allocPrint(gpa, "{{\"cmd\":\"{s}\"}}", .{command});
+    const escaped_cmd = try escapeJsonString(gpa, command);
+    defer gpa.free(escaped_cmd);
+    const body = try std.fmt.allocPrint(gpa, "{{\"cmd\":\"{s}\"}}", .{escaped_cmd});
     defer gpa.free(body);
 
     const url = try std.fmt.allocPrint(gpa, "http://{s}:{d}/exec", .{ host, port });
