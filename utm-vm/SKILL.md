@@ -100,7 +100,7 @@ vm_status → see which VMs are online, their versions, IPs
 2. Host: sudo utmm --host --install && sudo utmm --host
 3. For each Guest VM, run ONE command (no internet needed — from Host HTTP):
    - Linux/macOS: curl http://<gateway>:2121/bin/install.sh | sh -s -- --guest --hostname <name>
-   - Windows: find gateway, download install.ps1 from http://<gateway>:2121/bin/install.ps1, run with -Guest
+   - Windows: find gateway, download install.bat from http://<gateway>:2121/bin/install.bat, run with --guest
 4. vm_status → verify all VMs appear online
 ```
 
@@ -210,10 +210,9 @@ To download files from other directories, use `--exec` to copy them to `/opt/utm
 **A**: macOS uses `route -n get default`, not `ip route`. The install.sh auto-detects the correct command per OS. The README Quick Start now shows platform-specific commands.
 
 ### Q: Windows: SSH+PowerShell quoting is complex
-**A**: When running PowerShell commands over SSH, `$` variables may be interpolated by bash before reaching PowerShell. Write commands to a `.ps1` file first, then execute it. Example:
-```powershell
-iwr "http://<gateway>:2121/bin/install.ps1" -OutFile install.ps1
-.\install.ps1 -Guest -Hostname windowsvm
+**A**: Use the batch installer (`install.bat`) instead — no PowerShell dependency, no quoting issues. Example:
+```batch
+curl -o install.bat "http://<gateway>:2121/bin/install.bat" && install.bat --guest --hostname windowsvm
 ```
 
 ### Q: `zig-out/bin/utmm` is the wrong architecture after cross-compilation

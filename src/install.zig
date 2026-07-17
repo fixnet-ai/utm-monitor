@@ -2,7 +2,7 @@
 //! Supports three platforms: macOS (launchd), Linux (systemd), Windows (sc)
 //!
 //! Design: --install/--uninstall are the SINGLE source of truth for service
-//! management on ALL platforms. Install scripts (install.sh/install.ps1) only
+//! management on ALL platforms. Install scripts (install.sh/install.bat) only
 //! create the runtime environment (download, mkdir, symlink) and delegate to
 //! --install for service creation.
 

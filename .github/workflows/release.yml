@@ -50,7 +50,7 @@ jobs:
         run: |
           echo "==> Adding install scripts..."
           cp install.sh release/
-          cp install.ps1 release/
+          cp install.bat release/
           echo "==> Final release contents:"
           ls -lh release/
 

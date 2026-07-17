@@ -33,7 +33,7 @@ build_target aarch64-linux-musl   utmm-aarch64-linux
 echo ""
 echo "==> Copying install scripts..."
 cp install.sh release/
-cp install.ps1 release/
+cp install.bat release/
 
 echo ""
 echo "==> Creating utmm.zip..."
