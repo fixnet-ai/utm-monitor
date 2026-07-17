@@ -100,7 +100,9 @@ pub fn sendCommand(io: std.Io, allocator: std.mem.Allocator, command: []const u8
     }
 }
 
-/// Server: runs in a dedicated thread, accepts IPC connections
+/// Server: runs in a dedicated thread, accepts IPC connections.
+/// Each connection is handled in its own thread so a slow exec
+/// (e.g., Windows cmd.exe hang) doesn't block --status and other commands.
 pub fn startServer(io: std.Io, allocator: std.mem.Allocator, ctx: *anyopaque, handler: Handler) !void {
     const listen_addr = try std.Io.net.IpAddress.parse("127.0.0.1", IPC_PORT);
     var server = try listen_addr.listen(io, .{ .reuse_address = true });
@@ -113,10 +115,24 @@ pub fn startServer(io: std.Io, allocator: std.mem.Allocator, ctx: *anyopaque, ha
             std.debug.print("[ipc] accept failed: {}\n", .{err});
             continue;
         };
-        handleConnection(io, allocator, stream, ctx, handler) catch |err| {
-            std.debug.print("[ipc] Connection handling failed: {}\n", .{err});
-        };
+        // Spawn a thread per connection — prevents a slow HTTP exec
+        // from serializing all subsequent IPC commands.
+        const t = try std.Thread.spawn(.{}, handleConnectionThread, .{ io, allocator, stream, ctx, handler });
+        t.detach();
     }
+}
+
+/// Thread entry point: wraps handleConnection with error logging.
+fn handleConnectionThread(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    stream: std.Io.net.Stream,
+    ctx: *anyopaque,
+    handler: Handler,
+) void {
+    handleConnection(io, allocator, stream, ctx, handler) catch |err| {
+        std.debug.print("[ipc] Connection handling failed: {}\n", .{err});
+    };
 }
 
 /// Handle single IPC connection: read command → call handler → return result → close
