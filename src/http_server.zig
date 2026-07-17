@@ -523,22 +523,39 @@ fn handleExec(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocator)
 
     std.debug.print("[http-guest] EXEC: {s}\n", .{cmd});
 
-    // Execute
-    const shell: []const u8 = if (@import("builtin").os.tag == .windows) "cmd.exe" else "/bin/sh";
-    const shell_arg: []const u8 = if (@import("builtin").os.tag == .windows) "/c" else "-c";
-
-    const result = std.process.run(gpa, io, .{
-        .argv = &[_][]const u8{ shell, shell_arg, cmd },
-    }) catch |err| {
-        var err_buf: [256]u8 = undefined;
-        const err_msg = std.fmt.bufPrint(&err_buf, "ERR\nExecution failed: {}\n\n", .{err}) catch "ERR\nExecution failed\n\n";
-        try request.respond(err_msg, .{
-            .status = .internal_server_error,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "text/plain" },
-            },
-        });
-        return;
+    const builtin = @import("builtin");
+    const result = if (builtin.os.tag == .windows) blk: {
+        // Windows: avoid std.process.run — it creates stdout/stderr pipes
+        // with inheritable handles (CreateProcessW bInheritHandles=TRUE).
+        // Grandchild processes inherit the pipe write-end, preventing EOF
+        // and causing a permanent hang. Use file-based output instead.
+        break :blk execWindows(gpa, io, cmd) catch |err| {
+            var err_buf: [256]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "ERR\nExecution failed: {}\n\n", .{err}) catch "ERR\nExecution failed\n\n";
+            try request.respond(err_msg, .{
+                .status = .internal_server_error,
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "text/plain" },
+                },
+            });
+            return;
+        };
+    } else blk: {
+        const shell: []const u8 = "/bin/sh";
+        const shell_arg: []const u8 = "-c";
+        break :blk std.process.run(gpa, io, .{
+            .argv = &[_][]const u8{ shell, shell_arg, cmd },
+        }) catch |err| {
+            var err_buf: [256]u8 = undefined;
+            const err_msg = std.fmt.bufPrint(&err_buf, "ERR\nExecution failed: {}\n\n", .{err}) catch "ERR\nExecution failed\n\n";
+            try request.respond(err_msg, .{
+                .status = .internal_server_error,
+                .extra_headers = &.{
+                    .{ .name = "content-type", .value = "text/plain" },
+                },
+            });
+            return;
+        };
     };
     defer {
         gpa.free(result.stdout);
@@ -582,6 +599,79 @@ fn handleExec(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocator)
             },
         });
     }
+}
+
+/// Result of executing a command — mirrors std.process.RunResult.
+const ExecResult = struct {
+    term: std.process.Child.Term,
+    stdout: []u8,
+    stderr: []u8,
+};
+
+/// Execute a command on Windows using file-based stdout/stderr.
+///
+/// std.process.run uses pipes for stdout/stderr, and Zig's CreateProcessW
+/// sets bInheritHandles=TRUE. This means any grandchild process inherits
+/// the pipe write-end, preventing EOF and causing a permanent hang in
+/// the read loop. By spawning directly with file handles instead of pipes,
+/// we avoid the inheritance deadlock entirely.
+fn execWindows(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8) !ExecResult {
+    const tid: usize = @intCast(std.Thread.getCurrentId());
+
+    // Unique temp file names — thread ID is sufficient since each HTTP
+    // handler thread processes one request at a time.
+    const tmp_stdout = try std.fmt.allocPrint(gpa, "utmm_out_{d}.tmp", .{tid});
+    defer gpa.free(tmp_stdout);
+    const tmp_stderr = try std.fmt.allocPrint(gpa, "utmm_err_{d}.tmp", .{tid});
+    defer gpa.free(tmp_stderr);
+
+    // Create temp files and pass them as stdout/stderr to the child.
+    // On Windows, file handles passed this way do NOT create pipes —
+    // the child writes directly to the files.
+    const stdout_file = try std.Io.Dir.cwd().createFile(io, tmp_stdout, .{ .permissions = @enumFromInt(0o644) });
+    errdefer {
+        stdout_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, tmp_stdout) catch {};
+    }
+    const stderr_file = try std.Io.Dir.cwd().createFile(io, tmp_stderr, .{ .permissions = @enumFromInt(0o644) });
+    errdefer {
+        stderr_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, tmp_stderr) catch {};
+    }
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "cmd.exe", "/c", cmd },
+        .stdout = .{ .file = stdout_file },
+        .stderr = .{ .file = stderr_file },
+    });
+
+    // Close our file handles — the child has its own references via
+    // DuplicateHandle in CreateProcessW.
+    stdout_file.close(io);
+    stderr_file.close(io);
+
+    const term = try child.wait(io);
+
+    // Read output from temp files. readFileAlloc returns heap-allocated
+    // slices that the caller (handleExec's defer block) will free.
+    var stdout: []u8 = &.{};
+    var stderr: []u8 = &.{};
+    if (std.Io.Dir.cwd().readFileAlloc(io, tmp_stdout, gpa, @enumFromInt(1024 * 1024))) |data| {
+        stdout = data;
+    } else |_| {}
+    if (std.Io.Dir.cwd().readFileAlloc(io, tmp_stderr, gpa, @enumFromInt(1024 * 1024))) |data| {
+        stderr = data;
+    } else |_| {}
+
+    // Cleanup temp files
+    std.Io.Dir.cwd().deleteFile(io, tmp_stdout) catch {};
+    std.Io.Dir.cwd().deleteFile(io, tmp_stderr) catch {};
+
+    return .{
+        .term = term,
+        .stdout = stdout,
+        .stderr = stderr,
+    };
 }
 
 /// Extract "cmd" string from {"cmd":"..."} JSON — simple string scan
