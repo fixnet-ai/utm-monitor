@@ -300,7 +300,7 @@ pub fn installSelf(
                 // Install as user-level scheduled task (runs at logon with GUI access).
                 // Uses `start "UTM Agent" cmd /k` to open a visible console window.
                 const task_name = "UTM Agent";
-                const task_cmd = try std.fmt.allocPrint(allocator, "cmd /c start \"UTM Agent\" cmd /k \"{s}\" --agent", .{svc_exe});
+                const task_cmd = try std.fmt.allocPrint(allocator, "cmd /c start \"UTM Agent\" cmd /k \"chcp 65001 ^> nul && {s} --agent\"", .{svc_exe});
                 defer allocator.free(task_cmd);
 
                 // Delete existing task (ignore errors)
@@ -338,11 +338,12 @@ pub fn installSelf(
                     var bw = bat_file.writer(io, &bwb);
                     try bw.interface.print(
                         \\@echo off
+                        \\chcp 65001 > nul
                         \\echo Installing UTM Agent...
                         \\"{s}" --install --user
                         \\echo.
                         \\echo Starting UTM Agent...
-                        \\start "UTM Agent" cmd /k "{s} --agent"
+                        \\start "UTM Agent" cmd /k "chcp 65001 ^> nul && {s} --agent"
                     , .{ svc_exe, svc_exe });
                     try bw.interface.flush();
                     std.debug.print("[install] Windows: desktop shortcut created: {s}\n", .{bat_path});
