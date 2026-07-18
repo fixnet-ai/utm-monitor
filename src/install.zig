@@ -177,6 +177,33 @@ pub fn installSelf(
                     std.debug.print("[install] macOS: agent plist written to {s}\n", .{plist_path});
                     std.debug.print("[install] run: launchctl load {s}\n", .{plist_path});
                 }
+
+                // Create desktop shortcut (double-click to install + launch agent)
+                {
+                    const desktop = try std.fmt.allocPrint(allocator, "{s}/Desktop", .{home});
+                    defer allocator.free(desktop);
+                    const cmd_path = try std.fmt.allocPrint(allocator, "{s}/UTM-Agent.command", .{desktop});
+                    defer allocator.free(cmd_path);
+
+                    std.Io.Dir.cwd().createDir(io, desktop, @enumFromInt(0o755)) catch {};
+                    std.Io.Dir.cwd().deleteFile(io, cmd_path) catch {};
+                    const cmd_file = try std.Io.Dir.cwd().createFile(io, cmd_path, .{ .permissions = @enumFromInt(0o755) });
+                    defer cmd_file.close(io);
+                    var cwb: [2048]u8 = undefined;
+                    var cw = cmd_file.writer(io, &cwb);
+                    try cw.interface.print(
+                        \\#!/bin/bash
+                        \\# UTM Agent — double-click to install & launch
+                        \\cd "$(dirname "$0")" || true
+                        \\echo "Installing UTM Agent..."
+                        \\{s} --install --user
+                        \\echo ""
+                        \\echo "Starting UTM Agent..."
+                        \\exec {s} --agent
+                    , .{ svc_exe, svc_exe });
+                    try cw.interface.flush();
+                    std.debug.print("[install] macOS: desktop shortcut created: {s}\n", .{cmd_path});
+                }
             },
             .linux => {
                 // Install as user systemd service (runs in user session with GUI access).
@@ -242,6 +269,32 @@ pub fn installSelf(
                 } else |_| {
                     std.debug.print("[install] Linux: run manually: systemctl --user enable --now utmm-agent\n", .{});
                 }
+
+                // Create desktop shortcut (double-click to install + launch agent)
+                {
+                    const desktop = try std.fmt.allocPrint(allocator, "{s}/Desktop", .{home});
+                    defer allocator.free(desktop);
+                    const dt_path = try std.fmt.allocPrint(allocator, "{s}/utmm-agent.desktop", .{desktop});
+                    defer allocator.free(dt_path);
+
+                    std.Io.Dir.cwd().createDir(io, desktop, @enumFromInt(0o755)) catch {};
+                    std.Io.Dir.cwd().deleteFile(io, dt_path) catch {};
+                    const dt_file = try std.Io.Dir.cwd().createFile(io, dt_path, .{ .permissions = @enumFromInt(0o755) });
+                    defer dt_file.close(io);
+                    var dwb: [2048]u8 = undefined;
+                    var dw = dt_file.writer(io, &dwb);
+                    try dw.interface.print(
+                        \\[Desktop Entry]
+                        \\Type=Application
+                        \\Name=UTM Agent
+                        \\Comment=UTM Monitor Agent — GUI-aware exec forwarding
+                        \\Exec=bash -c "{s} --install --user; exec {s} --agent"
+                        \\Terminal=true
+                        \\Categories=Utility;
+                    , .{ svc_exe, svc_exe });
+                    try dw.interface.flush();
+                    std.debug.print("[install] Linux: desktop shortcut created: {s}\n", .{dt_path});
+                }
             },
             .windows => {
                 // Install as user-level scheduled task (runs at logon with GUI access).
@@ -270,6 +323,29 @@ pub fn installSelf(
                 } else |_| {
                     std.debug.print("[install] Windows: failed to create task — create manually:\n", .{});
                     std.debug.print("[install]   schtasks /create /tn \"{s}\" /tr \"{s}\" /sc onlogon\n", .{ task_name, task_cmd });
+                }
+
+                // Create desktop shortcut for all users (double-click to install + launch agent)
+                {
+                    const desktop = "C:\\Users\\Public\\Desktop";
+                    const bat_path = try std.fmt.allocPrint(allocator, "{s}\\UTM-Agent.bat", .{desktop});
+                    defer allocator.free(bat_path);
+
+                    std.Io.Dir.cwd().deleteFile(io, bat_path) catch {};
+                    const bat_file = try std.Io.Dir.cwd().createFile(io, bat_path, .{ .permissions = @enumFromInt(0o644) });
+                    defer bat_file.close(io);
+                    var bwb: [2048]u8 = undefined;
+                    var bw = bat_file.writer(io, &bwb);
+                    try bw.interface.print(
+                        \\@echo off
+                        \\echo Installing UTM Agent...
+                        \\"{s}" --install --user
+                        \\echo.
+                        \\echo Starting UTM Agent...
+                        \\start "UTM Agent" cmd /k "{s} --agent"
+                    , .{ svc_exe, svc_exe });
+                    try bw.interface.flush();
+                    std.debug.print("[install] Windows: desktop shortcut created: {s}\n", .{bat_path});
                 }
             },
         }
@@ -480,6 +556,11 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                         std.debug.print("[uninstall] failed to remove agent plist: {}\n", .{err});
                     }
                 };
+                // Remove desktop shortcut
+                const cmd_path = try std.fmt.allocPrint(allocator, "{s}/Desktop/UTM-Agent.command", .{home});
+                defer allocator.free(cmd_path);
+                std.Io.Dir.cwd().deleteFile(io, cmd_path) catch {};
+
                 std.debug.print("[uninstall] macOS: agent unloaded, plist removed\n", .{});
             },
             .linux => {
@@ -497,6 +578,12 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                     }
                 };
                 if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "daemon-reload" } })) |_| {} else |_| {}
+
+                // Remove desktop shortcut
+                const dt_path = try std.fmt.allocPrint(allocator, "{s}/Desktop/utmm-agent.desktop", .{home});
+                defer allocator.free(dt_path);
+                std.Io.Dir.cwd().deleteFile(io, dt_path) catch {};
+
                 std.debug.print("[uninstall] Linux: agent service stopped, unit removed\n", .{});
             },
             .windows => {
@@ -508,6 +595,11 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                 } else |_| {
                     std.debug.print("[uninstall] Windows: failed to remove task (may not exist)\n", .{});
                 }
+
+                // Remove desktop shortcut
+                const bat_path = "C:\\Users\\Public\\Desktop\\UTM-Agent.bat";
+                std.Io.Dir.cwd().deleteFile(io, bat_path) catch {};
+                std.debug.print("[uninstall] Windows: desktop shortcut removed\n", .{});
             },
         }
         std.debug.print("[uninstall] agent uninstall complete!\n", .{});
