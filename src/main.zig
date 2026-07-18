@@ -226,17 +226,21 @@ pub fn printHelp() void {
         \\  --log-file PATH     Log file path
         \\  --save-config       Save current parameters to config file
         \\
-        \\Host management commands:
+        \\Management commands (connect to persistent Host via IPC, no --host needed):
         \\  --status            Query all online guest status (with target/arch/os)
         \\  --exec TARGET CMD   Execute command on target guest (TARGET=hostname or FQDN)
         \\  --upload FILE VM    Upload a file to Guest VM (via HTTP, no curl needed)
         \\  --download VM REMOTE LOCAL  Download REMOTE from Guest VM → LOCAL file
         \\  --gen-init PLATFORM  Generate auto-start script (linux/macos/windows)
-        \\  --install           Install as system service (Guest: auto-start; Host: with --host)
+        \\  --install           Install as system service (Host: utmm --host --install)
         \\  --uninstall         Remove system service (works in both Guest and Host mode)
         \\  --mcp               Serve MCP JSON-RPC over stdio for Claude Code integration
-        \\                      (with --host: integrated mode, one process; without: IPC adapter)
+        \\                      (with --host: integrated mode; without: IPC adapter)
         \\  --version           Show version info
+        \\
+        \\NOTE: --exec/--status/--upload/--download require a running Host background
+        \\process (sudo utmm --host). Do NOT add --host to these commands — they
+        \\talk to the Host via IPC, not by starting a new listener.
         \\
     ;
     std.debug.print("{s}", .{help});
@@ -337,7 +341,7 @@ fn winServiceRun(io: std.Io, gpa: std.mem.Allocator, cli: CliArgs) !void {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const cli = try parseArgs(args);
+    var cli = try parseArgs(args);
 
     // --svc (internal): run as Windows service — must be checked before anything else
     if (cli.is_svc) {
@@ -366,6 +370,14 @@ pub fn main(init: std.process.Init) !void {
     if (cli.is_mcp and !cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_upload and !cli.cmd_download and !cli.cmd_gen_init and !cli.save_config and !cli.cmd_install and !cli.cmd_uninstall) {
         try mcp.run(init.io, init.gpa);
         return;
+    }
+
+    // Fault tolerance: --host is meaningless (and potentially confusing) when
+    // used with management commands (--exec/--status/--upload/--download).
+    // These commands always talk to the persistent Host via IPC first;
+    // --host here would misleadingly suggest "run a new host instance".
+    if (cli.cmd_exec or cli.cmd_status or cli.cmd_upload or cli.cmd_download) {
+        cli.is_host = false;
     }
 
     // --install/--uninstall work in both host and guest mode (install.zig uses cli.is_host)

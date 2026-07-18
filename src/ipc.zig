@@ -103,9 +103,27 @@ pub fn sendCommand(io: std.Io, allocator: std.mem.Allocator, command: []const u8
 /// Server: runs in a dedicated thread, accepts IPC connections.
 /// Each connection is handled in its own thread so a slow exec
 /// (e.g., Windows cmd.exe hang) doesn't block --status and other commands.
+/// Retries bind on transient port conflicts (TIME_WAIT, etc.) up to 30 seconds.
 pub fn startServer(io: std.Io, allocator: std.mem.Allocator, ctx: *anyopaque, handler: Handler) !void {
     const listen_addr = try std.Io.net.IpAddress.parse("127.0.0.1", IPC_PORT);
-    var server = try listen_addr.listen(io, .{ .reuse_address = true });
+
+    // Retry bind with backoff — port may be in TIME_WAIT from a previous instance.
+    // Without this, launchd fast-restart cycles cause the IPC server to die silently.
+    var server: std.Io.net.Server = undefined;
+    var bind_ok = false;
+    for (0..30) |attempt| {
+        server = listen_addr.listen(io, .{ .reuse_address = true }) catch |err| {
+            std.debug.print("[ipc] bind port {d} failed (attempt {d}/30): {}\n", .{ IPC_PORT, attempt + 1, err });
+            std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .real) catch {};
+            continue;
+        };
+        bind_ok = true;
+        break;
+    }
+    if (!bind_ok) {
+        std.debug.print("[ipc] FATAL: could not bind port {d} after 30 attempts\n", .{IPC_PORT});
+        return error.PortUnavailable;
+    }
     defer server.deinit(io);
 
     std.debug.print("[ipc] IPC server started on 127.0.0.1:{d}\n", .{IPC_PORT});

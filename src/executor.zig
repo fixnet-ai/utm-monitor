@@ -33,15 +33,6 @@ pub fn execRemote(
     return try allocator.dupe(u8, trimmed);
 }
 
-/// Set SO_REUSEADDR on UDP socket to share port with Host listener
-fn setReuseAddr(socket: std.Io.net.Socket) !void {
-    if (@import("builtin").os.tag == .windows) return; // Windows not supported
-    const sol_socket = std.posix.SOL.SOCKET;
-    const so_reuseaddr = std.posix.SO.REUSEADDR;
-    const one = [_]u8{1, 0, 0, 0}; // int 1 as bytes (little-endian)
-    try std.posix.setsockopt(socket.handle, sol_socket, so_reuseaddr, &one);
-}
-
 /// Resolve Guest info via UDP broadcast (send PING, wait for ANNOUNCE reply)
 /// target_name can be hostname or FQDN
 pub fn resolveGuest(
@@ -51,10 +42,11 @@ pub fn resolveGuest(
     target_name: []const u8,
 ) !protocol.GuestInfo {
     const broadcast_addr = try std.Io.net.IpAddress.parse("255.255.255.255", port);
-    const bind_addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
+    // Use ephemeral port (0) to avoid conflict with host listener on `port`.
+    // We only need to SEND to `port`; receiving ANNOUNCE replies works on any port.
+    const bind_addr = try std.Io.net.IpAddress.parse("0.0.0.0", 0);
     const socket = try bind_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true });
     defer socket.close(io);
-    try setReuseAddr(socket);
 
     // Send PING
     var msg_buf: [64]u8 = undefined;

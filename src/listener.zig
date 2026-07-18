@@ -30,10 +30,28 @@ pub const OnIpChanged = struct {
     }
 };
 
-/// Start UDP listen loop
+/// Start UDP listen loop.
+/// Retries bind on transient port conflicts up to 30 seconds.
 pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_changed: OnIpChanged) !void {
     const listen_addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
-    const socket = try listen_addr.bind(io, .{ .mode = .dgram });
+
+    // Retry bind with backoff — port may be in TIME_WAIT from a previous instance.
+    // Without this, launchd fast-restart cycles cause the host process to crash-loop.
+    var socket: std.Io.net.Socket = undefined;
+    var bind_ok = false;
+    for (0..30) |attempt| {
+        socket = listen_addr.bind(io, .{ .mode = .dgram }) catch |err| {
+            std.debug.print("[listener] bind port {d} failed (attempt {d}/30): {}\n", .{ port, attempt + 1, err });
+            std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .real) catch {};
+            continue;
+        };
+        bind_ok = true;
+        break;
+    }
+    if (!bind_ok) {
+        std.debug.print("[listener] FATAL: could not bind port {d} after 30 attempts\n", .{port});
+        return error.PortUnavailable;
+    }
     defer socket.close(io);
 
     var guests = std.StringHashMap(GuestState).init(allocator);

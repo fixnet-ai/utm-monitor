@@ -73,16 +73,24 @@ utmm --http-port 2122                     # Custom HTTP port
 
 ### Host End Runtime
 ```bash
+# ── Persistent Host (background daemon) ──
 sudo utmm --host                          # Continuous listener (needs sudo for /etc/hosts)
-utmm --host --status                      # Query all Guest status
-utmm --host --exec linuxvm "uname -a"     # Remote command execution
-utmm --host --upload file.txt linuxvm     # Upload file to Guest (no curl)
-utmm --host --download linuxvm f.txt ./f.txt  # Download file from Guest (no curl)
-utmm --host --install                     # Install as system service (Host mode: use --host --install)
+utmm --host --install                     # Install as system service (launchd/systemd/sc)
 utmm --host --uninstall                   # Remove system service
 utmm --host --serve-dir /path/to/binaries # Custom HTTP serve directory
 utmm --host --mcp                         # Integrated mode: Host + MCP in one process
+
+# ── Management Commands (talk to Host via IPC, NO --host needed) ──
+utmm --status                             # Query all Guest status
+utmm --exec linuxvm "uname -a"            # Remote command execution
+utmm --upload file.txt linuxvm            # Upload file to Guest (no curl)
+utmm --download linuxvm f.txt ./f.txt     # Download file from Guest (no curl)
 utmm --mcp                                # Adapter mode: MCP stdio → Host IPC bridge
+
+# ⚠️  Do NOT add --host to --exec/--status/--upload/--download.
+# These commands connect to the persistent Host via IPC (127.0.0.1:12347).
+# Adding --host would start a second listener that conflicts with the running Host.
+# (v0.1.22+: --host is auto-ignored when management commands are present.)
 ```
 
 ## Project File Structure
