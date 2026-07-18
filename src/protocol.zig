@@ -9,6 +9,9 @@ pub const DEFAULT_PORT: u16 = 12345;
 /// Default HTTP server port (Guest + Host)
 pub const DEFAULT_HTTP_PORT: u16 = 2121;
 
+/// Agent TCP port (Guest-side, 127.0.0.1) — forwarding target for GUI-aware exec
+pub const AGENT_PORT: u16 = 2123;
+
 /// /etc/hosts marker block
 pub const HOSTS_MARKER_BEGIN = "# UTM-MONITOR-BEGIN";
 pub const HOSTS_MARKER_END = "# UTM-MONITOR-END";

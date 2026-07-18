@@ -500,6 +500,58 @@ fn parseExecCmd(gpa: std.mem.Allocator, json: []const u8) ![]const u8 {
     return error.InvalidJson;
 }
 
+/// Try forwarding an exec command to the user-session Agent (127.0.0.1:2123).
+/// Returns the agent's response body (after OK\n) on success, or null if the
+/// agent is not running / connection fails / agent returns an error.
+fn tryForwardToAgent(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8) ?[]const u8 {
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", protocol.AGENT_PORT) catch return null;
+    const stream = addr.connect(io, .{ .mode = .stream }) catch return null;
+    defer stream.close(io);
+
+    // Send: EXEC\n<cmd>\n\n
+    {
+        var wb: [1024]u8 = undefined;
+        var writer = stream.writer(io, &wb);
+        writer.interface.print("EXEC\n{s}\n\n", .{cmd}) catch return null;
+        writer.interface.flush() catch {};
+    }
+
+    // Read response byte-by-byte until EOF
+    var resp: std.ArrayList(u8) = .empty;
+    errdefer resp.deinit(gpa);
+    {
+        var rb: [4096]u8 = undefined;
+        var reader = stream.reader(io, &rb);
+        while (true) {
+            const byte = reader.interface.takeByte() catch break;
+            resp.append(gpa, byte) catch return null;
+        }
+    }
+
+    const items = resp.items;
+    if (items.len < 3) {
+        resp.deinit(gpa);
+        return null;
+    }
+
+    if (std.mem.startsWith(u8, items, "OK\n")) {
+        const body = items[3..];
+        const result = gpa.dupe(u8, body) catch {
+            resp.deinit(gpa);
+            return null;
+        };
+        resp.deinit(gpa);
+        return result;
+    }
+
+    // Agent returned ERR or unknown — log and fall through to direct exec
+    if (std.mem.startsWith(u8, items, "ERR\n")) {
+        std.debug.print("[http-guest] agent refused: {s}\n", .{items[4..@min(items.len, 260)]});
+    }
+    resp.deinit(gpa);
+    return null;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // POST /exec — JSON command execution
 // ═══════════════════════════════════════════════════════════════════
@@ -545,6 +597,27 @@ fn handleExec(request: *http.Server.Request, io: std.Io, gpa: std.mem.Allocator)
 
     std.debug.print("[http-guest] EXEC: {s}\n", .{cmd});
 
+    // ── Try agent forwarding first (user-session exec with GUI access) ──
+    if (tryForwardToAgent(gpa, io, cmd)) |agent_output| {
+        defer gpa.free(agent_output);
+        var resp_buf: std.ArrayList(u8) = .empty;
+        defer resp_buf.deinit(gpa);
+        try resp_buf.appendSlice(gpa, "OK\n");
+        try resp_buf.appendSlice(gpa, agent_output);
+        if (agent_output.len > 0 and agent_output[agent_output.len - 1] != '\n') {
+            try resp_buf.append(gpa, '\n');
+        }
+        try resp_buf.append(gpa, '\n');
+        try request.respond(resp_buf.items, .{
+            .status = .ok,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "text/plain" },
+            },
+        });
+        return;
+    }
+
+    // ── Fallback: direct exec in service context (no GUI) ───────────
     const builtin = @import("builtin");
     const result = if (builtin.os.tag == .windows) blk: {
         // Windows: avoid std.process.run — it creates stdout/stderr pipes

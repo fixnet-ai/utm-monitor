@@ -57,6 +57,7 @@ comptime {
     _ = @import("executor.zig");
     _ = @import("ipc.zig");
     _ = @import("mcp.zig");
+    _ = @import("agent.zig");
 }
 
 /// CLI parse result
@@ -83,6 +84,8 @@ pub const CliArgs = struct {
     save_config: bool = false,
     /// Internal: run as Windows service (--svc, added by sc create)
     is_svc: bool = false,
+    /// Run as user-session Agent (Guest-side, GUI-aware exec forwarding)
+    is_agent: bool = false,
 
     // Management commands
     cmd_status: bool = false,
@@ -91,6 +94,8 @@ pub const CliArgs = struct {
     cmd_gen_init: bool = false,
     cmd_install: bool = false,
     cmd_uninstall: bool = false,
+    /// Install as user-level service (LaunchAgent / user systemd) — for --agent
+    is_user: bool = false,
     is_mcp: bool = false,
     exec_target: ?[]const u8 = null,
     exec_cmd: ?[]const u8 = null,
@@ -128,8 +133,12 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             }
         } else if (std.mem.eql(u8, arg, "--install")) {
             cli.cmd_install = true;
+        } else if (std.mem.eql(u8, arg, "--user")) {
+            cli.is_user = true;
         } else if (std.mem.eql(u8, arg, "--svc")) {
             cli.is_svc = true;
+        } else if (std.mem.eql(u8, arg, "--agent")) {
+            cli.is_agent = true;
         } else if (std.mem.eql(u8, arg, "--uninstall")) {
             cli.cmd_uninstall = true;
         } else if (std.mem.eql(u8, arg, "--upload")) {
@@ -209,6 +218,7 @@ pub fn printHelp() void {
         \\
         \\Mode selection:
         \\  --host              Run in Host mode (UDP listener + hosts management)
+        \\  --agent             Run user-session Agent (GUI-aware exec forwarding)
         \\  (no args)           Default Guest mode (UDP broadcast + HTTP server)
         \\
         \\Guest options:
@@ -232,8 +242,10 @@ pub fn printHelp() void {
         \\  --upload FILE VM    Upload a file to Guest VM (via HTTP, no curl needed)
         \\  --download VM REMOTE LOCAL  Download REMOTE from Guest VM → LOCAL file
         \\  --gen-init PLATFORM  Generate auto-start script (linux/macos/windows)
-        \\  --install           Install as system service (Host: utmm --host --install)
-        \\  --uninstall         Remove system service (works in both Guest and Host mode)
+        \\  --install           Install as system service (daemon: utmm --host --install)
+        \\  --install --user    Install agent as user auto-start (utmm --install --user)
+        \\  --uninstall         Remove system service (utmm --uninstall)
+        \\  --uninstall --user  Remove user agent auto-start (utmm --uninstall --user)
         \\  --mcp               Serve MCP JSON-RPC over stdio for Claude Code integration
         \\                      (with --host: integrated mode; without: IPC adapter)
         \\  --version           Show version info
@@ -241,6 +253,12 @@ pub fn printHelp() void {
         \\NOTE: --exec/--status/--upload/--download require a running Host background
         \\process (sudo utmm --host). Do NOT add --host to these commands — they
         \\talk to the Host via IPC, not by starting a new listener.
+        \\
+        \\Agent mode (Guest-side GUI-aware exec forwarding):
+        \\  utmm --agent         Start agent manually (opens TCP server on 127.0.0.1:2123)
+        \\  utmm --install --user  Install agent as user-level auto-start with terminal window
+        \\                          (macOS: LaunchAgent + Terminal, Linux: user systemd,
+        \\                           Windows: Task Scheduler with cmd window)
         \\
     ;
     std.debug.print("{s}", .{help});
@@ -361,6 +379,14 @@ pub fn main(init: std.process.Init) !void {
     // --help
     if (args.len > 1 and std.mem.eql(u8, args[1], "--help")) {
         printHelp();
+        return;
+    }
+
+    // --agent: run user-session Agent (TCP server for GUI-aware exec forwarding)
+    // Guest-side only — started by user-level auto-start (LaunchAgent / user systemd).
+    if (cli.is_agent) {
+        const agent = @import("agent.zig");
+        try agent.run(init.io, init.gpa);
         return;
     }
 

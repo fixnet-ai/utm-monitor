@@ -86,11 +86,11 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
         return;
     }
     if (cli.cmd_install) {
-        try install_mod.installSelf(io, gpa, cli.is_host, cli.hostname);
+        try install_mod.installSelf(io, gpa, cli.is_host, cli.hostname, cli.is_user);
         return;
     }
     if (cli.cmd_uninstall) {
-        try install_mod.uninstallSelf(io, gpa);
+        try install_mod.uninstallSelf(io, gpa, cli.is_user);
         return;
     }
     if (cli.cmd_upload) {
