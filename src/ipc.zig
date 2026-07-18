@@ -157,18 +157,16 @@ fn handleConnectionThread(
     };
 }
 
-/// Set receive timeout on a socket (cross-platform: POSIX timeval, Windows DWORD ms).
+/// Set receive timeout on a socket (Unix only — POSIX timeval via setsockopt).
 /// Best-effort — failures are silently ignored (timeout is a safety net, not critical).
+/// On Windows this is a no-op: Zig 0.16 Io abstraction doesn't expose the raw SOCKET handle.
 fn setRecvTimeout(socket: std.Io.net.Socket, timeout_secs: u32) void {
-    if (@import("builtin").os.tag == .windows) {
-        const timeout_ms: u32 = timeout_secs * 1000;
-        if (std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout_ms))) |_| {} else |_| {}
-    } else {
+    if (@import("builtin").os.tag != .windows) {
         const tv = std.posix.timeval{
-            .sec = timeout_secs,
+            .sec = @intCast(timeout_secs),
             .usec = 0,
         };
-        if (std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv))) |_| {} else |_| {}
+        _ = std.posix.setsockopt(socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
     }
 }
 
