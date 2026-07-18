@@ -291,11 +291,11 @@ The target architecture depends on your VM's actual architecture. How to query:
 
 ```bash
 # After Guest is online, query with --exec
-utmm --host --exec ubuntu "uname -m"      # aarch64 → aarch64-linux-musl
-utmm --host --exec macvm "uname -m"        # arm64  → aarch64-macos
+utmm --exec ubuntu "uname -m"      # aarch64 → aarch64-linux-musl
+utmm --exec macvm "uname -m"        # arm64  → aarch64-macos
 
 # Or check the target field in --status output
-utmm --host --status
+utmm --status
 ```
 
 ### 3.3 Obtain the Binary
@@ -407,10 +407,10 @@ Once the Guest starts, the Host can manage it remotely:
 
 ```bash
 # Background start via --exec
-utmm --host --exec ubuntu "nohup /opt/utmm/utmm &"
+utmm --exec ubuntu "nohup /opt/utmm/utmm &"
 
 # Install auto-start on boot via --exec
-utmm --host --exec ubuntu "/opt/utmm/utmm --install"
+utmm --exec ubuntu "/opt/utmm/utmm --install"
 ```
 
 #### Auto-Start on Boot Reference
@@ -419,7 +419,7 @@ utmm --host --exec ubuntu "/opt/utmm/utmm --install"
 
 ```bash
 # Execute in VM or via --exec
-utmm --host --gen-init macos
+utmm --gen-init macos
 # Generates plist content; place it in the VM's /Library/LaunchDaemons/com.utmm.plist
 # Then launchctl load /Library/LaunchDaemons/com.utmm.plist
 ```
@@ -428,7 +428,7 @@ utmm --host --gen-init macos
 
 ```bash
 # Execute in VM or via --exec
-utmm --host --gen-init linux
+utmm --gen-init linux
 # Generates unit file; place it in the VM's /etc/systemd/system/utmm.service
 # Then systemctl daemon-reload && systemctl enable --now utmm
 ```
@@ -437,7 +437,7 @@ utmm --host --gen-init linux
 
 ```bash
 # Execute in VM or via --exec
-utmm --host --gen-init windows
+utmm --gen-init windows
 # Generates script; use with schtasks to create a scheduled task:
 # schtasks /create /tn utmm /tr "C:\opt\utmm\utmm.exe" /sc ONSTART /ru SYSTEM /f
 # schtasks /run /tn utmm
@@ -478,11 +478,11 @@ grep -A 10 "UTM-MONITOR" /etc/hosts
 
 | # | Check Item | Command | Expected Result |
 |---|------------|---------|-----------------|
-| 1 | Guest process running | `utmm --host --exec ubuntu "ps aux \| grep utmm"` | Shows `/opt/utmm/utmm` process |
-| 2 | Host receiving broadcasts | `utmm --host --status` | Shows all Guests |
+| 1 | Guest process running | `utmm --exec ubuntu "ps aux \| grep utmm"` | Shows `/opt/utmm/utmm` process |
+| 2 | Host receiving broadcasts | `utmm --status` | Shows all Guests |
 | 3 | /etc/hosts synced | `grep "UTM-MONITOR" /etc/hosts` | Contains entries for 3 VMs |
-| 4 | Remote command channel | `utmm --host --exec ubuntu "uptime"` | Returns uptime |
-| 5 | HTTP service | `utmm --host --status` (shows all VMs online) | Returns guest list with versions |
+| 4 | Remote command channel | `utmm --exec ubuntu "uptime"` | Returns uptime |
+| 5 | HTTP service | `utmm --status` (shows all VMs online) | Returns guest list with versions |
 
 ---
 
@@ -511,7 +511,7 @@ Host Options:
   --config PATH          Config file path
   --log-file PATH        Log output path
 
-Host Management Commands:
+Management commands (connect to persistent Host via IPC, no --host needed):
   --status               Query online status of all Guests
   --exec TARGET CMD      Execute command on target Guest
   --upload FILE VM       Upload a file to Guest (via HTTP, no curl)
@@ -528,7 +528,7 @@ Host Management Commands:
 #### View All VM Status
 
 ```bash
-utmm --host --status
+utmm --status
 ```
 
 Example output:
@@ -547,38 +547,38 @@ If versions differ, it displays `⚠ Upgradable`, prompting you to bump ver.zig 
 
 ```bash
 # View system info
-utmm --host --exec linuxvm "uname -a"
-utmm --host --exec macvm "sw_vers"
-utmm --host --exec windowsvm "ver"
+utmm --exec linuxvm "uname -a"
+utmm --exec macvm "sw_vers"
+utmm --exec windowsvm "ver"
 
 # View load
-utmm --host --exec linuxvm "uptime"
+utmm --exec linuxvm "uptime"
 
 # View processes
-utmm --host --exec macvm "ps aux | head -5"
+utmm --exec macvm "ps aux | head -5"
 
 # Execute complex commands
-utmm --host --exec linuxvm "df -h && free -m"
+utmm --exec linuxvm "df -h && free -m"
 ```
 
 #### Transfer Files via HTTP
 
 ```bash
 # Upload a file to Guest (built-in, no curl required)
-utmm --host --upload ./local_file linuxvm
+utmm --upload ./local_file linuxvm
 
 # Download a file from Guest
-utmm --host --download linuxvm remote_file ./local_file
+utmm --download linuxvm remote_file ./local_file
 ```
 
 > **Important**: Both `--upload` and `--download` are limited to the Guest's `/opt/utmm/` directory (`C:\opt\utmm\` on Windows). The filename must be a **simple name without path separators** (`/` or `\`). For example:
-> - ✅ `utmm --host --download linuxvm app.log ./app.log`
-> - ❌ `utmm --host --download linuxvm /var/log/app.log ./app.log` (full path — returns error)
+> - ✅ `utmm --download linuxvm app.log ./app.log`
+> - ❌ `utmm --download linuxvm /var/log/app.log ./app.log` (full path — returns error)
 >
 > To get files from outside `/opt/utmm/`, use `--exec` to copy them first:
 > ```bash
-> utmm --host --exec linuxvm "cp /var/log/syslog /opt/utmm/syslog.log"
-> utmm --host --download linuxvm syslog.log ./syslog.log
+> utmm --exec linuxvm "cp /var/log/syslog /opt/utmm/syslog.log"
+> utmm --download linuxvm syslog.log ./syslog.log
 > ```
 >
 > **Under the hood**: `--upload` uses HTTP POST `/upload` with multipart/form-data; `--download` uses HTTP GET `/bin/:filename`. Both use `std.http.Client` — zero external dependencies. All transfers include MD5 ETag headers for integrity verification; mismatched files are rejected and deleted.
@@ -600,7 +600,7 @@ The Host automatically upgrades any Guest whose version doesn't match. No Guest 
 #### Check Guest Logs
 
 ```bash
-utmm --host --exec ubuntu "tail -20 /opt/utmm/utmm.log"
+utmm --exec ubuntu "tail -20 /opt/utmm/utmm.log"
 ```
 
 #### Force Sync /etc/hosts
@@ -694,10 +694,10 @@ git push origin v0.1.0
 
 ```bash
 # 1. Check if Guest process is running
-utmm --host --exec ubuntu "ps aux | grep utmm"
+utmm --exec ubuntu "ps aux | grep utmm"
 
 # 2. Check Guest logs to confirm broadcasts are being sent
-utmm --host --exec ubuntu "tail -5 /opt/utmm/utmm.log"
+utmm --exec ubuntu "tail -5 /opt/utmm/utmm.log"
 # Normal log line: [broadcast] Broadcast: linuxvm → 192.168.64.2
 
 # 3. Check if the Guest's displayed IP is the correct physical NIC IP
@@ -786,11 +786,11 @@ grep link_libc build.zig
 **Solution**:
 ```bash
 # 1. Use --exec to terminate the locking process
-utmm --host --exec linuxvm "pkill utmm"
+utmm --exec linuxvm "pkill utmm"
 
 # 2. Re-upload and restart
-utmm --host --upload ./new_binary linuxvm
-utmm --host --exec linuxvm "/opt/utmm/utmm &"
+utmm --upload ./new_binary linuxvm
+utmm --exec linuxvm "/opt/utmm/utmm &"
 ```
 
 **Advanced**: Auto-upgrade uploads via HTTP as a `.next` temporary file. The Guest uses a cross-platform safe rename strategy: (1) rename old binary away (`utmm` → `utmm.old`), (2) rename new binary into place (`utmm.next` → `utmm`), (3) spawn restart script that cleans up `.old`, (4) macOS: clear quarantine xattr. Works on Linux (directory VFS op), macOS (new inode avoids SIP), Windows (rename but not overwrite of running exe):
@@ -805,8 +805,8 @@ bump ver.zig && zig build  # auto-upgrade handles the rest
 **Diagnosis**:
 ```bash
 # Verify the file exists and has content on the Guest
-utmm --host --exec linuxvm "ls -la /opt/utmm/myfile.txt"
-utmm --host --exec linuxvm "cat /opt/utmm/myfile.txt"
+utmm --exec linuxvm "ls -la /opt/utmm/myfile.txt"
+utmm --exec linuxvm "cat /opt/utmm/myfile.txt"
 
 # Verify Guest HTTP server serves it correctly (from Host)
 curl -s "http://192.168.64.2:2121/bin/myfile.txt"
@@ -942,19 +942,19 @@ All Linux binaries are statically linked against musl — no glibc version depen
 
 ```bash
 # View VM architecture
-utmm --host --exec ubuntu "uname -m"
+utmm --exec ubuntu "uname -m"
 
 # View all network interfaces on VM
-utmm --host --exec ubuntu "ip addr show"
+utmm --exec ubuntu "ip addr show"
 
 # View Guest broadcast logs
-utmm --host --exec ubuntu "head -5 /opt/utmm/utmm.log"
+utmm --exec ubuntu "head -5 /opt/utmm/utmm.log"
 
 # Capture packets to verify broadcasts
 sudo tcpdump -i any port 12345 -n -c 10
 
 # Verify Guest is online (via Host status)
-utmm --host --status
+utmm --status
 
 # View Host listener
 ps aux | grep "utmm --host"
@@ -1242,8 +1242,8 @@ chmod +x /tmp/test.sh && /tmp/test.sh")
 
 | Scenario | Use |
 |----------|-----|
-| Quick status check | `utmm --host --status` |
-| One-shot command | `utmm --host --exec linuxvm "..."` |
+| Quick status check | `utmm --status` |
+| One-shot command | `utmm --exec linuxvm "..."` |
 | Interactive debugging | Claude Code with MCP tools |
 | Multi-step testing across VMs | Claude Code with MCP tools |
 | Deploy-test-verify loop | Claude Code with MCP tools |

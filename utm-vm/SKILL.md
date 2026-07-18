@@ -131,8 +131,8 @@ sudo utmm --host
 
 **Fallback:** If MCP tools are unavailable, you can use the CLI directly:
 ```bash
-utmm --host --status
-utmm --host --exec linuxvm "uname -a"
+utmm --status
+utmm --exec linuxvm "uname -a"
 ```
 
 ## Host Paths
@@ -189,9 +189,9 @@ chmod +x /opt/utmm/utmm
 **A**: This happens when you use a full path like `/opt/utmm/file.txt` instead of just the filename `file.txt`. The `/bin/` endpoint only accepts simple filenames (no `/` or `\`) and only reads from `/opt/utmm/` on the Guest. Use just the basename:
 ```
 # Wrong:
-utmm --host --download linuxvm /opt/utmm/app.log ./app.log
+utmm --download linuxvm /opt/utmm/app.log ./app.log
 # Correct:
-utmm --host --download linuxvm app.log ./app.log
+utmm --download linuxvm app.log ./app.log
 ```
 To download files from other directories, use `--exec` to copy them to `/opt/utmm/` first.
 
