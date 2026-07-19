@@ -15,6 +15,78 @@ const config_mod = @import("config.zig");
 const ipc = @import("ipc.zig");
 const mcp = @import("mcp.zig");
 const http_client = @import("http_client.zig");
+const builtin = @import("builtin");
+
+/// Try to start the Host daemon service, then wait for its IPC port to become ready.
+/// Returns true if the Host is now running (IPC port accepting connections).
+/// On failure prints instructions and returns false — caller should fall back to direct mode.
+fn tryStartHostService(io: std.Io, gpa: std.mem.Allocator) bool {
+    std.debug.print("[host] Host daemon is not running.\n", .{});
+
+    if (builtin.os.tag == .windows) {
+        const check = std.process.run(gpa, io, .{
+            .argv = &.{ "sc", "query", "UTM-Monitor" },
+        }) catch {
+            std.debug.print("[host] Host service is not installed.\n", .{});
+            std.debug.print("[host] Install first: utmm --host --install\n", .{});
+            std.debug.print("[host] Then start: sc start UTM-Monitor\n", .{});
+            return false;
+        };
+        _ = check;
+
+        std.debug.print("[host] Starting Host service (sc start)...\n", .{});
+        _ = std.process.run(gpa, io, .{
+            .argv = &.{ "sc", "start", "UTM-Monitor" },
+        }) catch {};
+    } else if (builtin.os.tag == .macos) {
+        const plist_path = "/Library/LaunchDaemons/com.utmm.plist";
+        const check = std.Io.Dir.cwd().openFile(io, plist_path, .{}) catch {
+            std.debug.print("[host] Host service is not installed.\n", .{});
+            std.debug.print("[host] Install first: sudo utmm --host --install\n", .{});
+            std.debug.print("[host] Then start: sudo launchctl load {s}\n", .{plist_path});
+            return false;
+        };
+        check.close(io);
+
+        std.debug.print("[host] Starting Host service (sudo launchctl load)...\n", .{});
+        _ = std.process.run(gpa, io, .{
+            .argv = &.{ "sudo", "launchctl", "load", plist_path },
+        }) catch {};
+    } else {
+        const unit_path = "/etc/systemd/system/utmm.service";
+        const check = std.Io.Dir.cwd().openFile(io, unit_path, .{}) catch {
+            std.debug.print("[host] Host service is not installed.\n", .{});
+            std.debug.print("[host] Install first: sudo utmm --host --install\n", .{});
+            std.debug.print("[host] Then start: sudo systemctl start utmm\n", .{});
+            return false;
+        };
+        check.close(io);
+
+        std.debug.print("[host] Starting Host service (sudo systemctl start)...\n", .{});
+        _ = std.process.run(gpa, io, .{
+            .argv = &.{ "sudo", "systemctl", "start", "utmm" },
+        }) catch {};
+    }
+
+    // Poll IPC port until it accepts connections (max 10 seconds)
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", ipc.IPC_PORT) catch return false;
+    var ready = false;
+    for (0..20) |_| {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .real) catch {};
+        if (addr.connect(io, .{ .mode = .stream })) |stream| {
+            stream.close(io);
+            ready = true;
+            break;
+        } else |_| {}
+    }
+
+    if (ready) {
+        std.debug.print("[host] Host is ready.\n", .{});
+    } else {
+        std.debug.print("[host] Host did not start in time.\n", .{});
+    }
+    return ready;
+}
 
 /// Host mode entry point (from std.process.Init)
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
@@ -27,8 +99,14 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
     // ── Management commands: forward via IPC to running Host ────
     if (cli.cmd_status) {
         ipc.sendCommand(io, gpa, "STATUS") catch {
-            // Host not running, fallback to direct UDP listen mode
-            try status_mod.queryStatus(io, gpa, cli.port);
+            // Host not running — try auto-start, then retry IPC
+            if (tryStartHostService(io, gpa)) {
+                ipc.sendCommand(io, gpa, "STATUS") catch {
+                    try status_mod.queryStatus(io, gpa, cli.port);
+                };
+            } else {
+                try status_mod.queryStatus(io, gpa, cli.port);
+            }
         };
         return;
     }
@@ -49,27 +127,35 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
         defer gpa.free(cmd);
 
         ipc.sendCommand(io, gpa, cmd) catch {
-            // Host not running, fallback to direct UDP PING + TCP exec
-            std.debug.print("[exec] Querying target {s}...\n", .{target_name});
-            const target_info = executor.resolveGuest(io, gpa, cli.port, target_name) catch |err| {
-                std.debug.print("[exec] Guest {s} not found: {}\n", .{ target_name, err });
-                return;
-            };
-            defer {
-                gpa.free(target_info.hostname);
-                gpa.free(target_info.ip);
-                gpa.free(target_info.target);
-                gpa.free(target_info.mac);
-                gpa.free(target_info.version);
-            }
+            // Host not running — try auto-start, then retry IPC
+            if (tryStartHostService(io, gpa)) {
+                ipc.sendCommand(io, gpa, cmd) catch |err2| {
+                    std.debug.print("[exec] IPC failed after starting host: {}\n", .{err2});
+                    return;
+                };
+            } else {
+                // Host not installed, fallback to direct UDP PING + TCP exec
+                std.debug.print("[exec] Querying target {s}...\n", .{target_name});
+                const target_info = executor.resolveGuest(io, gpa, cli.port, target_name) catch |err| {
+                    std.debug.print("[exec] Guest {s} not found: {}\n", .{ target_name, err });
+                    return;
+                };
+                defer {
+                    gpa.free(target_info.hostname);
+                    gpa.free(target_info.ip);
+                    gpa.free(target_info.target);
+                    gpa.free(target_info.mac);
+                    gpa.free(target_info.version);
+                }
 
-            std.debug.print("[exec] Connecting to {s} ({s}:{d})\n", .{ target_info.hostname, target_info.ip, target_info.http_port });
-            const result = executor.execRemote(io, gpa, target_info.ip, target_info.http_port, exec_cmd) catch |err| {
-                std.debug.print("[exec] Execution failed: {}\n", .{err});
-                return;
-            };
-            defer gpa.free(result);
-            std.debug.print("{s}\n", .{result});
+                std.debug.print("[exec] Connecting to {s} ({s}:{d})\n", .{ target_info.hostname, target_info.ip, target_info.http_port });
+                const result = executor.execRemote(io, gpa, target_info.ip, target_info.http_port, exec_cmd) catch |err| {
+                    std.debug.print("[exec] Execution failed: {}\n", .{err});
+                    return;
+                };
+                defer gpa.free(result);
+                std.debug.print("{s}\n", .{result});
+            }
         };
         return;
     }
@@ -108,26 +194,34 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
         defer gpa.free(cmd);
 
         ipc.sendCommand(io, gpa, cmd) catch {
-            std.debug.print("[upload] Resolving {s}...\n", .{target_name});
-            const target_info = executor.resolveGuest(io, gpa, cli.port, target_name) catch |err| {
-                std.debug.print("[upload] Guest {s} not found: {}\n", .{ target_name, err });
-                return;
-            };
-            defer {
-                gpa.free(target_info.hostname);
-                gpa.free(target_info.ip);
-                gpa.free(target_info.target);
-                gpa.free(target_info.mac);
-                gpa.free(target_info.version);
-            }
+            // Host not running — try auto-start, then retry IPC
+            if (tryStartHostService(io, gpa)) {
+                ipc.sendCommand(io, gpa, cmd) catch |err2| {
+                    std.debug.print("[upload] IPC failed after starting host: {}\n", .{err2});
+                    return;
+                };
+            } else {
+                std.debug.print("[upload] Resolving {s}...\n", .{target_name});
+                const target_info = executor.resolveGuest(io, gpa, cli.port, target_name) catch |err| {
+                    std.debug.print("[upload] Guest {s} not found: {}\n", .{ target_name, err });
+                    return;
+                };
+                defer {
+                    gpa.free(target_info.hostname);
+                    gpa.free(target_info.ip);
+                    gpa.free(target_info.target);
+                    gpa.free(target_info.mac);
+                    gpa.free(target_info.version);
+                }
 
-            const remote_name = std.fs.path.basename(local_file);
-            std.debug.print("[upload] Uploading {s} → {s} ({s}:{d})...\n", .{ local_file, target_info.hostname, target_info.ip, target_info.http_port });
-            const bytes = http_client.uploadFile(io, gpa, target_info.ip, target_info.http_port, local_file, remote_name) catch |err| {
-                std.debug.print("[upload] Upload failed: {}\n", .{err});
-                return;
-            };
-            std.debug.print("[upload] OK — {d} bytes written to /opt/utmm/{s} on {s}\n", .{ bytes, remote_name, target_info.hostname });
+                const remote_name = std.fs.path.basename(local_file);
+                std.debug.print("[upload] Uploading {s} → {s} ({s}:{d})...\n", .{ local_file, target_info.hostname, target_info.ip, target_info.http_port });
+                const bytes = http_client.uploadFile(io, gpa, target_info.ip, target_info.http_port, local_file, remote_name) catch |err| {
+                    std.debug.print("[upload] Upload failed: {}\n", .{err});
+                    return;
+                };
+                std.debug.print("[upload] OK — {d} bytes written to /opt/utmm/{s} on {s}\n", .{ bytes, remote_name, target_info.hostname });
+            }
         };
         return;
     }
@@ -147,25 +241,33 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
         defer gpa.free(cmd);
 
         ipc.sendCommand(io, gpa, cmd) catch {
-            std.debug.print("[download] Resolving {s}...\n", .{target_name});
-            const target_info = executor.resolveGuest(io, gpa, cli.port, target_name) catch |err| {
-                std.debug.print("[download] Guest {s} not found: {}\n", .{ target_name, err });
-                return;
-            };
-            defer {
-                gpa.free(target_info.hostname);
-                gpa.free(target_info.ip);
-                gpa.free(target_info.target);
-                gpa.free(target_info.mac);
-                gpa.free(target_info.version);
-            }
+            // Host not running — try auto-start, then retry IPC
+            if (tryStartHostService(io, gpa)) {
+                ipc.sendCommand(io, gpa, cmd) catch |err2| {
+                    std.debug.print("[download] IPC failed after starting host: {}\n", .{err2});
+                    return;
+                };
+            } else {
+                std.debug.print("[download] Resolving {s}...\n", .{target_name});
+                const target_info = executor.resolveGuest(io, gpa, cli.port, target_name) catch |err| {
+                    std.debug.print("[download] Guest {s} not found: {}\n", .{ target_name, err });
+                    return;
+                };
+                defer {
+                    gpa.free(target_info.hostname);
+                    gpa.free(target_info.ip);
+                    gpa.free(target_info.target);
+                    gpa.free(target_info.mac);
+                    gpa.free(target_info.version);
+                }
 
-            std.debug.print("[download] Downloading {s} from {s} ({s}:{d}) → {s}...\n", .{ remote_file, target_info.hostname, target_info.ip, target_info.http_port, local_path });
-            const bytes = http_client.downloadFile(io, gpa, target_info.ip, target_info.http_port, remote_file, local_path) catch |err| {
-                std.debug.print("[download] Download failed: {}\n", .{err});
-                return;
-            };
-            std.debug.print("[download] OK — {d} bytes saved to {s}\n", .{ bytes, local_path });
+                std.debug.print("[download] Downloading {s} from {s} ({s}:{d}) → {s}...\n", .{ remote_file, target_info.hostname, target_info.ip, target_info.http_port, local_path });
+                const bytes = http_client.downloadFile(io, gpa, target_info.ip, target_info.http_port, remote_file, local_path) catch |err| {
+                    std.debug.print("[download] Download failed: {}\n", .{err});
+                    return;
+                };
+                std.debug.print("[download] OK — {d} bytes saved to {s}\n", .{ bytes, local_path });
+            }
         };
         return;
     }

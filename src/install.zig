@@ -151,12 +151,15 @@ pub fn installSelf(
                 {
                     const desktop = try std.fmt.allocPrint(allocator, "{s}/Desktop", .{home});
                     defer allocator.free(desktop);
-                    const cmd_path = try std.fmt.allocPrint(allocator, "{s}/UTMM-Guest.command", .{desktop});
+                    const cmd_path = try std.fmt.allocPrint(allocator, "{s}/UTMM.command", .{desktop});
                     defer allocator.free(cmd_path);
-                    // Also clean up old name from versions before v0.1.24
-                    const old_cmd_path = try std.fmt.allocPrint(allocator, "{s}/UTMM-Agent.command", .{desktop});
-                    defer allocator.free(old_cmd_path);
-                    std.Io.Dir.cwd().deleteFile(io, old_cmd_path) catch {};
+                    // Also clean up old names from previous versions
+                    const old_agent = try std.fmt.allocPrint(allocator, "{s}/UTMM-Agent.command", .{desktop});
+                    defer allocator.free(old_agent);
+                    std.Io.Dir.cwd().deleteFile(io, old_agent) catch {};
+                    const old_guest = try std.fmt.allocPrint(allocator, "{s}/UTMM-Guest.command", .{desktop});
+                    defer allocator.free(old_guest);
+                    std.Io.Dir.cwd().deleteFile(io, old_guest) catch {};
 
                     std.Io.Dir.cwd().createDir(io, desktop, @enumFromInt(0o755)) catch {};
                     std.Io.Dir.cwd().deleteFile(io, cmd_path) catch {};
@@ -193,12 +196,15 @@ pub fn installSelf(
                 {
                     const desktop = try std.fmt.allocPrint(allocator, "{s}/Desktop", .{home});
                     defer allocator.free(desktop);
-                    const dt_path = try std.fmt.allocPrint(allocator, "{s}/utmm-guest.desktop", .{desktop});
+                    const dt_path = try std.fmt.allocPrint(allocator, "{s}/utmm.desktop", .{desktop});
                     defer allocator.free(dt_path);
                     // Also clean up old name from versions before v0.1.24
                     const old_dt_path = try std.fmt.allocPrint(allocator, "{s}/utmm-agent.desktop", .{desktop});
                     defer allocator.free(old_dt_path);
                     std.Io.Dir.cwd().deleteFile(io, old_dt_path) catch {};
+                    const old_guest_dt = try std.fmt.allocPrint(allocator, "{s}/utmm-guest.desktop", .{desktop});
+                    defer allocator.free(old_guest_dt);
+                    std.Io.Dir.cwd().deleteFile(io, old_guest_dt) catch {};
 
                     std.Io.Dir.cwd().createDir(io, desktop, @enumFromInt(0o755)) catch {};
                     std.Io.Dir.cwd().deleteFile(io, dt_path) catch {};
@@ -209,8 +215,8 @@ pub fn installSelf(
                     try dw.interface.print(
                         \\[Desktop Entry]
                         \\Type=Application
-                        \\Name=UTMM Guest
-                        \\Comment=UTMM Monitor — foreground guest (GUI-aware exec forwarding)
+                        \\Name=UTMM
+                        \\Comment=UTMM Monitor — foreground guest
                         \\Exec=bash -c "exec {s}"
                         \\Terminal=true
                         \\Categories=Utility;
@@ -450,13 +456,12 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                 if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", gui_target, plist_path } })) |_| {} else |_| {}
                 std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
 
-                // Remove desktop shortcuts (both old and new names)
-                const old_cmd = try std.fmt.allocPrint(allocator, "{s}/Desktop/UTMM-Agent.command", .{home});
-                defer allocator.free(old_cmd);
-                std.Io.Dir.cwd().deleteFile(io, old_cmd) catch {};
-                const new_cmd = try std.fmt.allocPrint(allocator, "{s}/Desktop/UTMM-Guest.command", .{home});
-                defer allocator.free(new_cmd);
-                std.Io.Dir.cwd().deleteFile(io, new_cmd) catch {};
+                // Remove desktop shortcuts (all historical names)
+                for ([_][]const u8{ "UTMM-Agent.command", "UTMM-Guest.command", "UTMM.command" }) |name| {
+                    const path = try std.fmt.allocPrint(allocator, "{s}/Desktop/{s}", .{ home, name });
+                    defer allocator.free(path);
+                    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+                }
 
                 // Kill any running guest
                 if (std.process.run(allocator, io, .{ .argv = &.{ "pkill", "-9", "-f", "utmm" } })) |_| {} else |_| {}
@@ -474,13 +479,12 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                 std.Io.Dir.cwd().deleteFile(io, service_path) catch {};
                 if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "daemon-reload" } })) |_| {} else |_| {}
 
-                // Remove desktop shortcuts (both old and new names)
-                const old_dt = try std.fmt.allocPrint(allocator, "{s}/Desktop/utmm-agent.desktop", .{home});
-                defer allocator.free(old_dt);
-                std.Io.Dir.cwd().deleteFile(io, old_dt) catch {};
-                const new_dt = try std.fmt.allocPrint(allocator, "{s}/Desktop/utmm-guest.desktop", .{home});
-                defer allocator.free(new_dt);
-                std.Io.Dir.cwd().deleteFile(io, new_dt) catch {};
+                // Remove desktop shortcuts (all historical names)
+                for ([_][]const u8{ "utmm-agent.desktop", "utmm-guest.desktop", "utmm.desktop" }) |name| {
+                    const path = try std.fmt.allocPrint(allocator, "{s}/Desktop/{s}", .{ home, name });
+                    defer allocator.free(path);
+                    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+                }
 
                 // Kill any running guest
                 if (std.process.run(allocator, io, .{ .argv = &.{ "pkill", "-9", "-f", "utmm" } })) |_| {} else |_| {}
