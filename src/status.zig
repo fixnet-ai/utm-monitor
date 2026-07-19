@@ -70,7 +70,7 @@ pub fn queryStatus(io: std.Io, allocator: std.mem.Allocator, port: u16) !void {
                 allocator.free(info.target);
                 allocator.free(info.mac);
                 allocator.free(info.version);
-                allocator.free(info.shell);
+                if (info.shell.len > 0) allocator.free(info.shell);
             }
         }
     }

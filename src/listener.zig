@@ -63,7 +63,7 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
             allocator.free(entry.value_ptr.target);
             allocator.free(entry.value_ptr.mac);
             allocator.free(entry.value_ptr.version);
-            allocator.free(entry.value_ptr.shell);
+            if (entry.value_ptr.shell.len > 0) allocator.free(entry.value_ptr.shell);
         }
         guests.deinit();
     }

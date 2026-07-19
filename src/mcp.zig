@@ -220,7 +220,7 @@ fn discoverAndStatus(block_io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
             gpa.free(info.target);
             gpa.free(info.mac);
             gpa.free(info.version);
-            gpa.free(info.shell);
+            if (info.shell.len > 0) gpa.free(info.shell);
         }
 
         const src_ip = switch (msg_result.from) {
@@ -291,7 +291,7 @@ fn execOnGuest(block_io: std.Io, gpa: std.mem.Allocator, target: []const u8, cmd
                 gpa.free(info.target);
                 gpa.free(info.mac);
                 gpa.free(info.version);
-                gpa.free(info.shell);
+                if (info.shell.len > 0) gpa.free(info.shell);
             }
 
             if (std.mem.eql(u8, info.hostname, target)) {

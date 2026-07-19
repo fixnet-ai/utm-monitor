@@ -80,7 +80,7 @@ pub const GuestInfo = struct {
     target: []const u8, // Zig target triplet: aarch64-linux, x86_64-windows, ...
     mac: []const u8, // Physical NIC MAC
     version: []const u8 = VERSION,
-    shell: []const u8 = "/bin/sh", // Detected shell binary (e.g. /bin/zsh, cmd.exe)
+    shell: []const u8 = "", // Detected shell binary (e.g. /bin/zsh, cmd.exe) — always heap after parse()
 
     /// Build FQDN for /etc/hosts: <hostname>.<target>.utm
     pub fn fqdn(self: GuestInfo, allocator: std.mem.Allocator) ![]const u8 {
@@ -122,6 +122,8 @@ pub const GuestInfo = struct {
             }
         }
 
+        // Note: shell stays "" if not present in ANNOUNCE (old Guest).
+        // Callers must check info.shell.len > 0 and apply their own fallback.
         return info;
     }
 };
@@ -176,12 +178,14 @@ test "GuestInfo.parse" {
         allocator.free(info.target);
         allocator.free(info.mac);
         allocator.free(info.version);
+        if (info.shell.len > 0) allocator.free(info.shell);
     }
 
     try std.testing.expectEqualStrings("testvm", info.hostname);
     try std.testing.expectEqualStrings("aarch64-linux", info.target);
     try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", info.mac);
     try std.testing.expectEqualStrings("192.168.1.100", info.ip);
+    try std.testing.expectEqualStrings("", info.shell); // empty when ANNOUNCE has no shell: line
 }
 
 test "GuestInfo.fqdn" {

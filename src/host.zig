@@ -75,15 +75,24 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
         return config_mod.saveConfig(block_io, gpa, cfg, cli.config_path orelse "utmm.conf");
     }
 
+    // Default serve_dir to exe directory if not specified (needed for auto-upgrade)
+    const serve_dir = if (cli.serve_dir) |sd| sd else blk: {
+        const exe_path = try std.process.executablePathAlloc(block_io, gpa);
+        defer gpa.free(exe_path);
+        const dir = std.fs.path.dirname(exe_path) orelse "/opt/utmm";
+        break :blk try gpa.dupe(u8, dir);
+    };
+    defer if (cli.serve_dir == null) gpa.free(serve_dir);
+
     // --host --mcp: integrated mode (Host daemon + MCP in one process)
     if (cli.is_host and cli.is_mcp) {
-        try runHostDaemon(block_io, gpa, cli.port, cli.hosts_file, cli.serve_dir, true);
+        try runHostDaemon(block_io, gpa, cli.port, cli.hosts_file, serve_dir, true);
         return;
     }
 
     // --host: daemon mode
     if (cli.is_host) {
-        try runHostDaemon(block_io, gpa, cli.port, cli.hosts_file, cli.serve_dir, false);
+        try runHostDaemon(block_io, gpa, cli.port, cli.hosts_file, serve_dir, false);
         return;
     }
 
@@ -474,7 +483,7 @@ fn processAnnounce(
         gpa.free(info.target);
         gpa.free(info.mac);
         gpa.free(info.version);
-        gpa.free(info.shell);
+        if (info.shell.len > 0) gpa.free(info.shell);
     }
 
     // Extract source IP from UDP packet
@@ -492,16 +501,12 @@ fn processAnnounce(
         const ip_changed = !std.mem.eql(u8, existing.ip, actual_ip);
         const ver_changed = !std.mem.eql(u8, existing.version, info.version);
 
-        if (ip_changed) {
-            std.debug.print("[host] ⚡ IP changed: {s}  {s} → {s}\n", .{ info.hostname, existing.ip, actual_ip });
-            gpa.free(existing.ip);
-            existing.ip = try gpa.dupe(u8, actual_ip);
-            try syncHostsFile(gpa, io, hosts_path, guests);
-        }
+        var needs_sync = ip_changed;
 
         if (ver_changed) {
             gpa.free(existing.version);
             existing.version = try gpa.dupe(u8, info.version);
+            needs_sync = true;
         }
 
         // Update shell if changed (guest may have been reinstalled with different shell)
@@ -509,6 +514,11 @@ fn processAnnounce(
         if (!std.mem.eql(u8, existing.shell, shell)) {
             gpa.free(existing.shell);
             existing.shell = try gpa.dupe(u8, shell);
+            needs_sync = true;
+        }
+
+        if (needs_sync) {
+            try syncHostsFile(gpa, io, hosts_path, guests);
         }
 
         const host_version_mismatch = !std.mem.eql(u8, info.version, protocol.VERSION);
@@ -590,57 +600,116 @@ fn readGuestStateFile(io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, STATE_FILE, gpa, @enumFromInt(64 * 1024));
 }
 
+const AutoUpgradeArgs = struct {
+    serve_dir: []const u8,
+    hostname: []const u8,
+    ip: []const u8,
+    port: u16,
+};
+
 fn spawnAutoUpgrade(
-    io: std.Io,
+    _: std.Io,
     gpa: std.mem.Allocator,
     serve_dir: []const u8,
     hostname: []const u8,
     ip: []const u8,
     port: u16,
 ) !void {
-    // Determine the binary filename for the guest's target
-    // The serve_dir contains files like utmm-aarch64-linux, utmm-aarch64-macos, utmm-aarch64-windows.exe
-    // We need to find the right one for this guest. Since we don't have the target triple
-    // in this function, we try reading all guest state file entries to find the target.
-    const target = try lookupGuestTargetInStateFile(io, gpa, hostname);
+    // Clone data for background thread (runs its own zio Runtime)
+    const args = try gpa.create(AutoUpgradeArgs);
+    args.serve_dir = try gpa.dupe(u8, serve_dir);
+    args.hostname = try gpa.dupe(u8, hostname);
+    args.ip = try gpa.dupe(u8, ip);
+    args.port = port;
+
+    const thread = try std.Thread.spawn(.{}, doAutoUpgrade, .{gpa, args});
+    thread.detach();
+}
+
+fn doAutoUpgrade(gpa: std.mem.Allocator, args: *AutoUpgradeArgs) !void {
+    defer {
+        gpa.free(args.serve_dir);
+        gpa.free(args.hostname);
+        gpa.free(args.ip);
+        gpa.destroy(args);
+    }
+
+    // Blocking I/O for file reads in background thread
+    const block_io = std.Io.Threaded.global_single_threaded.io();
+
+    // Read state file for target
+    const state_data = std.Io.Dir.cwd().readFileAlloc(block_io, STATE_FILE, gpa, @enumFromInt(64 * 1024)) catch |err| {
+        std.debug.print("[upgrade] Cannot read state for {s}: {}\n", .{ args.hostname, err });
+        return;
+    };
+    defer gpa.free(state_data);
+
+    const target = blk: {
+        var lines = std.mem.splitSequence(u8, state_data, "\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var fields = std.mem.splitSequence(u8, line, "\t");
+            const h = fields.next() orelse continue;
+            const t = fields.next() orelse continue;
+            if (std.mem.eql(u8, h, args.hostname)) {
+                break :blk try gpa.dupe(u8, t);
+            }
+        }
+        std.debug.print("[upgrade] Guest {s} not in state file, skipping\n", .{args.hostname});
+        return;
+    };
     defer gpa.free(target);
 
-    const bin_name = try std.fmt.allocPrint(gpa, "utmm-{s}", .{target});
-    defer gpa.free(bin_name);
+    const bin_name = protocol.deploymentFilename(target) orelse {
+        std.debug.print("[upgrade] Unknown target {s} for {s}, skipping\n", .{ target, args.hostname });
+        return;
+    };
 
-    // Read the new binary from serve_dir
-    const serve_path = try std.fs.path.join(gpa, &.{ serve_dir, bin_name });
+    const serve_path = std.fs.path.join(gpa, &.{ args.serve_dir, bin_name }) catch |err| {
+        std.debug.print("[upgrade] Path join error: {}\n", .{err});
+        return;
+    };
     defer gpa.free(serve_path);
 
-    std.debug.print("[upgrade] Reading {s} for {s}\n", .{ serve_path, hostname });
-    const bin_data = std.Io.Dir.cwd().readFileAlloc(io, serve_path, gpa, @enumFromInt(50 * 1024 * 1024)) catch |err| {
+    std.debug.print("[upgrade] Reading {s} for {s}\n", .{ serve_path, args.hostname });
+    const bin_data = std.Io.Dir.cwd().readFileAlloc(block_io, serve_path, gpa, @enumFromInt(50 * 1024 * 1024)) catch |err| {
         std.debug.print("[upgrade] Cannot read {s}: {}\n", .{ serve_path, err });
         return;
     };
     defer gpa.free(bin_data);
 
     // Build upload payload: "utmm.next\0<binary data>"
-    const upload_payload = try gpa.alloc(u8, "utmm.next".len + 1 + bin_data.len);
+    const upload_name: []const u8 = if (std.mem.indexOf(u8, target, "windows") != null) "utmm.next.exe" else "utmm.next";
+    const upload_payload = try gpa.alloc(u8, upload_name.len + 1 + bin_data.len);
     defer gpa.free(upload_payload);
-    @memcpy(upload_payload[0.."utmm.next".len], "utmm.next");
-    upload_payload["utmm.next".len] = 0;
-    @memcpy(upload_payload["utmm.next".len + 1 ..], bin_data);
+    @memcpy(upload_payload[0..upload_name.len], upload_name);
+    upload_payload[upload_name.len] = 0;
+    @memcpy(upload_payload[upload_name.len + 1 ..], bin_data);
 
-    // zio Runtime for async TCP
-    var rt = try zio.Runtime.init(gpa, .{});
+    // zio Runtime for async TCP (background thread — safe to create its own)
+    var rt = zio.Runtime.init(gpa, .{}) catch |err| {
+        std.debug.print("[upgrade] Runtime init error: {}\n", .{err});
+        return;
+    };
     defer rt.deinit();
 
-    const addr = try zio.net.IpAddress.parseIp(ip, port);
+    const addr = zio.net.IpAddress.parseIp(args.ip, args.port) catch |err| {
+        std.debug.print("[upgrade] Parse error: {}\n", .{err});
+        return;
+    };
     var stream = addr.connect(.{ .timeout = zio.Timeout.fromSeconds(10) }) catch |err| {
-        std.debug.print("[upgrade] Failed to connect to {s}:{d}: {}\n", .{ hostname, port, err });
+        std.debug.print("[upgrade] Failed to connect to {s}:{d}: {}\n", .{ args.hostname, args.port, err });
         return;
     };
     defer stream.close();
 
-    std.debug.print("[upgrade] Uploading v{any} to {s} ({s})\n", .{ @import("ver.zig").VERSION, hostname, ip });
+    std.debug.print("[upgrade] Uploading v{any} to {s} ({s})\n", .{ @import("ver.zig").VERSION, args.hostname, args.ip });
 
     // Upload the binary
-    try transport.sendToStream(&stream, transport.MsgType.UPLOAD_REQ, upload_payload);
+    transport.sendToStream(&stream, transport.MsgType.UPLOAD_REQ, upload_payload) catch |err| {
+        std.debug.print("[upgrade] Upload send error: {}\n", .{err});
+        return;
+    };
 
     const resp = transport.recvFromStream(&stream, gpa, zio.Timeout.fromSeconds(30)) catch |err| {
         std.debug.print("[upgrade] Upload response error: {}\n", .{err});
@@ -659,8 +728,11 @@ fn spawnAutoUpgrade(
     };
     defer gpa.free(restart_cmd);
 
-    try transport.sendToStream(&stream, transport.MsgType.EXEC_REQ, restart_cmd);
-    std.debug.print("[upgrade] Sent restart command to {s}\n", .{hostname});
+    transport.sendToStream(&stream, transport.MsgType.EXEC_REQ, restart_cmd) catch |err| {
+        std.debug.print("[upgrade] Restart command error: {}\n", .{err});
+        return;
+    };
+    std.debug.print("[upgrade] Sent restart command to {s}\n", .{args.hostname});
 }
 
 /// Build the platform-specific restart command for auto-upgrade, based on guest target.
