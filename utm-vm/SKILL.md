@@ -66,7 +66,7 @@ The command runs in the VM's native shell:
 - Windows: backslashes in paths work, forward slashes also work in cmd.exe
 - Single quotes are safer than double quotes for shell commands
 
-> **Auto-upgrade**: The Host uploads `utmm.new` to any Guest whose version doesn't match. The Guest detects it in its 1-second broadcast loop and self-upgrades (atomic rename + detached restart). Bump `src/ver.zig` and rebuild — all online Guests upgrade within seconds.
+> **Auto-upgrade**: The Host uploads `utmm.next` (or `utmm.next.exe` on Windows) to any Guest whose version doesn't match. The Guest detects it in its 1-second broadcast loop and self-upgrades (atomic rename + detached restart). Bump `src/ver.zig` and rebuild — all online Guests upgrade within seconds.
 
 ## Core Workflows
 

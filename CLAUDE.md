@@ -20,8 +20,9 @@ windowsvm: user=Administrator, passwd=111, app_path=C:\opt\
 ## Architecture Design
 
 ### Two Run Modes (Same Binary)
-- **Guest mode (default)**: UDP broadcast hostname+IP + HTTP server (2121)
-- **Host mode (--host)**: UDP listener + HTTP file server + /etc/hosts sync + management commands (--status/--exec etc.)
+- **Guest mode (default)**: Foreground mode — stops any background service, runs in terminal, restarts service on exit. With `--svc`: daemon mode (UDP broadcast hostname+IP + HTTP server on port 2121). Use `--install --user` to create a desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
+- **Host mode (--host)**: UDP listener + HTTP file server + /etc/hosts sync + IPC service + management commands (--status/--exec etc.)
+- **MCP integrated mode (--host --mcp)**: Host + MCP JSON-RPC server in one process, no separate Host daemon needed
 
 ### Complete Data Flow
 ```
@@ -34,7 +35,8 @@ Guest (windows)  ──UDP broadcast──┘                    └── hosts
 - **UDP broadcast** (port 12345): Guest broadcasts `ANNOUNCE\nname: X\nip: Y\n...` every second, Host listens
 - **HTTP** (port 2121): Guest serves /health, /version, /update, /bin/:filename, /upload, /exec; Host serves /version, /bin/:filename for Guest bootstrap
 - **IPC** (port 12347): Host internal TCP channel for --status/--exec/--upload/--download command forwarding
-- **Auto-upgrade**: Host detects Guest version mismatch via ANNOUNCE → pushes new binary via HTTP upload (ETag MD5 verified) + remote restart. Guest uses cross-platform safe rename (old → .old, .next → final) compatible with Linux/macOS/Windows. No Guest polling.
+- **Auto-start Host service**: Management commands (--status/--exec/--upload/--download) auto-start the Host daemon via the OS service manager when IPC connection fails — no manual `utmm --host` needed
+- **Auto-upgrade**: Host detects Guest version mismatch via ANNOUNCE → pushes new binary via HTTP upload (ETag MD5 verified). Guest uses cross-platform safe rename (old → .old, .next → final) + detached restart. Compatible with Linux/macOS/Windows. No Guest polling.
 
 ### Key Design Decisions
 - Single binary, dual mode: reduces maintenance burden
@@ -56,19 +58,25 @@ zig build -Dtarget=x86_64-linux-musl    # → utmm-x86_64-linux
 zig build -Dtarget=x86_64-macos   # → utmm-x86_64-macos
 zig build -Dtarget=x86_64-windows  # → utmm-x86_64-windows.exe
 zig build -Dtarget=x86-linux-musl    # → utmm-x86-linux
-zig build -Dtarget=x86-windows  # → utmm-x86-windows.exe
+zig build -Dtarget=x86-windows  # → utmm-x86-windows.exe (may have linker warning on some toolchains)
 ```
+
+> **Note**: `x86-windows` (32-bit) may produce a non-fatal linker warning on some Zig toolchains. This is a build system quirk, not a code issue. The 32-bit Windows target is rarely used — all modern Windows VMs are aarch64 or x86_64.
 
 ### Tests/Testing
 ```bash
-zig build test                                   # All tests (currently 61)
+zig build test                                   # All tests (currently 53)
 ```
 
 ### Guest End Runtime
 ```bash
-utmm                                      # Default Guest
+utmm                                      # Default Guest (foreground: stop service, run, restart on exit)
 utmm --hostname myvm --port 12345         # Custom parameters
 utmm --http-port 2122                     # Custom HTTP port
+utmm --svc                                # Daemon mode (launched by service manager)
+utmm --install                            # Install as system service (Guest mode)
+utmm --install --user                     # Create desktop shortcut (UTMM) for foreground launcher
+utmm --uninstall --user                   # Remove desktop shortcut
 ```
 
 ### Host End Runtime
@@ -91,6 +99,8 @@ utmm --mcp                                # Adapter mode: MCP stdio → Host IPC
 # These commands connect to the persistent Host via IPC (127.0.0.1:12347).
 # Adding --host would start a second listener that conflicts with the running Host.
 # (v0.1.22+: --host is auto-ignored when management commands are present.)
+# (v0.1.26+: if Host service is not running, management commands auto-start it via
+#  the OS service manager — launchctl/systemctl/sc start — then retry IPC.)
 ```
 
 ## Project File Structure
@@ -111,7 +121,8 @@ src/
 ├── executor.zig       # Host: --exec remote execution + resolveGuest + findGuest
 ├── ipc.zig            # Host: IPC service (127.0.0.1:12347 TCP command forwarding)
 ├── mcp.zig            # MCP JSON-RPC server (--mcp flag, stdio transport)
-├── install.zig        # --install/--uninstall system service + --gen-init script generation
+├── install.zig        # --install/--uninstall system service + --gen-init script generation + desktop shortcuts
+├── agent.zig          # Guest: foreground mode (stop service, run in TTY, restart on exit)
 └── config.zig         # Config persistence + logging system
 ```
 

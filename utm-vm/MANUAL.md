@@ -32,7 +32,7 @@ utmm --host       # Host mode
 | Runs on | Inside each VM | Host machine |
 | Count | One per VM | Only one |
 | Responsibility | UDP broadcast of its own info | Listen for broadcasts + sync /etc/hosts |
-| Ancillary Services | HTTP server (2121): file upload/download + exec | IPC service (12347) + management commands (--status/--exec) |
+| Ancillary Services | HTTP server (2121): file upload/download + exec | IPC service (12347) + management commands (--status/--exec) + MCP JSON-RPC (--mcp) |
 | Required Privileges | Regular user | `sudo` (to write /etc/hosts) |
 
 ### 1.3 Data Flow Overview
@@ -311,7 +311,7 @@ Each release automatically builds 8 binaries for all VM scenarios, packaged as `
 | `utmm-aarch64-linux` | ARM64 Linux VMs | aarch64-linux-musl |
 | `utmm-x86_64-macos` | Intel Mac + Apple Silicon Mac (physical) | x86_64-macos |
 | `utmm-aarch64-macos` | ARM macOS VMs (UTM guests, no Rosetta 2) | aarch64-macos |
-| `utmm-x86-windows.exe` | 32-bit x86 Windows VMs | x86-windows |
+| `utmm-x86-windows.exe` | 32-bit x86 Windows VMs (rare) | x86-windows |
 | `utmm-x86_64-windows.exe` | 64-bit x86 Windows VMs | x86_64-windows |
 | `utmm-aarch64-windows.exe` | ARM64 Windows VMs | aarch64-windows |
 
@@ -433,14 +433,15 @@ utmm --gen-init linux
 # Then systemctl daemon-reload && systemctl enable --now utmm
 ```
 
-**Windows — Task Scheduler**:
+**Windows — SCM (Service Control Manager)**:
 
 ```bash
 # Execute in VM or via --exec
 utmm --gen-init windows
-# Generates script; use with schtasks to create a scheduled task:
-# schtasks /create /tn utmm /tr "C:\opt\utmm\utmm.exe" /sc ONSTART /ru SYSTEM /f
-# schtasks /run /tn utmm
+# Generates a script; or install directly as a Windows service:
+C:\opt\utmm\utmm.exe --install
+# This registers with SCM via 'sc create UTM-Monitor'
+# Start with:  sc start UTM-Monitor
 ```
 
 ### 3.6 Start Host Service
@@ -494,8 +495,9 @@ grep -A 10 "UTM-MONITOR" /etc/hosts
 Usage: utmm [options]
 
 Mode Selection:
-  (no arguments)         Guest mode (default)
+  (no arguments)         Guest mode (default: foreground, stop service, run, restart on exit)
   --host                 Host mode
+  --svc                  Run as daemon (launched by service manager, no service mgmt)
 
 Guest Options:
   --port PORT            UDP broadcast port         (default 12345)
@@ -510,15 +512,21 @@ Host Options:
   --marker TAG           Hosts marker text          (default UTM-MONITOR)
   --config PATH          Config file path
   --log-file PATH        Log output path
+  --save-config          Save current configuration
 
-Management commands (connect to persistent Host via IPC, no --host needed):
+Management commands (connect to persistent Host via IPC, no --host needed;
+  auto-start Host daemon via service manager if not running):
   --status               Query online status of all Guests
   --exec TARGET CMD      Execute command on target Guest
   --upload FILE VM       Upload a file to Guest (via HTTP, no curl)
   --download VM R L      Download file from Guest (via HTTP GET /bin/...)
   --gen-init PLATFORM    Generate auto-start boot script (linux/macos/windows)
-  --install              Install as system service (Guest mode auto-start; add --host for Host mode)
+  --install              Install as system service (Guest mode; add --host for Host)
+  --install --user       Create desktop shortcut (UTMM) for foreground guest launcher
   --uninstall            Remove system service and stop running processes
+  --uninstall --user     Remove desktop shortcut
+  --mcp                  Serve MCP JSON-RPC over stdio (adapter: bridge to Host IPC)
+  --mcp --host           Integrated mode: Host + MCP in one process
   --save-config          Save current configuration
   --version              Display version
 ```
@@ -618,14 +626,11 @@ grep -A 10 "UTM-MONITOR" /etc/hosts
 
 ### 4.3 Configuration File
 
-`--save-config` persists current parameters to a file, automatically loaded on next startup:
+`--save-config` writes a default configuration file for future use:
 
 ```bash
-utmm --host --port 12345 --save-config
-# Saves to ./utmm.conf
-
-cat utmm.conf
-# port=12345
+utmm --host --save-config
+# Saves to ./utmm.conf (or custom path via --config)
 ```
 
 ### 4.4 Version Upgrade Process
@@ -740,7 +745,7 @@ lsof -i :12345
 
 **Symptom**: Process disappears when the window is closed after direct launch
 
-**Solution**: Use Task Scheduler instead of direct launch, or auto-install the service via `--install`. Execute in the VM:
+**Solution**: Use SCM (Service Control Manager) instead of direct launch, or auto-install the service via `--install`. Execute in the VM:
 
 ```cmd
 C:\opt\utmm\utmm.exe --install
@@ -816,9 +821,11 @@ curl -s "http://192.168.64.2:2121/bin/myfile.txt"
 
 **Solution**: Upgrade to utmm v0.1.5 or later. The fix replaces `take()` with `readVec()`, which correctly handles partial reads.
 
-### 5.9 Port Conflict
+### 5.9 Port Conflict / Host Not Running
 
-**Management commands (--status/--exec) no longer conflict with the Host UDP port**. Since Phase 9, management commands are forwarded to the persistent Host process via IPC (127.0.0.1:12347 TCP), and the CLI process no longer directly binds the UDP port.
+**Management commands (--status/--exec/--upload/--download) no longer conflict with the Host UDP port**. Since Phase 9, management commands are forwarded to the persistent Host process via IPC (127.0.0.1:12347 TCP), and the CLI process no longer directly binds the UDP port.
+
+**Auto-start Host service (v0.1.26+)**: If the Host daemon is not running when a management command is invoked, the CLI auto-starts it via the OS service manager (`launchctl load` / `systemctl start` / `sc start`) and retries the IPC connection. This eliminates the need for manual `sudo utmm --host` which can cause port conflicts with an already-installed service.
 
 If ports 12345/2121 are occupied by other programs, they can be changed via parameters:
 
@@ -871,7 +878,8 @@ utmm/
 │   ├── executor.zig       # --exec remote execution
 │   ├── ipc.zig            # IPC module (127.0.0.1:12347 TCP command forwarding)
 │   ├── mcp.zig            # MCP JSON-RPC server (--mcp flag)
-│   ├── install.zig        # --install / --gen-init service installation
+│   ├── install.zig        # --install/--uninstall + desktop shortcuts + --gen-init
+│   ├── agent.zig           # Guest foreground mode (stop service, TTY, restart on exit)
 │   └── config.zig         # Configuration persistence + logging
 └── zig-out/
     └── bin/
@@ -886,7 +894,7 @@ utmm/
 | libc | System | `getifaddrs` / `gethostname` / `getenv` |
 | launchd | macOS system | macOS auto-start on boot |
 | systemd | Linux system | Linux auto-start on boot |
-| Task Scheduler | Windows system | Windows auto-start on boot |
+| SCM | Windows system | Windows auto-start on boot (Service Control Manager) |
 | HTTP+IPC | Built-in | File transfer + remote execution + command forwarding |
 
 ### 6.3 Binary Packaging (8 Binaries → All VMs)
@@ -1039,12 +1047,11 @@ sudo chmod +x /usr/local/bin/utmm
 
 ```bash
 sudo mkdir -p /opt/utmm
-# 5 binaries cover all scenarios (see §6.4)
-for bin in utmm utmm-aarch64-linux utmm-x86_64-macos utmm-aarch64-macos utmm.exe; do
-  sudo curl -fsSL \
-    "https://github.com/fixnet-ai/utm-monitor/releases/latest/download/$bin" \
-    -o "/opt/utmm/$bin"
-done
+# Download utmm.zip (contains all 8 platform binaries + install scripts)
+sudo curl -fsSL \
+  "https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.zip" \
+  -o "/opt/utmm/utmm.zip"
+cd /opt/utmm && sudo unzip -o utmm.zip && sudo rm utmm.zip
 sudo chmod +x /opt/utmm/*
 ```
 

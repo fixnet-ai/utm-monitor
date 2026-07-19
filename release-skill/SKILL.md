@@ -29,6 +29,8 @@ Update these two files:
 - `src/ver.zig`: `pub const VERSION = "X.Y.Z";`
 - `build.zig.zon`: `.version = "X.Y.Z",`
 
+> **Note**: `build.zig.zon` version field is mainly for the Zig package manager. The single source of truth for the runtime version is `src/ver.zig`.
+
 ### Step 3: Run tests
 
 ```bash
@@ -46,6 +48,8 @@ Must pass. Stop and fix if any test fails.
 This builds 8 targets into `release/` and creates `utmm.zip`:
 `x86-windows`, `x86_64-windows`, `aarch64-windows`, `x86_64-macos`,
 `aarch64-macos`, `x86-linux-musl`, `x86_64-linux-musl`, `aarch64-linux-musl`
+
+> **Note**: `x86-windows` (32-bit) may produce a non-fatal linker warning on some Zig toolchains. If it fails, skip it — the 32-bit Windows target is rarely used.
 
 ### Step 5: Commit & tag
 

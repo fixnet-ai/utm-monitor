@@ -37,8 +37,10 @@ The headline feature. After a quick one-time setup, your AI agent manages your V
 - **Auto Version Upgrade** — Host detects Guest version mismatch via UDP broadcast, auto-pushes new binary via HTTP — no Guest polling needed
 - **HTTP File Service** — Guest built-in HTTP server (thread-per-connection); file upload/download/exec all via HTTP
 - **File Upload/Download** — `--upload` and `--download` commands replace curl for manual file transfers
-- **Auto-Start on Boot** — Supports launchd / systemd / Task Scheduler
+- **Auto-Start on Boot** — Supports launchd / systemd / Windows SCM (Service Control Manager)
+- **Auto-Start Host Service** — Management commands auto-start the Host daemon when it's not running
 - **Single Binary, Dual Mode** — Default Guest mode; `--host` switches to Host mode
+- **MCP Integrated Mode** — `--host --mcp` runs Host + MCP server in one process, no separate daemon
 
 
 
@@ -142,10 +144,10 @@ curl "http://$GW:2121/bin/install.sh" | sh -s -- --guest --hostname macvm
 curl -o install.bat "http://<gateway>:2121/bin/install.bat" && install.bat --guest --hostname windowsvm
 
 # ─── Verify ───
-utmm --host --status                 # check all VM status
-utmm --host --exec linuxvm "uname -a" # run command on VM
-utmm --host --upload ./f.txt linuxvm  # upload file to VM (no curl)
-utmm --host --download linuxvm f.txt ./f.txt  # download file from VM (no curl)
+utmm --status                 # check all VM status
+utmm --exec linuxvm "uname -a" # run command on VM
+utmm --upload ./f.txt linuxvm  # upload file to VM (no curl)
+utmm --download linuxvm f.txt ./f.txt  # download file from VM (no curl)
 ```
 
 ## Documentation

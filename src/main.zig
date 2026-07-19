@@ -82,7 +82,7 @@ pub const CliArgs = struct {
     serve_dir: ?[]const u8 = null,
     /// Whether to save config
     save_config: bool = false,
-    /// Internal: run as Windows service (--svc, added by sc create)
+    /// Run as daemon via service manager (--svc, set by --install service configs)
     is_svc: bool = false,
     /// Run as foreground guest (stop service, run, restart on exit).
     /// When false and no management commands: run as daemon (pure guest, no service mgmt).
