@@ -9,7 +9,6 @@
 //! Tools:   vm_status, vm_exec.
 
 const std = @import("std");
-const zio = @import("zio");
 const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
 
@@ -313,21 +312,17 @@ fn execOnGuest(block_io: std.Io, gpa: std.mem.Allocator, target: []const u8, cmd
     defer gpa.free(ip);
 
     // TCP connect + exec
-    var rt = try zio.Runtime.init(gpa, .{});
-    defer rt.deinit();
-    const io = rt.io();
-
     const addr = try std.Io.net.IpAddress.parse(ip, port);
-    var stream = addr.connect(io, .{ .mode = .stream }) catch |err| {
+    var stream = addr.connect(block_io, .{ .mode = .stream }) catch |err| {
         std.debug.print("[mcp] Connect to {s}:{d} failed: {}\n", .{ ip, port, err });
         return err;
     };
-    defer stream.close(io);
+    defer stream.close(block_io);
 
     var wbuf: [65536]u8 = undefined;
     var rbuf: [65536]u8 = undefined;
-    var writer = stream.writer(io, &wbuf);
-    var reader = stream.reader(io, &rbuf);
+    var writer = stream.writer(block_io, &wbuf);
+    var reader = stream.reader(block_io, &rbuf);
 
     try transport.sendMessage(&writer, transport.MsgType.EXEC_REQ, cmd);
     writer.interface.flush() catch {};

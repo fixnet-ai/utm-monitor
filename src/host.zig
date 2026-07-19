@@ -1,7 +1,7 @@
-//! Host mode orchestration — zio-based fiber runtime.
+//! Host mode orchestration — threaded I/O model.
 //!
 //! Two modes:
-//!   1. Daemon (--host): UDP listener + /etc/hosts sync + auto-upgrade via zio
+//!   1. Daemon (--host): UDP listener + /etc/hosts sync + auto-upgrade via std.Thread
 //!   2. Management commands (--status/--exec/--upload/--download): stateless,
 //!      discover guests via UDP broadcast, then talk directly to guest TCP port.
 //!
@@ -9,7 +9,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zio = @import("zio");
 const protocol = @import("protocol.zig");
 const listener = @import("listener.zig");
 const hosts_file = @import("hosts_file.zig");
@@ -150,79 +149,50 @@ fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
 
     std.debug.print("[exec] Connecting to {s} ({s}:{d})\n", .{ target, ip, port });
 
-    const ip_dupe = try gpa.dupe(u8, ip);
-    const cmd_dupe = try gpa.dupe(u8, cmd);
-
-    // zproxy pattern: enable_main_executor + single executor. The calling thread
-    // becomes the executor, and handle.join() parks it while the spawned task runs.
-    var rt = try zio.Runtime.init(gpa, .{});
-    defer rt.deinit();
-
-    const ExecCtx = struct {
-        ip: []const u8,
-        port: u16,
-        cmd: []const u8,
+    const addr = std.Io.net.IpAddress.parse(ip, port) catch |err| {
+        std.debug.print("[exec] parseIp failed for {s}:{d}: {}\n", .{ ip, port, err });
+        return err;
     };
+    var stream = addr.connect(block_io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("[exec] Failed to connect to {s}:{d}: {}\n", .{ ip, port, err });
+        return err;
+    };
+    defer stream.close(block_io);
 
-    const execTask = struct {
-        fn run(runtime: *zio.Runtime, ctx: ExecCtx) !void {
-            const allocator = runtime.allocator;
+    var wbuf: [65536]u8 = undefined;
+    var rbuf: [65536]u8 = undefined;
+    var writer = stream.writer(block_io, &wbuf);
+    var reader = stream.reader(block_io, &rbuf);
 
-            // zproxy pattern: zio.net.IpAddress.connect() with timeout
-            std.debug.print("[exec-task] Parsing address {s}:{d}...\n", .{ ctx.ip, ctx.port });
-            const addr = zio.net.IpAddress.parseIp(ctx.ip, ctx.port) catch |err| {
-                std.debug.print("[exec] parseIp failed for {s}:{d}: {}\n", .{ ctx.ip, ctx.port, err });
-                return err;
-            };
-            std.debug.print("[exec-task] Parsed, connecting...\n", .{});
-            var stream = addr.connect(.{ .timeout = zio.Timeout.fromSeconds(5) }) catch |err| {
-                std.debug.print("[exec] Failed to connect to {s}:{d}: {}\n", .{ ctx.ip, ctx.port, err });
-                return err;
-            };
-            std.debug.print("[exec-task] Connected!\n", .{});
-            defer stream.close();
+    try transport.sendMessage(&writer, transport.MsgType.EXEC_REQ, cmd);
+    writer.interface.flush() catch {};
 
-            // zproxy pattern: stream.writeAll() directly — no buffered writer
-            try transport.sendToStream(&stream, transport.MsgType.EXEC_REQ, ctx.cmd);
+    // Read response messages until EXEC_EXIT or error
+    while (true) {
+        const msg = transport.recvMessage(&reader, gpa) catch break;
+        if (msg == null) break;
+        defer gpa.free(msg.?.payload);
 
-            // Read response messages until EXEC_EXIT or error
-            while (true) {
-                const msg = transport.recvFromStream(&stream, allocator, zio.Timeout.fromSeconds(30)) catch break;
-                if (msg == null) break;
-                defer allocator.free(msg.?.payload);
-
-                switch (msg.?.msg_type) {
-                    transport.MsgType.EXEC_STDOUT => {
-                        std.debug.print("{s}", .{msg.?.payload});
-                    },
-                    transport.MsgType.EXEC_STDERR => {
-                        std.debug.print("{s}", .{msg.?.payload});
-                    },
-                    transport.MsgType.ERROR => {
-                        std.debug.print("[exec] Error: {s}\n", .{msg.?.payload});
-                        return error.RemoteError;
-                    },
-                    transport.MsgType.EXEC_EXIT => {
-                        if (msg.?.payload.len >= 4) {
-                            const exit_code = std.mem.readInt(i32, msg.?.payload[0..4], .big);
-                            if (exit_code != 0) std.process.exit(@intCast(exit_code));
-                        }
-                        return;
-                    },
-                    else => {},
+        switch (msg.?.msg_type) {
+            transport.MsgType.EXEC_STDOUT => {
+                std.debug.print("{s}", .{msg.?.payload});
+            },
+            transport.MsgType.EXEC_STDERR => {
+                std.debug.print("{s}", .{msg.?.payload});
+            },
+            transport.MsgType.ERROR => {
+                std.debug.print("[exec] Error: {s}\n", .{msg.?.payload});
+                return error.RemoteError;
+            },
+            transport.MsgType.EXEC_EXIT => {
+                if (msg.?.payload.len >= 4) {
+                    const exit_code = std.mem.readInt(i32, msg.?.payload[0..4], .big);
+                    if (exit_code != 0) std.process.exit(@intCast(exit_code));
                 }
-            }
+                return;
+            },
+            else => {},
         }
-    }.run;
-
-    var handle = try rt.spawn(execTask, .{ rt, ExecCtx{ .ip = ip_dupe, .port = port, .cmd = cmd_dupe } });
-    defer gpa.free(ip_dupe);
-    defer gpa.free(cmd_dupe);
-
-    const result = handle.join();
-    if (result) |_| {} else |err| switch (err) {
-        error.Canceled => {},
-        else => return err,
     }
 }
 
@@ -233,7 +203,7 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
     };
     defer gpa.free(ip);
 
-    // Read local file (sync, uses block_io)
+    // Read local file
     const file_data = std.Io.Dir.cwd().readFileAlloc(block_io, local_file, gpa, @enumFromInt(50 * 1024 * 1024)) catch |err| {
         std.debug.print("[upload] Cannot read {s}: {}\n", .{ local_file, err });
         return err;
@@ -249,50 +219,33 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
     payload[basename.len] = 0;
     @memcpy(payload[basename.len + 1 ..], file_data);
 
-    const ip_dupe = try gpa.dupe(u8, ip);
-
-    var rt = try zio.Runtime.init(gpa, .{});
-    defer rt.deinit();
-
-    const UploadCtx = struct {
-        ip: []const u8,
-        port: u16,
-        payload: []const u8,
-        target: []const u8,
+    const addr = std.Io.net.IpAddress.parse(ip, port) catch |err| {
+        std.debug.print("[upload] parseIp failed: {}\n", .{err});
+        return err;
     };
+    var stream = addr.connect(block_io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("[upload] Failed to connect: {}\n", .{err});
+        return err;
+    };
+    defer stream.close(block_io);
 
-    const uploadTask = struct {
-        fn run(runtime: *zio.Runtime, ctx: UploadCtx) !void {
-            const allocator = runtime.allocator;
+    std.debug.print("[upload] Uploading → {s} ({s}:{d})...\n", .{ target, ip, port });
 
-            const addr = try zio.net.IpAddress.parseIp(ctx.ip, ctx.port);
-            var stream = addr.connect(.{ .timeout = zio.Timeout.fromSeconds(5) }) catch |err| {
-                std.debug.print("[upload] Failed to connect: {}\n", .{err});
-                return err;
-            };
-            defer stream.close();
+    var wbuf: [65536]u8 = undefined;
+    var rbuf: [65536]u8 = undefined;
+    var writer = stream.writer(block_io, &wbuf);
+    var reader = stream.reader(block_io, &rbuf);
 
-            std.debug.print("[upload] Uploading → {s} ({s}:{d})...\n", .{ ctx.target, ctx.ip, ctx.port });
-            try transport.sendToStream(&stream, transport.MsgType.UPLOAD_REQ, ctx.payload);
+    try transport.sendMessage(&writer, transport.MsgType.UPLOAD_REQ, payload);
+    writer.interface.flush() catch {};
 
-            const resp = (transport.recvFromStream(&stream, allocator, zio.Timeout.fromSeconds(30)) catch null) orelse {
-                std.debug.print("[upload] No response\n", .{});
-                return error.NoResponse;
-            };
-            defer allocator.free(resp.payload);
+    const resp = (transport.recvMessage(&reader, gpa) catch null) orelse {
+        std.debug.print("[upload] No response\n", .{});
+        return error.NoResponse;
+    };
+    defer gpa.free(resp.payload);
 
-            std.debug.print("{s}\n", .{resp.payload});
-        }
-    }.run;
-
-    var handle = try rt.spawn(uploadTask, .{ rt, UploadCtx{ .ip = ip_dupe, .port = port, .payload = payload, .target = target } });
-    defer gpa.free(ip_dupe);
-
-    const result = handle.join();
-    if (result) |_| {} else |err| switch (err) {
-        error.Canceled => {},
-        else => return err,
-    }
+    std.debug.print("{s}\n", .{resp.payload});
 }
 
 fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, remote_file: []const u8, local_path: []const u8) !void {
@@ -302,79 +255,56 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
     };
     defer gpa.free(ip);
 
-    const ip_dupe = try gpa.dupe(u8, ip);
-    const remote_dupe = try gpa.dupe(u8, remote_file);
-    const local_dupe = try gpa.dupe(u8, local_path);
-
-    var rt = try zio.Runtime.init(gpa, .{});
-    defer rt.deinit();
-
-    const DownloadCtx = struct {
-        ip: []const u8,
-        port: u16,
-        remote: []const u8,
-        local: []const u8,
-        target: []const u8,
+    const addr = std.Io.net.IpAddress.parse(ip, port) catch |err| {
+        std.debug.print("[download] parseIp failed: {}\n", .{err});
+        return err;
     };
+    var stream = addr.connect(block_io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("[download] Failed to connect: {}\n", .{err});
+        return err;
+    };
+    defer stream.close(block_io);
 
-    const downloadTask = struct {
-        fn run(runtime: *zio.Runtime, ctx: DownloadCtx) !void {
-            const allocator = runtime.allocator;
+    std.debug.print("[download] Downloading {s} from {s} ({s}:{d}) → {s}...\n", .{ remote_file, target, ip, port, local_path });
 
-            const addr = try zio.net.IpAddress.parseIp(ctx.ip, ctx.port);
-            var stream = addr.connect(.{ .timeout = zio.Timeout.fromSeconds(5) }) catch |err| {
-                std.debug.print("[download] Failed to connect: {}\n", .{err});
-                return err;
-            };
-            defer stream.close();
+    var wbuf: [65536]u8 = undefined;
+    var rbuf: [65536]u8 = undefined;
+    var writer = stream.writer(block_io, &wbuf);
+    var reader = stream.reader(block_io, &rbuf);
 
-            std.debug.print("[download] Downloading {s} from {s} ({s}:{d}) → {s}...\n", .{ ctx.remote, ctx.target, ctx.ip, ctx.port, ctx.local });
-            try transport.sendToStream(&stream, transport.MsgType.FILE_REQ, ctx.remote);
+    try transport.sendMessage(&writer, transport.MsgType.FILE_REQ, remote_file);
+    writer.interface.flush() catch {};
 
-            // Receive FILE_RESP/EOF chunks and write to local file
-            const file = try std.Io.Dir.cwd().createFile(runtime.io(), ctx.local, .{ .permissions = @enumFromInt(0o755) });
-            defer file.close(runtime.io());
+    // Receive FILE_RESP/EOF chunks and write to local file
+    const file = try std.Io.Dir.cwd().createFile(block_io, local_path, .{});
+    defer file.close(block_io);
 
-            var wb: [4096]u8 = undefined;
-            var fw = file.writer(runtime.io(), &wb);
-            var total: usize = 0;
+    var total: usize = 0;
 
-            while (true) {
-                const msg = try transport.recvFromStream(&stream, allocator, zio.Timeout.fromSeconds(30)) orelse return error.UnexpectedEOF;
-                defer allocator.free(msg.payload);
+    while (true) {
+        const msg = try transport.recvMessage(&reader, gpa) orelse return error.UnexpectedEOF;
+        defer gpa.free(msg.payload);
 
-                switch (msg.msg_type) {
-                    transport.MsgType.FILE_RESP => {
-                        _ = try fw.interface.write(msg.payload);
-                        total += msg.payload.len;
-                    },
-                    transport.MsgType.EOF => {
-                        try fw.flush();
-                        std.debug.print("[download] Received {d} bytes → {s}\n", .{ total, ctx.local });
-                        return;
-                    },
-                    transport.MsgType.ERROR => {
-                        std.debug.print("[download] Remote error: {s}\n", .{msg.payload});
-                        return error.RemoteError;
-                    },
-                    else => {
-                        std.debug.print("[download] Unexpected message type 0x{x}\n", .{msg.msg_type});
-                        return error.ProtocolError;
-                    },
-                }
-            }
+        switch (msg.msg_type) {
+            transport.MsgType.FILE_RESP => {
+                var wb: [4096]u8 = undefined;
+                var fw = file.writer(block_io, &wb);
+                _ = try fw.interface.write(msg.payload);
+                total += msg.payload.len;
+            },
+            transport.MsgType.EOF => {
+                std.debug.print("[download] Received {d} bytes → {s}\n", .{ total, local_path });
+                return;
+            },
+            transport.MsgType.ERROR => {
+                std.debug.print("[download] Remote error: {s}\n", .{msg.payload});
+                return error.RemoteError;
+            },
+            else => {
+                std.debug.print("[download] Unexpected message type 0x{x}\n", .{msg.msg_type});
+                return error.ProtocolError;
+            },
         }
-    }.run;
-
-    var handle = try rt.spawn(downloadTask, .{ rt, DownloadCtx{ .ip = ip_dupe, .port = port, .remote = remote_dupe, .local = local_dupe, .target = target } });
-    defer gpa.free(ip_dupe);
-    defer gpa.free(remote_dupe);
-    defer gpa.free(local_dupe);
-
-    const result = handle.join();
-    if (result) |_| {} else |err| switch (err) {
-        error.Canceled => {},
-        else => return err,
     }
 }
 
@@ -383,7 +313,7 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn runHostDaemon(
-    _: std.Io,
+    block_io: std.Io,
     gpa: std.mem.Allocator,
     port: u16,
     hosts_path: []const u8,
@@ -394,11 +324,8 @@ fn runHostDaemon(
     std.debug.print("[host] Hosts file: {s}\n", .{hosts_path});
     if (serve_dir) |sd| std.debug.print("[host] Serve dir: {s}\n", .{sd});
 
-    var rt = try zio.Runtime.init(gpa, .{});
-    defer rt.deinit();
-    const io = rt.io();
-
-    // Shared guest list (single-fiber access, no mutex needed)
+    // Shared guest list (accessible from UDP listener thread, no mutex needed
+    // since only the listener thread writes; main thread only reads in MCP mode)
     var guests = std.StringHashMap(GuestEntry).init(gpa);
     defer {
         var it = guests.iterator();
@@ -414,51 +341,51 @@ fn runHostDaemon(
         guests.deinit();
     }
 
-    var group: std.Io.Group = .init;
-    defer group.cancel(io);
-
-    // Fiber 1: UDP listener loop
-    try group.concurrent(io, udpListenerFiber, .{
-        io, gpa, port, hosts_path, serve_dir, &guests,
+    // Thread 1: UDP listener loop
+    const listener_thread = try std.Thread.spawn(.{}, udpListenerThread, .{
+        block_io, gpa, port, hosts_path, serve_dir, &guests,
     });
 
-    // Main fiber: wait (keep alive) or run MCP
+    // Main thread: wait (keep alive) or run MCP
     if (with_mcp) {
         // TODO: integrated MCP mode
         std.debug.print("[host] Integrated MCP mode not yet implemented\n", .{});
     }
 
-    // Keep alive
+    // Keep alive — sleep 60s at a time
     while (true) {
-        try std.Io.sleep(io, std.Io.Duration.fromSeconds(60), .awake);
+        std.Io.sleep(block_io, std.Io.Duration.fromSeconds(60), .awake) catch {};
     }
+
+    // Unreachable, but join listener thread on clean shutdown path
+    _ = listener_thread;
 }
 
-/// Fiber: UDP listener — dispatches ANNOUNCE messages to hosts_file sync and auto-upgrade
-fn udpListenerFiber(
-    io: std.Io,
+/// Thread: UDP listener — dispatches ANNOUNCE messages to hosts_file sync and auto-upgrade
+fn udpListenerThread(
+    block_io: std.Io,
     gpa: std.mem.Allocator,
     port: u16,
     hosts_path: []const u8,
     serve_dir: ?[]const u8,
     guests: *std.StringHashMap(GuestEntry),
-) std.Io.Cancelable!void {
+) !void {
     const listen_addr = std.Io.net.IpAddress.parse("0.0.0.0", port) catch |err| {
         std.debug.print("[host] Parse error: {}\n", .{err});
-        return error.Canceled;
+        return err;
     };
-    var socket = listen_addr.bind(io, .{ .mode = .dgram }) catch |err| {
+    var socket = listen_addr.bind(block_io, .{ .mode = .dgram }) catch |err| {
         std.debug.print("[host] UDP bind failed on {d}: {}\n", .{ port, err });
-        return error.Canceled;
+        return err;
     };
-    defer socket.close(io);
+    defer socket.close(block_io);
 
     std.debug.print("[host] Listening on UDP {d}\n", .{port});
 
     var recv_buf: [2048]u8 = undefined;
 
     while (true) {
-        processAnnounce(io, gpa, &socket, port, hosts_path, serve_dir, guests, &recv_buf) catch |err| {
+        processAnnounce(block_io, gpa, &socket, port, hosts_path, serve_dir, guests, &recv_buf) catch |err| {
             std.debug.print("[host] Error processing announce: {}\n", .{err});
             continue;
         };
@@ -606,7 +533,6 @@ fn writeGuestStateFile(io: std.Io, gpa: std.mem.Allocator, guests: *std.StringHa
     var wb: [4096]u8 = undefined;
     var fw = file.writer(io, &wb);
     _ = fw.interface.write(buf.items) catch {};
-    fw.interface.flush() catch {};
 }
 
 fn readGuestStateFile(io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
@@ -630,7 +556,7 @@ fn spawnAutoUpgrade(
     target: []const u8,
     port: u16,
 ) !void {
-    // Clone data for background thread (runs its own zio Runtime)
+    // Clone data for background thread
     const args = try gpa.create(AutoUpgradeArgs);
     args.serve_dir = try gpa.dupe(u8, serve_dir);
     args.hostname = try gpa.dupe(u8, hostname);
@@ -686,32 +612,31 @@ fn doAutoUpgrade(gpa: std.mem.Allocator, args: *AutoUpgradeArgs) !void {
     upload_payload[upload_name.len] = 0;
     @memcpy(upload_payload[upload_name.len + 1 ..], bin_data);
 
-    // zio Runtime for async TCP (background thread — safe to create its own)
-    var rt = zio.Runtime.init(gpa, .{}) catch |err| {
-        std.debug.print("[upgrade] Runtime init error: {}\n", .{err});
-        return;
-    };
-    defer rt.deinit();
-
-    const addr = zio.net.IpAddress.parseIp(args.ip, args.port) catch |err| {
+    const addr = std.Io.net.IpAddress.parse(args.ip, args.port) catch |err| {
         std.debug.print("[upgrade] Parse error: {}\n", .{err});
         return;
     };
-    var stream = addr.connect(.{ .timeout = zio.Timeout.fromSeconds(10) }) catch |err| {
+    var stream = addr.connect(block_io, .{ .mode = .stream }) catch |err| {
         std.debug.print("[upgrade] Failed to connect to {s}:{d}: {}\n", .{ args.hostname, args.port, err });
         return;
     };
-    defer stream.close();
+    defer stream.close(block_io);
 
     std.debug.print("[upgrade] Uploading v{any} to {s} ({s})\n", .{ @import("ver.zig").VERSION, args.hostname, args.ip });
 
+    var wbuf: [65536]u8 = undefined;
+    var rbuf: [65536]u8 = undefined;
+    var writer = stream.writer(block_io, &wbuf);
+    var reader = stream.reader(block_io, &rbuf);
+
     // Upload the binary
-    transport.sendToStream(&stream, transport.MsgType.UPLOAD_REQ, upload_payload) catch |err| {
+    transport.sendMessage(&writer, transport.MsgType.UPLOAD_REQ, upload_payload) catch |err| {
         std.debug.print("[upgrade] Upload send error: {}\n", .{err});
         return;
     };
+    writer.interface.flush() catch {};
 
-    const resp = transport.recvFromStream(&stream, gpa, zio.Timeout.fromSeconds(30)) catch |err| {
+    const resp = transport.recvMessage(&reader, gpa) catch |err| {
         std.debug.print("[upgrade] Upload response error: {}\n", .{err});
         return;
     } orelse {
@@ -728,10 +653,11 @@ fn doAutoUpgrade(gpa: std.mem.Allocator, args: *AutoUpgradeArgs) !void {
     };
     defer gpa.free(restart_cmd);
 
-    transport.sendToStream(&stream, transport.MsgType.EXEC_REQ, restart_cmd) catch |err| {
+    transport.sendMessage(&writer, transport.MsgType.EXEC_REQ, restart_cmd) catch |err| {
         std.debug.print("[upgrade] Restart command error: {}\n", .{err});
         return;
     };
+    writer.interface.flush() catch {};
     std.debug.print("[upgrade] Sent restart command to {s}\n", .{args.hostname});
 }
 
@@ -772,7 +698,7 @@ fn shellFromTarget(target: []const u8) []const u8 {
 
 /// Look up a guest's target triple from the state file.
 fn lookupGuestTargetInStateFile(io: std.Io, gpa: std.mem.Allocator, hostname: []const u8) ![]const u8 {
-    const data = try std.Io.Dir.cwd().readFileAlloc(io, STATE_FILE, gpa, @enumFromInt(64 * 1024));
+    const data = try readGuestStateFile(io, gpa);
     defer gpa.free(data);
 
     var lines = std.mem.splitSequence(u8, data, "\n");

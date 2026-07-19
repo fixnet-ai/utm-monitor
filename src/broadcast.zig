@@ -501,7 +501,7 @@ pub fn broadcastLoop(
         .allow_broadcast = true,
     }) catch |err| {
         std.debug.print("[broadcast] Bind {s}:0 failed: {}, retrying without broadcast option\n", .{ bind_ip, err });
-        // Some platforms (Windows zio) don't support .allow_broadcast at bind time.
+        // Some platforms may not support .allow_broadcast at bind time.
         // Fall back: bind without it, then set SO_BROADCAST manually after.
         return broadcastLoopFallback(io, port, info, bind_addr, is_svc);
     };
@@ -530,7 +530,7 @@ pub fn broadcastLoop(
         socket.send(io, &broadcast_addr, msg) catch |err| {
             std.debug.print("[broadcast] Send failed: {}\n", .{err});
         };
-        try std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake);
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {};
     }
 }
 
@@ -543,12 +543,12 @@ fn broadcastLoopFallback(
     is_svc: bool,
 ) !void {
     const broadcast_addr = try std.Io.net.IpAddress.parse("255.255.255.255", port);
-    // Try with .allow_broadcast first; on some platforms (Windows zio) this
-    // option is unsupported at bind time. Fall back to bind without it.
+    // Try with .allow_broadcast first; on some platforms this option is
+    // unsupported at bind time. Fall back to bind without it.
     const socket = bind_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| switch (err) {
         error.OptionUnsupported => blk: {
             const s = try bind_addr.bind(io, .{ .mode = .dgram });
-            // zio's os/windows.zig is missing SO.BROADCAST; enable it manually.
+            // Enable SO.BROADCAST manually on Windows.
             if (builtin.os.tag == .windows) {
                 const ws2 = struct {
                     const SOCKET = *anyopaque;
@@ -594,7 +594,7 @@ fn broadcastLoopFallback(
         socket.send(io, &broadcast_addr, msg) catch |err| {
             std.debug.print("[broadcast] Send failed: {}\n", .{err});
         };
-        try std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake);
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {};
     }
 }
 
@@ -627,7 +627,7 @@ pub fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
 
     // Open the install directory for relative-path operations.
     // Using CWD with absolute paths breaks on Windows services (CWD is System32).
-    const dir = std.Io.Dir.cwd().openDir(io, install_dir, .{}) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(io, install_dir, .{}) catch |err| {
         std.debug.print("[broadcast] Self-upgrade: cannot open {s}: {}\n", .{ install_dir, err });
         return;
     };

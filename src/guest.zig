@@ -1,19 +1,14 @@
-//! Guest mode orchestration — zio-based fiber runtime.
+//! Guest mode orchestration — threaded I/O model.
 //!
-//! Starts two concurrent fibers:
+//! Starts two threads:
 //!   1. UDP broadcast loop (every 1s on port 2121, from broadcast.zig)
 //!   2. TCP server (accept loop on port 2121, handles VERSION/HEALTH/FILE/UPLOAD/EXEC)
 //!
-//! Uses zio for async I/O — fiber-based concurrency, no thread-per-connection overhead.
+//! Uses std.Thread for concurrency — one thread per connection.
 //! Protocol: length-prefixed messages via transport.zig (replaces HTTP).
-//!
-//! Note: zio requires all fiber functions to return Io.Cancelable!void (only
-//! error{Canceled}). We wrap external functions and catch non-Canceled errors
-//! at the fiber boundary.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const zio = @import("zio");
 const broadcast = @import("broadcast.zig");
 const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
@@ -73,60 +68,63 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
         _ = libc.chdir("/opt/utmm");
     }
 
-    // ── Initialize zio Runtime ────────────────────────────────────────────
-    var rt = try zio.Runtime.init(gpa, .{});
-    defer rt.deinit();
-    const io = rt.io();
+    // ── Thread 1: UDP broadcast loop ──────────────────────────────────────
+    // Clone sysinfo fields for the broadcast thread (thread-safe ownership)
+    const bc_info = broadcast.SystemInfo{
+        .hostname = try gpa.dupe(u8, sysinfo.hostname),
+        .ip = try gpa.dupe(u8, sysinfo.ip),
+        .mac = try gpa.dupe(u8, sysinfo.mac),
+        .target = sysinfo.target,
+        .iface_name = try gpa.dupe(u8, sysinfo.iface_name),
+        .shell = try gpa.dupe(u8, sysinfo.shell),
+    };
+    const bc_thread = try std.Thread.spawn(.{}, broadcastThread, .{ block_io, port, bc_info, cli.is_svc });
+    bc_thread.detach();
 
-    var group: Io.Group = .init;
-    defer group.cancel(io);
-
-    // Fiber 1: UDP broadcast loop (wrapped for zio Cancelable return type)
-    try group.concurrent(io, broadcastFiber, .{ io, port, sysinfo, cli.is_svc });
-
-    // Main fiber: TCP server accept loop
-    try tcpServerLoop(io, gpa, &group, port);
+    // ── Main thread: TCP server accept loop ───────────────────────────────
+    try tcpServerLoop(block_io, gpa, port);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Broadcast fiber (wraps broadcast.broadcastLoop for zio Io.Cancelable!void)
+// Broadcast thread (wraps broadcast.broadcastLoop)
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn broadcastFiber(io: Io, port: u16, info: broadcast.SystemInfo, is_svc: bool) Io.Cancelable!void {
-    broadcast.broadcastLoop(io, port, info, is_svc) catch |err| {
-        std.debug.print("[guest] Broadcast fiber error: {}\n", .{err});
-        return error.Canceled;
+fn broadcastThread(block_io: Io, port: u16, info: broadcast.SystemInfo, is_svc: bool) !void {
+    broadcast.broadcastLoop(block_io, port, info, is_svc) catch |err| {
+        std.debug.print("[guest] Broadcast thread error: {}\n", .{err});
     };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// TCP server (accept loop on main fiber)
+// TCP server (accept loop on main thread)
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn tcpServerLoop(io: Io, gpa: std.mem.Allocator, group: *Io.Group, port: u16) Io.Cancelable!void {
+fn tcpServerLoop(block_io: Io, gpa: std.mem.Allocator, port: u16) !void {
     const addr = Io.net.IpAddress.parse("0.0.0.0", port) catch |err| {
         std.debug.print("[guest] Failed to parse bind addr: {}\n", .{err});
-        return error.Canceled;
+        return err;
     };
-    var server = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+    var server = addr.listen(block_io, .{ .reuse_address = true }) catch |err| {
         std.debug.print("[guest] Failed to listen on {d}: {}\n", .{ port, err });
-        return error.Canceled;
+        return err;
     };
-    defer server.deinit(io);
+    defer server.deinit(block_io);
 
     std.debug.print("[guest] TCP server listening on port {d}\n", .{port});
 
     while (true) {
-        const stream = server.accept(io) catch |err| {
+        const stream = server.accept(block_io) catch |err| {
             std.debug.print("[guest] Accept error: {}\n", .{err});
             continue;
         };
-        errdefer stream.close(io);
+        errdefer stream.close(block_io);
 
-        group.concurrent(io, handleClient, .{ io, gpa, stream }) catch |err| {
-            std.debug.print("[guest] Failed to spawn handler fiber: {}\n", .{err});
-            stream.close(io);
+        const conn_thread = std.Thread.spawn(.{}, handleClient, .{ block_io, gpa, stream }) catch |err| {
+            std.debug.print("[guest] Failed to spawn handler thread: {}\n", .{err});
+            stream.close(block_io);
+            continue;
         };
+        conn_thread.detach();
     }
 }
 
@@ -134,14 +132,14 @@ fn tcpServerLoop(io: Io, gpa: std.mem.Allocator, group: *Io.Group, port: u16) Io
 // Per-connection TCP handler
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn handleClient(io: Io, gpa: std.mem.Allocator, stream: Io.net.Stream) Io.Cancelable!void {
-    defer stream.close(io);
+fn handleClient(block_io: Io, gpa: std.mem.Allocator, stream: Io.net.Stream) !void {
+    defer stream.close(block_io);
 
     var read_buf: [65536]u8 = undefined;
-    var reader = stream.reader(io, &read_buf);
+    var reader = stream.reader(block_io, &read_buf);
 
     var write_buf: [65536]u8 = undefined;
-    var writer = stream.writer(io, &write_buf);
+    var writer = stream.writer(block_io, &write_buf);
 
     const msg = transport.recvMessage(&reader, gpa) catch |err| {
         std.debug.print("[guest] recvMessage error: {}\n", .{err});
@@ -150,7 +148,7 @@ fn handleClient(io: Io, gpa: std.mem.Allocator, stream: Io.net.Stream) Io.Cancel
     if (msg == null) return;
     defer gpa.free(msg.?.payload);
 
-    dispatchMessage(io, gpa, &writer, msg.?.msg_type, msg.?.payload) catch |err| {
+    dispatchMessage(block_io, gpa, &writer, msg.?.msg_type, msg.?.payload) catch |err| {
         std.debug.print("[guest] dispatch error: {}\n", .{err});
         transport.sendString(&writer, transport.MsgType.ERROR, "Internal error") catch {};
     };
@@ -161,7 +159,7 @@ fn handleClient(io: Io, gpa: std.mem.Allocator, stream: Io.net.Stream) Io.Cancel
 }
 
 fn dispatchMessage(
-    io: Io,
+    block_io: Io,
     gpa: std.mem.Allocator,
     writer: anytype,
     msg_type: u8,
@@ -181,13 +179,13 @@ fn dispatchMessage(
                 try transport.sendString(writer, transport.MsgType.ERROR, "Invalid filename");
                 return;
             }
-            try transport.streamFile(writer, io, payload);
+            try transport.streamFile(writer, block_io, payload);
         },
         transport.MsgType.UPLOAD_REQ => {
-            try handleUpload(io, writer, payload);
+            try handleUpload(block_io, writer, payload);
         },
         transport.MsgType.EXEC_REQ => {
-            try handleExec(io, gpa, writer, payload);
+            try handleExec(block_io, gpa, writer, payload);
         },
         else => {
             std.debug.print("[guest] Unknown message type: 0x{x}\n", .{msg_type});
@@ -200,7 +198,7 @@ fn dispatchMessage(
 // Message handlers
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn handleUpload(io: Io, writer: anytype, payload: []const u8) !void {
+fn handleUpload(block_io: Io, writer: anytype, payload: []const u8) !void {
     const null_pos = std.mem.indexOfScalar(u8, payload, 0) orelse {
         try transport.sendString(writer, transport.MsgType.ERROR, "Invalid upload format");
         return;
@@ -215,36 +213,35 @@ fn handleUpload(io: Io, writer: anytype, payload: []const u8) !void {
         return;
     }
 
-    var file = std.Io.Dir.cwd().createFile(io, filename, .{ .permissions = @enumFromInt(0o755) }) catch |err| {
+    var file = std.Io.Dir.cwd().createFile(block_io, filename, .{}) catch |err| {
         try transport.sendString(writer, transport.MsgType.ERROR, "Cannot create file");
         return err;
     };
-    defer file.close(io);
+    defer file.close(block_io);
 
     var wb: [4096]u8 = undefined;
-    var fw = file.writer(io, &wb);
+    var fw = file.writer(block_io, &wb);
     _ = fw.interface.write(file_data) catch {};
-    fw.interface.flush() catch {};
 
-    const written: usize = @intCast(file.length(io) catch file_data.len);
+    const written: u64 = file.length(block_io) catch file_data.len;
     var resp_buf: [64]u8 = undefined;
     const resp = std.fmt.bufPrint(&resp_buf, "OK\n{d}", .{written}) catch "OK";
     try transport.sendString(writer, transport.MsgType.UPLOAD_RESP, resp);
     std.debug.print("[guest] Uploaded {s}: {d} bytes\n", .{ filename, written });
 }
 
-fn handleExec(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !void {
+fn handleExec(block_io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !void {
     std.debug.print("[guest] EXEC: {s}\n", .{cmd});
 
     if (builtin.os.tag == .windows) {
-        try execWindows(io, gpa, writer, cmd);
+        try execWindows(gpa, writer, cmd);
     } else {
-        try execPosix(io, gpa, writer, cmd);
+        try execPosix(block_io, gpa, writer, cmd);
     }
 }
 
-fn execPosix(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !void {
-    const result = std.process.run(gpa, io, .{
+fn execPosix(block_io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !void {
+    const result = std.process.run(gpa, block_io, .{
         .argv = &.{ guest_shell, "-l", "-c", cmd },
     }) catch |err| {
         try transport.sendString(writer, transport.MsgType.ERROR, "Execution failed");
@@ -273,12 +270,10 @@ fn execPosix(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !
     try transport.sendMessage(writer, transport.MsgType.EXEC_EXIT, &exit_buf);
 }
 
-fn execWindows(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !void {
-    // On Windows, zio's IOCP backend doesn't support async pipe I/O for child
-    // processes. Use a dedicated Threaded instance with a real allocator
-    // (global_single_threaded uses Allocator.failing, which causes OutOfMemory
-    // in processSpawnWindows's internal ArenaAllocator).
-    _ = io;
+fn execWindows(gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !void {
+    // On Windows, the process I/O context (global_single_threaded) uses
+    // Allocator.failing, which causes OutOfMemory in processSpawnWindows.
+    // Use a dedicated Threaded instance with a real allocator.
     var threaded = std.Io.Threaded.init(gpa, .{});
     const block_io = threaded.io();
     const result = std.process.run(gpa, block_io, .{

@@ -4,11 +4,10 @@
 //!   [4 bytes big-endian: payload length N][1 byte: message type][N bytes: payload]
 //!
 //! Two API layers:
-//!   - sendMessage/recvMessage: generic, work with any writer/reader (std.Io, zio Stream)
-//!   - sendToStream/recvFromStream: zio.net.Stream native (follows zproxy pattern)
+//!   - sendMessage/recvMessage: generic, work with any writer/reader (std.Io, Stream.Writer/Reader)
+//!   - streamFile/receiveFile: file transfer helpers
 
 const std = @import("std");
-const zio = @import("zio");
 
 /// Message type constants (replacing HTTP endpoints + IPC commands)
 pub const MsgType = struct {
@@ -32,7 +31,7 @@ pub const MsgType = struct {
 pub const MAX_PAYLOAD: usize = 50 * 1024 * 1024;
 
 /// Read exactly `len` bytes from a reader into buf.
-/// Callers always pass a pointer. Handles types with .interface (zio Stream.Reader, Io.File.Reader)
+/// Callers always pass a pointer. Handles types with .interface (Stream.Writer/Reader, File.Writer/Reader)
 /// and plain Io.Reader (tests via .fixed()) transparently.
 fn readAll(reader_ptr: anytype, buf: []u8) !void {
     var pos: usize = 0;
@@ -48,7 +47,7 @@ fn readAll(reader_ptr: anytype, buf: []u8) !void {
 }
 
 /// Write exactly `len` bytes from buf to a writer.
-/// Callers always pass a pointer. Handles types with .interface (zio Stream.Writer, Io.File.Writer)
+/// Callers always pass a pointer. Handles types with .interface (Stream.Writer, File.Writer)
 /// and plain Io.Writer (tests via .fixed()) transparently.
 fn writeAll(writer_ptr: anytype, buf: []const u8) !void {
     var pos: usize = 0;
@@ -127,69 +126,6 @@ pub fn sendString(writer: anytype, msg_type: u8, text: []const u8) !void {
     try sendMessage(writer, msg_type, text);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// zio.net.Stream native API — no buffered writer/reader wrappers.
-// Follows zproxy pattern: use stream.writeAll() / stream.read() directly.
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Send a framed message directly to a zio.net.Stream (no buffering).
-pub fn sendToStream(stream: *zio.net.Stream, msg_type: u8, payload: []const u8) !void {
-    const total_len: u32 = @intCast(1 + payload.len);
-    var header: [5]u8 = undefined;
-    writeU32Be(header[0..4], total_len);
-    header[4] = msg_type;
-
-    // Write header + payload with one or two writeAll calls
-    try stream.writeAll(&header, .none);
-    if (payload.len > 0) {
-        try stream.writeAll(payload, .none);
-    }
-}
-
-/// Receive a framed message from a zio.net.Stream. Allocates payload (caller owns).
-/// Returns null on clean EOF. Uses timeout for each read.
-pub fn recvFromStream(stream: *zio.net.Stream, allocator: std.mem.Allocator, timeout: zio.Timeout) !?struct { msg_type: u8, payload: []u8 } {
-    // Read 4-byte length header
-    var len_buf: [4]u8 = undefined;
-    readExact(stream, &len_buf, timeout) catch |err| switch (err) {
-        error.EndOfStream => return null,
-        else => |e| return e,
-    };
-    const total_len = readU32Be(&len_buf);
-
-    if (total_len == 0) return error.EmptyMessage;
-    if (total_len > MAX_PAYLOAD) return error.MessageTooLarge;
-
-    // Read type byte
-    var type_buf: [1]u8 = undefined;
-    try readExact(stream, &type_buf, timeout);
-    const msg_type = type_buf[0];
-
-    const payload_len = total_len - 1;
-    if (payload_len == 0) {
-        return .{ .msg_type = msg_type, .payload = &.{} };
-    }
-
-    const payload = try allocator.alloc(u8, payload_len);
-    errdefer allocator.free(payload);
-    readExact(stream, payload, timeout) catch |err| {
-        allocator.free(payload);
-        return err;
-    };
-
-    return .{ .msg_type = msg_type, .payload = payload };
-}
-
-/// Read exactly `len` bytes from a zio.net.Stream into buf.
-fn readExact(stream: *zio.net.Stream, buf: []u8, timeout: zio.Timeout) !void {
-    var pos: usize = 0;
-    while (pos < buf.len) {
-        const n = try stream.read(buf[pos..], timeout);
-        if (n == 0) return error.EndOfStream;
-        pos += n;
-    }
-}
-
 /// Stream a file to the peer in FILE_RESP chunks + EOF marker.
 /// Chunk size: 64KB. After all chunks, sends EOF message.
 pub fn streamFile(writer: anytype, io: std.Io, file_path: []const u8) !void {
@@ -205,7 +141,7 @@ pub fn streamFile(writer: anytype, io: std.Io, file_path: []const u8) !void {
     var offset: u64 = 0;
     while (offset < file_len) {
         const to_read = @min(fbuf.len, file_len - offset);
-        const n = file.readPositional(io, &.{fbuf[0..to_read]}, offset) catch break;
+        const n = file.readPositionalAll(io, fbuf[0..to_read], offset) catch break;
         if (n == 0) break;
         try sendMessage(writer, MsgType.FILE_RESP, fbuf[0..n]);
         offset += n;
@@ -217,11 +153,9 @@ pub fn streamFile(writer: anytype, io: std.Io, file_path: []const u8) !void {
 
 /// Receive FILE_RESP/EOF chunks and write to a file. Returns total bytes written.
 pub fn receiveFile(reader: anytype, io: std.Io, allocator: std.mem.Allocator, dest_path: []const u8) !usize {
-    const file = try std.Io.Dir.cwd().createFile(io, dest_path, .{ .permissions = @enumFromInt(0o755) });
+    const file = try std.Io.Dir.cwd().createFile(io, dest_path, .{});
     defer file.close(io);
 
-    var wb: [4096]u8 = undefined;
-    var fw = file.writer(io, &wb);
     var total: usize = 0;
 
     while (true) {
@@ -230,11 +164,12 @@ pub fn receiveFile(reader: anytype, io: std.Io, allocator: std.mem.Allocator, de
 
         switch (msg.msg_type) {
             MsgType.FILE_RESP => {
+                var wb: [4096]u8 = undefined;
+                var fw = file.writer(io, &wb);
                 _ = try fw.interface.write(msg.payload);
                 total += msg.payload.len;
             },
             MsgType.EOF => {
-                try fw.interface.flush();
                 return total;
             },
             MsgType.ERROR => {

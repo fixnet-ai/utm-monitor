@@ -6,7 +6,7 @@ const listener = @import("listener.zig");
 
 pub fn queryStatus(io: std.Io, allocator: std.mem.Allocator, port: u16) !void {
     // Bind to the broadcast port to collect guest ANNOUNCE messages.
-    // SO_REUSEADDR is set by zio's netBindIpImpl for UDP sockets, allowing
+    // SO_REUSEADDR is set by std.Io.net for UDP sockets, allowing
     // --status to share port 2121 with the Host daemon.
     const listen_addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
     const socket = listen_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {

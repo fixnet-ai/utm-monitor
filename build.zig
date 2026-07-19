@@ -4,6 +4,11 @@ const std = @import("std");
 /// See utm-vm/MANUAL.md §6.x for the full compatibility matrix
 fn deploymentFilename(target: std.Target) []const u8 {
     return switch (target.cpu.arch) {
+        .x86 => switch (target.os.tag) {
+            .linux => "utmm-x86-linux",
+            .windows => "utmm-x86-windows.exe",
+            else => "utmm",
+        },
         .x86_64 => switch (target.os.tag) {
             .linux => "utmm-x86_64-linux",
             .macos => "utmm-x86_64-macos",
@@ -24,11 +29,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const zio = b.dependency("zio", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
     const exe = b.addExecutable(.{
         .name = "utmm",
         .root_module = b.createModule(.{
@@ -38,7 +38,6 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    exe.root_module.addImport("zio", zio.module("zio"));
 
     b.installArtifact(exe);
 
