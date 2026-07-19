@@ -20,30 +20,31 @@ windowsvm: user=Administrator, passwd=111, app_path=C:\opt\
 ## Architecture Design
 
 ### Two Run Modes (Same Binary)
-- **Guest mode (default)**: Foreground mode — stops any background service, runs in terminal, restarts service on exit. With `--svc`: daemon mode (UDP broadcast hostname+IP + HTTP server on port 2121). Use `--install --user` to create a desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
-- **Host mode (--host)**: UDP listener + HTTP file server + /etc/hosts sync + IPC service + management commands (--status/--exec etc.)
+- **Guest mode (default)**: Foreground mode — stops any background service, runs in terminal, restarts service on exit. With `--svc`: daemon mode (UDP broadcast hostname+IP + TCP transport server on port 2121). Use `--install --user` to create a desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
+- **Host mode (--host)**: UDP listener + TCP transport + /etc/hosts sync + management commands (--status/--exec etc.)
 - **MCP integrated mode (--host --mcp)**: Host + MCP JSON-RPC server in one process, no separate Host daemon needed
 
 ### Complete Data Flow
 ```
-Guest (macvm)    ──UDP broadcast──┐                    ┌── HTTP(2121) → Host file serving
-Guest (linuxvm)  ──UDP broadcast──┤──→ Host listener(12345)─┼── HTTP(2121) → Host exec/upload
+Guest (macvm)    ──UDP broadcast──┐                    ┌── TCP(2121) → Version, Health, Exec, Upload, Download
+Guest (linuxvm)  ──UDP broadcast──┤──→ Host listener(12345)─┼── TCP(2121) → Guest bootstrap binary serving
 Guest (windows)  ──UDP broadcast──┘                    └── hosts file sync
 ```
 
 ### Communication Protocol
 - **UDP broadcast** (port 12345): Guest broadcasts `ANNOUNCE\nname: X\nip: Y\n...` every second, Host listens
-- **HTTP** (port 2121): Guest serves /health, /version, /update, /bin/:filename, /upload, /exec; Host serves /version, /bin/:filename for Guest bootstrap
-- **IPC** (port 12347): Host internal TCP channel for --status/--exec/--upload/--download command forwarding
-- **Auto-start Host service**: Management commands (--status/--exec/--upload/--download) auto-start the Host daemon via the OS service manager when IPC connection fails — no manual `utmm --host` needed
-- **Auto-upgrade**: Host detects Guest version mismatch via ANNOUNCE → pushes new binary via HTTP upload (ETag MD5 verified). Guest uses cross-platform safe rename (old → .old, .next → final) + detached restart. Compatible with Linux/macOS/Windows. No Guest polling.
+- **TCP transport** (port 2121): Binary frame protocol (4B big-endian length + 1B message type + payload). Guest serves VERSION_REQ, HEALTH_REQ, EXEC_REQ, FILE_REQ, UPLOAD_REQ. Host serves FILE_REQ for Guest bootstrap.
+- **Management commands** (--status/--exec/--upload/--download): Discover Guest IP via UDP broadcast, then connect directly via TCP transport. When UDP port is occupied (Host daemon running), fall back to reading `/tmp/utmm-guests.tsv` state file.
+- **Auto-start Host service**: Management commands auto-start the Host daemon via the OS service manager when the UDP port is not bound — no manual `utmm --host` needed
+- **Auto-upgrade**: Host detects Guest version mismatch via ANNOUNCE → pushes new binary via TCP UPLOAD_REQ (ETag MD5 verified). Guest uses cross-platform safe rename (old → .old, .next → final) + detached restart via EXEC_REQ. Compatible with Linux/macOS/Windows. No Guest polling.
 
 ### Key Design Decisions
 - Single binary, dual mode: reduces maintenance burden
 - UDP broadcast: no target address configuration needed, auto-discovery
 - IP change callback → auto-update /etc/hosts marked block
-- HTTP thread model: one thread per connection, `std.http.Server`/`Client` from standard library
-- Zero external dependencies: no Node.js, no Python, no SSH/SCP, no curl — everything via HTTP + UDP
+- zio async Runtime: io_uring (Linux) / kqueue (macOS) / IOCP (Windows) — unified async backend replacing std.Thread
+- Binary frame TCP protocol: 4B length prefix + 1B type + payload, single connection multiplexing, zero parsing overhead
+- Zero external dependencies: no Node.js, no Python, no SSH/SCP, no curl — everything via TCP + UDP
 - Host-push auto-upgrade: version mismatch detected in ANNOUNCE → Host pushes binary + restarts Guest. No Guest polling, no shell scripts. Cross-platform safe rename: old→.old, .next→final, spawn restart. ETag MD5 integrity verified on all uploads.
 
 ## Build & Run
@@ -57,22 +58,19 @@ zig build -Dtarget=aarch64-windows  # → utmm-aarch64-windows.exe
 zig build -Dtarget=x86_64-linux-musl    # → utmm-x86_64-linux
 zig build -Dtarget=x86_64-macos   # → utmm-x86_64-macos
 zig build -Dtarget=x86_64-windows  # → utmm-x86_64-windows.exe
-zig build -Dtarget=x86-linux-musl    # → utmm-x86-linux
-zig build -Dtarget=x86-windows  # → utmm-x86-windows.exe (may have linker warning on some toolchains)
 ```
 
-> **Note**: `x86-windows` (32-bit) may produce a non-fatal linker warning on some Zig toolchains. This is a build system quirk, not a code issue. The 32-bit Windows target is rarely used — all modern Windows VMs are aarch64 or x86_64.
+> **Note**: 32-bit x86 targets (x86-linux-musl, x86-windows) are no longer supported — zio's coroutine implementation requires 64-bit. All modern VMs are aarch64 or x86_64.
 
 ### Tests/Testing
 ```bash
-zig build test                                   # All tests (currently 53)
+zig build test                                   # All tests
 ```
 
 ### Guest End Runtime
 ```bash
 utmm                                      # Default Guest (foreground: stop service, run, restart on exit)
 utmm --hostname myvm --port 12345         # Custom parameters
-utmm --http-port 2122                     # Custom HTTP port
 utmm --svc                                # Daemon mode (launched by service manager)
 utmm --install                            # Install as system service (Guest mode)
 utmm --install --user                     # Create desktop shortcut (UTMM) for foreground launcher
@@ -85,22 +83,20 @@ utmm --uninstall --user                   # Remove desktop shortcut
 sudo utmm --host                          # Continuous listener (needs sudo for /etc/hosts)
 utmm --host --install                     # Install as system service (launchd/systemd/sc)
 utmm --host --uninstall                   # Remove system service
-utmm --host --serve-dir /path/to/binaries # Custom HTTP serve directory
+utmm --host --serve-dir /path/to/binaries # Custom binary serve directory
 utmm --host --mcp                         # Integrated mode: Host + MCP in one process
 
-# ── Management Commands (talk to Host via IPC, NO --host needed) ──
+# ── Management Commands (talk to Host/Guest via UDP discover + TCP, NO --host needed) ──
 utmm --status                             # Query all Guest status
 utmm --exec linuxvm "uname -a"            # Remote command execution
 utmm --upload file.txt linuxvm            # Upload file to Guest (no curl)
 utmm --download linuxvm f.txt ./f.txt     # Download file from Guest (no curl)
-utmm --mcp                                # Adapter mode: MCP stdio → Host IPC bridge
+utmm --mcp                                # Adapter mode: MCP stdio → direct UDP+TCP
 
-# ⚠️  Do NOT add --host to --exec/--status/--upload/--download.
-# These commands connect to the persistent Host via IPC (127.0.0.1:12347).
-# Adding --host would start a second listener that conflicts with the running Host.
-# (v0.1.22+: --host is auto-ignored when management commands are present.)
+# Management commands discover Guest IP via UDP broadcast + state file fallback.
+# When Host daemon is running (UDP port occupied), they read /tmp/utmm-guests.tsv.
 # (v0.1.26+: if Host service is not running, management commands auto-start it via
-#  the OS service manager — launchctl/systemctl/sc start — then retry IPC.)
+#  the OS service manager — launchctl/systemctl/sc start — then retry.)
 ```
 
 ## Project File Structure
@@ -109,18 +105,14 @@ src/
 ├── main.zig           # Entry point, CLI parsing, mode dispatch
 ├── ver.zig            # Single source of truth for version (bump to trigger auto-upgrade)
 ├── protocol.zig       # Message protocol: constants, GuestInfo, buildAnnounce/Ping/ExecReq
-├── guest.zig          # Guest orchestration: HTTP server thread + broadcast loop (no version polling)
-├── host.zig           # Host orchestration: management cmd dispatch + listener loop + auto-upgrade
+├── transport.zig      # Binary frame protocol: 4B len + 1B type + payload over TCP
+├── guest.zig          # Guest orchestration: TCP transport server + broadcast loop (no version polling)
+├── host.zig           # Host orchestration: management cmd dispatch + listener loop + auto-upgrade + hosts sync
 ├── broadcast.zig      # Guest: getLocalIp/getHostname/broadcastLoop + getDefaultGateway
 ├── listener.zig       # Host: UDP listener, IP change detection, OnIpChanged callback
 ├── hosts_file.zig     # /etc/hosts marked block read/write
-├── http_server.zig    # Guest HTTP server: /health, /version, /update, /bin/:filename, /upload, /exec
-├── http_client.zig    # HTTP client: GET/POST for version check, exec, upload, download
-├── host_http.zig      # Host HTTP file server: /version, /bin/:filename (read-only bootstrap)
 ├── status.zig         # Host: --status query + formatStatusTable
-├── executor.zig       # Host: --exec remote execution + resolveGuest + findGuest
-├── ipc.zig            # Host: IPC service (127.0.0.1:12347 TCP command forwarding)
-├── mcp.zig            # MCP JSON-RPC server (--mcp flag, stdio transport)
+├── mcp.zig            # MCP JSON-RPC server (--mcp flag, stdio transport, direct UDP+TCP)
 ├── install.zig        # --install/--uninstall system service + --gen-init script generation + desktop shortcuts
 ├── agent.zig          # Guest: foreground mode (stop service, run in TTY, restart on exit)
 └── config.zig         # Config persistence + logging system
@@ -147,6 +139,14 @@ Before starting any work, read the following files (if they exist), then use the
 - Container initialization: `.{}` → `.empty` / `.init`
 - `usingnamespace` / `async`/`await` / `@Type` / `@cImport` — removed
 - libxev `close()` returns void on kqueue backend (not error union)
+
+### zio Async Runtime Patterns
+- `Runtime.init(gpa, .{})` → `spawn()` for tasks, `handle.join()` to wait
+- `Io.net.Stream` with `writeAll()`/`read()` directly (no buffered wrapper needed for simple cases)
+- `Io.net.Stream.Writer` has `interface: Io.Writer` field — use `writer.interface.flush()` to drain buffered data
+- `BufWriter` data is lost when it goes out of scope — use persistent reader/writer across calls
+- Mutual recursion with error set inference: use explicit `anyerror!T` return type to break dependency loop
+- 32-bit x86 not supported by zio coroutines — 6 targets only (aarch64 + x86_64 × linux/macos/windows)
 
 ### 1. Think Before Coding
 **Don't assume. Don't hide confusion. Explicitly present trade-offs.**

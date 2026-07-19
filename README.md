@@ -15,7 +15,7 @@ The headline feature. After a quick one-time setup, your AI agent manages your V
 ## Daily Usage Examples
 
 ```
-“Start lldb remote debug app“
+"Start lldb remote debug app"
 "Check the status of all VMs"
 "Run the test suite on linuxvm"
 "Deploy the latest build to all VMs"
@@ -34,13 +34,14 @@ The headline feature. After a quick one-time setup, your AI agent manages your V
 - **Auto IP Discovery** — Guest UDP broadcasts hostname+IP every second; Host auto-listens, ignoring VPN/tunnel interfaces
 - **Automatic /etc/hosts Sync** — Host updates the hosts file marker block on IP change, so `linuxvm` always resolves
 - **Remote Command Execution** — `--exec` sends commands to any VM, auto-adapts macOS/Linux/Windows shell
-- **Auto Version Upgrade** — Host detects Guest version mismatch via UDP broadcast, auto-pushes new binary via HTTP — no Guest polling needed
-- **HTTP File Service** — Guest built-in HTTP server (thread-per-connection); file upload/download/exec all via HTTP
-- **File Upload/Download** — `--upload` and `--download` commands replace curl for manual file transfers
-- **Auto-Start on Boot** — Supports launchd / systemd / Windows SCM (Service Control Manager)
+- **Auto Version Upgrade** — Host detects Guest version mismatch via UDP broadcast, auto-pushes new binary via TCP transport — no Guest polling needed
+- **TCP Transport Protocol** — Binary frame protocol (4B length + 1B type + payload) replaces HTTP; single connection multiplexing, zero parsing overhead
+- **File Upload/Download** — `--upload` and `--download` commands for file transfers over TCP transport
+- **Auto-Start on Boot** — Supports launchd / systemd / Windows scheduled tasks
 - **Auto-Start Host Service** — Management commands auto-start the Host daemon when it's not running
 - **Single Binary, Dual Mode** — Default Guest mode; `--host` switches to Host mode
 - **MCP Integrated Mode** — `--host --mcp` runs Host + MCP server in one process, no separate daemon
+- **zio Async Runtime** — io_uring (Linux) / kqueue (macOS) / IOCP (Windows) for high-performance async I/O
 
 
 
@@ -54,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.
 ```
 
 The install script:
-- Downloads `utmm.zip` from GitHub Releases (contains all 8 platform binaries)
+- Downloads `utmm.zip` from GitHub Releases (contains all 6 platform binaries)
 - Extracts to `/opt/utmm/` (configurable via `INSTALL_DIR`)
 - Creates `/opt/utmm/utmm` → `utmm-{arch}-{os}` symlink for the Host
 - Creates `/usr/local/bin/utmm` → `/opt/utmm/utmm` convenience symlink
@@ -95,7 +96,7 @@ claude mcp add utmm -- utmm --mcp
 sudo utmm --host
 ```
 
-Keep this running. The Host serves binaries from `/opt/utmm/` by default (all 8 platform binaries are already there from install). To auto-start on boot:
+Keep this running. The Host serves binaries from `/opt/utmm/` by default (all 6 platform binaries are already there from install). To auto-start on boot:
 
 ```bash
 sudo utmm --install
@@ -162,7 +163,7 @@ utmm --download linuxvm f.txt ./f.txt  # download file from VM (no curl)
 
 - **Precompiled binary**: Zero dependencies — download and run
 - **MCP**: Built into the binary via `--mcp` flag. Zero external dependencies.
-- **Source build**: [Zig](https://ziglang.org) 0.16.0
+- **Source build**: [Zig](https://ziglang.org) 0.16.0 + zio async library (bundled in zig-pkg/)
 
 ## Architecture
 
@@ -171,8 +172,7 @@ Guest (linuxvm)  ──UDP broadcast──┐
 Guest (macvm)    ──UDP broadcast──┤──→ Host listener (12345)
 Guest (windows)  ──UDP broadcast──┘         │
                                             ├─ /etc/hosts sync
-                                            ├─ HTTP server (2121)
-                                            ├─ IPC (127.0.0.1:12347)
+                                            ├─ TCP transport (2121)
                                             │       ↑
                                             └─ MCP JSON-RPC (stdio)
                                                     ↑

@@ -66,7 +66,7 @@ The command runs in the VM's native shell:
 - Windows: backslashes in paths work, forward slashes also work in cmd.exe
 - Single quotes are safer than double quotes for shell commands
 
-> **Auto-upgrade**: The Host uploads `utmm.next` (or `utmm.next.exe` on Windows) to any Guest whose version doesn't match. The Guest detects it in its 1-second broadcast loop and self-upgrades (atomic rename + detached restart). Bump `src/ver.zig` and rebuild — all online Guests upgrade within seconds.
+> **Auto-upgrade**: The Host uploads `utmm.next` (or `utmm.next.exe` on Windows) via TCP transport to any Guest whose version doesn't match. The Guest detects it in its 1-second broadcast loop and self-upgrades (atomic rename + detached restart). Bump `src/ver.zig` and rebuild — all online Guests upgrade within seconds.
 
 ## Core Workflows
 
@@ -98,7 +98,7 @@ vm_status → see which VMs are online, their versions, IPs
 ```
 1. Host: curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 2. Host: sudo utmm --host --install && sudo utmm --host
-3. For each Guest VM, run ONE command (no internet needed — from Host HTTP):
+3. For each Guest VM, run ONE command (no internet needed — from Host TCP):
    - Linux/macOS: curl http://<gateway>:2121/bin/install.sh | sh -s -- --guest --hostname <name>
    - Windows: find gateway, download install.bat from http://<gateway>:2121/bin/install.bat, run with --guest
 4. vm_status → verify all VMs appear online
@@ -116,18 +116,19 @@ No internet access needed on Guest VMs.
 
 ## Prerequisites & Troubleshooting
 
-**The Host must be running before any MCP tool works:**
+**The Host must be running for auto-upgrade and /etc/hosts sync:**
 ```bash
 sudo utmm --host
 ```
 
+**MCP adapter mode works independently** — `utmm --mcp` discovers Guests via UDP broadcast (with `/tmp/utmm-guests.tsv` state file fallback) and connects directly via TCP transport.
+
 | Symptom | Likely cause | Action |
 |---------|-------------|--------|
-| "Host is not running" | Host process died or never started | `sudo utmm --host` |
+| "No VMs online" | VMs not booted, or guest utmm not running | Check VMs are booted; verify `utmm` is running inside each |
 | "GuestNotFound" for a VM | VM is offline or name mismatch | Run `vm_status` to see which VMs are actually online |
-| "No VMs currently online" | VMs not booted, or guest utmm not running | Check VMs are booted; verify `utmm` is running inside each |
 | VM marked "upgradable" | Guest binary is older than Host | Host will auto-upgrade within seconds — bump ver.zig and rebuild |
-| vm_status returns empty but CLI --status shows VMs | MCP IPC issue | Use `utmm --host --mcp` for integrated mode (bypasses IPC) |
+| vm_status returns empty but CLI --status shows VMs | UDP port not available, no state file | Start Host (`sudo utmm --host`) to write state file; or use `--host --mcp` for integrated mode |
 
 **Fallback:** If MCP tools are unavailable, you can use the CLI directly:
 ```bash
@@ -141,20 +142,21 @@ utmm --exec linuxvm "uname -a"
 |------|------|
 | Host binary (symlink) | `/usr/local/bin/utmm` → `/opt/utmm/utmm` |
 | Host binary (actual) | `/opt/utmm/utmm` → `/opt/utmm/utmm-aarch64-macos` |
-| All platform binaries | `/opt/utmm/utmm-*` (8 binaries from utmm.zip) |
+| All platform binaries | `/opt/utmm/utmm-*` (6 binaries from utmm.zip) |
 | Host service plist | `/Library/LaunchDaemons/com.utmm.plist` |
 | Host log | `/var/log/utmm-host.log` |
-| Serve directory (HTTP) | `/opt/utmm/` by default (configurable via `--serve-dir`) |
+| Serve directory (TCP) | `/opt/utmm/` by default (configurable via `--serve-dir`) |
+| State file | `/tmp/utmm-guests.tsv` (TSV: hostname, target, ip, mac, version) |
 
 ## Bootstrap Troubleshooting
 
-### Guest can't download from Host HTTP (curl error 28/timeout)
+### Guest can't download from Host (connection timeout)
 
-**Symptom**: The `/update` script fetches successfully but the download within the script fails with a connection timeout.
+**Symptom**: The install script fetches successfully but the download within the script fails with a connection timeout.
 
-**Cause**: The `/update` script uses the Host IP from the HTTP `Host` header. If the Guest is on a UTM bridge network that can't route to the Host's physical NIC IP, the download fails. Example: macvm on bridge100 (192.168.64.0/24) cannot reach the Host's en0 IP (192.168.3.130).
+**Cause**: The Guest is on a UTM bridge network that can't route to the Host's physical NIC IP. Example: macvm on bridge100 (192.168.64.0/24) cannot reach the Host's en0 IP (192.168.3.130).
 
-**Solution**: The `/update` endpoint now auto-detects the correct IP from the HTTP Host header. Ensure you're using the latest version. If the issue persists, download the binary directly:
+**Solution**: Use the bridge gateway IP directly:
 ```bash
 # Use the bridge gateway IP (192.168.64.1, 192.168.65.1, etc.) directly:
 GATEWAY=$(ip route | grep default | awk '{print $3}')
@@ -167,17 +169,13 @@ chmod +x /opt/utmm/utmm
 
 **Symptom**: After restarting a Guest with a new hostname, both the old and new names appear in `--status`.
 
-**Cause**: The Host's UDP listener caches Guest entries. Old entries remain until they expire. There's currently no active cleanup for renamed guests.
+**Cause**: The Host's UDP listener caches Guest entries. Old entries remain until they expire.
 
 **Workaround**: Restart the Host process (`sudo pkill utmm && sudo utmm --host`). The stale entry will be gone after restart.
 
-### `/update` script fails: directory not found
+### Guest broadcasts with wrong hostname (OS default instead of specified name)
 
-**Symptom**: `curl: (23) client returned ERROR on write` when executing `/update`.
-
-**Cause**: Older versions of the `/update` script did not create `/opt/utmm/` before downloading.
-
-**Solution**: The latest `/update` script includes `mkdir -p`. If you're using an older Host, create the directory manually first: `sudo mkdir -p /opt/utmm`.
+**A**: This was a bug in install.sh — `--install` was called without `--hostname`. Fixed in v0.1.5. If affected, restart the Guest: `pkill utmm && /opt/utmm/utmm --hostname <name> &`
 
 ## Limitations
 
@@ -185,8 +183,8 @@ chmod +x /opt/utmm/utmm
 - VM IPs can change on reboot — always check `vm_status` first, don't cache IPs
 - Windows cmd.exe has different escaping rules than bash — test simple commands first
 
-### Q: `--download` fails with "Guest not found" or "HttpStatusNotOk" but the Guest is online
-**A**: This happens when you use a full path like `/opt/utmm/file.txt` instead of just the filename `file.txt`. The `/bin/` endpoint only accepts simple filenames (no `/` or `\`) and only reads from `/opt/utmm/` on the Guest. Use just the basename:
+### Q: `--download` fails with "Guest not found" but the Guest is online
+**A**: This happens when you use a full path like `/opt/utmm/file.txt` instead of just the filename `file.txt`. The FILE_REQ endpoint only accepts simple filenames (no `/` or `\`) and only reads from `/opt/utmm/` on the Guest. Use just the basename:
 ```
 # Wrong:
 utmm --download linuxvm /opt/utmm/app.log ./app.log
@@ -197,17 +195,11 @@ To download files from other directories, use `--exec` to copy them to `/opt/utm
 
 ## Deployment FAQs (from bare-metal validation)
 
-### Q: Guest broadcasts with wrong hostname (OS default instead of specified name)
-**A**: This was a bug in install.sh — `--install` was called without `--hostname`. Fixed in v0.1.5. The install script now passes `--hostname` to `--install`. If affected, restart the Guest: `pkill utmm && /opt/utmm/utmm --hostname <name> &`
-
-### Q: `--download` returns "0 bytes saved" but file exists on Guest
-**A**: Known bug in versions before v0.1.5. The HTTP client's `take(n)` requires exactly `n` bytes and discards buffered data on EndOfStream. Fixed by using `readVec()` instead. Upgrade to v0.1.5+.
-
-### Q: HTTP upload fails with "Bad Request" or truncated file
-**A**: Required CRLF (`\r\n`) line endings in multipart/form-data headers. Zig's `\\` line continuation only produces LF (`\n`). Fixed in v0.1.5 by using `++` string concatenation with explicit `\r\n`. Ensure version >= v0.1.5.
+### Q: `zig-out/bin/utmm` is the wrong architecture after cross-compilation
+**A**: `zig build` always overwrites `zig-out/bin/utmm` with the LAST target built. After cross-compiling all targets, rebuild native last: `zig build -Doptimize=ReleaseSafe`. Or use the specifically-named output file (e.g., `zig-out/bin/utmm-aarch64-macos`) for the correct architecture.
 
 ### Q: macOS Guest: `ip route` command not found
-**A**: macOS uses `route -n get default`, not `ip route`. The install.sh auto-detects the correct command per OS. The README Quick Start now shows platform-specific commands.
+**A**: macOS uses `route -n get default`, not `ip route`. The install.sh auto-detects the correct command per OS.
 
 ### Q: Windows: SSH+PowerShell quoting is complex
 **A**: Use the batch installer (`install.bat`) instead — no PowerShell dependency, no quoting issues. Example:
@@ -215,8 +207,8 @@ To download files from other directories, use `--exec` to copy them to `/opt/utm
 curl -o install.bat "http://<gateway>:2121/bin/install.bat" && install.bat --guest --hostname windowsvm
 ```
 
-### Q: `zig-out/bin/utmm` is the wrong architecture after cross-compilation
-**A**: `zig build` always overwrites `zig-out/bin/utmm` with the LAST target built. After cross-compiling all targets, rebuild native last: `zig build -Doptimize=ReleaseSafe`. Or use the specifically-named output file (e.g., `zig-out/bin/utmm-aarch64-macos`) for the correct architecture.
+### Q: 32-bit x86 build fails
+**A**: 32-bit x86 targets are no longer supported in v0.2.0. zio's coroutine implementation requires 64-bit. All modern VMs are aarch64 or x86_64.
 
 ## Reference Manual
 
