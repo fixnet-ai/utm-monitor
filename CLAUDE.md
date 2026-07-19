@@ -27,12 +27,12 @@ windowsvm: user=Administrator, passwd=111, app_path=C:\opt\
 ### Complete Data Flow
 ```
 Guest (macvm)    ──UDP broadcast──┐                    ┌── TCP(2121) → Version, Health, Exec, Upload, Download
-Guest (linuxvm)  ──UDP broadcast──┤──→ Host listener(12345)─┼── TCP(2121) → Guest bootstrap binary serving
+Guest (linuxvm)  ──UDP broadcast──┤──→ Host listener(2121)─┼── TCP(2121) → Guest bootstrap binary serving
 Guest (windows)  ──UDP broadcast──┘                    └── hosts file sync
 ```
 
 ### Communication Protocol
-- **UDP broadcast** (port 12345): Guest broadcasts `ANNOUNCE\nname: X\nip: Y\n...` every second, Host listens
+- **UDP broadcast** (port 2121): Guest broadcasts `ANNOUNCE\nname: X\nip: Y\n...` every second, Host listens
 - **TCP transport** (port 2121): Binary frame protocol (4B big-endian length + 1B message type + payload). Guest serves VERSION_REQ, HEALTH_REQ, EXEC_REQ, FILE_REQ, UPLOAD_REQ. Host serves FILE_REQ for Guest bootstrap.
 - **Management commands** (--status/--exec/--upload/--download): Discover Guest IP via UDP broadcast, then connect directly via TCP transport. When UDP port is occupied (Host daemon running), fall back to reading `/tmp/utmm-guests.tsv` state file.
 - **Auto-start Host service**: Management commands auto-start the Host daemon via the OS service manager when the UDP port is not bound — no manual `utmm --host` needed
@@ -70,7 +70,7 @@ zig build test                                   # All tests
 ### Guest End Runtime
 ```bash
 utmm                                      # Default Guest (foreground: stop service, run, restart on exit)
-utmm --hostname myvm --port 12345         # Custom parameters
+utmm --hostname myvm --port 2121         # Custom parameters
 utmm --svc                                # Daemon mode (launched by service manager)
 utmm --install                            # Install as system service (Guest mode)
 utmm --install --user                     # Create desktop shortcut (UTMM) for foreground launcher

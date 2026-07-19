@@ -264,86 +264,29 @@ fn execPosix(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !
 }
 
 fn execWindows(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !void {
-    const tid = std.Thread.getCurrentId();
-
-    const tmp_stdout = std.fmt.allocPrint(gpa, "utmm_out_{d}.tmp", .{tid}) catch {
-        try transport.sendString(writer, transport.MsgType.ERROR, "Alloc failed");
-        return;
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "cmd.exe", "/c", cmd },
+    }) catch |err| {
+        try transport.sendString(writer, transport.MsgType.ERROR, "Execution failed");
+        return err;
     };
-    defer gpa.free(tmp_stdout);
-    const tmp_stderr = std.fmt.allocPrint(gpa, "utmm_err_{d}.tmp", .{tid}) catch {
-        try transport.sendString(writer, transport.MsgType.ERROR, "Alloc failed");
-        return;
-    };
-    defer gpa.free(tmp_stderr);
-    const tmp_bat = std.fmt.allocPrint(gpa, "utmm_cmd_{d}.bat", .{tid}) catch {
-        try transport.sendString(writer, transport.MsgType.ERROR, "Alloc failed");
-        return;
-    };
-    defer gpa.free(tmp_bat);
-
-    // Write .bat file
-    {
-        const bat_file = std.Io.Dir.cwd().createFile(io, tmp_bat, .{ .permissions = @enumFromInt(0o644) }) catch |err| {
-            try transport.sendString(writer, transport.MsgType.ERROR, "Cannot create batch file");
-            return err;
-        };
-        defer bat_file.close(io);
-        var wb: [4096]u8 = undefined;
-        var bat_w = bat_file.writer(io, &wb);
-        _ = bat_w.interface.write("@echo off\r\n") catch 0;
-        _ = bat_w.interface.write(cmd) catch 0;
-        _ = bat_w.interface.write("\r\n") catch 0;
-        bat_w.interface.flush() catch {};
+    defer {
+        gpa.free(result.stdout);
+        gpa.free(result.stderr);
     }
 
-    const stdout_f = std.Io.Dir.cwd().createFile(io, tmp_stdout, .{ .permissions = @enumFromInt(0o644) }) catch |err| {
-        try transport.sendString(writer, transport.MsgType.ERROR, "Cannot create stdout file");
-        return err;
-    };
-    const stderr_f = std.Io.Dir.cwd().createFile(io, tmp_stderr, .{ .permissions = @enumFromInt(0o644) }) catch |err| {
-        stdout_f.close(io);
-        try transport.sendString(writer, transport.MsgType.ERROR, "Cannot create stderr file");
-        return err;
-    };
+    if (result.stdout.len > 0) {
+        try transport.sendMessage(writer, transport.MsgType.EXEC_STDOUT, result.stdout);
+    }
+    if (result.stderr.len > 0) {
+        try transport.sendMessage(writer, transport.MsgType.EXEC_STDERR, result.stderr);
+    }
 
-    var child = std.process.spawn(io, .{
-        .argv = &.{ "cmd.exe", "/c", tmp_bat },
-        .stdout = .{ .file = stdout_f },
-        .stderr = .{ .file = stderr_f },
-    }) catch |err| {
-        stdout_f.close(io);
-        stderr_f.close(io);
-        try transport.sendString(writer, transport.MsgType.ERROR, "Spawn failed");
-        return err;
-    };
-
-    stdout_f.close(io);
-    stderr_f.close(io);
-
-    const term = child.wait(io) catch std.process.Child.Term{ .unknown = 0 };
-
-    if (std.Io.Dir.cwd().readFileAlloc(io, tmp_stdout, gpa, @enumFromInt(10 * 1024 * 1024))) |data| {
-        if (data.len > 0) {
-            try transport.sendMessage(writer, transport.MsgType.EXEC_STDOUT, data);
-        }
-        gpa.free(data);
-    } else |_| {}
-
-    if (std.Io.Dir.cwd().readFileAlloc(io, tmp_stderr, gpa, @enumFromInt(10 * 1024 * 1024))) |data| {
-        if (data.len > 0) {
-            try transport.sendMessage(writer, transport.MsgType.EXEC_STDERR, data);
-        }
-        gpa.free(data);
-    } else |_| {}
-
-    std.Io.Dir.cwd().deleteFile(io, tmp_stdout) catch {};
-    std.Io.Dir.cwd().deleteFile(io, tmp_stderr) catch {};
-    std.Io.Dir.cwd().deleteFile(io, tmp_bat) catch {};
-
-    const exit_code: i32 = switch (term) {
+    const exit_code: i32 = switch (result.term) {
         .exited => |code| @intCast(code),
-        else => -1,
+        .signal => @as(i32, -1),
+        .stopped => @as(i32, -2),
+        .unknown => @as(i32, -3),
     };
     var exit_buf: [4]u8 = undefined;
     std.mem.writeInt(i32, &exit_buf, exit_code, .big);

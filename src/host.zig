@@ -501,8 +501,8 @@ fn processAnnounce(
             existing.version = try gpa.dupe(u8, info.version);
         }
 
-        if (ver_changed and serve_dir != null) {
-            // Auto-upgrade: guest version doesn't match host
+        const host_version_mismatch = !std.mem.eql(u8, info.version, protocol.VERSION);
+        if (ver_changed and host_version_mismatch and serve_dir != null) {
             try spawnAutoUpgrade(io, gpa, serve_dir.?, info.hostname, actual_ip, port);
         }
     } else {
@@ -516,6 +516,11 @@ fn processAnnounce(
             .version = try gpa.dupe(u8, info.version),
         });
         try syncHostsFile(gpa, io, hosts_path, guests);
+
+        // Auto-upgrade on first sight if guest version doesn't match host
+        if (!std.mem.eql(u8, info.version, protocol.VERSION) and serve_dir != null) {
+            try spawnAutoUpgrade(io, gpa, serve_dir.?, info.hostname, actual_ip, port);
+        }
     }
 }
 
@@ -649,7 +654,7 @@ fn spawnAutoUpgrade(
 fn restartCommand(gpa: std.mem.Allocator, target: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, target, "windows") != null) {
         return gpa.dupe(u8,
-            \\cmd /c "move /Y C:\opt\utmm\utmm.exe C:\opt\utmm\utmm.old 2>nul & move /Y C:\opt\utmm\utmm.next C:\opt\utmm\utmm.exe & schtasks /run /tn utmm-guest"
+            \\cmd /c "move /Y C:\opt\utmm\utmm.exe C:\opt\utmm\utmm.old 2>nul & move /Y C:\opt\utmm\utmm.next C:\opt\utmm\utmm.exe & sc start UTM-Monitor"
         );
     }
     if (std.mem.indexOf(u8, target, "macos") != null) {

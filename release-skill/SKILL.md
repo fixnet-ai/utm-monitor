@@ -45,11 +45,11 @@ Must pass. Stop and fix if any test fails.
 ./release-skill/build.sh
 ```
 
-This builds 8 targets into `release/` and creates `utmm.zip`:
-`x86-windows`, `x86_64-windows`, `aarch64-windows`, `x86_64-macos`,
-`aarch64-macos`, `x86-linux-musl`, `x86_64-linux-musl`, `aarch64-linux-musl`
+This builds 6 targets into `release/` and creates `utmm.zip`:
+`x86_64-windows`, `aarch64-windows`, `x86_64-macos`,
+`aarch64-macos`, `x86_64-linux-musl`, `aarch64-linux-musl`
 
-> **Note**: `x86-windows` (32-bit) may produce a non-fatal linker warning on some Zig toolchains. If it fails, skip it — the 32-bit Windows target is rarely used.
+> **Note**: 32-bit x86 targets are no longer supported — zio's coroutine implementation requires 64-bit.
 
 ### Step 5: Commit & tag
 

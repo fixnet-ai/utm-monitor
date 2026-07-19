@@ -43,10 +43,10 @@ utmm --host       # Host mode
 │                                                                      │
 │  ┌─────────────┐    ┌──────────────────┐    ┌──────────────────┐     │
 │  │ /etc/hosts   │◄───│ hosts_file module │◄───│ listener         │     │
-│  │              │    │ (marker block     │    │ (12345 UDP)      │     │
+│  │              │    │ (marker block     │    │ (2121 UDP)      │     │
 │  └─────────────┘    │  update)           │    └────────┬─────────┘     │
 │                     └──────────────────┘             ▲               │
-│                                          UDP broadcast (255.255.255.255:12345)
+│                                          UDP broadcast (255.255.255.255:2121)
 │                                          One ANNOUNCE message per second
 │                                    ┌──────┼──────┐                   │
 │                                    ▼      ▼      ▼                   │
@@ -67,9 +67,9 @@ utmm --host       # Host mode
 
 ### 1.4 Communication Protocols
 
-#### UDP Broadcast Messages (Guest → Host, Port 12345)
+#### UDP Broadcast Messages (Guest → Host, Port 2121)
 
-The Guest sends one ANNOUNCE message per second to `255.255.255.255:12345`:
+The Guest sends one ANNOUNCE message per second to `255.255.255.255:2121`:
 
 ```
 ANNOUNCE
@@ -138,7 +138,7 @@ The `target` in the FQDN is the Zig cross-compilation target triple, directly us
 
 Management commands (`--status`/`--exec`/`--upload`/`--download`) discover Guest IPs via:
 
-1. **UDP broadcast** — bind port 12345, listen for ANNOUNCE messages (1-2 seconds)
+1. **UDP broadcast** — bind port 2121, listen for ANNOUNCE messages (1-2 seconds)
 2. **State file fallback** — when UDP port is occupied (Host daemon running), read `/tmp/utmm-guests.tsv`
 
 Once the Guest IP is discovered, management commands connect directly to the Guest via TCP transport (port 2121). No intermediate IPC layer.
@@ -174,8 +174,7 @@ On **Windows**, the Guest self-reports its IP as `0.0.0.0` (fallback value), and
 
 | Port | Protocol | Direction | Purpose |
 |------|----------|-----------|---------|
-| 12345 | UDP | Guest → Host | Broadcast ANNOUNCE |
-| 2121 | TCP | Bidirectional | TCP transport: Guest exec/upload/download + Host binary serving |
+| 2121 | UDP + TCP | Bidirectional | UDP broadcast ANNOUNCE + TCP transport (exec/upload/download/bootstrap) |
 
 ### 2.2 Network Topology Requirements
 
@@ -431,8 +430,8 @@ utmm --gen-init linux
 utmm --gen-init windows
 # Generates a script; or install directly:
 C:\opt\utmm\utmm.exe --install
-# This creates a scheduled task via 'schtasks /create /tn utmm-guest'
-# Start with:  schtasks /run /tn utmm-guest
+# This creates a Windows Service via 'sc create "UTM-Monitor"'
+# Start with:  sc start UTM-Monitor
 ```
 
 ### 3.6 Start Host Service
@@ -454,7 +453,7 @@ After starting, the following output indicates normal operation:
 
 ```
 [host] Starting to listen for Guest broadcasts...
-[listener] Listening on port 12345
+[listener] Listening on port 2121
 [listener] Discovered new guest: macvm (192.168.64.4)
 [listener] Discovered new guest: linuxvm (192.168.64.2)
 [listener] Discovered new guest: windowsvm (192.168.65.2)
@@ -491,12 +490,12 @@ Mode Selection:
   --svc                  Run as daemon (launched by service manager, no service mgmt)
 
 Guest Options:
-  --port PORT            UDP broadcast port         (default 12345)
+  --port PORT            UDP broadcast port         (default 2121)
   --hostname NAME        Local hostname (auto-detect by default)
   --log-file PATH        Log output path
 
 Host Options:
-  --port PORT            UDP listen port            (default 12345)
+  --port PORT            UDP listen port            (default 2121)
   --hosts-file PATH      Hosts file path            (default /etc/hosts)
   --serve-dir PATH       TCP serve directory        (default: /opt/utmm/)
   --marker TAG           Hosts marker text          (default UTM-MONITOR)
@@ -700,11 +699,11 @@ utmm --exec ubuntu "tail -5 /opt/utmm/utmm.log"
 # If it shows a tun/utun interface, tunnel filtering is not working
 
 # 4. Use tcpdump on Host to verify packets are received
-sudo tcpdump -i any port 12345 -n
+sudo tcpdump -i any port 2121 -n
 # Should see UDP packets from each VM
 
 # 5. Check if port is occupied
-lsof -i :12345
+lsof -i :2121
 ```
 
 ### 5.2 Wrong IP Detected (Tunnel/VPN Interference)
@@ -735,7 +734,7 @@ lsof -i :12345
 
 **Symptom**: Process disappears when the window is closed after direct launch
 
-**Solution**: Use scheduled task instead of direct launch, or auto-install via `--install`. Execute in the VM:
+**Solution**: Use Windows Service instead of direct launch, or auto-install via `--install`. Execute in the VM:
 
 ```cmd
 C:\opt\utmm\utmm.exe --install
@@ -799,7 +798,7 @@ bump ver.zig && zig build  # auto-upgrade handles the rest
 
 **Auto-start Host service (v0.1.26+)**: If the Host daemon is not running when a management command is invoked, the CLI auto-starts it via the OS service manager (`launchctl load` / `systemctl start` / `sc start`) and retries.
 
-If ports 12345/2121 are occupied by other programs, they can be changed via parameters:
+If port 2121 is occupied by another program, it can be changed via the `--port` parameter:
 
 ```bash
 # Guest side
@@ -863,7 +862,7 @@ utmm/
 | libc | System | `getifaddrs` / `gethostname` / `getenv` |
 | launchd | macOS system | macOS auto-start on boot |
 | systemd | Linux system | Linux auto-start on boot |
-| schtasks | Windows system | Windows auto-start on boot (scheduled task) |
+| sc (SCM) | Windows system | Windows auto-start on boot (Windows Service) |
 | TCP+UDP | Built-in | File transfer + remote execution + broadcast discovery |
 
 ### 6.3 Binary Packaging (6 Binaries → All VMs)
@@ -924,7 +923,7 @@ utmm --exec ubuntu "ip addr show"
 utmm --exec ubuntu "head -5 /opt/utmm/utmm.log"
 
 # Capture packets to verify broadcasts
-sudo tcpdump -i any port 12345 -n -c 10
+sudo tcpdump -i any port 2121 -n -c 10
 
 # Verify Guest is online (via Host status)
 utmm --status
@@ -956,7 +955,7 @@ sudo killall -HUP mDNSResponder
 | `error.ConnectionRefused` | Guest TCP server not started | Check if Guest process is running |
 | `GuestNotFound` | UDP broadcast not reaching | Check if network is on same broadcast domain |
 | Tunnel IP detected | VPN interface interference | utun/tun added to exclusion list |
-| Windows process disappears | Direct launch without scheduled task | Use --install to install as scheduled task |
+| Windows process disappears | Direct launch without Windows Service | Use --install to install as Windows Service |
 | Upload file locked | Target file mmap'd by process | Kill process and retry |
 | `zig-out/bin/utmm` is wrong arch | `zig build` overwrites with last target | Use named file e.g. `utmm-aarch64-macos` |
 | 32-bit x86 build fails | zio coroutines require 64-bit | Use x86_64 target (all modern VMs are 64-bit) |
@@ -979,7 +978,7 @@ utmm --mcp      ← built into the binary (adapter mode: direct UDP+TCP)
 Guest VMs (linuxvm, macvm, windowsvm)
   │
   ├─ TCP transport (2121): exec, upload, download
-  └─ UDP broadcast (12345): announce hostname+IP
+  └─ UDP broadcast (2121): announce hostname+IP
 ```
 
 The `--mcp` flag acts as a standalone adapter — it discovers Guest IPs via UDP broadcast (with `/tmp/utmm-guests.tsv` state file fallback) and connects directly to Guests via TCP transport. No intermediate Host process needed for MCP operation.
@@ -1058,7 +1057,7 @@ Expected output:
 ```
 [host] Starting to listen for Guest broadcasts...
 [broadcast] Physical NIC en0: 192.168.3.130
-[listener] Listening on port 12345
+[listener] Listening on port 2121
 ```
 
 Keep this terminal open — the Host runs in the foreground. To auto-start on boot:
@@ -1217,7 +1216,7 @@ chmod +x /tmp/test.sh && /tmp/test.sh")
 | "GuestNotFound" for a VM | VM offline or hostname typo | `vm_status` to see online VMs |
 | VM marked "upgradable" | Guest binary older than Host | Host auto-upgrades within seconds — bump ver.zig and rebuild |
 | MCP tools can't discover Guests | UDP port in use, no state file | Ensure Host is running (writes state file); or use `--host --mcp` for integrated mode |
-| Port 12345 AddressInUse at Host start | Old `utmm` process still running | `sudo pkill -f utmm && sudo utmm --host` |
+| Port 2121 AddressInUse at Host start | Old `utmm` process still running | `sudo pkill -f utmm && sudo utmm --host` |
 | `--status` shows stale/duplicate entries | Guest renamed but old entry cached | Restart Host: `sudo pkill utmm && sudo utmm --host` |
 | Windows bootstrap: command not found | Old bootstrap script | Use latest install.bat from the Host |
 
@@ -1266,9 +1265,10 @@ rm -f /var/log/utmm*.log /opt/utmm*.log
 **Windows Guest** (run inside VM or via SSH):
 ```cmd
 taskkill /f /im utmm.exe
-schtasks /delete /tn utmm-guest /f
-rmdir /s /q C:\opt\utmm C:\opt\utmm_win
-del C:\opt\utmm*.log C:\opt\utm-monitor*
+sc stop UTM-Monitor 2>nul
+sc delete UTM-Monitor 2>nul
+rmdir /s /q C:\opt\utmm
+del C:\opt\utmm*.log 2>nul
 ```
 
 ### 7.8 Skill (Bundled)
