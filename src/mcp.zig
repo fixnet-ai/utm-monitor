@@ -9,10 +9,15 @@
 //! Tools:   vm_status, vm_exec.
 
 const std = @import("std");
-const ipc = @import("ipc.zig");
+const zio = @import("zio");
 const protocol = @import("protocol.zig");
+const transport = @import("transport.zig");
 
-const IPC_PORT = ipc.IPC_PORT;
+/// Unified port for UDP broadcast + TCP (was IPC_PORT in old ipc.zig)
+pub const CMD_PORT: u16 = protocol.DEFAULT_PORT;
+
+/// Handler function type for integrated mode (Host daemon passes its handler).
+pub const Handler = *const fn (*anyopaque, []const u8) anyerror![]const u8;
 
 // ── MCP protocol constants ─────────────────────────────────────────────────
 
@@ -129,7 +134,7 @@ fn sendNotificationResponse(io: std.Io, result_json: []const u8) !void {
 }
 
 fn writeMessage(io: std.Io, json: []const u8) !void {
-    var wb: [4096]u8 = undefined;
+    var wb: [65536]u8 = undefined;
     var writer = std.Io.File.stdout().writer(io, &wb);
     writer.interface.print("Content-Length: {d}\r\n\r\n{s}\n", .{ json.len, json }) catch {};
     writer.interface.flush() catch {};
@@ -137,22 +142,260 @@ fn writeMessage(io: std.Io, json: []const u8) !void {
 
 // ── Tool handlers ──────────────────────────────────────────────────────────
 
-/// Execute a tool via IPC (adapter mode) or direct handler (integrated mode).
-fn execToolViaIpc(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    command: []const u8,
-) ![]const u8 {
-    return ipc.sendCommandRaw(io, allocator, command);
+/// Execute a command via direct UDP+TCP (adapter mode — no Host daemon needed).
+/// Supports: "STATUS_JSON" → discover all guests, "EXEC\\n<vm>\\n<cmd>" → exec on vm.
+fn sendCommandRaw(block_io: std.Io, gpa: std.mem.Allocator, command: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, command, "STATUS_JSON")) {
+        return discoverAndStatus(block_io, gpa);
+    }
+    if (std.mem.startsWith(u8, command, "EXEC\n")) {
+        const rest = command["EXEC\n".len..];
+        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return error.InvalidCommand;
+        const vm = rest[0..nl];
+        const cmd = rest[nl + 1 ..];
+        return execOnGuest(block_io, gpa, vm, cmd);
+    }
+    return error.UnknownCommand;
 }
 
-fn execToolDirect(
-    _: std.mem.Allocator,
-    ctx: *anyopaque,
-    handler: ipc.Handler,
-    command: []const u8,
-) ![]const u8 {
-    return handler(ctx, command);
+/// JSON-builder helper: append a JSON key-value string pair.
+fn appendJsonKv(list: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const u8, value: []const u8, comma: bool) !void {
+    try list.appendSlice(alloc, "\"");
+    try list.appendSlice(alloc, key);
+    try list.appendSlice(alloc, "\":\"");
+    const escaped = try jsonEscape(alloc, value);
+    defer alloc.free(escaped);
+    try list.appendSlice(alloc, escaped);
+    try list.appendSlice(alloc, "\"");
+    if (comma) try list.appendSlice(alloc, ",");
+}
+
+/// Discover all guests via UDP broadcast → build JSON status.
+/// Falls back to state file if UDP port is in use (Host daemon running).
+fn discoverAndStatus(block_io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
+    const port = CMD_PORT;
+    const listen_addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
+    var socket = listen_addr.bind(block_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
+        std.debug.print("[mcp] UDP bind failed: {}\n", .{err});
+        // Fallback: read state file
+        return buildStatusFromStateFile(block_io, gpa) catch
+            gpa.dupe(u8, "{\"guests\":[]}");
+    };
+    defer socket.close(block_io);
+
+    // Send PING to provoke immediate ANNOUNCE responses
+    {
+        const bc_addr = try std.Io.net.IpAddress.parse("255.255.255.255", port);
+        const bind_ip = try std.Io.net.IpAddress.parse("0.0.0.0", 0);
+        var bc_socket = try bind_ip.bind(block_io, .{ .mode = .dgram, .allow_broadcast = true });
+        defer bc_socket.close(block_io);
+        var ping_buf: [64]u8 = undefined;
+        var ping_writer: std.Io.Writer = .fixed(&ping_buf);
+        try protocol.buildPing(&ping_writer);
+        bc_socket.send(block_io, &bc_addr, ping_writer.buffered()) catch {};
+    }
+
+    var json: std.ArrayList(u8) = .empty;
+    try json.appendSlice(gpa, "{\"guests\":[");
+    var recv_buf: [2048]u8 = undefined;
+    const deadline_ns = std.Io.Timestamp.now(block_io, .real).nanoseconds + 3_000_000_000;
+    var first: bool = true;
+
+    while (std.Io.Timestamp.now(block_io, .real).nanoseconds < deadline_ns) {
+        const msg_result = socket.receive(block_io, &recv_buf) catch break;
+        const msg = msg_result.data;
+
+        if (std.mem.indexOf(u8, msg, "ANNOUNCE") == null) continue;
+
+        const info = protocol.GuestInfo.parse(gpa, msg) catch continue;
+        defer {
+            gpa.free(info.hostname);
+            gpa.free(info.ip);
+            gpa.free(info.target);
+            gpa.free(info.mac);
+            gpa.free(info.version);
+        }
+
+        const src_ip = switch (msg_result.from) {
+            .ip4 => |a| try std.fmt.allocPrint(gpa, "{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }),
+            .ip6 => |a| try std.fmt.allocPrint(gpa, "{any}", .{a}),
+        };
+        defer gpa.free(src_ip);
+
+        const use_src = std.mem.eql(u8, info.ip, "0.0.0.0") or std.mem.startsWith(u8, info.ip, "127.");
+        const actual_ip = if (use_src) src_ip else info.ip;
+
+        if (!first) try json.appendSlice(gpa, ",");
+        first = false;
+        try json.appendSlice(gpa, "{");
+        try appendJsonKv(&json, gpa, "hostname", info.hostname, true);
+        try appendJsonKv(&json, gpa, "ip", actual_ip, true);
+        try appendJsonKv(&json, gpa, "target", info.target, true);
+        try appendJsonKv(&json, gpa, "mac", info.mac, true);
+        try appendJsonKv(&json, gpa, "version", info.version, false);
+        try json.appendSlice(gpa, "}");
+    }
+    try json.appendSlice(gpa, "]}");
+    return json.toOwnedSlice(gpa);
+}
+
+/// Discover a specific guest by hostname via UDP, then TCP exec on it.
+/// Falls back to state file if UDP port is in use (Host daemon running).
+fn execOnGuest(block_io: std.Io, gpa: std.mem.Allocator, target: []const u8, cmd: []const u8) ![]const u8 {
+    const port = CMD_PORT;
+
+    // UDP discover guest IP (with state file fallback)
+    const ip = blk: {
+        const listen_addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
+        var socket = listen_addr.bind(block_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
+            std.debug.print("[mcp] UDP bind failed: {}\n", .{err});
+            // Fallback: lookup in state file
+            break :blk lookupGuestIpInStateFile(block_io, gpa, target) catch null;
+        };
+        defer socket.close(block_io);
+
+        // Send PING
+        {
+            const bc_addr = try std.Io.net.IpAddress.parse("255.255.255.255", port);
+            const bind_ip = try std.Io.net.IpAddress.parse("0.0.0.0", 0);
+            var bc_socket = try bind_ip.bind(block_io, .{ .mode = .dgram, .allow_broadcast = true });
+            defer bc_socket.close(block_io);
+            var ping_buf: [64]u8 = undefined;
+            var ping_writer: std.Io.Writer = .fixed(&ping_buf);
+            try protocol.buildPing(&ping_writer);
+            bc_socket.send(block_io, &bc_addr, ping_writer.buffered()) catch {};
+        }
+
+        var recv_buf: [2048]u8 = undefined;
+        const deadline_ns = std.Io.Timestamp.now(block_io, .real).nanoseconds + 3_000_000_000;
+        var result: ?[]const u8 = null;
+
+        while (std.Io.Timestamp.now(block_io, .real).nanoseconds < deadline_ns) {
+            const msg_result = socket.receive(block_io, &recv_buf) catch break;
+            const msg = msg_result.data;
+
+            if (std.mem.indexOf(u8, msg, "ANNOUNCE") == null) continue;
+
+            const info = protocol.GuestInfo.parse(gpa, msg) catch continue;
+            defer {
+                gpa.free(info.hostname);
+                gpa.free(info.ip);
+                gpa.free(info.target);
+                gpa.free(info.mac);
+                gpa.free(info.version);
+            }
+
+            if (std.mem.eql(u8, info.hostname, target)) {
+                const fqdn = try info.fqdn(gpa);
+                defer gpa.free(fqdn);
+                if (std.mem.eql(u8, fqdn, target) or std.mem.eql(u8, info.hostname, target)) {
+                    const src_ip = switch (msg_result.from) {
+                        .ip4 => |a| try std.fmt.allocPrint(gpa, "{d}.{d}.{d}.{d}", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }),
+                        .ip6 => |a| try std.fmt.allocPrint(gpa, "{any}", .{a}),
+                    };
+                    const use_src = std.mem.eql(u8, info.ip, "0.0.0.0") or std.mem.startsWith(u8, info.ip, "127.");
+                    result = if (use_src) src_ip else try gpa.dupe(u8, info.ip);
+                    break;
+                }
+            }
+        }
+        break :blk result;
+    } orelse return error.GuestNotFound;
+    defer gpa.free(ip);
+
+    // TCP connect + exec
+    var rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    const addr = try std.Io.net.IpAddress.parse(ip, port);
+    var stream = addr.connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("[mcp] Connect to {s}:{d} failed: {}\n", .{ ip, port, err });
+        return err;
+    };
+    defer stream.close(io);
+
+    var wbuf: [65536]u8 = undefined;
+    var rbuf: [65536]u8 = undefined;
+    var writer = stream.writer(io, &wbuf);
+    var reader = stream.reader(io, &rbuf);
+
+    try transport.sendMessage(&writer, transport.MsgType.EXEC_REQ, cmd);
+    writer.interface.flush() catch {};
+
+    var output: std.ArrayList(u8) = .empty;
+    while (true) {
+        const msg = (transport.recvMessage(&reader, gpa) catch break) orelse break;
+        defer gpa.free(msg.payload);
+
+        switch (msg.msg_type) {
+            transport.MsgType.EXEC_STDOUT => try output.appendSlice(gpa, msg.payload),
+            transport.MsgType.EXEC_STDERR => try output.appendSlice(gpa, msg.payload),
+            transport.MsgType.ERROR => {
+                try output.appendSlice(gpa, "ERROR: ");
+                try output.appendSlice(gpa, msg.payload);
+            },
+            transport.MsgType.EXEC_EXIT => break,
+            else => {},
+        }
+    }
+    return output.toOwnedSlice(gpa);
+}
+
+const STATE_FILE = "/tmp/utmm-guests.tsv";
+
+/// Build JSON status from state file (fallback when UDP port is in use).
+fn buildStatusFromStateFile(block_io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
+    const data = try std.Io.Dir.cwd().readFileAlloc(block_io, STATE_FILE, gpa, @enumFromInt(64 * 1024));
+    defer gpa.free(data);
+
+    var json: std.ArrayList(u8) = .empty;
+    try json.appendSlice(gpa, "{\"guests\":[");
+    var first: bool = true;
+
+    var lines = std.mem.splitSequence(u8, data, "\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitSequence(u8, line, "\t");
+        const hostname = fields.next() orelse continue;
+        const target = fields.next() orelse continue;
+        const ip = fields.next() orelse continue;
+        const mac = fields.next() orelse continue;
+        const version = fields.next() orelse continue;
+
+        if (!first) try json.appendSlice(gpa, ",");
+        first = false;
+        try json.appendSlice(gpa, "{");
+        try appendJsonKv(&json, gpa, "hostname", hostname, true);
+        try appendJsonKv(&json, gpa, "ip", ip, true);
+        try appendJsonKv(&json, gpa, "target", target, true);
+        try appendJsonKv(&json, gpa, "mac", mac, true);
+        try appendJsonKv(&json, gpa, "version", version, false);
+        try json.appendSlice(gpa, "}");
+    }
+    try json.appendSlice(gpa, "]}");
+    return json.toOwnedSlice(gpa);
+}
+
+/// Look up a guest's IP in the state file (fallback when UDP port is in use).
+/// State file format: hostname\ttarget\tip\tmac\tversion
+fn lookupGuestIpInStateFile(block_io: std.Io, gpa: std.mem.Allocator, target: []const u8) ![]const u8 {
+    const data = try std.Io.Dir.cwd().readFileAlloc(block_io, STATE_FILE, gpa, @enumFromInt(64 * 1024));
+    defer gpa.free(data);
+
+    var lines = std.mem.splitSequence(u8, data, "\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitSequence(u8, line, "\t");
+        const hostname = fields.next() orelse continue;
+        _ = fields.next() orelse continue; // skip target
+        const ip = fields.next() orelse continue;
+
+        if (std.mem.eql(u8, hostname, target)) {
+            return gpa.dupe(u8, ip);
+        }
+    }
+    return error.GuestNotFound;
 }
 
 /// Handle vm_status: STATUS_JSON → markdown + JSON.
@@ -160,10 +403,10 @@ fn handleVmStatus(
     allocator: std.mem.Allocator,
     io: std.Io,
     ctx: ?*anyopaque,
-    handler: ?ipc.Handler,
+    handler: ?Handler,
 ) ![]const u8 {
-    const raw = if (ctx) |c| try execToolDirect(allocator, c, handler.?, "STATUS_JSON")
-        else try execToolViaIpc(allocator, io, "STATUS_JSON");
+    const raw = if (ctx) |c| try handler.?(c, "STATUS_JSON")
+        else try sendCommandRaw(io, allocator, "STATUS_JSON");
     defer allocator.free(raw);
 
     // Try parsing as JSON; fall back to raw output
@@ -237,15 +480,15 @@ fn handleVmExec(
     allocator: std.mem.Allocator,
     io: std.Io,
     ctx: ?*anyopaque,
-    handler: ?ipc.Handler,
+    handler: ?Handler,
     vm: []const u8,
     command: []const u8,
 ) ![]const u8 {
     const ipc_cmd = try std.fmt.allocPrint(allocator, "EXEC\n{s}\n{s}", .{ vm, command });
     defer allocator.free(ipc_cmd);
 
-    const raw = if (ctx) |c| try execToolDirect(allocator, c, handler.?, ipc_cmd)
-        else try execToolViaIpc(allocator, io, ipc_cmd);
+    const raw = if (ctx) |c| try handler.?(c, ipc_cmd)
+        else try sendCommandRaw(io, allocator, ipc_cmd);
     defer allocator.free(raw);
 
     const trimmed = std.mem.trim(u8, raw, " \n\r");
@@ -273,14 +516,12 @@ const MCPRequest = struct {
 };
 
 /// Read one MCP request from stdin. Returns null on EndOfStream.
-fn readRequest(allocator: std.mem.Allocator, io: std.Io) !?MCPRequest {
+/// Uses the same persistent reader for all calls (to avoid losing buffered data between requests).
+fn readRequest(allocator: std.mem.Allocator, reader: anytype) !?MCPRequest {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
     // Read until we have a complete Content-Length header + body
-    var rb: [4096]u8 = undefined;
-    var reader = std.Io.File.stdin().reader(io, &rb);
-
     while (true) {
         const byte = reader.interface.takeByte() catch |err| switch (err) {
             error.EndOfStream => {
@@ -375,15 +616,18 @@ fn readRequest(allocator: std.mem.Allocator, io: std.Io) !?MCPRequest {
     const id_val = if (obj.get("id")) |v| v else std.json.Value{ .null = {} };
     const id_owned = cloneValue(allocator, id_val) catch std.json.Value{ .null = {} };
 
-    const params_obj = getNestedObject(obj, "params");
+    // Deep-clone params before deinit — ObjectMap keys and Value strings point into parsed arena.
+    const params_cloned: ?std.json.ObjectMap = if (getNestedObject(obj, "params")) |p| blk: {
+        break :blk try cloneObjectMapDeep(allocator, p);
+    } else null;
 
-    // We're done with parsed — deinit it. method_owned and id_owned are independent copies.
+    // We're done with parsed — deinit it. method_owned, id_owned, and params_cloned are independent copies.
     parsed.deinit();
 
     return MCPRequest{
         .method = method_owned,
         .id = id_owned,
-        .params = params_obj,
+        .params = params_cloned,
     };
 }
 
@@ -398,6 +642,82 @@ fn cloneValue(allocator: std.mem.Allocator, val: std.json.Value) !std.json.Value
         .string => |s| .{ .string = try allocator.dupe(u8, s) },
         else => .{ .null = {} },
     };
+}
+
+/// Deep-clone a JSON Value including nested objects and arrays.
+fn cloneValueDeep(allocator: std.mem.Allocator, val: std.json.Value) !std.json.Value {
+    return switch (val) {
+        .null => .{ .null = {} },
+        .bool => |b| .{ .bool = b },
+        .integer => |n| .{ .integer = n },
+        .float => |f| .{ .float = f },
+        .number_string => |s| .{ .number_string = try allocator.dupe(u8, s) },
+        .string => |s| .{ .string = try allocator.dupe(u8, s) },
+        .object => |o| .{ .object = try cloneObjectMapDeep(allocator, o) },
+        .array => |a| blk: {
+            var arr = try allocator.alloc(std.json.Value, a.items.len);
+            errdefer {
+                for (arr) |*item| freeValueDeep(allocator, item);
+                allocator.free(arr);
+            }
+            for (a.items, 0..) |item, i| {
+                arr[i] = try cloneValueDeep(allocator, item);
+            }
+            break :blk .{ .array = .{ .items = arr, .capacity = arr.len, .allocator = allocator } };
+        },
+    };
+}
+
+/// Deep-clone an ObjectMap, duplicating all keys and recursively cloning all values.
+fn cloneObjectMapDeep(allocator: std.mem.Allocator, src: std.json.ObjectMap) anyerror!std.json.ObjectMap {
+    var dst: std.json.ObjectMap = .empty;
+    errdefer freeObjectMapDeep(allocator, &dst);
+
+    var it = src.iterator();
+    while (it.next()) |entry| {
+        const key_dupe = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key_dupe);
+        var val_clone = try cloneValueDeep(allocator, entry.value_ptr.*);
+        errdefer freeValueDeep(allocator, &val_clone);
+        try dst.put(allocator, key_dupe, val_clone);
+    }
+    return dst;
+}
+
+/// Free a deep-cloned ObjectMap (keys + nested values).
+fn freeObjectMapDeep(allocator: std.mem.Allocator, map: *std.json.ObjectMap) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        var val = entry.value_ptr.*;
+        freeValueDeep(allocator, &val);
+    }
+    map.deinit(allocator);
+}
+
+/// Free a deep-cloned Value (strings, nested objects, arrays).
+fn freeValueDeep(allocator: std.mem.Allocator, val: *std.json.Value) void {
+    switch (val.*) {
+        .number_string => |s| {
+            allocator.free(s);
+            val.* = .{ .number_string = &.{} };
+        },
+        .string => |s| {
+            allocator.free(s);
+            val.* = .{ .string = &.{} };
+        },
+        .object => |*o| {
+            var map = o.*;
+            freeObjectMapDeep(allocator, &map);
+            val.* = .{ .null = {} };
+        },
+        .array => |*a| {
+            for (a.items) |*item| freeValueDeep(allocator, item);
+            allocator.free(a.items);
+            val.* = .{ .null = {} };
+        },
+        else => {},
+    }
 }
 
 /// Free a cloned value.
@@ -415,11 +735,13 @@ fn handleRequest(
     allocator: std.mem.Allocator,
     io: std.Io,
     ctx: ?*anyopaque,
-    handler: ?ipc.Handler,
+    handler: ?Handler,
     req: MCPRequest,
 ) !void {
+    var params_mut = req.params;
     defer allocator.free(req.method);
     defer freeValue(allocator, req.id);
+    defer if (params_mut) |*p| freeObjectMapDeep(allocator, p);
 
     const is_notification = switch (req.id) {
         .null => true,
@@ -528,23 +850,28 @@ fn handleRequest(
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
-/// Adapter mode: each tool call forwards to Host IPC (127.0.0.1:12347).
+/// Adapter mode: each tool call uses direct UDP+TCP (no Host daemon needed).
 /// Blocks until stdin closes (Claude Code exits).
 pub fn run(io: std.Io, allocator: std.mem.Allocator) !void {
-    std.debug.print("[mcp] MCP server starting (adapter mode, IPC 127.0.0.1:{d})\n", .{IPC_PORT});
+    std.debug.print("[mcp] MCP server starting (adapter mode, direct UDP+TCP)\n", .{});
     try mcpLoop(io, allocator, null, null);
 }
 
-/// Integrated mode: tool calls dispatch directly to ipcHandler (no TCP roundtrip).
-/// Blocks until stdin closes (Claude Code exits). Host services run in threads.
-pub fn runDirect(io: std.Io, allocator: std.mem.Allocator, ctx: *anyopaque, handler: ipc.Handler) !void {
+/// Integrated mode: tool calls dispatch directly to handler (no TCP roundtrip).
+/// Blocks until stdin closes (Claude Code exits).
+pub fn runDirect(io: std.Io, allocator: std.mem.Allocator, ctx: *anyopaque, handler: Handler) !void {
     std.debug.print("[mcp] MCP server starting (integrated mode, direct handler)\n", .{});
     try mcpLoop(io, allocator, ctx, handler);
 }
 
-fn mcpLoop(io: std.Io, allocator: std.mem.Allocator, ctx: ?*anyopaque, handler: ?ipc.Handler) !void {
+fn mcpLoop(io: std.Io, allocator: std.mem.Allocator, ctx: ?*anyopaque, handler: ?Handler) !void {
+    // Persistent buffered stdin reader — creating a new one per request causes
+    // buffered data to be lost between requests.
+    var rb: [65536]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io, &rb);
+
     while (true) {
-        const req = readRequest(allocator, io) catch |err| switch (err) {
+        const req = readRequest(allocator, &reader) catch |err| switch (err) {
             error.EndOfStream => break,
             error.InvalidJson => {
                 // Try to send a parse error (use null id since we can't parse the actual id)

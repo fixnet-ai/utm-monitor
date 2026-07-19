@@ -3,11 +3,8 @@
 const std = @import("std");
 const ver = @import("ver.zig");
 
-/// Default UDP broadcast/listen port
-pub const DEFAULT_PORT: u16 = 12345;
-
-/// Default HTTP server port (Guest + Host)
-pub const DEFAULT_HTTP_PORT: u16 = 2121;
+/// Default UDP broadcast/listen + TCP message port (unified on 2121)
+pub const DEFAULT_PORT: u16 = 2121;
 
 /// /etc/hosts marker block
 pub const HOSTS_MARKER_BEGIN = "# UTM-MONITOR-BEGIN";
@@ -82,7 +79,6 @@ pub const GuestInfo = struct {
     ip: []const u8,
     target: []const u8, // Zig target triplet: aarch64-linux, x86_64-windows, ...
     mac: []const u8, // Physical NIC MAC
-    http_port: u16 = DEFAULT_HTTP_PORT,
     version: []const u8 = VERSION,
 
     /// Build FQDN for /etc/hosts: <hostname>.<target>.utm
@@ -117,8 +113,6 @@ pub const GuestInfo = struct {
                     info.target = try allocator.dupe(u8, value);
                 } else if (std.mem.eql(u8, key, "mac")) {
                     info.mac = try allocator.dupe(u8, value);
-                } else if (std.mem.eql(u8, key, "http")) {
-                    info.http_port = try std.fmt.parseInt(u16, value, 10);
                 } else if (std.mem.eql(u8, key, "version")) {
                     info.version = try allocator.dupe(u8, value);
                 }
@@ -139,7 +133,6 @@ pub fn buildAnnounce(
     try writer.print("target: {s}\n", .{info.target});
     try writer.print("mac: {s}\n", .{info.mac});
     try writer.print("ip: {s}\n", .{info.ip});
-    try writer.print("http: {d}\n", .{info.http_port});
     try writer.print("version: {s}\n", .{VERSION});
     try writer.print("\n", .{});
     try writer.flush();
@@ -169,7 +162,6 @@ test "GuestInfo.parse" {
         \\target: aarch64-linux
         \\mac: aa:bb:cc:dd:ee:ff
         \\ip: 192.168.1.100
-        \\http: 2121
         \\version: 1.1.0
         \\
     ;
@@ -186,7 +178,6 @@ test "GuestInfo.parse" {
     try std.testing.expectEqualStrings("aarch64-linux", info.target);
     try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", info.mac);
     try std.testing.expectEqualStrings("192.168.1.100", info.ip);
-    try std.testing.expectEqual(@as(u16, 2121), info.http_port);
 }
 
 test "GuestInfo.fqdn" {

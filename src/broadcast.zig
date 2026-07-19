@@ -465,7 +465,6 @@ pub fn broadcastLoop(
     io: std.Io,
     port: u16,
     info: SystemInfo,
-    http_port: u16,
     is_svc: bool,
 ) !void {
     const broadcast_addr = try std.Io.net.IpAddress.parse("255.255.255.255", port);
@@ -477,9 +476,10 @@ pub fn broadcastLoop(
         .mode = .dgram,
         .allow_broadcast = true,
     }) catch |err| {
-        std.debug.print("[broadcast] Bind {s}:0 failed: {}, falling back to 0.0.0.0\n", .{ bind_ip, err });
-        const fallback = try std.Io.net.IpAddress.parse("0.0.0.0", 0);
-        return broadcastLoopFallback(io, port, info, http_port, fallback, is_svc);
+        std.debug.print("[broadcast] Bind {s}:0 failed: {}, retrying without broadcast option\n", .{ bind_ip, err });
+        // Some platforms (Windows zio) don't support .allow_broadcast at bind time.
+        // Fall back: bind without it, then set SO_BROADCAST manually after.
+        return broadcastLoopFallback(io, port, info, bind_addr, is_svc);
     };
     defer socket.close(io);
 
@@ -489,7 +489,6 @@ pub fn broadcastLoop(
         .ip = info.ip,
         .target = info.target,
         .mac = info.mac,
-        .http_port = http_port,
     };
     var msg_buf: [1024]u8 = undefined;
     var msg_writer: std.Io.Writer = .fixed(&msg_buf);
@@ -506,7 +505,7 @@ pub fn broadcastLoop(
         socket.send(io, &broadcast_addr, msg) catch |err| {
             std.debug.print("[broadcast] Send failed: {}\n", .{err});
         };
-        try std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .real);
+        try std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake);
     }
 }
 
@@ -515,12 +514,40 @@ fn broadcastLoopFallback(
     io: std.Io,
     port: u16,
     info: SystemInfo,
-    http_port: u16,
     bind_addr: std.Io.net.IpAddress,
     is_svc: bool,
 ) !void {
     const broadcast_addr = try std.Io.net.IpAddress.parse("255.255.255.255", port);
-    const socket = try bind_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true });
+    // Try with .allow_broadcast first; on some platforms (Windows zio) this
+    // option is unsupported at bind time. Fall back to bind without it.
+    const socket = bind_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| switch (err) {
+        error.OptionUnsupported => blk: {
+            const s = try bind_addr.bind(io, .{ .mode = .dgram });
+            // zio's os/windows.zig is missing SO.BROADCAST; enable it manually.
+            if (builtin.os.tag == .windows) {
+                const ws2 = struct {
+                    const SOCKET = *anyopaque;
+                    extern "ws2_32" fn setsockopt(
+                        s: SOCKET,
+                        level: i32,
+                        optname: i32,
+                        optval: [*]const u8,
+                        optlen: i32,
+                    ) callconv(.winapi) i32;
+                };
+                const enable: u32 = 1;
+                _ = ws2.setsockopt(
+                    @ptrCast(s.handle),
+                    0xffff, // SOL_SOCKET
+                    0x0020, // SO_BROADCAST
+                    @as([*]const u8, @ptrCast(&enable)),
+                    @sizeOf(u32),
+                );
+            }
+            break :blk s;
+        },
+        else => |e| return e,
+    };
     defer socket.close(io);
 
     const announce_info = protocol.GuestInfo{
@@ -528,7 +555,6 @@ fn broadcastLoopFallback(
         .ip = info.ip,
         .target = info.target,
         .mac = info.mac,
-        .http_port = http_port,
     };
     var msg_buf: [1024]u8 = undefined;
     var msg_writer: std.Io.Writer = .fixed(&msg_buf);
@@ -542,7 +568,7 @@ fn broadcastLoopFallback(
         socket.send(io, &broadcast_addr, msg) catch |err| {
             std.debug.print("[broadcast] Send failed: {}\n", .{err});
         };
-        try std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .real);
+        try std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake);
     }
 }
 
@@ -566,7 +592,7 @@ fn broadcastLoopFallback(
 ///   Linux:   rename() is a directory op — old inode stays alive
 ///   macOS:   same as Linux; SIP won't SIGKILL new binary (different inode)
 ///   Windows: .exe is locked while running; script handles rename after exit
-fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
+pub fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
     const new_name: []const u8 = if (builtin.os.tag == .windows) "utmm.next.exe" else "utmm.next";
     const final_name: []const u8 = if (builtin.os.tag == .windows) "utmm.exe" else "utmm";
     const old_name: []const u8 = if (builtin.os.tag == .windows) "utmm.old.exe" else "utmm.old";

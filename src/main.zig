@@ -48,14 +48,10 @@ comptime {
     _ = @import("hosts_file.zig");
     _ = @import("broadcast.zig");
     _ = @import("listener.zig");
-    _ = @import("http_server.zig");
-    _ = @import("http_client.zig");
-    _ = @import("host_http.zig");
+    _ = @import("transport.zig");
     _ = @import("install.zig");
     _ = @import("config.zig");
     _ = @import("status.zig");
-    _ = @import("executor.zig");
-    _ = @import("ipc.zig");
     _ = @import("mcp.zig");
     _ = @import("agent.zig");
 }
@@ -64,10 +60,8 @@ comptime {
 pub const CliArgs = struct {
     /// Whether in Host mode
     is_host: bool = false,
-    /// UDP port
+    /// UDP port (also used for TCP — unified on 2121)
     port: u16 = protocol.DEFAULT_PORT,
-    /// HTTP server port (guest + host side)
-    http_port: u16 = protocol.DEFAULT_HTTP_PORT,
     /// Guest hostname (default: auto-detect hostname)
     hostname: ?[]const u8 = null,
     /// hosts file path (host side)
@@ -181,11 +175,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
         } else if (std.mem.eql(u8, arg, "--port")) {
             i += 1;
             if (i < args.len) cli.port = try std.fmt.parseInt(u16, args[i], 10);
-        } else if (std.mem.eql(u8, arg, "--http-port")) {
-            i += 1;
-            if (i < args.len) {
-                cli.http_port = try std.fmt.parseInt(u16, args[i], 10);
-            }
         } else if (std.mem.eql(u8, arg, "--hostname")) {
             i += 1;
             if (i < args.len) cli.hostname = args[i];
@@ -222,12 +211,11 @@ pub fn printHelp() void {
         \\
         \\Guest options:
         \\  --hostname NAME     Local hostname (auto-detect by default)
-        \\  --port PORT         UDP broadcast port (default 12345)
-        \\  --http-port PORT    HTTP server port (default 2121)
+        \\  --port PORT         UDP broadcast + TCP server port (default 2121)
         \\  --log-file PATH     Log file path
         \\
         \\Host options:
-        \\  --port PORT         UDP listen port (default 12345)
+        \\  --port PORT         UDP listen port (default 2121)
         \\  --hosts-file PATH   hosts file path (default /etc/hosts)
         \\  --serve-dir PATH    HTTP serve directory (default: exe directory)
         \\  --marker TAG        Marker comment text (default "UTM-MONITOR")
@@ -412,7 +400,7 @@ pub fn main(init: std.process.Init) !void {
         // This gives the user GUI-aware exec access (runs in user session, not daemon).
         // System daemons use --svc to skip the stop/restart logic.
         const agent = @import("agent.zig");
-        try agent.run(init.io, init.gpa, cli.hostname, cli.port, cli.http_port);
+        try agent.run(init.io, init.gpa, cli.hostname, cli.port);
     }
 }
 
@@ -429,11 +417,10 @@ test "parseArgs - host mode" {
     try std.testing.expect(cli.is_host);
 }
 
-test "parseArgs - custom ports" {
-    const args = &[_][:0]const u8{ "utmm", "--port", "9999", "--http-port", "2122" };
+test "parseArgs - custom port" {
+    const args = &[_][:0]const u8{ "utmm", "--port", "9999" };
     const cli = try parseArgs(args);
     try std.testing.expectEqual(@as(u16, 9999), cli.port);
-    try std.testing.expectEqual(@as(u16, 2122), cli.http_port);
 }
 
 test "parseArgs - management commands" {

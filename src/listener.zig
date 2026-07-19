@@ -10,7 +10,6 @@ pub const GuestState = struct {
     ip: []const u8,
     target: []const u8,
     mac: []const u8,
-    http_port: u16,
     version: []const u8,
     last_seen: i96,
 
@@ -106,7 +105,6 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
             .ip = actual_ip,
             .target = info.target,
             .mac = info.mac,
-            .http_port = info.http_port,
             .version = info.version,
             .last_seen = now,
         };
@@ -142,7 +140,6 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
                     .ip = existing.ip,
                     .target = existing.target,
                     .mac = existing.mac,
-                    .http_port = existing.http_port,
                     .version = existing.version,
                     .last_seen = existing.last_seen,
                 };
@@ -174,7 +171,6 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
                     .ip = existing.ip,
                     .target = existing.target,
                     .mac = existing.mac,
-                    .http_port = existing.http_port,
                     .version = existing.version,
                     .last_seen = existing.last_seen,
                 };
@@ -191,10 +187,6 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
                 if (!std.mem.eql(u8, existing.mac, info.mac)) {
                     allocator.free(existing.mac);
                     existing.mac = try allocator.dupe(u8, info.mac);
-                    changed = true;
-                }
-                if (existing.http_port != info.http_port) {
-                    existing.http_port = info.http_port;
                     changed = true;
                 }
                 existing.last_seen = now;

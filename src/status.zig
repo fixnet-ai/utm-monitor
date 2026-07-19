@@ -4,20 +4,15 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const listener = @import("listener.zig");
 
-fn setReuseAddr(socket: std.Io.net.Socket) !void {
-    if (@import("builtin").os.tag == .windows) return;
-    const sol_socket = std.posix.SOL.SOCKET;
-    const so_reuseaddr = std.posix.SO.REUSEADDR;
-    const one = [_]u8{1, 0, 0, 0};
-    try std.posix.setsockopt(socket.handle, sol_socket, so_reuseaddr, &one);
-}
-
 pub fn queryStatus(io: std.Io, allocator: std.mem.Allocator, port: u16) !void {
-    // Listen on broadcast port for guest ANNOUNCE messages
+    // Bind to the broadcast port to collect guest ANNOUNCE messages.
+    // SO_REUSEADDR is set by zio's netBindIpImpl for UDP sockets, allowing
+    // --status to share port 2121 with the Host daemon.
     const listen_addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
-    const socket = try listen_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true });
+    const socket = listen_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
+        return err;
+    };
     defer socket.close(io);
-    setReuseAddr(socket) catch {};
 
     var guests: std.ArrayList(listener.GuestState) = .empty;
     defer {
@@ -65,12 +60,10 @@ pub fn queryStatus(io: std.Io, allocator: std.mem.Allocator, port: u16) !void {
                     .ip = real_ip,
                     .target = info.target,
                     .mac = info.mac,
-                    .http_port = info.http_port,
                     .version = info.version,
                     .last_seen = std.Io.Timestamp.now(io, .real).nanoseconds,
                 });
             } else {
-                // Free temp fields for duplicates
                 allocator.free(info.hostname);
                 allocator.free(info.target);
                 allocator.free(info.mac);
@@ -84,7 +77,6 @@ pub fn queryStatus(io: std.Io, allocator: std.mem.Allocator, port: u16) !void {
         return;
     }
 
-    // Output: hostname, target, ip, mac, version, status
     std.debug.print("\n{s: <16} {s: <18} {s: <16} {s: <18} {s: <10} {s}\n", .{ "Hostname", "Target", "IP", "MAC", "Version", "Status" });
     std.debug.print("{s:-<85}\n", .{""});
     for (guests.items) |g| {

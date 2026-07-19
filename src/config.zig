@@ -6,8 +6,7 @@ const std = @import("std");
 
 /// Configuration items
 pub const Config = struct {
-    port: u16 = 12345,
-    http_port: u16 = 2121,
+    port: u16 = 2121,
     name: []const u8 = "",
     hosts_file: []const u8 = "/etc/hosts",
     marker: []const u8 = "UTM-MONITOR",
@@ -89,7 +88,7 @@ pub fn saveConfig(io: std.Io, _: std.mem.Allocator, config: Config, path: []cons
 
     try writer.interface.print("# UTM Monitor config file\n", .{});
     try writer.interface.print("port={d}\n", .{config.port});
-    try writer.interface.print("http_port={d}\n", .{config.http_port});
+    try writer.interface.print("port={d}\n", .{config.port});
     try writer.interface.print("name={s}\n", .{config.name});
     try writer.interface.print("hosts_file={s}\n", .{config.hosts_file});
     try writer.interface.print("marker={s}\n", .{config.marker});
@@ -123,7 +122,7 @@ test "Logger default" {
 
 test "Config defaults" {
     const cfg = Config{};
-    try std.testing.expectEqual(@as(u16, 12345), cfg.port);
-    try std.testing.expectEqual(@as(u16, 2121), cfg.http_port);
+    try std.testing.expectEqual(@as(u16, 2121), cfg.port);
     try std.testing.expectEqualStrings("/etc/hosts", cfg.hosts_file);
+    try std.testing.expectEqualStrings("UTM-MONITOR", cfg.marker);
 }
