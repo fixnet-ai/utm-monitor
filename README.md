@@ -164,6 +164,7 @@ utmm --download linuxvm f.txt ./f.txt  # download file from VM (no curl)
 - **Precompiled binary**: Zero dependencies — download and run
 - **MCP**: Built into the binary via `--mcp` flag. Zero external dependencies.
 - **Source build**: [Zig](https://ziglang.org) 0.16.0 + zio async library (bundled in zig-pkg/)
+- **Supported targets**: 6 binaries (aarch64 + x86_64 × linux/macos/windows). 32-bit x86 is excluded — zio's coroutine implementation does not implement x86 32-bit context switching. All modern UTM VMs are aarch64 or x86_64.
 
 ## Architecture
 

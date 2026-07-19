@@ -60,7 +60,7 @@ zig build -Dtarget=x86_64-macos   # → utmm-x86_64-macos
 zig build -Dtarget=x86_64-windows  # → utmm-x86_64-windows.exe
 ```
 
-> **Note**: 32-bit x86 targets (x86-linux-musl, x86-windows) are no longer supported — zio's coroutine implementation requires 64-bit. All modern VMs are aarch64 or x86_64.
+> **Note**: 32-bit x86 targets (x86-linux-musl, x86-windows) are not supported — zio's coroutine implementation does not implement x86 32-bit context switching (`@compileError("unimplemented architecture: x86")` in coroutines.zig:108). zio supports x86_64, aarch64, arm, riscv64/32, loongarch64, powerpc64, and sparc64 — but our release only covers the 6 targets relevant to UTM VMs (aarch64 + x86_64 × linux/macos/windows).
 
 ### Tests/Testing
 ```bash

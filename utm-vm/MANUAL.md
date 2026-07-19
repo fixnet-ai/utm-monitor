@@ -878,7 +878,7 @@ Each release builds 6 binaries covering all architecture+OS combinations, packag
 | 5 | `utmm-x86_64-windows.exe` | `x86_64-windows` | 64-bit x86 Windows VMs |
 | 6 | `utmm-aarch64-windows.exe` | `aarch64-windows` | ARM64 Windows VMs |
 
-> **32-bit x86 removed**: zio coroutine implementation requires 64-bit. All modern VMs are aarch64 or x86_64.
+> **Why 6 binaries (not 8)?** zio's coroutine context switching supports 8 architectures (x86_64, aarch64, arm, riscv64, riscv32, loongarch64, powerpc64, sparc64) but explicitly excludes 32-bit x86 (`@compileError("unimplemented architecture: x86")` in `coroutines.zig:108`). Our release covers the 6 targets relevant to UTM VMs: aarch64 + x86_64 × linux/macos/windows.
 
 **Compatibility matrix** — which binary to use for each VM scenario:
 
