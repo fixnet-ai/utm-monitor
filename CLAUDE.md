@@ -42,11 +42,11 @@ Guest (windows)  ──UDP broadcast──┘                    └── hosts
 - Single binary, dual mode: reduces maintenance burden
 - UDP broadcast: no target address configuration needed, auto-discovery
 - IP change callback → auto-update /etc/hosts marked block
-- zio async Runtime: io_uring (Linux) / kqueue (macOS) / IOCP (Windows) — unified async backend replacing std.Thread
+- `std.Io` blocking I/O with `std.Thread` concurrency — simple threaded model, no async runtime
 - Binary frame TCP protocol: 4B length prefix + 1B type + payload, single connection multiplexing, zero parsing overhead
 - Zero external dependencies: no Node.js, no Python, no SSH/SCP, no curl — everything via TCP + UDP
 - Host-push auto-upgrade: version mismatch detected in ANNOUNCE → Host pushes binary + restarts Guest. No Guest polling, no shell scripts. Cross-platform safe rename: old→.old, .next→final, spawn restart. ETag MD5 integrity verified on all uploads. Debounce via `last_upgrade_host_version` (prevents re-trigger after Host restart) and `target` passthrough (avoids state file read race).
-- **Windows child processes**: zio IOCP backend does not support async pipe I/O for child processes. Use `std.Io.Threaded.init(gpa, .{})` for `std.process.run` on Windows. Never use `Threaded.global_single_threaded` — it uses `Allocator.failing` and causes OutOfMemory in `processSpawnWindows`.
+- **Windows child processes**: On Windows, `std.process.Init.io` is `global_single_threaded` which uses `Allocator.failing`. Use `std.Io.Threaded.init(gpa, .{})` for `std.process.run` on Windows in daemon/service contexts. In foreground mode (agent.zig), `init.io` from the desktop shortcut works directly.
 
 ## Build & Run
 
@@ -61,7 +61,7 @@ zig build -Dtarget=x86_64-macos   # → utmm-x86_64-macos
 zig build -Dtarget=x86_64-windows  # → utmm-x86_64-windows.exe
 ```
 
-> **Note**: 32-bit x86 targets (x86-linux-musl, x86-windows) are not supported — zio's coroutine implementation does not implement x86 32-bit context switching (`@compileError("unimplemented architecture: x86")` in coroutines.zig:108). zio supports x86_64, aarch64, arm, riscv64/32, loongarch64, powerpc64, and sparc64 — but our release only covers the 6 targets relevant to UTM VMs (aarch64 + x86_64 × linux/macos/windows).
+> **Note**: 32-bit x86 targets are now supported again. x86-linux-musl builds and passes tests. x86-windows has a pre-existing linker issue (`_system@4` symbol resolution) unrelated to our code — this is a Zig/LLD toolchain limitation when targeting 32-bit Windows. All modern UTM VMs are aarch64 or x86_64.
 
 ### Tests/Testing
 ```bash
@@ -143,14 +143,14 @@ Before starting any work, read the following files (if they exist), then use the
 - `std.process.Child.Term` fields are lowercase: `.exited`, `.signal`, `.stopped`, `.unknown`. Combine cases: `.signal, .stopped, .unknown =>` (comma-separated, no payload capture)
 - `std.Io.Threaded.global_single_threaded` uses `Allocator.failing` — never use for `std.process.run` (causes OutOfMemory). Use `std.Io.Threaded.init(gpa, .{})` instead
 
-### zio Async Runtime Patterns
-- `Runtime.init(gpa, .{})` → `spawn()` for tasks, `handle.join()` to wait
-- `Io.net.Stream` with `writeAll()`/`read()` directly (no buffered wrapper needed for simple cases)
-- `Io.net.Stream.Writer` has `interface: Io.Writer` field — use `writer.interface.flush()` to drain buffered data
+### Threaded I/O Concurrency Patterns
+- `std.Thread.spawn(.{}, fn, .{args...})` → `thread.detach()` for fire-and-forget tasks
+- `std.Io.net.Stream` with `reader(io, &buf)` / `writer(io, &buf)` for buffered TCP I/O
+- `Stream.Writer` has `interface: Io.Writer` field — use `writer.interface.flush()` to drain buffered data before closing
 - `BufWriter` data is lost when it goes out of scope — use persistent reader/writer across calls
-- Mutual recursion with error set inference: use explicit `anyerror!T` return type to break dependency loop
-- 32-bit x86 not supported by zio coroutines — 6 targets only (aarch64 + x86_64 × linux/macos/windows)
-- **Windows IOCP limitation**: zio IOCP does not support async pipe I/O for child processes. Use `std.Io.Threaded.init(gpa, .{})` (not `global_single_threaded`) for `std.process.run` on Windows. macOS/Linux: zio's io_uring/kqueue handles `std.process.run` via blocking I/O without Threaded wrapper
+- Guest: main thread runs TCP accept loop, one detached thread per connection + one detached broadcast thread
+- Host: main thread runs UDP listener, management commands connect via blocking I/O
+- On Windows daemon/service contexts, use `std.Io.Threaded.init(gpa, .{})` for `std.process.run` (not `global_single_threaded` — uses `Allocator.failing`)
 
 ### 1. Think Before Coding
 **Don't assume. Don't hide confusion. Explicitly present trade-offs.**

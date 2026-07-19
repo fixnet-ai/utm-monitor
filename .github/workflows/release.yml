@@ -25,7 +25,7 @@ jobs:
       - name: Build all targets
         run: |
           mkdir -p release
-          # 6 binaries covering all VM scenarios (32-bit x86 excluded — zio doesn't support it)
+          # 6 primary binaries covering all VM scenarios (+ x86-linux-musl also builds)
           targets="x86_64-windows aarch64-windows x86_64-macos aarch64-macos x86_64-linux-musl aarch64-linux-musl"
           for target in $targets; do
             echo "==> Building $target ..."

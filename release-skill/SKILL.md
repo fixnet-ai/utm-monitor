@@ -49,7 +49,7 @@ This builds 6 targets into `release/` and creates `utmm.zip`:
 `x86_64-windows`, `aarch64-windows`, `x86_64-macos`,
 `aarch64-macos`, `x86_64-linux-musl`, `aarch64-linux-musl`
 
-> **Note**: 32-bit x86 targets are no longer supported — zio's coroutine implementation requires 64-bit.
+> **Note**: 32-bit x86-linux-musl also builds but is not in the release set — all modern VMs are 64-bit.
 
 ### Step 5: Commit & tag
 

@@ -219,8 +219,8 @@ To download files from other directories, use `--exec` to copy them to `/opt/utm
 curl -o install.bat "http://<gateway>:2121/bin/install.bat" && install.bat --guest --hostname windowsvm
 ```
 
-### Q: 32-bit x86 build fails with "unimplemented architecture: x86"
-**A**: zio's coroutine context switching explicitly excludes 32-bit x86 (`coroutines.zig:108`). zio supports 8 other architectures (x86_64, aarch64, arm, riscv64/32, loongarch64, powerpc64, sparc64), but our 6 release targets only cover aarch64 + x86_64 × linux/macos/windows — the architectures relevant to UTM VMs. 32-bit x86 is not planned for support.
+### Q: Does utmm support 32-bit x86?
+**A**: Yes, since v0.2.5, 32-bit x86-linux-musl builds and passes tests. x86-windows has a pre-existing linker issue unrelated to utmm code. All modern UTM VMs are aarch64 or x86_64, so 32-bit is a bonus, not a requirement.
 
 ## Reference Manual
 

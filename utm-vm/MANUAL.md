@@ -111,7 +111,7 @@ The Guest runs a TCP transport server on port 2121 using a binary frame protocol
 | `UPLOAD_REQ` / `UPLOAD_RESP` | Host → Guest | File upload (auto-upgrade, --upload) |
 | `EXEC_REQ` / `STDOUT` / `STDERR` / `EXIT` | Host → Guest | Remote command execution |
 
-**Runtime model**: zio async Runtime (io_uring on Linux, kqueue on macOS, IOCP on Windows) — event-driven, single-threaded async I/O handling all connections concurrently.
+**Runtime model**: `std.Thread` concurrency with `std.Io` blocking I/O — simple, portable, and reliable across all platforms.
 
 The shell is read from `$SHELL` at Guest startup (v0.2.2+):
 - **macOS/Linux**: reads the `$SHELL` env var (e.g. `/bin/zsh`, `/bin/bash`), falls back to `/bin/sh`
@@ -317,7 +317,7 @@ Each release automatically builds 6 binaries for all VM scenarios, packaged as `
 | `utmm-x86_64-windows.exe` | 64-bit x86 Windows VMs | x86_64-windows |
 | `utmm-aarch64-windows.exe` | ARM64 Windows VMs | aarch64-windows |
 
-> **32-bit x86 dropped**: zio async Runtime's coroutine implementation requires 64-bit. All modern VMs are aarch64 or x86_64. 32-bit x86 targets (`x86-linux-musl`, `x86-windows`) are no longer buildable.
+> **32-bit x86 support**: x86-linux-musl builds since v0.2.5. x86-windows has a pre-existing linker issue unrelated to utmm.
 
 > **macOS Rosetta 2 note**: Apple Silicon **physical** Macs can run `utmm-x86_64-macos` (x86_64) via Rosetta 2. However, UTM ARM macOS **VMs** lack Rosetta 2, so they need `utmm-aarch64-macos` (native aarch64). If you need Rosetta 2 on a physical Mac: `softwareupdate --install-rosetta`.
 
@@ -830,7 +830,7 @@ utmm --host --port 12348
 
 ```
 utmm/
-├── build.zig              # Build script (includes link_libc, zio dependency)
+├── build.zig              # Build script (zero external dependencies)
 ├── build.zig.zon          # Package manifest
 ├── install.sh             # Host one-click installation script
 ├── manual.md              # This manual
@@ -846,13 +846,12 @@ utmm/
 ├── utm-vm/
 │   ├── SKILL.md           # Claude Code skill
 │   └── MANUAL.md          # This manual
-├── zig-pkg/               # Vendored zio async Runtime (local SO_REUSEPORT patch)
 ├── src/
 │   ├── main.zig           # Entry point + CLI parsing
 │   ├── protocol.zig       # Message protocol (ANNOUNCE constants, GuestInfo)
 │   ├── ver.zig            # Single version source (bump to trigger auto-upgrade)
 │   ├── transport.zig      # Binary frame TCP protocol (4B len + 1B type + payload)
-│   ├── guest.zig          # Guest mode: zio TCP server + UDP broadcast loop
+│   ├── guest.zig          # Guest mode: threaded TCP server + UDP broadcast loop
 │   ├── host.zig           # Host mode: listener + auto-upgrade + management cmds + hosts sync
 │   ├── broadcast.zig      # UDP broadcast + gateway detection (getifaddrs)
 │   ├── listener.zig       # UDP listener (includes source IP extraction)
@@ -872,7 +871,6 @@ utmm/
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | Zig | 0.16.0 | Programming language |
-| zio | 0.16.0 | Async Runtime (io_uring/kqueue/IOCP) — vendored in zig-pkg/ |
 | libc | System | `getifaddrs` / `gethostname` / `getenv` |
 | launchd | macOS system | macOS auto-start on boot |
 | systemd | Linux system | Linux auto-start on boot |
@@ -892,7 +890,7 @@ Each release builds 6 binaries covering all architecture+OS combinations, packag
 | 5 | `utmm-x86_64-windows.exe` | `x86_64-windows` | 64-bit x86 Windows VMs |
 | 6 | `utmm-aarch64-windows.exe` | `aarch64-windows` | ARM64 Windows VMs |
 
-> **Why 6 binaries (not 8)?** zio's coroutine context switching supports 8 architectures (x86_64, aarch64, arm, riscv64, riscv32, loongarch64, powerpc64, sparc64) but explicitly excludes 32-bit x86 (`@compileError("unimplemented architecture: x86")` in `coroutines.zig:108`). Our release covers the 6 targets relevant to UTM VMs: aarch64 + x86_64 × linux/macos/windows.
+> **6 primary release targets** cover all UTM VM scenarios (aarch64 + x86_64 × linux/macos/windows). 32-bit x86-linux-musl also builds (since v0.2.5) but is not in the release set — all modern VMs are 64-bit.
 
 **Compatibility matrix** — which binary to use for each VM scenario:
 
@@ -972,7 +970,7 @@ sudo killall -HUP mDNSResponder
 | Windows process disappears | Direct launch without scheduled task | Use --install to install as scheduled task (autostart on boot) |
 | Upload file locked | Target file mmap'd by process | Kill process and retry |
 | `zig-out/bin/utmm` is wrong arch | `zig build` overwrites with last target | Use named file e.g. `utmm-aarch64-macos` |
-| 32-bit x86 build fails | zio coroutines require 64-bit | Use x86_64 target (all modern VMs are 64-bit) |
+| 32-bit x86 build fails | x86-windows has linker issue (unrelated to utmm) | Use x86_64 target (all modern VMs are 64-bit) |
 
 ---
 

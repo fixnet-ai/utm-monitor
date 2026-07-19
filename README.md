@@ -1,184 +1,106 @@
 # UTM Monitor
 
-**UTM virtual machine management** — auto IP discovery, remote execution, remote debug, and auto-upgrade. Built-in MCP server lets any AI agent (Claude Code, Codex, Gemini CLI, etc.) manage your VMs through natural language.
+**Let AI agents manage your VMs.** Auto IP discovery, remote execution, file transfer, and seamless version upgrades — all through natural language via MCP. Built into one zero-dependency Zig binary.
 
-Written in Zig 0.16.0. Single binary, dual mode. Zero external dependencies.
+## AI Agent Experience
 
-## AI Agent Integration (MCP + Skill)
+Once installed, your AI agent gets two tools:
 
-The headline feature. After a quick one-time setup, your AI agent manages your VMs via standard MCP protocol:
-| Tool | What your AI agent can do |
-|------|--------------------------|
-| `vm_status` | Discover all VMs: hostname, IP, OS/arch, version, upgradable? |
-| `vm_exec` | Run any shell command on Linux/macOS/Windows VMs |
-
-## Daily Usage Examples
+| Tool | What it does |
+|------|-------------|
+| `vm_status` | Discover all VMs — hostname, IP, OS, arch, version, online status |
+| `vm_exec` | Run any shell command on any VM (Linux/macOS/Windows) |
 
 ```
-"Start lldb remote debug app"
 "Check the status of all VMs"
 "Run the test suite on linuxvm"
-"Deploy the latest build to all VMs"
 "Show me the last 50 lines of the log on windowsvm"
-"Is macvm running the latest version?"
-"What's using CPU on linuxvm?"
-"Can linuxvm reach windowsvm over the network?"
-"Create a test script on linuxvm and run it"
-"Upload a config file to linuxvm"
-"Download the app log from windowsvm"
+"Deploy the latest build to all VMs"
+"Upload the config file to macvm"
+"What's the network latency between linuxvm and windowsvm?"
 ```
 
-## Features
-
-- **MCP Server + Skill** — AI-driven VM management: discover, execute — all via natural language. Works with any MCP-compatible agent
-- **Auto IP Discovery** — Guest UDP broadcasts hostname+IP every second; Host auto-listens, ignoring VPN/tunnel interfaces
-- **Automatic /etc/hosts Sync** — Host updates the hosts file marker block on IP change, so `linuxvm` always resolves
-- **Remote Command Execution** — `--exec` sends commands to any VM, auto-adapts macOS/Linux/Windows shell
-- **Auto Version Upgrade** — Host detects Guest version mismatch via UDP broadcast, auto-pushes new binary via TCP transport — no Guest polling needed
-- **TCP Transport Protocol** — Binary frame protocol (4B length + 1B type + payload) replaces HTTP; single connection multiplexing, zero parsing overhead
-- **File Upload/Download** — `--upload` and `--download` commands for file transfers over TCP transport
-- **Auto-Start on Boot** — Supports launchd / systemd / Windows Scheduled Task
-- **Auto-Start Host Service** — Management commands auto-start the Host daemon when it's not running
-- **Single Binary, Dual Mode** — Default Guest mode; `--host` switches to Host mode
-- **MCP Integrated Mode** — `--host --mcp` runs Host + MCP server in one process, no separate daemon
-- **zio Async Runtime** — io_uring (Linux) / kqueue (macOS) / IOCP (Windows) for high-performance async I/O
-
-
+Works with any MCP-compatible agent: Claude Code, Codex, Gemini CLI, and others.
 
 ## One-Time Setup
 
-### 1. Download & Install (macOS / Linux)
+### 1. Install on Host (your Mac)
 
 ```bash
-# One-command install: downloads utmm.zip, extracts to /opt/utmm/, creates symlinks
 curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 ```
 
-The install script:
-- Downloads `utmm.zip` from GitHub Releases (contains all 6 platform binaries)
-- Extracts to `/opt/utmm/` (configurable via `INSTALL_DIR`)
-- Creates `/opt/utmm/utmm` → `utmm-{arch}-{os}` symlink for the Host
-- Creates `/usr/local/bin/utmm` → `/opt/utmm/utmm` convenience symlink
+This downloads all platform binaries to `/opt/utmm/` and creates the `utmm` command.
 
-### 2. Download Skill (optional, for richer agent context)
-
-```bash
-cd ~/utmm
-
-# Download Skill files (SKILL.md + MANUAL.md reference)
-mkdir -p utm-vm
-curl -o utm-vm/SKILL.md \
-  https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/utm-vm/SKILL.md
-curl -o utm-vm/MANUAL.md \
-  https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/utm-vm/MANUAL.md
-```
-
-> The Skill files give your AI agent richer context about VM management workflows. Path conventions vary by agent — see your agent's docs for skill directory setup.
-
-### 3. Register MCP server
-
-The `utmm` binary has a built-in MCP server via `--mcp`. Registration command depends on your AI agent:
+### 2. Register with your AI agent
 
 ```bash
 # Claude Code
 claude mcp add utmm -- utmm --mcp
 
-# Codex / other MCP-compatible agents — configure as a stdio MCP server:
-# command: utmm
-# args: ["--mcp"]
+# Other agents — configure as stdio MCP server:
+#   command: utmm
+#   args: ["--mcp"]
 ```
 
-> **Integrated mode (all-in-one):** use `utmm --host --mcp` instead — runs the full Host + MCP in a single process, no separate Host daemon needed.
+> Use `utmm --host --mcp` for all-in-one mode: Host + MCP in a single process.
 
-### 4. Start the Host
+### 3. Start the Host
 
 ```bash
-sudo utmm --host
+sudo utmm --host --install   # auto-start on boot
+sudo utmm --host             # or run immediately
 ```
 
-Keep this running. The Host serves binaries from `/opt/utmm/` by default (all 6 platform binaries are already there from install). To auto-start on boot:
+### 4. Install on each VM (Guest)
+
+No internet needed — Guests fetch everything from the Host over the network:
 
 ```bash
-sudo utmm --install
-```
-
-### 5. Verify
-
-```bash
-# CLI test
-utmm --host --status
-
-# MCP is built in — test with a ping
-printf 'Content-Length: 50\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}\n' | utmm --mcp
-# → Content-Length: 47
-# → {"jsonrpc":"2.0","id":1,"result":{}}
-```
-
-Done! Now ask your AI agent: "Check the status of all VMs".
-
-> **Alternative: source build** — if you prefer building from source, see [MANUAL.md §2](./utm-vm/MANUAL.md#2-installation) for Zig build instructions.
-
-
-## Quick Start (CLI only)
-
-```bash
-# ─── Host (your Mac) — always deploy Host first ───
-
-# One-command install (downloads utmm.zip, extracts to /opt/utmm/, creates symlinks)
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
-
-# Start the Host (needs sudo for /etc/hosts sync)
-sudo utmm --host --install    # auto-start on boot
-sudo utmm --host              # or run immediately
-
-# ─── Guest (inside each VM) — one command per Guest ───
-# No internet needed — install.sh auto-detects the Host via default gateway
-
-# Linux Guest (as root)
+# Linux VM (as root)
 curl http://$(ip route | grep default | awk '{print $3}'):2121/bin/install.sh | sh -s -- --guest --hostname linuxvm
 
-# macOS Guest (as root — note: macOS uses 'route', not 'ip route')
+# macOS VM (as root)
 GW=$(route -n get default 2>/dev/null | awk '/gateway/{print $2}')
 curl "http://$GW:2121/bin/install.sh" | sh -s -- --guest --hostname macvm
 
-# Windows Guest (as Administrator)
+# Windows VM (as Administrator)
 curl -o install.bat "http://<gateway>:2121/bin/install.bat" && install.bat --guest --hostname windowsvm
-
-# ─── Verify ───
-utmm --status                 # check all VM status
-utmm --exec linuxvm "uname -a" # run command on VM
-utmm --upload ./f.txt linuxvm  # upload file to VM (no curl)
-utmm --download linuxvm f.txt ./f.txt  # download file from VM (no curl)
 ```
 
-## Documentation
+Done. Ask your AI agent: "Check the status of all VMs".
 
-| Document | For |
-|----------|-----|
-| **[MANUAL.md](./utm-vm/MANUAL.md)** | Full manual: install, daily usage, troubleshooting, MCP setup |
-| **[CLAUDE.md](./CLAUDE.md)** | Development guide (build commands, architecture, code style) |
+## CLI Quick Reference
 
+For when you're in a terminal without an agent:
 
-## Dependencies
+```bash
+utmm --status                          # all VM status
+utmm --exec linuxvm "uname -a"         # run a command
+utmm --upload ./file.txt linuxvm       # upload a file
+utmm --download linuxvm file.txt ./    # download a file
+```
 
-- **Precompiled binary**: Zero dependencies — download and run
-- **MCP**: Built into the binary via `--mcp` flag. Zero external dependencies.
-- **Source build**: [Zig](https://ziglang.org) 0.16.0 + zio async library (bundled in zig-pkg/)
-- **Supported targets**: 6 binaries (aarch64 + x86_64 × linux/macos/windows). 32-bit x86 is excluded — zio's coroutine implementation does not implement x86 32-bit context switching. All modern UTM VMs are aarch64 or x86_64.
-
-## Architecture
+## How It Works
 
 ```
-Guest (linuxvm)  ──UDP broadcast──┐
-Guest (macvm)    ──UDP broadcast──┤──→ Host listener (2121)
-Guest (windows)  ──UDP broadcast──┘         │
-                                            ├─ /etc/hosts sync
-                                            ├─ TCP transport (2121)
-                                            │       ↑
-                                            └─ MCP JSON-RPC (stdio)
-                                                    ↑
-                                          AI Agent (Claude Code, Codex, ...)
+Guest VMs ──UDP broadcast (name + IP)──→ Host ──→ /etc/hosts sync
+                ↑                              ├──→ MCP JSON-RPC (stdio) ← AI Agent
+                └── TCP transport (exec, upload, download, upgrade)
 ```
+
+- **Auto-discovery**: Guests broadcast their IP every second; Host always knows where they are
+- **Auto-upgrade**: Host detects version mismatch → pushes new binary → Guest self-updates within seconds
+- **Auto-start**: Management commands auto-start the Host service when needed
+- **Zero deps**: No Python, Node.js, SSH, or external libraries — one binary, everywhere
+
+## Docs
+
+| For | Read |
+|-----|------|
+| Using with AI agents, troubleshooting | **[SKILL.md](./utm-vm/SKILL.md)** |
+| Full reference manual | **[MANUAL.md](./utm-vm/MANUAL.md)** |
+| Building from source, development | **[CLAUDE.md](./CLAUDE.md)** |
 
 ## License
 
