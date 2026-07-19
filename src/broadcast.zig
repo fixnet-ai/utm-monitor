@@ -104,6 +104,56 @@ fn readSysFs(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]cons
     return try allocator.dupe(u8, buf[0..n]);
 }
 
+/// Windows: use route print to get the IP address of the physical NIC
+/// Parses `route print 0.0.0.0` output to extract the Interface column
+/// (the local IP of the NIC that reaches the default gateway).
+/// Falls back to PowerShell if route print fails.
+fn getWindowsIp(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "route", "print", "0.0.0.0" },
+    }) catch {
+        return allocator.dupe(u8, "0.0.0.0");
+    };
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    // Route table format: Network  Netmask  Gateway  Interface  Metric
+    //   0.0.0.0  0.0.0.0  192.168.64.1  192.168.64.2  25
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "0.0.0.0")) {
+            var fields = std.mem.splitSequence(u8, trimmed, " ");
+            _ = fields.next(); // 0.0.0.0 (network)
+            _ = fields.next(); // 0.0.0.0 (netmask)
+            _ = fields.next(); // gateway
+            if (fields.next()) |iface_ip| {
+                if (std.mem.containsAtLeast(u8, iface_ip, 1, ".")) {
+                    return allocator.dupe(u8, iface_ip);
+                }
+            }
+        }
+    }
+
+    // Fallback: try PowerShell
+    const ps_result = std.process.run(allocator, io, .{
+        .argv = &.{ "powershell", "-NoProfile", "-Command",
+            "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -notmatch 'Loopback'} | Select-Object -First 1).IPAddress" },
+    }) catch {
+        return allocator.dupe(u8, "0.0.0.0");
+    };
+    defer {
+        allocator.free(ps_result.stdout);
+        allocator.free(ps_result.stderr);
+    }
+    const ps_trimmed = std.mem.trim(u8, ps_result.stdout, " \n\r\t");
+    if (ps_trimmed.len > 0) return try allocator.dupe(u8, ps_trimmed);
+
+    return allocator.dupe(u8, "0.0.0.0");
+}
+
 /// Windows: use getmac command to get physical NIC MAC address
 fn getWindowsMac(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     const result = std.process.run(allocator, io, .{
@@ -238,12 +288,13 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
         break :blk try allocator.dupe(u8, name);
     };
 
-    // Windows: use getmac command to get MAC address
+    // Windows: detect IP + MAC via OS commands
     if (builtin.os.tag == .windows) {
+        const ip = try getWindowsIp(io, allocator);
         const mac = try getWindowsMac(io, allocator);
         return SystemInfo{
             .hostname = hostname,
-            .ip = try allocator.dupe(u8, "0.0.0.0"),
+            .ip = ip,
             .mac = mac,
             .target = target,
             .iface_name = try allocator.dupe(u8, "unknown"),
@@ -407,11 +458,15 @@ fn getGatewayWindows(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
 test "getDefaultGateway - signature" { _ = getDefaultGateway; }
 
 /// Guest broadcast loop
+/// is_svc: true when running as system daemon (--svc), enables self-upgrade.
+///         false when running in foreground (user terminal), skips self-upgrade
+///         to avoid race condition with defer service restart.
 pub fn broadcastLoop(
     io: std.Io,
     port: u16,
     info: SystemInfo,
     http_port: u16,
+    is_svc: bool,
 ) !void {
     const broadcast_addr = try std.Io.net.IpAddress.parse("255.255.255.255", port);
 
@@ -424,7 +479,7 @@ pub fn broadcastLoop(
     }) catch |err| {
         std.debug.print("[broadcast] Bind {s}:0 failed: {}, falling back to 0.0.0.0\n", .{ bind_ip, err });
         const fallback = try std.Io.net.IpAddress.parse("0.0.0.0", 0);
-        return broadcastLoopFallback(io, port, info, http_port, fallback);
+        return broadcastLoopFallback(io, port, info, http_port, fallback, is_svc);
     };
     defer socket.close(io);
 
@@ -442,14 +497,15 @@ pub fn broadcastLoop(
     const msg = msg_writer.buffered();
 
     while (true) {
-        // ── Self-upgrade check ──────────────────────────────────────
-        // Host uploads utmm.next; Guest auto-detects and self-upgrades
-        try checkSelfUpgrade(io, &info);
+        // ── Self-upgrade check (daemon only) ────────────────────────
+        // Host uploads utmm.next; daemon Guest auto-detects and self-upgrades.
+        // Foreground mode skips this — the background service handles upgrades
+        // when it restarts after the user closes the terminal window.
+        if (is_svc) try checkSelfUpgrade(io, &info);
 
         socket.send(io, &broadcast_addr, msg) catch |err| {
             std.debug.print("[broadcast] Send failed: {}\n", .{err});
         };
-        std.debug.print("[broadcast] Broadcast: {s} ({s}) → {s}\n", .{ info.hostname, info.target, info.ip });
         try std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .real);
     }
 }
@@ -461,6 +517,7 @@ fn broadcastLoopFallback(
     info: SystemInfo,
     http_port: u16,
     bind_addr: std.Io.net.IpAddress,
+    is_svc: bool,
 ) !void {
     const broadcast_addr = try std.Io.net.IpAddress.parse("255.255.255.255", port);
     const socket = try bind_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true });
@@ -479,13 +536,12 @@ fn broadcastLoopFallback(
     const msg = msg_writer.buffered();
 
     while (true) {
-        // ── Self-upgrade check ──────────────────────────────────────
-        try checkSelfUpgrade(io, &info);
+        // ── Self-upgrade check (daemon only) ────────────────────────
+        if (is_svc) try checkSelfUpgrade(io, &info);
 
         socket.send(io, &broadcast_addr, msg) catch |err| {
             std.debug.print("[broadcast] Send failed: {}\n", .{err});
         };
-        std.debug.print("[broadcast] Broadcast: {s} ({s}) → {s}\n", .{ info.hostname, info.target, info.ip });
         try std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .real);
     }
 }
@@ -538,37 +594,49 @@ fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
     // Step 1: Move old binary out of the way (utmm → utmm.old)
     // Step 2: Place new binary at the target name (utmm.next → utmm)
     if (builtin.os.tag == .windows) {
-        // On Windows, use cmd /c for rename operations. Io.Dir.rename
-        // fails in service context. Use "cd /d" to avoid quoting issues
-        // with argv-to-command-line conversion in CreateProcess.
+        // On Windows, running .exe files are locked — we cannot rename
+        // the current binary while it's executing.  Instead we schedule
+        // everything via a batch script that runs AFTER we exit.
+        //
+        // Strategy (all in _upgrade.bat, launched detached before exit):
+        //   1. Wait for our process to die       (ping -n 3 127.0.0.1)
+        //   2. Delete stale .old if present
+        //   3. Rename current .exe → .old        (now unlocked)
+        //   4. Rename .next → .exe
+        //   5. Start the service with the new binary
+        //   6. Self-delete the batch file
+        //
+        // This avoids the "file in use" problem entirely — all renames
+        // happen after we exit, when the .exe lock is released.
 
-        // Step 1: Remove stale .old, then rename current → .old
-        const ren1_cmd = try std.fmt.allocPrint(std.heap.page_allocator,
-            "cd /d {s} && del /f {s} 2>nul & ren {s} {s}",
-            .{ install_dir, old_name, final_name, old_name });
-        defer std.heap.page_allocator.free(ren1_cmd);
-        if (std.process.run(std.heap.page_allocator, io, .{
-            .argv = &.{ "cmd", "/c", ren1_cmd },
-        })) |_| {} else |err| {
-            std.debug.print("[broadcast] Self-upgrade: ren {s}->{s} failed: {}\n", .{ final_name, old_name, err });
-            return;
-        }
+        const bat_full_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}\\{s}", .{ install_dir, bat_name });
+        defer std.heap.page_allocator.free(bat_full_path);
 
-        // Step 2: Place new binary at the target name (utmm.next → utmm)
-        const ren2_cmd = try std.fmt.allocPrint(std.heap.page_allocator,
-            "cd /d {s} && ren {s} {s}",
-            .{ install_dir, new_name, final_name });
-        defer std.heap.page_allocator.free(ren2_cmd);
-        if (std.process.run(std.heap.page_allocator, io, .{
-            .argv = &.{ "cmd", "/c", ren2_cmd },
-        })) |_| {} else |err| {
-            std.debug.print("[broadcast] Self-upgrade: ren .next failed: {}\n", .{err});
-            // Rollback: put old binary back
-            const rollback_cmd = try std.fmt.allocPrint(std.heap.page_allocator,
-                "cd /d {s} && ren {s} {s}",
-                .{ install_dir, old_name, final_name });
-            defer std.heap.page_allocator.free(rollback_cmd);
-            _ = std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "cmd", "/c", rollback_cmd } }) catch {};
+        if (dir.createFile(io, bat_name, .{ .permissions = @enumFromInt(0o644) })) |bat_file| {
+            var wb: [1024]u8 = undefined;
+            var bat_writer = bat_file.writer(io, &wb);
+            bat_writer.interface.print(
+                \\@echo off
+                \\ping -n 3 127.0.0.1 >nul
+                \\cd /d {0s}
+                \\del /f {1s} 2>nul
+                \\ren {2s} {1s}
+                \\if errorlevel 1 goto :failed
+                \\ren {3s} {2s}
+                \\if errorlevel 1 goto :failed
+                \\sc start UTM-Monitor
+                \\del "%~f0" 2>nul
+                \\exit /b 0
+                \\:failed
+                \\echo Upgrade failed — .next may still be staged
+                \\del "%~f0" 2>nul
+                \\exit /b 1
+                \\
+            , .{ install_dir, old_name, final_name, new_name }) catch {};
+            bat_writer.interface.flush() catch {};
+            bat_file.close(io);
+        } else |_| {
+            std.debug.print("[broadcast] Self-upgrade: cannot write {s}\n", .{bat_name});
             return;
         }
     } else {
@@ -604,32 +672,13 @@ fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
 
     // Step 3: Spawn restart script (detached, survives our exit).
     if (builtin.os.tag == .windows) {
-        // Write a .bat file that cleans up .old and restarts the service.
-        // Use std.process.spawn so it's non-blocking — our process exits
-        // immediately and the bat runs independently in the background.
-        const old_full_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}\\{s}", .{ install_dir, old_name }) catch return;
-        defer std.heap.page_allocator.free(old_full_path);
+        // The batch file was already written above (before the renames).
+        // Now just spawn it and exit.
         const bat_full_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}\\{s}", .{ install_dir, bat_name }) catch return;
         defer std.heap.page_allocator.free(bat_full_path);
-
-        if (dir.createFile(io, bat_name, .{ .permissions = @enumFromInt(0o644) })) |bat_file| {
-            var wb: [512]u8 = undefined;
-            var bat_writer = bat_file.writer(io, &wb);
-            bat_writer.interface.print(
-                \\@echo off
-                \\ping -n 3 127.0.0.1 >nul
-                \\del /f "{0s}" 2>nul
-                \\sc start UTM-Monitor
-                \\del "%~f0" 2>nul
-                \\
-            , .{old_full_path}) catch {};
-            bat_writer.interface.flush() catch {};
-            bat_file.close(io);
-            // spawn() returns immediately — bat runs independently
-            _ = std.process.spawn(io, .{
-                .argv = &.{ "cmd", "/c", bat_full_path },
-            }) catch {};
-        } else |_| {}
+        _ = std.process.spawn(io, .{
+            .argv = &.{ "cmd", "/c", bat_full_path },
+        }) catch {};
     } else {
         const old_full_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, old_name }) catch return;
         defer std.heap.page_allocator.free(old_full_path);

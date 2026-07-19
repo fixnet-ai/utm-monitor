@@ -84,8 +84,9 @@ pub const CliArgs = struct {
     save_config: bool = false,
     /// Internal: run as Windows service (--svc, added by sc create)
     is_svc: bool = false,
-    /// Run as user-session Agent (Guest-side, GUI-aware exec forwarding)
-    is_agent: bool = false,
+    /// Run as foreground guest (stop service, run, restart on exit).
+    /// When false and no management commands: run as daemon (pure guest, no service mgmt).
+    /// This is the default mode when no flags are provided.
 
     // Management commands
     cmd_status: bool = false,
@@ -137,8 +138,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             cli.is_user = true;
         } else if (std.mem.eql(u8, arg, "--svc")) {
             cli.is_svc = true;
-        } else if (std.mem.eql(u8, arg, "--agent")) {
-            cli.is_agent = true;
         } else if (std.mem.eql(u8, arg, "--uninstall")) {
             cli.cmd_uninstall = true;
         } else if (std.mem.eql(u8, arg, "--upload")) {
@@ -218,8 +217,8 @@ pub fn printHelp() void {
         \\
         \\Mode selection:
         \\  --host              Run in Host mode (UDP listener + hosts management)
-        \\  --agent             Run user-session Agent (GUI-aware exec forwarding)
-        \\  (no args)           Default Guest mode (UDP broadcast + HTTP server)
+        \\  (no args)           Default Guest mode (stop service, foreground, restart on exit)
+        \\  --svc               Run as daemon (launched by service manager, no service mgmt)
         \\
         \\Guest options:
         \\  --hostname NAME     Local hostname (auto-detect by default)
@@ -243,9 +242,9 @@ pub fn printHelp() void {
         \\  --download VM REMOTE LOCAL  Download REMOTE from Guest VM → LOCAL file
         \\  --gen-init PLATFORM  Generate auto-start script (linux/macos/windows)
         \\  --install           Install as system service (daemon: utmm --host --install)
-        \\  --install --user    Install agent as user auto-start (utmm --install --user)
+        \\  --install --user    Create desktop shortcut for foreground guest launcher
         \\  --uninstall         Remove system service (utmm --uninstall)
-        \\  --uninstall --user  Remove user agent auto-start (utmm --uninstall --user)
+        \\  --uninstall --user  Remove desktop shortcut (utmm --uninstall --user)
         \\  --mcp               Serve MCP JSON-RPC over stdio for Claude Code integration
         \\                      (with --host: integrated mode; without: IPC adapter)
         \\  --version           Show version info
@@ -254,11 +253,11 @@ pub fn printHelp() void {
         \\process (sudo utmm --host). Do NOT add --host to these commands — they
         \\talk to the Host via IPC, not by starting a new listener.
         \\
-        \\Agent mode (Guest-side GUI-aware exec forwarding):
-        \\  utmm --agent         Start agent manually (opens TCP server on 127.0.0.1:2123)
-        \\  utmm --install --user  Install agent as user-level auto-start with terminal window
-        \\                          (macOS: LaunchAgent + Terminal, Linux: user systemd,
-        \\                           Windows: Task Scheduler with cmd window)
+        \\Foreground Guest mode (default when no flags):
+        \\  utmm                 Stop background service, run Guest in foreground,
+        \\                       restart service on exit (Ctrl+C or close window)
+        \\  utmm --hostname X    Override auto-detected hostname
+        \\  utmm --install --user  Create desktop shortcut for foreground launcher
         \\
     ;
     std.debug.print("{s}", .{help});
@@ -361,12 +360,16 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var cli = try parseArgs(args);
 
-    // --svc (internal): run as Windows service — must be checked before anything else
+    // --svc (internal): run as system daemon — no service stop/restart.
+    // On Windows this registers with SCM; on POSIX it just runs guest directly.
+    // Must be checked before anything else so the service manager gets a clean
+    // guest process without foreground mode's service management logic.
     if (cli.is_svc) {
         if (builtin.os.tag == .windows) {
             return winServiceRun(init.io, init.gpa, cli);
         }
-        std.debug.print("[svc] --svc is only valid on Windows\n", .{});
+        // POSIX: service manager launched us — just run guest directly
+        try guest.run(init, cli);
         return;
     }
 
@@ -379,14 +382,6 @@ pub fn main(init: std.process.Init) !void {
     // --help
     if (args.len > 1 and std.mem.eql(u8, args[1], "--help")) {
         printHelp();
-        return;
-    }
-
-    // --agent: run user-session Agent (TCP server for GUI-aware exec forwarding)
-    // Guest-side only — started by user-level auto-start (LaunchAgent / user systemd).
-    if (cli.is_agent) {
-        const agent = @import("agent.zig");
-        try agent.run(init.io, init.gpa);
         return;
     }
 
@@ -412,7 +407,12 @@ pub fn main(init: std.process.Init) !void {
     } else if (cli.cmd_install or cli.cmd_uninstall) {
         try host_mod.run(init, cli);
     } else {
-        try guest.run(init, cli);
+        // Default Guest mode (foreground): stop background service, run Guest in
+        // foreground with visible terminal, restart service on exit (Ctrl+C / close).
+        // This gives the user GUI-aware exec access (runs in user session, not daemon).
+        // System daemons use --svc to skip the stop/restart logic.
+        const agent = @import("agent.zig");
+        try agent.run(init.io, init.gpa, cli.hostname, cli.port, cli.http_port);
     }
 }
 

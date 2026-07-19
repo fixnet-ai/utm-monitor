@@ -1,202 +1,218 @@
-//! Agent — user-session TCP server for GUI-aware exec on Guest VMs
+//! Foreground Guest mode — the default when utmm is launched with no arguments.
 //!
-//! The Guest background service (launchd / systemd / Task Scheduler) runs in
-//! the system session (Session 0 on Windows) and cannot interact with the
-//! desktop.  The Agent is a companion process that runs in the user's login
-//! session — launched via a user-level auto-start item with a visible terminal
-//! window — and takes over `/exec` commands so they can open GUI apps.
+//! Design:
+//!   utmm
+//!     1. Stop the background system service (sc / launchctl / systemctl)
+//!     2. Run Guest mode in the foreground (UDP broadcast + HTTP server)
+//!     3. When the window is closed or Ctrl+C pressed, restart the service
 //!
-//! Data flow:
-//!   Host --HTTP POST /exec--> Guest HTTP server (2121)
-//!     --> try Agent forwarding (127.0.0.1:2123)
-//!       --> Agent execs in user session (GUI-capable)
-//!       --> returns result to HTTP server --> Host
-//!     --> fallback: direct exec (current behaviour, no GUI)
+//! Because this runs in the user's login session (not Session 0 on Windows),
+//! exec commands forwarded through the Guest HTTP server NATURALLY have GUI
+//! access.  No separate TCP forwarding port is needed.
 //!
-//! Protocol (TCP, request-response, close = EOF):
-//!   HTTP server → Agent: EXEC\n<cmd>\n\n
-//!   Agent → HTTP server: OK\n<output><EOF>  or  ERR\n<error><EOF>
+//! System daemons use --svc to bypass this stop/restart logic and run guest
+//! directly — that's how launchd/systemd/SCM start the background service.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
+const guest = @import("guest.zig");
+const main = @import("main.zig");
 
-/// Result of executing a command.
-const ExecResult = std.process.RunResult;
+/// Run the foreground guest: if stdout is a terminal, print banner, stop the
+/// background service, run guest interactively, and restart service on exit.
+/// If stdout is NOT a terminal (e.g. launched by systemd/launchd without --svc),
+/// fall back to plain daemon mode — backward compatible with old service configs.
+pub fn run(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    hostname_override: ?[]const u8,
+    port: u16,
+    http_port: u16,
+) !void {
+    // Detect whether we're in an interactive terminal (TTY).
+    // If not, we were likely launched by a service manager without --svc
+    // (old config). Fall back to daemon mode.
+    const is_tty: bool = if (builtin.os.tag == .windows)
+        // Windows: check if process has a console window
+        blk: {
+            const kernel32 = struct {
+                extern "kernel32" fn GetConsoleWindow() callconv(.winapi) ?*anyopaque;
+            };
+            break :blk kernel32.GetConsoleWindow() != null;
+        }
+    else
+        // POSIX: check if stdout is a terminal
+        blk: {
+            const libc = struct {
+                extern "c" fn isatty(fd: c_int) c_int;
+            };
+            break :blk libc.isatty(1) != 0;
+        };
 
-/// Run the Agent: open terminal window, print banner, listen for exec commands.
-/// This function is the entry point for `utmm --agent`.  It blocks forever.
-pub fn run(io: std.Io, gpa: std.mem.Allocator) !void {
-    // ── Banner ───────────────────────────────────────────────────────────
+    if (!is_tty) {
+        // Daemon mode — no service management, just run guest directly.
+        const cli = main.CliArgs{
+            .port = port,
+            .http_port = http_port,
+            .hostname = hostname_override,
+        };
+        return guest.runWithIo(io, gpa, cli);
+    }
+
+    // ── Foreground mode (TTY) ────────────────────────────────────────────
     const banner =
         \\╔══════════════════════════════════════════════════════╗
-        \\║  utmm agent v{0s}
+        \\║  utmm guest v{0s}
         \\╠══════════════════════════════════════════════════════╣
-        \\║  Listening on 127.0.0.1:{1d}
-        \\║  Waiting for exec commands from Guest HTTP server...
+        \\║  Taking over from background service...
+        \\║  Close this window to restart the background service.
         \\╚══════════════════════════════════════════════════════╝
         \\
     ;
-    std.debug.print(banner, .{ protocol.VERSION, protocol.AGENT_PORT });
+    std.debug.print(banner, .{protocol.VERSION});
 
-    // ── TCP server ───────────────────────────────────────────────────────
-    const addr = std.Io.net.IpAddress.parse("127.0.0.1", protocol.AGENT_PORT) catch |err| {
-        std.debug.print("[agent] FATAL: cannot parse address: {}\n", .{err});
-        return err;
-    };
-    var server = addr.listen(io, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("[agent] FATAL: cannot bind port {d}: {}\n", .{ protocol.AGENT_PORT, err });
-        std.debug.print("[agent] Is another agent already running?\n", .{});
-        return err;
-    };
-    defer server.deinit(io);
+    // ── Stop background service ──────────────────────────────────────────
+    stopBackgroundService(io, gpa);
 
-    while (true) {
-        const stream = server.accept(io) catch |err| {
-            std.debug.print("[agent] accept error: {}\n", .{err});
-            continue;
-        };
-        const t = std.Thread.spawn(.{}, handleConnection, .{ io, gpa, stream }) catch |err| {
-            std.debug.print("[agent] thread spawn error: {}\n", .{err});
-            stream.close(io);
-            continue;
-        };
-        t.detach();
-    }
+    // ── Always restart service on exit ───────────────────────────────────
+    defer restartBackgroundService(io, gpa);
+
+    // Install signal/ctrl handler so we restart even on Ctrl+C / window close
+    installShutdownHandler(io, gpa);
+
+    // ── Run Guest in foreground ──────────────────────────────────────────
+    // Same ports as the service — the agent takes over completely.
+    const cli = main.CliArgs{
+        .port = port,
+        .http_port = http_port,
+        .hostname = hostname_override,
+    };
+    try guest.runWithIo(io, gpa, cli);
 }
 
-/// Handle one agent connection: read EXEC\n<cmd>\n\n → exec → return result.
-fn handleConnection(io: std.Io, gpa: std.mem.Allocator, stream: std.Io.net.Stream) void {
-    defer stream.close(io);
+// ═══════════════════════════════════════════════════════════════════════════
+// Service start/stop helpers
+// ═══════════════════════════════════════════════════════════════════════════
 
-    // ── Read command (until \n\n) ──────────────────────────────────────
-    var cmd_buf: [65536]u8 = undefined;
-    var cmd_len: usize = 0;
-    {
-        var rb: [4096]u8 = undefined;
-        var reader = stream.reader(io, &rb);
-        while (cmd_len < cmd_buf.len - 1) {
-            const byte = reader.interface.takeByte() catch break;
-            cmd_buf[cmd_len] = byte;
-            cmd_len += 1;
-            if (cmd_len >= 2 and
-                cmd_buf[cmd_len - 2] == '\n' and
-                cmd_buf[cmd_len - 1] == '\n') break;
-        }
-    }
-    if (cmd_len < 2) return;
+fn stopBackgroundService(io: std.Io, gpa: std.mem.Allocator) void {
+    std.debug.print("[guest] Stopping background service...\n", .{});
 
-    // Strip trailing \n\n
-    const raw_cmd = cmd_buf[0 .. cmd_len - 2];
-
-    // Skip "EXEC\n" prefix if present (protocol: EXEC\n<cmd>\n\n)
-    const cmd = if (std.mem.startsWith(u8, raw_cmd, "EXEC\n"))
-        raw_cmd["EXEC\n".len..]
-    else
-        raw_cmd;
-
-    std.debug.print("[agent] EXEC: {s}\n", .{cmd});
-
-    // ── Execute the command in user session ─────────────────────────────
-    const result = execInUserSession(gpa, io, cmd) catch |err| {
-        var wb: [256]u8 = undefined;
-        var writer = stream.writer(io, &wb);
-        writer.interface.print("ERR\n{}\n", .{err}) catch {};
-        writer.interface.flush() catch {};
-        return;
-    };
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
-
-    // ── Send response ──────────────────────────────────────────────────
-    {
-        var wb: [65536]u8 = undefined;
-        var writer = stream.writer(io, &wb);
-        if (result.term == .exited and result.term.exited == 0) {
-            writer.interface.print("OK\n{s}", .{result.stdout}) catch {};
-        } else {
-            writer.interface.print("ERR\n{s}", .{result.stderr}) catch {};
-        }
-        writer.interface.flush() catch {};
-    }
-}
-
-/// Execute a command in the user's desktop session.
-/// The Agent runs as a user-level process (LaunchAgent / user systemd /
-/// user Task Scheduler), so commands it spawns inherit the user's GUI session.
-fn execInUserSession(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8) !ExecResult {
     if (builtin.os.tag == .windows) {
-        return execWindows(gpa, io, cmd);
+        // sc stop returns non-zero if already stopped — ignore errors
+        if (std.process.run(gpa, io, .{ .argv = &.{ "sc", "stop", "UTM-Monitor" } })) |r| {
+            _ = r;
+            std.debug.print("[guest] Service stopped.\n", .{});
+        } else |_| {
+            std.debug.print("[guest] Service was not running (or stop failed).\n", .{});
+        }
+        // Give the service time to fully stop and release ports
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(2), .real) catch {};
+    } else if (builtin.os.tag == .macos) {
+        if (std.process.run(gpa, io, .{
+            .argv = &.{ "sudo", "launchctl", "bootout", "system", "/Library/LaunchDaemons/com.utmm.plist" },
+        })) |_| {
+            std.debug.print("[guest] Service stopped.\n", .{});
+        } else |_| {
+            std.debug.print("[guest] Service was not running (or bootout failed).\n", .{});
+        }
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .real) catch {};
+    } else {
+        // Linux
+        if (std.process.run(gpa, io, .{ .argv = &.{ "sudo", "systemctl", "stop", "utmm" } })) |_| {
+            std.debug.print("[guest] Service stopped.\n", .{});
+        } else |_| {
+            std.debug.print("[guest] Service was not running (or stop failed).\n", .{});
+        }
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .real) catch {};
     }
-    const shell: []const u8 = "/bin/sh";
-    const shell_arg: []const u8 = "-c";
-    return std.process.run(gpa, io, .{
-        .argv = &[_][]const u8{ shell, shell_arg, cmd },
-    });
+}
+
+fn restartBackgroundService(io: std.Io, gpa: std.mem.Allocator) void {
+    std.debug.print("[guest] Restarting background service...\n", .{});
+
+    if (builtin.os.tag == .windows) {
+        if (std.process.run(gpa, io, .{ .argv = &.{ "sc", "start", "UTM-Monitor" } })) |_| {
+            std.debug.print("[guest] Service restarted.\n", .{});
+        } else |_| {
+            std.debug.print("[guest] WARNING: failed to restart service (sc start).\n", .{});
+        }
+    } else if (builtin.os.tag == .macos) {
+        if (std.process.run(gpa, io, .{
+            .argv = &.{ "sudo", "launchctl", "load", "/Library/LaunchDaemons/com.utmm.plist" },
+        })) |_| {
+            std.debug.print("[guest] Service restarted.\n", .{});
+        } else |_| {
+            std.debug.print("[guest] WARNING: failed to restart service (launchctl load).\n", .{});
+        }
+    } else {
+        // Linux
+        if (std.process.run(gpa, io, .{ .argv = &.{ "sudo", "systemctl", "start", "utmm" } })) |_| {
+            std.debug.print("[guest] Service restarted.\n", .{});
+        } else |_| {
+            std.debug.print("[guest] WARNING: failed to restart service (systemctl start).\n", .{});
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Windows exec — file-based stdout/stderr to avoid pipe-inheritance hangs.
-// Same approach as http_server.execWindows.
+// Signal / Ctrl handler — restart service even on unclean exit
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn execWindows(gpa: std.mem.Allocator, io: std.Io, cmd: []const u8) !ExecResult {
-    const tid: usize = @intCast(std.Thread.getCurrentId());
+/// Global state for signal handler access (set once before guest loop).
+var g_io: ?std.Io = null;
+var g_gpa: ?std.mem.Allocator = null;
 
-    const tmp_stdout = try std.fmt.allocPrint(gpa, "utmm_agent_out_{d}.tmp", .{tid});
-    defer gpa.free(tmp_stdout);
-    const tmp_stderr = try std.fmt.allocPrint(gpa, "utmm_agent_err_{d}.tmp", .{tid});
-    defer gpa.free(tmp_stderr);
-    const tmp_bat = try std.fmt.allocPrint(gpa, "utmm_agent_cmd_{d}.bat", .{tid});
-    defer gpa.free(tmp_bat);
+fn installShutdownHandler(io: std.Io, gpa: std.mem.Allocator) void {
+    g_io = io;
+    g_gpa = gpa;
 
-    // Write command to .bat file
-    {
-        const bat_file = try std.Io.Dir.cwd().createFile(io, tmp_bat, .{ .permissions = @enumFromInt(0o644) });
-        defer bat_file.close(io);
-        var wb: [4096]u8 = undefined;
-        var writer = bat_file.writer(io, &wb);
-        _ = try writer.interface.write("@echo off\r\n");
-        _ = try writer.interface.write(cmd);
-        _ = try writer.interface.write("\r\n");
-        try writer.interface.flush();
+    if (builtin.os.tag == .windows) {
+        const kernel32 = struct {
+            extern "kernel32" fn SetConsoleCtrlHandler(
+                handler: ?*const fn (u32) callconv(.winapi) u32,
+                add: u32,
+            ) callconv(.winapi) u32;
+        };
+        _ = kernel32.SetConsoleCtrlHandler(winCtrlHandler, 1);
+    } else {
+        // POSIX: catch SIGINT, SIGTERM, SIGHUP
+        // Use SA_RESETHAND so the handler fires once, then reverts to default.
+        // This is safe because we're about to exit anyway.
+        const SA = struct {
+            extern "c" fn signal(sig: c_int, handler: ?*const fn (c_int) callconv(.c) void) ?*const fn (c_int) callconv(.c) void;
+        };
+        _ = SA.signal(2, posixShutdownHandler); // SIGINT
+        _ = SA.signal(15, posixShutdownHandler); // SIGTERM
+        _ = SA.signal(1, posixShutdownHandler); // SIGHUP
     }
+}
 
-    const stdout_file = try std.Io.Dir.cwd().createFile(io, tmp_stdout, .{ .permissions = @enumFromInt(0o644) });
-    errdefer {
-        stdout_file.close(io);
-        std.Io.Dir.cwd().deleteFile(io, tmp_stdout) catch {};
+fn posixShutdownHandler(sig: c_int) callconv(.c) void {
+    _ = sig;
+    // Restart service — libc system() call, pragmatic for signal context.
+    // Declare extern to avoid std.c.system portability issues.
+    const libc = struct {
+        extern "c" fn system(command: [*:0]const u8) c_int;
+    };
+    if (builtin.os.tag == .macos) {
+        _ = libc.system("sudo launchctl load /Library/LaunchDaemons/com.utmm.plist");
+    } else if (builtin.os.tag != .windows) {
+        _ = libc.system("sudo systemctl start utmm");
     }
-    const stderr_file = try std.Io.Dir.cwd().createFile(io, tmp_stderr, .{ .permissions = @enumFromInt(0o644) });
-    errdefer {
-        stderr_file.close(io);
-        std.Io.Dir.cwd().deleteFile(io, tmp_stderr) catch {};
-    }
+    // Use raw exit to avoid any Zig runtime cleanup in signal context
+    std.process.exit(0);
+}
 
-    var child = try std.process.spawn(io, .{
-        .argv = &.{ "cmd.exe", "/c", tmp_bat },
-        .stdout = .{ .file = stdout_file },
-        .stderr = .{ .file = stderr_file },
-    });
-    stdout_file.close(io);
-    stderr_file.close(io);
-
-    const term = try child.wait(io);
-
-    var stdout: []u8 = &.{};
-    var stderr: []u8 = &.{};
-    if (std.Io.Dir.cwd().readFileAlloc(io, tmp_stdout, gpa, @enumFromInt(1024 * 1024))) |data| {
-        stdout = data;
-    } else |_| {}
-    if (std.Io.Dir.cwd().readFileAlloc(io, tmp_stderr, gpa, @enumFromInt(1024 * 1024))) |data| {
-        stderr = data;
-    } else |_| {}
-
-    std.Io.Dir.cwd().deleteFile(io, tmp_stdout) catch {};
-    std.Io.Dir.cwd().deleteFile(io, tmp_stderr) catch {};
-    std.Io.Dir.cwd().deleteFile(io, tmp_bat) catch {};
-
-    return .{ .term = term, .stdout = stdout, .stderr = stderr };
+fn winCtrlHandler(dwCtrlType: u32) callconv(.winapi) u32 {
+    // CTRL_CLOSE_EVENT = 2, CTRL_C_EVENT = 0, CTRL_BREAK_EVENT = 1
+    _ = dwCtrlType;
+    // Restart service — use system() for simplicity
+    const kernel32 = struct {
+        extern "kernel32" fn system(cmd: [*:0]const u8) callconv(.winapi) c_int;
+    };
+    _ = kernel32.system("sc start UTM-Monitor");
+    return 1; // TRUE = event handled
 }
 
 test "agent run" {

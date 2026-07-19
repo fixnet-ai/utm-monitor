@@ -88,7 +88,7 @@ pub fn genInit(platform: Platform) []const u8 {
 /// hostname_override: if provided, baked into the service command line so
 /// the process starts with the correct --hostname on every boot.
 /// user_mode: if true, install as user-level auto-start (LaunchAgent / user systemd /
-///   Task Scheduler) for the --agent process. Otherwise install as system-level
+///   Task Scheduler) for the foreground guest. Otherwise install as system-level
 ///   daemon (LaunchDaemon / system systemd / Windows service).
 pub fn installSelf(
     io: std.Io,
@@ -118,72 +118,45 @@ pub fn installSelf(
         try std.fmt.allocPrint(allocator, "{s}/utmm", .{exe_dir});
     defer allocator.free(svc_exe);
 
-    // ── User-level agent install ────────────────────────────────────────
+    // ── User-level foreground guest install (desktop shortcut) ──────────
     if (user_mode) {
+        // Default mode (no flags) = foreground guest: stop service, run, restart on exit.
+        // Just pass --hostname if we have a custom one to override auto-detection.
+        const fg_cmd: []const u8 = if (hostname_override) |h|
+            try std.fmt.allocPrint(allocator, "{s} --hostname {s}", .{ svc_exe, h })
+        else
+            try std.fmt.allocPrint(allocator, "{s}", .{svc_exe});
+        defer allocator.free(fg_cmd);
+
         switch (platform) {
             .macos => {
-                // Install as LaunchAgent (runs in user session with GUI access).
-                // Uses osascript to open a Terminal window so the agent logs are visible.
+                // Foreground guest is manual, on-demand — no auto-start service.
+                // Just create a desktop shortcut to open the guest in Terminal.
                 const home = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "/Users/root";
-                const agent_dir = try std.fmt.allocPrint(allocator, "{s}/Library/LaunchAgents", .{home});
-                defer allocator.free(agent_dir);
-                const plist_path = try std.fmt.allocPrint(allocator, "{s}/com.utmm-agent.plist", .{agent_dir});
-                defer allocator.free(plist_path);
 
-                // Create LaunchAgents directory if needed
-                std.Io.Dir.cwd().createDir(io, agent_dir, @enumFromInt(0o755)) catch |err| {
-                    if (err != error.PathAlreadyExists) return err;
-                };
-
-                // Unload existing agent first (ignore errors)
-                const uid = std.c.getuid();
-                const gui_target = try std.fmt.allocPrint(allocator, "gui/{d}", .{uid});
-                defer allocator.free(gui_target);
-                if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", gui_target, plist_path } })) |_| {} else |_| {}
-
-                // Write plist
-                std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
-                const file = try std.Io.Dir.cwd().createFile(io, plist_path, .{ .permissions = @enumFromInt(0o644) });
-                defer file.close(io);
-                var write_buf: [4096]u8 = undefined;
-                var writer = file.writer(io, &write_buf);
-                try writer.interface.print(
-                    \\<?xml version="1.0" encoding="UTF-8"?>
-                    \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-                    \\  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-                    \\<plist version="1.0">
-                    \\<dict>
-                    \\    <key>Label</key>
-                    \\    <string>com.utmm-agent</string>
-                    \\    <key>ProgramArguments</key>
-                    \\    <array>
-                    \\        <string>osascript</string>
-                    \\        <string>-e</string>
-                    \\        <string>tell app "Terminal" to do script "{s} --agent"</string>
-                    \\    </array>
-                    \\    <key>RunAtLoad</key>
-                    \\    <true/>
-                    \\    <key>KeepAlive</key>
-                    \\    <true/>
-                    \\</dict>
-                    \\</plist>
-                , .{svc_exe});
-                try writer.interface.flush();
-
-                // Load the agent immediately
-                if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "load", plist_path } })) |_| {
-                    std.debug.print("[install] macOS: agent plist written + loaded: {s}\n", .{plist_path});
-                } else |_| {
-                    std.debug.print("[install] macOS: agent plist written to {s}\n", .{plist_path});
-                    std.debug.print("[install] run: launchctl load {s}\n", .{plist_path});
+                // Clean up any leftover LaunchAgent from previous versions
+                {
+                    const agent_dir = try std.fmt.allocPrint(allocator, "{s}/Library/LaunchAgents", .{home});
+                    defer allocator.free(agent_dir);
+                    const plist_path = try std.fmt.allocPrint(allocator, "{s}/com.utmm-agent.plist", .{agent_dir});
+                    defer allocator.free(plist_path);
+                    const uid: u32 = if (builtin.os.tag != .windows) std.c.getuid() else 0;
+                    const gui_target = try std.fmt.allocPrint(allocator, "gui/{d}", .{uid});
+                    defer allocator.free(gui_target);
+                    if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", gui_target, plist_path } })) |_| {} else |_| {}
+                    std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
                 }
 
-                // Create desktop shortcut (double-click to install + launch agent)
+                // Create desktop shortcut (double-click to launch guest in Terminal)
                 {
                     const desktop = try std.fmt.allocPrint(allocator, "{s}/Desktop", .{home});
                     defer allocator.free(desktop);
-                    const cmd_path = try std.fmt.allocPrint(allocator, "{s}/UTM-Agent.command", .{desktop});
+                    const cmd_path = try std.fmt.allocPrint(allocator, "{s}/UTMM-Guest.command", .{desktop});
                     defer allocator.free(cmd_path);
+                    // Also clean up old name from versions before v0.1.24
+                    const old_cmd_path = try std.fmt.allocPrint(allocator, "{s}/UTMM-Agent.command", .{desktop});
+                    defer allocator.free(old_cmd_path);
+                    std.Io.Dir.cwd().deleteFile(io, old_cmd_path) catch {};
 
                     std.Io.Dir.cwd().createDir(io, desktop, @enumFromInt(0o755)) catch {};
                     std.Io.Dir.cwd().deleteFile(io, cmd_path) catch {};
@@ -193,89 +166,39 @@ pub fn installSelf(
                     var cw = cmd_file.writer(io, &cwb);
                     try cw.interface.print(
                         \\#!/bin/bash
-                        \\# UTM Agent — double-click to install & launch
+                        \\# UTMM Guest — foreground launcher (GUI-aware exec forwarding)
                         \\cd "$(dirname "$0")" || true
-                        \\echo "Installing UTM Agent..."
-                        \\{s} --install --user
-                        \\echo ""
-                        \\echo "Starting UTM Agent..."
-                        \\exec {s} --agent
-                    , .{ svc_exe, svc_exe });
+                        \\exec {s}
+                    , .{fg_cmd});
                     try cw.interface.flush();
-                    std.debug.print("[install] macOS: desktop shortcut created: {s}\n", .{cmd_path});
+                    std.debug.print("[install] macOS: guest desktop shortcut created: {s}\n", .{cmd_path});
                 }
             },
             .linux => {
-                // Install as user systemd service (runs in user session with GUI access).
-                // Uses x-terminal-emulator to open a terminal window for visible agent logs.
+                // Foreground guest is manual, on-demand — no auto-start service.
+                // Just create a desktop shortcut to open the guest in a terminal.
                 const home = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "/root";
-                const agent_dir = try std.fmt.allocPrint(allocator, "{s}/.config/systemd/user", .{home});
-                defer allocator.free(agent_dir);
-                const service_path = try std.fmt.allocPrint(allocator, "{s}/utmm-agent.service", .{agent_dir});
-                defer allocator.free(service_path);
 
-                // Create user systemd directory if needed
-                std.Io.Dir.cwd().createDir(io, agent_dir, @enumFromInt(0o755)) catch |err| {
-                    if (err != error.PathAlreadyExists and err != error.NotDir) {
-                        // Try creating parent directories recursively
-                        const config_dir = try std.fmt.allocPrint(allocator, "{s}/.config", .{home});
-                        defer allocator.free(config_dir);
-                        std.Io.Dir.cwd().createDir(io, config_dir, @enumFromInt(0o755)) catch |e| {
-                            if (e != error.PathAlreadyExists) return e;
-                        };
-                        const systemd_dir = try std.fmt.allocPrint(allocator, "{s}/.config/systemd", .{home});
-                        defer allocator.free(systemd_dir);
-                        std.Io.Dir.cwd().createDir(io, systemd_dir, @enumFromInt(0o755)) catch |e2| {
-                            if (e2 != error.PathAlreadyExists) return e2;
-                        };
-                        std.Io.Dir.cwd().createDir(io, agent_dir, @enumFromInt(0o755)) catch |e3| {
-                            if (e3 != error.PathAlreadyExists) return e3;
-                        };
-                    }
-                };
-
-                const content = try std.fmt.allocPrint(allocator,
-                    \\[Unit]
-                    \\Description=UTM Monitor Agent (GUI-aware exec)
-                    \\After=graphical-session.target
-                    \\PartOf=graphical-session.target
-                    \\
-                    \\[Service]
-                    \\Type=simple
-                    \\ExecStart=/usr/bin/x-terminal-emulator -e "{s} --agent"
-                    \\Restart=on-failure
-                    \\RestartSec=5
-                    \\
-                    \\[Install]
-                    \\WantedBy=default.target
-                , .{svc_exe});
-                defer allocator.free(content);
-
-                std.Io.Dir.cwd().deleteFile(io, service_path) catch {};
-                const file = try std.Io.Dir.cwd().createFile(io, service_path, .{ .permissions = @enumFromInt(0o644) });
-                defer file.close(io);
-                var write_buf: [4096]u8 = undefined;
-                var writer = file.writer(io, &write_buf);
-                try writer.interface.writeAll(content);
-                try writer.interface.flush();
-
-                // Reload user systemd and enable
-                if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "daemon-reload" } })) |_| {} else |_| {}
-                if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "enable", "utmm-agent.service" } })) |_| {
-                    std.debug.print("[install] Linux: user agent service enabled\n", .{});
-                } else |_| {}
-                if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "start", "utmm-agent.service" } })) |_| {
-                    std.debug.print("[install] Linux: user agent service started\n", .{});
-                } else |_| {
-                    std.debug.print("[install] Linux: run manually: systemctl --user enable --now utmm-agent\n", .{});
+                // Clean up any leftover user systemd from previous versions
+                {
+                    const service_path = try std.fmt.allocPrint(allocator, "{s}/.config/systemd/user/utmm-agent.service", .{home});
+                    defer allocator.free(service_path);
+                    if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "stop", "utmm-agent.service" } })) |_| {} else |_| {}
+                    if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "disable", "utmm-agent.service" } })) |_| {} else |_| {}
+                    std.Io.Dir.cwd().deleteFile(io, service_path) catch {};
+                    if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "daemon-reload" } })) |_| {} else |_| {}
                 }
 
-                // Create desktop shortcut (double-click to install + launch agent)
+                // Create desktop shortcut (double-click to launch guest in terminal)
                 {
                     const desktop = try std.fmt.allocPrint(allocator, "{s}/Desktop", .{home});
                     defer allocator.free(desktop);
-                    const dt_path = try std.fmt.allocPrint(allocator, "{s}/utmm-agent.desktop", .{desktop});
+                    const dt_path = try std.fmt.allocPrint(allocator, "{s}/utmm-guest.desktop", .{desktop});
                     defer allocator.free(dt_path);
+                    // Also clean up old name from versions before v0.1.24
+                    const old_dt_path = try std.fmt.allocPrint(allocator, "{s}/utmm-agent.desktop", .{desktop});
+                    defer allocator.free(old_dt_path);
+                    std.Io.Dir.cwd().deleteFile(io, old_dt_path) catch {};
 
                     std.Io.Dir.cwd().createDir(io, desktop, @enumFromInt(0o755)) catch {};
                     std.Io.Dir.cwd().deleteFile(io, dt_path) catch {};
@@ -286,50 +209,27 @@ pub fn installSelf(
                     try dw.interface.print(
                         \\[Desktop Entry]
                         \\Type=Application
-                        \\Name=UTM Agent
-                        \\Comment=UTM Monitor Agent — GUI-aware exec forwarding
-                        \\Exec=bash -c "{s} --install --user; exec {s} --agent"
+                        \\Name=UTMM Guest
+                        \\Comment=UTMM Monitor — foreground guest (GUI-aware exec forwarding)
+                        \\Exec=bash -c "exec {s}"
                         \\Terminal=true
                         \\Categories=Utility;
-                    , .{ svc_exe, svc_exe });
+                    , .{fg_cmd});
                     try dw.interface.flush();
-                    std.debug.print("[install] Linux: desktop shortcut created: {s}\n", .{dt_path});
+                    std.debug.print("[install] Linux: guest desktop shortcut created: {s}\n", .{dt_path});
                 }
             },
             .windows => {
-                // Install as user-level scheduled task (runs at logon with GUI access).
-                // Uses `start "UTM Agent" cmd /k` to open a visible console window.
-                const task_name = "UTM Agent";
-                const task_cmd = try std.fmt.allocPrint(allocator, "cmd /c start \"UTM Agent\" cmd /k \"chcp 65001 ^> nul && {s} --agent\"", .{svc_exe});
-                defer allocator.free(task_cmd);
-
-                // Delete existing task (ignore errors)
-                if (std.process.run(allocator, io, .{
-                    .argv = &.{ "schtasks", "/delete", "/tn", task_name, "/f" },
-                })) |_| {} else |_| {}
-
-                // Create task: run at user logon
-                std.debug.print("[install] Windows: creating scheduled task '{s}'...\n", .{task_name});
-                if (std.process.run(allocator, io, .{
-                    .argv = &.{ "schtasks", "/create", "/tn", task_name, "/tr", task_cmd, "/sc", "onlogon", "/rl", "highest" },
-                })) |_| {
-                    std.debug.print("[install] Windows: agent scheduled task created (runs at next logon)\n", .{});
-                    // Also start it now
-                    if (std.process.run(allocator, io, .{
-                        .argv = &.{ "schtasks", "/run", "/tn", task_name },
-                    })) |_| {
-                        std.debug.print("[install] Windows: agent started\n", .{});
-                    } else |_| {}
-                } else |_| {
-                    std.debug.print("[install] Windows: failed to create task — create manually:\n", .{});
-                    std.debug.print("[install]   schtasks /create /tn \"{s}\" /tr \"{s}\" /sc onlogon\n", .{ task_name, task_cmd });
-                }
-
-                // Create desktop shortcut for all users (double-click to install + launch agent)
+                // Foreground guest is a manual, on-demand tool — no auto-start.
+                // Just create a desktop shortcut that opens the guest terminal window.
                 {
                     const desktop = "C:\\Users\\Public\\Desktop";
-                    const bat_path = try std.fmt.allocPrint(allocator, "{s}\\UTM-Agent.bat", .{desktop});
+                    const bat_path = try std.fmt.allocPrint(allocator, "{s}\\UTMM.bat", .{desktop});
                     defer allocator.free(bat_path);
+                    // Also clean up old name from versions before v0.1.24
+                    const old_bat_path = try std.fmt.allocPrint(allocator, "{s}\\UTMM-Agent.bat", .{desktop});
+                    defer allocator.free(old_bat_path);
+                    std.Io.Dir.cwd().deleteFile(io, old_bat_path) catch {};
 
                     std.Io.Dir.cwd().deleteFile(io, bat_path) catch {};
                     const bat_file = try std.Io.Dir.cwd().createFile(io, bat_path, .{ .permissions = @enumFromInt(0o644) });
@@ -339,18 +239,14 @@ pub fn installSelf(
                     try bw.interface.print(
                         \\@echo off
                         \\chcp 65001 > nul
-                        \\echo Installing UTM Agent...
-                        \\"{s}" --install --user
-                        \\echo.
-                        \\echo Starting UTM Agent...
-                        \\start "UTM Agent" cmd /k "chcp 65001 ^> nul && {s} --agent"
-                    , .{ svc_exe, svc_exe });
+                        \\{s}
+                    , .{fg_cmd});
                     try bw.interface.flush();
-                    std.debug.print("[install] Windows: desktop shortcut created: {s}\n", .{bat_path});
+                    std.debug.print("[install] Windows: guest desktop shortcut created: {s}\n", .{bat_path});
                 }
             },
         }
-        std.debug.print("[install] agent installation complete!\n", .{});
+        std.debug.print("[install] guest installation complete!\n", .{});
         return;
     }
 
@@ -410,6 +306,7 @@ pub fn installSelf(
                     \\    <key>ProgramArguments</key>
                     \\    <array>
                     \\        <string>{s}</string>
+                    \\        <string>--svc</string>
                 , .{svc_exe});
                 try writer.interface.flush();
                 if (hostname_override) |h| {
@@ -441,9 +338,9 @@ pub fn installSelf(
             const service_path = "/etc/systemd/system/utmm.service";
             const desc: []const u8 = if (is_host) "UTM Monitor Host Service" else "UTM Monitor Guest Service";
             const extra_args: []const u8 = if (is_host) " --host" else if (hostname_override) |h|
-                try std.fmt.allocPrint(allocator, " --hostname {s}", .{h})
+                try std.fmt.allocPrint(allocator, " --svc --hostname {s}", .{h})
             else
-                "";
+                " --svc";
             const content = try std.fmt.allocPrint(allocator,
                 \\[Unit]
                 \\Description={s}
@@ -536,74 +433,80 @@ pub fn installSelf(
 /// user_mode: if true, uninstall the user-level agent instead of the system daemon.
 pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) !void {
     const platform = Platform.detect();
-    std.debug.print("[uninstall] detected platform: {s}, mode: {s}\n", .{ platform.asStr(), if (user_mode) "user-agent" else "system" });
+    std.debug.print("[uninstall] detected platform: {s}, mode: {s}\n", .{ platform.asStr(), if (user_mode) "user-guest" else "system" });
 
     // ── User-level agent uninstall ──────────────────────────────────────
     if (user_mode) {
         switch (platform) {
             .macos => {
                 const home = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "/Users/root";
+
+                // Clean up leftover LaunchAgent from previous versions
                 const plist_path = try std.fmt.allocPrint(allocator, "{s}/Library/LaunchAgents/com.utmm-agent.plist", .{home});
                 defer allocator.free(plist_path);
-
-                const uid = std.c.getuid();
+                const uid: u32 = if (builtin.os.tag != .windows) std.c.getuid() else 0;
                 const gui_target = try std.fmt.allocPrint(allocator, "gui/{d}", .{uid});
                 defer allocator.free(gui_target);
-                // Unload the agent
                 if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", gui_target, plist_path } })) |_| {} else |_| {}
-                // Remove plist
-                std.Io.Dir.cwd().deleteFile(io, plist_path) catch |err| {
-                    if (err != error.FileNotFound) {
-                        std.debug.print("[uninstall] failed to remove agent plist: {}\n", .{err});
-                    }
-                };
-                // Remove desktop shortcut
-                const cmd_path = try std.fmt.allocPrint(allocator, "{s}/Desktop/UTM-Agent.command", .{home});
-                defer allocator.free(cmd_path);
-                std.Io.Dir.cwd().deleteFile(io, cmd_path) catch {};
+                std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
 
-                std.debug.print("[uninstall] macOS: agent unloaded, plist removed\n", .{});
+                // Remove desktop shortcuts (both old and new names)
+                const old_cmd = try std.fmt.allocPrint(allocator, "{s}/Desktop/UTMM-Agent.command", .{home});
+                defer allocator.free(old_cmd);
+                std.Io.Dir.cwd().deleteFile(io, old_cmd) catch {};
+                const new_cmd = try std.fmt.allocPrint(allocator, "{s}/Desktop/UTMM-Guest.command", .{home});
+                defer allocator.free(new_cmd);
+                std.Io.Dir.cwd().deleteFile(io, new_cmd) catch {};
+
+                // Kill any running guest
+                if (std.process.run(allocator, io, .{ .argv = &.{ "pkill", "-9", "-f", "utmm" } })) |_| {} else |_| {}
+
+                std.debug.print("[uninstall] macOS: guest cleaned up\n", .{});
             },
             .linux => {
                 const home = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "/root";
+
+                // Clean up leftover user systemd from previous versions
                 const service_path = try std.fmt.allocPrint(allocator, "{s}/.config/systemd/user/utmm-agent.service", .{home});
                 defer allocator.free(service_path);
-
-                // Stop and disable user service
                 if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "stop", "utmm-agent.service" } })) |_| {} else |_| {}
                 if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "disable", "utmm-agent.service" } })) |_| {} else |_| {}
-                // Remove unit file
-                std.Io.Dir.cwd().deleteFile(io, service_path) catch |err| {
-                    if (err != error.FileNotFound) {
-                        std.debug.print("[uninstall] failed to remove agent unit: {}\n", .{err});
-                    }
-                };
+                std.Io.Dir.cwd().deleteFile(io, service_path) catch {};
                 if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "daemon-reload" } })) |_| {} else |_| {}
 
-                // Remove desktop shortcut
-                const dt_path = try std.fmt.allocPrint(allocator, "{s}/Desktop/utmm-agent.desktop", .{home});
-                defer allocator.free(dt_path);
-                std.Io.Dir.cwd().deleteFile(io, dt_path) catch {};
+                // Remove desktop shortcuts (both old and new names)
+                const old_dt = try std.fmt.allocPrint(allocator, "{s}/Desktop/utmm-agent.desktop", .{home});
+                defer allocator.free(old_dt);
+                std.Io.Dir.cwd().deleteFile(io, old_dt) catch {};
+                const new_dt = try std.fmt.allocPrint(allocator, "{s}/Desktop/utmm-guest.desktop", .{home});
+                defer allocator.free(new_dt);
+                std.Io.Dir.cwd().deleteFile(io, new_dt) catch {};
 
-                std.debug.print("[uninstall] Linux: agent service stopped, unit removed\n", .{});
+                // Kill any running guest
+                if (std.process.run(allocator, io, .{ .argv = &.{ "pkill", "-9", "-f", "utmm" } })) |_| {} else |_| {}
+
+                std.debug.print("[uninstall] Linux: guest cleaned up\n", .{});
             },
             .windows => {
-                const task_name = "UTM Agent";
+                // Clean up any leftover Task Scheduler from previous versions
+                const task_name = "UTMM Agent";
                 if (std.process.run(allocator, io, .{
                     .argv = &.{ "schtasks", "/delete", "/tn", task_name, "/f" },
-                })) |_| {
-                    std.debug.print("[uninstall] Windows: agent scheduled task removed\n", .{});
-                } else |_| {
-                    std.debug.print("[uninstall] Windows: failed to remove task (may not exist)\n", .{});
-                }
+                })) |_| {} else |_| {}
 
-                // Remove desktop shortcut
-                const bat_path = "C:\\Users\\Public\\Desktop\\UTM-Agent.bat";
-                std.Io.Dir.cwd().deleteFile(io, bat_path) catch {};
-                std.debug.print("[uninstall] Windows: desktop shortcut removed\n", .{});
+                // Remove desktop shortcuts (both old and new names)
+                const old_bat = "C:\\Users\\Public\\Desktop\\UTMM-Agent.bat";
+                std.Io.Dir.cwd().deleteFile(io, old_bat) catch {};
+                const new_bat = "C:\\Users\\Public\\Desktop\\UTMM.bat";
+                std.Io.Dir.cwd().deleteFile(io, new_bat) catch {};
+
+                // Kill any running guest
+                if (std.process.run(allocator, io, .{ .argv = &.{ "taskkill", "/f", "/im", "utmm.exe" } })) |_| {} else |_| {}
+
+                std.debug.print("[uninstall] Windows: guest cleaned up\n", .{});
             },
         }
-        std.debug.print("[uninstall] agent uninstall complete!\n", .{});
+        std.debug.print("[uninstall] guest uninstall complete!\n", .{});
         return;
     }
 

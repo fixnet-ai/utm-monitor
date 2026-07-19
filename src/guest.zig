@@ -60,11 +60,8 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
     });
     http_thread.detach();
 
-    // Note: version-check loop removed — Host handles auto-upgrade by pushing
-    // new binary via HTTP upload when ANNOUNCE version doesn't match Host's version.
-
-    // Main thread runs broadcast loop
-    // Broadcast sends http_port for Guest discovery
-    // Note: version-check loop removed — Host auto-pushes upgrades when version mismatches
-    try broadcast.broadcastLoop(io, cli.port, sysinfo, cli.http_port);
+    // Main thread runs broadcast loop.
+    // is_svc: true when running as system daemon (--svc), enables self-upgrade.
+    //         false when running in foreground, skips self-upgrade.
+    try broadcast.broadcastLoop(io, cli.port, sysinfo, cli.http_port, cli.is_svc);
 }
