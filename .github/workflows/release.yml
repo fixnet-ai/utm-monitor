@@ -25,19 +25,17 @@ jobs:
       - name: Build all targets
         run: |
           mkdir -p release
-          # 8 binaries covering all VM scenarios (see MANUAL.md §6.x compatibility matrix)
-          targets="x86-windows x86_64-windows aarch64-windows x86_64-macos aarch64-macos x86-linux-musl x86_64-linux-musl aarch64-linux-musl"
+          # 6 binaries covering all VM scenarios (32-bit x86 excluded — zio doesn't support it)
+          targets="x86_64-windows aarch64-windows x86_64-macos aarch64-macos x86_64-linux-musl aarch64-linux-musl"
           for target in $targets; do
             echo "==> Building $target ..."
             zig build -Dtarget=$target -Doptimize=ReleaseSafe
             # build.zig outputs utmm-{arch}-{os}[.exe] deployment filenames
             case "$target" in
-              x86-windows)          bin="utmm-x86-windows.exe" ;;
               x86_64-windows)       bin="utmm-x86_64-windows.exe" ;;
               aarch64-windows)      bin="utmm-aarch64-windows.exe" ;;
               x86_64-macos)         bin="utmm-x86_64-macos" ;;
               aarch64-macos)        bin="utmm-aarch64-macos" ;;
-              x86-linux-musl)       bin="utmm-x86-linux" ;;
               x86_64-linux-musl)    bin="utmm-x86_64-linux" ;;
               aarch64-linux-musl)   bin="utmm-aarch64-linux" ;;
             esac
