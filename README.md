@@ -37,7 +37,7 @@ The headline feature. After a quick one-time setup, your AI agent manages your V
 - **Auto Version Upgrade** — Host detects Guest version mismatch via UDP broadcast, auto-pushes new binary via TCP transport — no Guest polling needed
 - **TCP Transport Protocol** — Binary frame protocol (4B length + 1B type + payload) replaces HTTP; single connection multiplexing, zero parsing overhead
 - **File Upload/Download** — `--upload` and `--download` commands for file transfers over TCP transport
-- **Auto-Start on Boot** — Supports launchd / systemd / Windows Service (SCM)
+- **Auto-Start on Boot** — Supports launchd / systemd / Windows Scheduled Task
 - **Auto-Start Host Service** — Management commands auto-start the Host daemon when it's not running
 - **Single Binary, Dual Mode** — Default Guest mode; `--host` switches to Host mode
 - **MCP Integrated Mode** — `--host --mcp` runs Host + MCP server in one process, no separate daemon

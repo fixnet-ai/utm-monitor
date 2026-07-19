@@ -158,7 +158,7 @@ utmm --exec linuxvm "uname -a"
 | Host service plist | `/Library/LaunchDaemons/com.utmm.plist` |
 | Host log | `/var/log/utmm-host.log` |
 | Serve directory (TCP) | `/opt/utmm/` by default (configurable via `--serve-dir`) |
-| State file | `/tmp/utmm-guests.tsv` (TSV: hostname, target, ip, mac, version) |
+| State file | `/tmp/utmm-guests.tsv` (TSV: hostname, target, ip, mac, version, shell) |
 
 ## Bootstrap Troubleshooting
 

@@ -153,10 +153,10 @@ Once the Guest IP is discovered, management commands connect directly to the Gue
 The Host writes this TSV file after each `/etc/hosts` sync:
 
 ```
-hostname	target	ip	mac	version
-linuxvm	aarch64-linux-musl	192.168.64.2	16:a0:6c:ba:ae:fa	0.2.0
-macvm	aarch64-macos	192.168.64.4	1a:97:6d:38:0c:6c	0.2.0
-windowsvm	aarch64-windows	192.168.65.2	66:DC:DA:EC:A1:59	0.2.0
+hostname	target	ip	mac	version	shell
+linuxvm	aarch64-linux-musl	192.168.64.2	16:a0:6c:ba:ae:fa	0.2.4	/bin/bash
+macvm	aarch64-macos	192.168.64.4	1a:97:6d:38:0c:6c	0.2.4	/bin/zsh
+windowsvm	aarch64-windows	192.168.65.2	66:DC:DA:EC:A1:59	0.2.4	cmd.exe
 ```
 
 ### 1.5 Physical NIC Detection
@@ -435,8 +435,10 @@ utmm --gen-init linux
 utmm --gen-init windows
 # Generates a script; or install directly:
 C:\opt\utmm\utmm.exe --install
-# This creates a Windows Service via 'sc create "UTM-Monitor"'
-# Start with:  sc start UTM-Monitor
+# This creates a Windows scheduled task 'utmm-guest' (runs at boot, every 5 min).
+# The scheduled task launches utmm without --svc — the binary auto-detects
+# non-TTY mode and runs in daemon mode automatically.
+# Start immediately with:  schtasks /run /tn utmm-guest
 ```
 
 ### 3.6 Start Host Service
@@ -492,7 +494,7 @@ Usage: utmm [options]
 Mode Selection:
   (no arguments)         Guest mode (default: foreground, stop service, run, restart on exit)
   --host                 Host mode
-  --svc                  Run as daemon (launched by service manager, no service mgmt)
+  --svc                  Run as daemon (launched by service mgr; non-TTY auto-detection also enables daemon mode)
 
 Guest Options:
   --port PORT            UDP broadcast port         (default 2121)
@@ -597,7 +599,11 @@ The Host automatically upgrades any Guest whose version doesn't match. No Guest 
 
 **To trigger**: bump `src/ver.zig`, `zig build`, restart Host. All online Guests upgrade within seconds.
 
-**Debounce**: upgrades only trigger once per Guest per session. After restart, the new ANNOUNCE carries the updated version, so no repeat.
+**Debounce**: upgrades only trigger once per Guest per (guest_version, host_version) pair. Two triggers:
+- **Guest version changed** — Guest binary was upgraded (new ANNOUNCE carries updated version)
+- **Host version changed since last attempt** — Host was restarted with a new binary (covers Host-only upgrades without Guest version bump). Tracked via `last_upgrade_host_version` field.
+
+After restart, the new ANNOUNCE carries the updated version, so no repeat.
 
 #### Check Guest Logs
 
@@ -739,11 +745,14 @@ lsof -i :2121
 
 **Symptom**: Process disappears when the window is closed after direct launch
 
-**Solution**: Use Windows Service instead of direct launch, or auto-install via `--install`. Execute in the VM:
+**Solution**: Install as a scheduled task via `--install` (creates `utmm-guest` task that runs at boot and every 5 minutes). Execute in the VM:
 
 ```cmd
 C:\opt\utmm\utmm.exe --install
+schtasks /run /tn utmm-guest
 ```
+
+Or create a desktop shortcut for foreground mode: `C:\opt\utmm\utmm.exe --install --user` (creates `UTMM.bat` on the desktop).
 
 ### 5.5 /etc/hosts Not Updated
 
@@ -867,7 +876,7 @@ utmm/
 | libc | System | `getifaddrs` / `gethostname` / `getenv` |
 | launchd | macOS system | macOS auto-start on boot |
 | systemd | Linux system | Linux auto-start on boot |
-| sc (SCM) | Windows system | Windows auto-start on boot (Windows Service) |
+| sc (schtasks) | Windows system | Windows auto-start on boot (Scheduled Task) |
 | TCP+UDP | Built-in | File transfer + remote execution + broadcast discovery |
 
 ### 6.3 Binary Packaging (6 Binaries → All VMs)
@@ -960,7 +969,7 @@ sudo killall -HUP mDNSResponder
 | `error.ConnectionRefused` | Guest TCP server not started | Check if Guest process is running |
 | `GuestNotFound` | UDP broadcast not reaching | Check if network is on same broadcast domain |
 | Tunnel IP detected | VPN interface interference | utun/tun added to exclusion list |
-| Windows process disappears | Direct launch without Windows Service | Use --install to install as Windows Service |
+| Windows process disappears | Direct launch without scheduled task | Use --install to install as scheduled task (autostart on boot) |
 | Upload file locked | Target file mmap'd by process | Kill process and retry |
 | `zig-out/bin/utmm` is wrong arch | `zig build` overwrites with last target | Use named file e.g. `utmm-aarch64-macos` |
 | 32-bit x86 build fails | zio coroutines require 64-bit | Use x86_64 target (all modern VMs are 64-bit) |
@@ -1270,8 +1279,7 @@ rm -f /var/log/utmm*.log /opt/utmm*.log
 **Windows Guest** (run inside VM or via SSH):
 ```cmd
 taskkill /f /im utmm.exe
-sc stop UTM-Monitor 2>nul
-sc delete UTM-Monitor 2>nul
+schtasks /delete /tn utmm-guest /f 2>nul
 rmdir /s /q C:\opt\utmm
 del C:\opt\utmm*.log 2>nul
 ```

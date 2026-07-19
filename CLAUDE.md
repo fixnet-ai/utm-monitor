@@ -20,7 +20,7 @@ windowsvm: user=Administrator, passwd=111, app_path=C:\opt\
 ## Architecture Design
 
 ### Two Run Modes (Same Binary)
-- **Guest mode (default)**: Foreground mode — stops any background service, runs in terminal, restarts service on exit. With `--svc`: daemon mode (UDP broadcast hostname+IP + TCP transport server on port 2121). Use `--install --user` to create a desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
+- **Guest mode (default)**: Foreground mode — detects TTY, stops any background service, runs in terminal, restarts service on exit. Non-TTY invocation (e.g., scheduled tasks) falls back to daemon mode with `is_svc = true` — no `--svc` flag needed for schtasks/launchd/systemd. With `--svc`: explicit daemon mode (UDP broadcast hostname+IP + TCP transport server on port 2121). Use `--install --user` to create a desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
 - **Host mode (--host)**: UDP listener + TCP transport + /etc/hosts sync + management commands (--status/--exec etc.)
 - **MCP integrated mode (--host --mcp)**: Host + MCP JSON-RPC server in one process, no separate Host daemon needed
 
@@ -36,7 +36,7 @@ Guest (windows)  ──UDP broadcast──┘                    └── hosts
 - **TCP transport** (port 2121): Binary frame protocol (4B big-endian length + 1B message type + payload). Guest serves VERSION_REQ, HEALTH_REQ, EXEC_REQ, FILE_REQ, UPLOAD_REQ. Host serves FILE_REQ for Guest bootstrap.
 - **Management commands** (--status/--exec/--upload/--download): Discover Guest IP via UDP broadcast, then connect directly via TCP transport. When UDP port is occupied (Host daemon running), fall back to reading `/tmp/utmm-guests.tsv` state file.
 - **Auto-start Host service**: Management commands auto-start the Host daemon via the OS service manager when the UDP port is not bound — no manual `utmm --host` needed
-- **Auto-upgrade**: Host detects Guest version mismatch via ANNOUNCE → pushes new binary via TCP UPLOAD_REQ (ETag MD5 verified). Guest uses cross-platform safe rename (old → .old, .next → final) + detached restart via EXEC_REQ. Compatible with Linux/macOS/Windows. No Guest polling.
+- **Auto-upgrade**: Host detects Guest version mismatch via ANNOUNCE → pushes new binary via TCP UPLOAD_REQ (ETag MD5 verified). Guest uses cross-platform safe rename (old → .old, .next → final) + detached restart via EXEC_REQ. Compatible with Linux/macOS/Windows. No Guest polling. Triggers on: (a) Guest version changed since last seen, OR (b) Host version changed since last upgrade attempt (covers Host binary update without Guest version bump). Uses `last_upgrade_host_version` field in GuestEntry for debounce; passes `target` directly from ANNOUNCE to avoid state file race.
 
 ### Key Design Decisions
 - Single binary, dual mode: reduces maintenance burden
@@ -45,7 +45,8 @@ Guest (windows)  ──UDP broadcast──┘                    └── hosts
 - zio async Runtime: io_uring (Linux) / kqueue (macOS) / IOCP (Windows) — unified async backend replacing std.Thread
 - Binary frame TCP protocol: 4B length prefix + 1B type + payload, single connection multiplexing, zero parsing overhead
 - Zero external dependencies: no Node.js, no Python, no SSH/SCP, no curl — everything via TCP + UDP
-- Host-push auto-upgrade: version mismatch detected in ANNOUNCE → Host pushes binary + restarts Guest. No Guest polling, no shell scripts. Cross-platform safe rename: old→.old, .next→final, spawn restart. ETag MD5 integrity verified on all uploads.
+- Host-push auto-upgrade: version mismatch detected in ANNOUNCE → Host pushes binary + restarts Guest. No Guest polling, no shell scripts. Cross-platform safe rename: old→.old, .next→final, spawn restart. ETag MD5 integrity verified on all uploads. Debounce via `last_upgrade_host_version` (prevents re-trigger after Host restart) and `target` passthrough (avoids state file read race).
+- **Windows child processes**: zio IOCP backend does not support async pipe I/O for child processes. Use `std.Io.Threaded.init(gpa, .{})` for `std.process.run` on Windows. Never use `Threaded.global_single_threaded` — it uses `Allocator.failing` and causes OutOfMemory in `processSpawnWindows`.
 
 ## Build & Run
 
@@ -139,6 +140,8 @@ Before starting any work, read the following files (if they exist), then use the
 - Container initialization: `.{}` → `.empty` / `.init`
 - `usingnamespace` / `async`/`await` / `@Type` / `@cImport` — removed
 - libxev `close()` returns void on kqueue backend (not error union)
+- `std.process.Child.Term` fields are lowercase: `.exited`, `.signal`, `.stopped`, `.unknown`. Combine cases: `.signal, .stopped, .unknown =>` (comma-separated, no payload capture)
+- `std.Io.Threaded.global_single_threaded` uses `Allocator.failing` — never use for `std.process.run` (causes OutOfMemory). Use `std.Io.Threaded.init(gpa, .{})` instead
 
 ### zio Async Runtime Patterns
 - `Runtime.init(gpa, .{})` → `spawn()` for tasks, `handle.join()` to wait
@@ -147,6 +150,7 @@ Before starting any work, read the following files (if they exist), then use the
 - `BufWriter` data is lost when it goes out of scope — use persistent reader/writer across calls
 - Mutual recursion with error set inference: use explicit `anyerror!T` return type to break dependency loop
 - 32-bit x86 not supported by zio coroutines — 6 targets only (aarch64 + x86_64 × linux/macos/windows)
+- **Windows IOCP limitation**: zio IOCP does not support async pipe I/O for child processes. Use `std.Io.Threaded.init(gpa, .{})` (not `global_single_threaded`) for `std.process.run` on Windows. macOS/Linux: zio's io_uring/kqueue handles `std.process.run` via blocking I/O without Threaded wrapper
 
 ### 1. Think Before Coding
 **Don't assume. Don't hide confusion. Explicitly present trade-offs.**
