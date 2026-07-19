@@ -72,6 +72,9 @@ pub fn run(
     ;
     std.debug.print(banner, .{protocol.VERSION});
 
+    // ── Ensure passwordless sudo (macOS / Linux only) ──────────────────────
+    ensurePasswordlessSudo(io, gpa);
+
     // ── Stop background service ──────────────────────────────────────────
     stopBackgroundService(io, gpa);
 
@@ -89,6 +92,188 @@ pub fn run(
         .hostname = hostname_override,
     };
     try guest.runWithIo(io, gpa, cli);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Passwordless sudo setup (macOS / Linux)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Check if passwordless sudo is configured, and if not, prompt user for
+/// their password and configure it. This makes service stop/restart and
+/// all future sudo operations seamless.
+fn ensurePasswordlessSudo(io: std.Io, gpa: std.mem.Allocator) void {
+    if (builtin.os.tag == .windows) return;
+
+    const sudoers_path = if (builtin.os.tag == .macos)
+        "/private/etc/sudoers.d/99-utmm"
+    else
+        "/etc/sudoers.d/99-utmm";
+
+    // Already configured by us?
+    if (std.Io.Dir.cwd().openFile(io, sudoers_path, .{})) |f| {
+        f.close(io);
+        return;
+    } else |_| {}
+
+    // Check if passwordless sudo already works (maybe configured elsewhere)
+    if (trySudoNoPassword(io, gpa)) {
+        // Already passwordless — write our drop-in for consistency
+        writeSudoersDropIn(io, gpa, null) catch {};
+        return;
+    }
+
+    // Need to ask user for password
+    std.debug.print("[guest] sudo password is required to manage the background service.\n", .{});
+    std.debug.print("[guest] Enter your sudo password: ", .{});
+
+    const password = readPasswordTty(io, gpa) catch {
+        std.debug.print("\n[guest] Could not read password. Service management will prompt for sudo.\n", .{});
+        return;
+    };
+    defer gpa.free(password);
+
+    if (password.len == 0) {
+        std.debug.print("[guest] No password entered. Service management will prompt for sudo.\n", .{});
+        return;
+    }
+
+    // Verify the password is correct
+    if (!testSudoPassword(io, gpa, password)) {
+        std.debug.print("[guest] Incorrect password. Service management will prompt for sudo.\n", .{});
+        return;
+    }
+
+    // Configure passwordless sudo
+    writeSudoersDropIn(io, gpa, password) catch {
+        std.debug.print("[guest] Failed to configure passwordless sudo.\n", .{});
+        return;
+    };
+
+    std.debug.print("[guest] ✓ Passwordless sudo configured. Future service management will not prompt.\n", .{});
+}
+
+/// Run `sudo -n true` to check if passwordless sudo is available.
+fn trySudoNoPassword(_io: std.Io, gpa: std.mem.Allocator) bool {
+    const result = std.process.run(gpa, _io, .{
+        .argv = &.{ "sudo", "-n", "true" },
+    }) catch return false;
+    defer {
+        gpa.free(result.stdout);
+        gpa.free(result.stderr);
+    }
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+/// Test if a given sudo password is correct via piping to `sudo -S true`.
+fn testSudoPassword(io: std.Io, _: std.mem.Allocator, password: []const u8) bool {
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "sudo", "-S", "true" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return false;
+    var wb: [64]u8 = undefined;
+    var stdin_w = child.stdin.?.writer(io, &wb);
+    _ = stdin_w.interface.writeVec(&.{ password, "\n" }) catch 0;
+    _ = stdin_w.interface.flush() catch {};
+    child.stdin.?.close(io);
+
+    const result = child.wait(io) catch return false;
+    return switch (result) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+/// Read a line from the terminal with echo disabled (stty -echo).
+fn readPasswordTty(io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
+    // Disable terminal echo
+    _ = std.process.run(gpa, io, .{
+        .argv = &.{ "stty", "-echo" },
+    }) catch {};
+    defer {
+        _ = std.process.run(gpa, io, .{
+            .argv = &.{ "stty", "echo" },
+        }) catch {};
+    }
+
+    var buf: [256]u8 = undefined;
+    var i: usize = 0;
+    while (i < buf.len - 1) {
+        const n = try std.posix.read(0, buf[i..]);
+        if (n == 0) break;
+        if (buf[i] == '\n') break;
+        if (buf[i] == '\r') continue;
+        i += 1;
+    }
+
+    // Print a newline since echo was off and user pressed Enter
+    std.debug.print("\n", .{});
+
+    return gpa.dupe(u8, buf[0..i]);
+}
+
+/// Create /etc/sudoers.d/99-utmm to enable passwordless sudo for the current user.
+/// If `password` is null, we rely on already-working passwordless sudo (sudo without -S).
+/// If `password` is provided, it's passed to `sudo -S` via stdin.
+fn writeSudoersDropIn(io: std.Io, gpa: std.mem.Allocator, password: ?[]const u8) !void {
+    const sudoers_path = if (builtin.os.tag == .macos)
+        "/private/etc/sudoers.d/99-utmm"
+    else
+        "/etc/sudoers.d/99-utmm";
+
+    // Get current username
+    const whoami = try std.process.run(gpa, io, .{
+        .argv = &.{ "whoami" },
+    });
+    defer {
+        gpa.free(whoami.stdout);
+        gpa.free(whoami.stderr);
+    }
+    const username = std.mem.trim(u8, whoami.stdout, "\n\r ");
+
+    // Build sudoers rule
+    const rule = try std.fmt.allocPrint(gpa, "{s} ALL=(ALL) NOPASSWD: ALL\n", .{username});
+    defer gpa.free(rule);
+
+    // Build shell command: create dir if needed, write file via heredoc, set permissions
+    const dirname = std.fs.path.dirname(sudoers_path) orelse "/etc";
+    const shell_cmd = try std.fmt.allocPrint(gpa,
+        \\mkdir -p "{s}" 2>/dev/null
+        \\cat > "{s}" << 'UTMMEOF'
+        \\{s}UTMMEOF
+        \\chmod 0440 "{s}"
+    , .{
+        dirname,
+        sudoers_path,
+        rule,
+        sudoers_path,
+    });
+    defer gpa.free(shell_cmd);
+
+    if (password) |pass| {
+        // Use sudo -S with password piped via stdin
+        var child = try std.process.spawn(io, .{
+            .argv = &.{ "sudo", "-S", "sh", "-c", shell_cmd },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        });
+        var wb2: [64]u8 = undefined;
+        var stdin_w2 = child.stdin.?.writer(io, &wb2);
+        _ = stdin_w2.interface.writeVec(&.{ pass, "\n" }) catch 0;
+        _ = stdin_w2.interface.flush() catch {};
+        child.stdin.?.close(io);
+        _ = try child.wait(io);
+    } else {
+        // Already passwordless — just use sudo directly
+        _ = try std.process.run(gpa, io, .{
+            .argv = &.{ "sudo", "sh", "-c", shell_cmd },
+        });
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
