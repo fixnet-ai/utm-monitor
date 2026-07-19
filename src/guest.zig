@@ -274,10 +274,19 @@ fn execPosix(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !
 }
 
 fn execWindows(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !void {
-    const result = std.process.run(gpa, io, .{
+    // On Windows, zio's IOCP backend doesn't support async pipe I/O for child
+    // processes. Use a dedicated Threaded instance with a real allocator
+    // (global_single_threaded uses Allocator.failing, which causes OutOfMemory
+    // in processSpawnWindows's internal ArenaAllocator).
+    _ = io;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    const block_io = threaded.io();
+    const result = std.process.run(gpa, block_io, .{
         .argv = &.{ "cmd.exe", "/c", cmd },
     }) catch |err| {
-        try transport.sendString(writer, transport.MsgType.ERROR, "Execution failed");
+        var err_buf: [256]u8 = undefined;
+        const err_msg = std.fmt.bufPrint(&err_buf, "Execution failed: {s}", .{@errorName(err)}) catch "Execution failed";
+        try transport.sendString(writer, transport.MsgType.ERROR, err_msg);
         return err;
     };
     defer {
@@ -294,9 +303,7 @@ fn execWindows(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8)
 
     const exit_code: i32 = switch (result.term) {
         .exited => |code| @intCast(code),
-        .signal => @as(i32, -1),
-        .stopped => @as(i32, -2),
-        .unknown => @as(i32, -3),
+        .signal, .stopped, .unknown => @as(i32, -1),
     };
     var exit_buf: [4]u8 = undefined;
     std.mem.writeInt(i32, &exit_buf, exit_code, .big);

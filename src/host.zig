@@ -25,6 +25,9 @@ const GuestEntry = struct {
     mac: []const u8,
     version: []const u8,
     shell: []const u8 = "unknown",
+    /// Host version at last upgrade attempt — prevents re-triggering auto-upgrade
+    /// every second when guest version hasn't changed but host was updated.
+    last_upgrade_host_version: []const u8 = "0.0.0",
 };
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
@@ -184,23 +187,24 @@ fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
 
             // Read response messages until EXEC_EXIT or error
             while (true) {
-                const msg = (transport.recvFromStream(&stream, allocator, zio.Timeout.fromSeconds(30)) catch break) orelse break;
-                defer allocator.free(msg.payload);
+                const msg = transport.recvFromStream(&stream, allocator, zio.Timeout.fromSeconds(30)) catch break;
+                if (msg == null) break;
+                defer allocator.free(msg.?.payload);
 
-                switch (msg.msg_type) {
+                switch (msg.?.msg_type) {
                     transport.MsgType.EXEC_STDOUT => {
-                        std.debug.print("{s}", .{msg.payload});
+                        std.debug.print("{s}", .{msg.?.payload});
                     },
                     transport.MsgType.EXEC_STDERR => {
-                        std.debug.print("{s}", .{msg.payload});
+                        std.debug.print("{s}", .{msg.?.payload});
                     },
                     transport.MsgType.ERROR => {
-                        std.debug.print("[exec] Error: {s}\n", .{msg.payload});
+                        std.debug.print("[exec] Error: {s}\n", .{msg.?.payload});
                         return error.RemoteError;
                     },
                     transport.MsgType.EXEC_EXIT => {
-                        if (msg.payload.len >= 4) {
-                            const exit_code = std.mem.readInt(i32, msg.payload[0..4], .big);
+                        if (msg.?.payload.len >= 4) {
+                            const exit_code = std.mem.readInt(i32, msg.?.payload[0..4], .big);
                             if (exit_code != 0) std.process.exit(@intCast(exit_code));
                         }
                         return;
@@ -405,6 +409,7 @@ fn runHostDaemon(
             gpa.free(entry.value_ptr.mac);
             gpa.free(entry.value_ptr.version);
             gpa.free(entry.value_ptr.shell);
+            gpa.free(entry.value_ptr.last_upgrade_host_version);
         }
         guests.deinit();
     }
@@ -522,13 +527,22 @@ fn processAnnounce(
         }
 
         const host_version_mismatch = !std.mem.eql(u8, info.version, protocol.VERSION);
-        if (ver_changed and host_version_mismatch and serve_dir != null) {
-            try spawnAutoUpgrade(io, gpa, serve_dir.?, info.hostname, actual_ip, port);
+        const host_ver_upgraded = !std.mem.eql(u8, existing.last_upgrade_host_version, protocol.VERSION);
+
+        // Trigger auto-upgrade when:
+        // 1. Guest version changed AND mismatches host (guest older than host), OR
+        // 2. Host version changed since last upgrade attempt (host newer than guest)
+        if (host_version_mismatch and serve_dir != null and (ver_changed or host_ver_upgraded)) {
+            try spawnAutoUpgrade(io, gpa, serve_dir.?, info.hostname, actual_ip, info.target, port);
+            // Record that we attempted upgrade with current host version
+            gpa.free(existing.last_upgrade_host_version);
+            existing.last_upgrade_host_version = try gpa.dupe(u8, protocol.VERSION);
         }
     } else {
         std.debug.print("[host] 🆕 New guest: {s} ({s}) → {s}\n", .{ info.hostname, info.target, actual_ip });
         _ = try gpa.alloc(u8, 0); // dummy to bind allocator
         const shell = if (info.shell.len > 0) info.shell else shellFromTarget(info.target);
+        const host_mismatch = !std.mem.eql(u8, info.version, protocol.VERSION);
         try guests.put(try gpa.dupe(u8, info.hostname), .{
             .hostname = try gpa.dupe(u8, info.hostname),
             .ip = try gpa.dupe(u8, actual_ip),
@@ -536,13 +550,12 @@ fn processAnnounce(
             .mac = try gpa.dupe(u8, info.mac),
             .version = try gpa.dupe(u8, info.version),
             .shell = try gpa.dupe(u8, shell),
+            .last_upgrade_host_version = if (host_mismatch and serve_dir != null) blk: {
+                try spawnAutoUpgrade(io, gpa, serve_dir.?, info.hostname, actual_ip, info.target, port);
+                break :blk try gpa.dupe(u8, protocol.VERSION);
+            } else try gpa.dupe(u8, "0.0.0"),
         });
         try syncHostsFile(gpa, io, hosts_path, guests);
-
-        // Auto-upgrade on first sight if guest version doesn't match host
-        if (!std.mem.eql(u8, info.version, protocol.VERSION) and serve_dir != null) {
-            try spawnAutoUpgrade(io, gpa, serve_dir.?, info.hostname, actual_ip, port);
-        }
     }
 }
 
@@ -604,6 +617,7 @@ const AutoUpgradeArgs = struct {
     serve_dir: []const u8,
     hostname: []const u8,
     ip: []const u8,
+    target: []const u8,
     port: u16,
 };
 
@@ -613,6 +627,7 @@ fn spawnAutoUpgrade(
     serve_dir: []const u8,
     hostname: []const u8,
     ip: []const u8,
+    target: []const u8,
     port: u16,
 ) !void {
     // Clone data for background thread (runs its own zio Runtime)
@@ -620,6 +635,7 @@ fn spawnAutoUpgrade(
     args.serve_dir = try gpa.dupe(u8, serve_dir);
     args.hostname = try gpa.dupe(u8, hostname);
     args.ip = try gpa.dupe(u8, ip);
+    args.target = try gpa.dupe(u8, target);
     args.port = port;
 
     const thread = try std.Thread.spawn(.{}, doAutoUpgrade, .{gpa, args});
@@ -631,34 +647,18 @@ fn doAutoUpgrade(gpa: std.mem.Allocator, args: *AutoUpgradeArgs) !void {
         gpa.free(args.serve_dir);
         gpa.free(args.hostname);
         gpa.free(args.ip);
+        gpa.free(args.target);
         gpa.destroy(args);
     }
 
-    // Blocking I/O for file reads in background thread
-    const block_io = std.Io.Threaded.global_single_threaded.io();
+    // Use a dedicated Threaded instance with a real allocator.
+    // global_single_threaded uses Allocator.failing, which causes OutOfMemory.
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    const block_io = threaded.io();
 
-    // Read state file for target
-    const state_data = std.Io.Dir.cwd().readFileAlloc(block_io, STATE_FILE, gpa, @enumFromInt(64 * 1024)) catch |err| {
-        std.debug.print("[upgrade] Cannot read state for {s}: {}\n", .{ args.hostname, err });
-        return;
-    };
-    defer gpa.free(state_data);
-
-    const target = blk: {
-        var lines = std.mem.splitSequence(u8, state_data, "\n");
-        while (lines.next()) |line| {
-            if (line.len == 0) continue;
-            var fields = std.mem.splitSequence(u8, line, "\t");
-            const h = fields.next() orelse continue;
-            const t = fields.next() orelse continue;
-            if (std.mem.eql(u8, h, args.hostname)) {
-                break :blk try gpa.dupe(u8, t);
-            }
-        }
-        std.debug.print("[upgrade] Guest {s} not in state file, skipping\n", .{args.hostname});
-        return;
-    };
-    defer gpa.free(target);
+    // Target is passed directly from the ANNOUNCE handler — no need to read
+    // the state file (which also had a race condition with state file writes).
+    const target = args.target;
 
     const bin_name = protocol.deploymentFilename(target) orelse {
         std.debug.print("[upgrade] Unknown target {s} for {s}, skipping\n", .{ target, args.hostname });
@@ -736,10 +736,15 @@ fn doAutoUpgrade(gpa: std.mem.Allocator, args: *AutoUpgradeArgs) !void {
 }
 
 /// Build the platform-specific restart command for auto-upgrade, based on guest target.
+/// On Windows: write a batch file that does atomic rename after the current process exits,
+/// then restart via the scheduled task. Running .exe files are locked on Windows,
+/// so rename must happen outside the current process.
 fn restartCommand(gpa: std.mem.Allocator, target: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, target, "windows") != null) {
+        // Write upgrade batch file, then launch it detached before exiting.
+        // The batch file: waits → renames .next.exe → .exe → restarts via schtasks
         return gpa.dupe(u8,
-            \\cmd /c "move /Y C:\opt\utmm\utmm.exe C:\opt\utmm\utmm.old 2>nul & move /Y C:\opt\utmm\utmm.next C:\opt\utmm\utmm.exe & sc start UTM-Monitor"
+            \\(echo @echo off && echo ping -n 3 127.0.0.1 ^>nul && echo cd /d C:\opt\utmm && echo del /f utmm.old.exe 2^>nul && echo ren utmm.exe utmm.old.exe && echo ren utmm.next.exe utmm.exe && echo schtasks /run /tn utmm-guest && echo del "%%~f0" 2^>nul) > C:\opt\utmm\_upgrade.bat && start "" /b cmd /c C:\opt\utmm\_upgrade.bat && taskkill /f /im utmm.exe
         );
     }
     if (std.mem.indexOf(u8, target, "macos") != null) {

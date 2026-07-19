@@ -676,7 +676,7 @@ pub fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
                 \\if errorlevel 1 goto :failed
                 \\ren {3s} {2s}
                 \\if errorlevel 1 goto :failed
-                \\sc start UTM-Monitor
+                \\schtasks /run /tn utmm-guest
                 \\del "%~f0" 2>nul
                 \\exit /b 0
                 \\:failed

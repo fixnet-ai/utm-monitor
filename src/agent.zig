@@ -51,9 +51,12 @@ pub fn run(
 
     if (!is_tty) {
         // Daemon mode — no service management, just run guest directly.
+        // Set is_svc = true so the broadcast loop enables self-upgrade checks
+        // (we skip the Windows SCM entry point, but still act as a daemon).
         const cli = main.CliArgs{
             .port = port,
             .hostname = hostname_override,
+            .is_svc = true,
         };
         return guest.runWithIo(io, gpa, cli);
     }
@@ -96,8 +99,13 @@ fn stopBackgroundService(io: std.Io, gpa: std.mem.Allocator) void {
     std.debug.print("[guest] Stopping background service...\n", .{});
 
     if (builtin.os.tag == .windows) {
+        // Use a dedicated Threaded instance with a real allocator.
+        // global_single_threaded uses Allocator.failing, which causes
+        // OutOfMemory in processSpawnWindows's internal ArenaAllocator.
+        var threaded = std.Io.Threaded.init(gpa, .{});
+        const block_io = threaded.io();
         // sc stop returns non-zero if already stopped — ignore errors
-        if (std.process.run(gpa, io, .{ .argv = &.{ "sc", "stop", "UTM-Monitor" } })) |r| {
+        if (std.process.run(gpa, block_io, .{ .argv = &.{ "sc", "stop", "UTM-Monitor" } })) |r| {
             _ = r;
             std.debug.print("[guest] Service stopped.\n", .{});
         } else |_| {
@@ -129,7 +137,10 @@ fn restartBackgroundService(io: std.Io, gpa: std.mem.Allocator) void {
     std.debug.print("[guest] Restarting background service...\n", .{});
 
     if (builtin.os.tag == .windows) {
-        if (std.process.run(gpa, io, .{ .argv = &.{ "sc", "start", "UTM-Monitor" } })) |_| {
+        // Use a dedicated Threaded instance with a real allocator.
+        var threaded = std.Io.Threaded.init(gpa, .{});
+        const block_io = threaded.io();
+        if (std.process.run(gpa, block_io, .{ .argv = &.{ "sc", "start", "UTM-Monitor" } })) |_| {
             std.debug.print("[guest] Service restarted.\n", .{});
         } else |_| {
             std.debug.print("[guest] WARNING: failed to restart service (sc start).\n", .{});
