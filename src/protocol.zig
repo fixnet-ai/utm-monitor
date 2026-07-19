@@ -80,6 +80,7 @@ pub const GuestInfo = struct {
     target: []const u8, // Zig target triplet: aarch64-linux, x86_64-windows, ...
     mac: []const u8, // Physical NIC MAC
     version: []const u8 = VERSION,
+    shell: []const u8 = "/bin/sh", // Detected shell binary (e.g. /bin/zsh, cmd.exe)
 
     /// Build FQDN for /etc/hosts: <hostname>.<target>.utm
     pub fn fqdn(self: GuestInfo, allocator: std.mem.Allocator) ![]const u8 {
@@ -115,6 +116,8 @@ pub const GuestInfo = struct {
                     info.mac = try allocator.dupe(u8, value);
                 } else if (std.mem.eql(u8, key, "version")) {
                     info.version = try allocator.dupe(u8, value);
+                } else if (std.mem.eql(u8, key, "shell")) {
+                    info.shell = try allocator.dupe(u8, value);
                 }
             }
         }
@@ -134,6 +137,7 @@ pub fn buildAnnounce(
     try writer.print("mac: {s}\n", .{info.mac});
     try writer.print("ip: {s}\n", .{info.ip});
     try writer.print("version: {s}\n", .{VERSION});
+    try writer.print("shell: {s}\n", .{info.shell});
     try writer.print("\n", .{});
     try writer.flush();
 }

@@ -53,6 +53,7 @@ pub const SystemInfo = struct {
     mac: []const u8,
     target: []const u8, // Zig target triplet
     iface_name: []const u8, // Physical NIC interface name
+    shell: []const u8, // Detected shell binary (e.g. /bin/zsh, cmd.exe)
 };
 
 /// Zig target triplet (compile-time constant)
@@ -75,6 +76,23 @@ fn zigTarget() []const u8 {
         return arch ++ "-" ++ os_tag ++ "-musl";
     }
     return arch ++ "-" ++ os_tag;
+}
+
+/// Detect shell for command execution from $SHELL environment variable.
+/// POSIX: reads $SHELL at startup, falls back to /bin/sh if unset.
+/// Windows: always cmd.exe (no $SHELL equivalent).
+fn detectShell(allocator: std.mem.Allocator) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        return allocator.dupe(u8, "cmd.exe");
+    }
+
+    // Read $SHELL environment variable
+    if (std.c.getenv("SHELL")) |sh| {
+        const sh_slice = std.mem.sliceTo(sh, 0);
+        if (sh_slice.len > 0) return allocator.dupe(u8, sh_slice);
+    }
+
+    return allocator.dupe(u8, "/bin/sh");
 }
 
 /// Check if the interface name is a physical NIC (exclude tunnel/virtual interfaces)
@@ -292,24 +310,28 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
     if (builtin.os.tag == .windows) {
         const ip = try getWindowsIp(io, allocator);
         const mac = try getWindowsMac(io, allocator);
+        const shell = try detectShell(allocator);
         return SystemInfo{
             .hostname = hostname,
             .ip = ip,
             .mac = mac,
             .target = target,
             .iface_name = try allocator.dupe(u8, "unknown"),
+            .shell = shell,
         };
     }
 
     // Unix: use getifaddrs() to enumerate interfaces, pick first physical NIC
     var ifap: ?*ifaddrs = undefined;
     if (getifaddrs(&ifap) != 0) {
+        const shell = try detectShell(allocator);
         return SystemInfo{
             .hostname = hostname,
             .ip = try allocator.dupe(u8, "0.0.0.0"),
             .mac = try allocator.dupe(u8, "00:00:00:00:00:00"),
             .target = target,
             .iface_name = try allocator.dupe(u8, "unknown"),
+            .shell = shell,
         };
     }
     defer freeifaddrs(ifap);
@@ -345,6 +367,7 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
 
     // Get MAC
     const mac = try getMacAddress(io, allocator, iface_name);
+    const shell = try detectShell(allocator);
 
     return SystemInfo{
         .hostname = hostname,
@@ -352,6 +375,7 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
         .mac = mac,
         .target = target,
         .iface_name = iface_name,
+        .shell = shell,
     };
 }
 
@@ -489,6 +513,7 @@ pub fn broadcastLoop(
         .ip = info.ip,
         .target = info.target,
         .mac = info.mac,
+        .shell = info.shell,
     };
     var msg_buf: [1024]u8 = undefined;
     var msg_writer: std.Io.Writer = .fixed(&msg_buf);
@@ -555,6 +580,7 @@ fn broadcastLoopFallback(
         .ip = info.ip,
         .target = info.target,
         .mac = info.mac,
+        .shell = info.shell,
     };
     var msg_buf: [1024]u8 = undefined;
     var msg_writer: std.Io.Writer = .fixed(&msg_buf);

@@ -20,6 +20,11 @@ const transport = @import("transport.zig");
 
 const Io = std.Io;
 
+/// Detected shell binary — set at startup by runWithIo, used by execPosix.
+/// POSIX: e.g. "/bin/zsh" — exec adds "-l -c" for login environment.
+/// Windows: "cmd.exe" — exec adds "/c".
+var guest_shell: []const u8 = "/bin/sh";
+
 /// Guest mode entry point (from std.process.Init)
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     return runWithIo(init.io, init.gpa, cli);
@@ -35,6 +40,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
         gpa.free(sysinfo.ip);
         gpa.free(sysinfo.mac);
         gpa.free(sysinfo.iface_name);
+        gpa.free(sysinfo.shell);
     }
 
     if (cli.hostname) |n| {
@@ -42,12 +48,16 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
         sysinfo.hostname = try gpa.dupe(u8, n);
     }
 
+    // Store shell for use by exec handlers (with -l for login environment)
+    guest_shell = sysinfo.shell;
+
     const port = cli.port;
 
     std.debug.print("[guest] Hostname: {s}\n", .{sysinfo.hostname});
     std.debug.print("[guest] Target: {s}\n", .{sysinfo.target});
     std.debug.print("[guest] IP: {s}\n", .{sysinfo.ip});
     std.debug.print("[guest] MAC: {s}\n", .{sysinfo.mac});
+    std.debug.print("[guest] Shell: {s}\n", .{guest_shell});
     std.debug.print("[guest] Port: {d} (UDP broadcast + TCP)\n", .{port});
 
     // Ensure CWD is /opt/utmm/ (or C:\opt\utmm\ on Windows)
@@ -235,7 +245,7 @@ fn handleExec(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) 
 
 fn execPosix(io: Io, gpa: std.mem.Allocator, writer: anytype, cmd: []const u8) !void {
     const result = std.process.run(gpa, io, .{
-        .argv = &.{ "/bin/sh", "-c", cmd },
+        .argv = &.{ guest_shell, "-l", "-c", cmd },
     }) catch |err| {
         try transport.sendString(writer, transport.MsgType.ERROR, "Execution failed");
         return err;

@@ -32,16 +32,28 @@ auto-syncs VM IPs to `/etc/hosts`, so hostnames like `linuxvm` always resolve.
 
 **Always call this FIRST** in any VM workflow. It tells you:
 - Which VMs are online, their IP, OS/arch, MAC address
+- **Which shell to use** (`shell` field — read from `$SHELL` at Guest startup):
+  - macOS/Linux: the user's configured `$SHELL` (e.g. `/bin/zsh`, `/bin/bash`), falls back to `/bin/sh`
+  - Windows: `cmd.exe`
 - Whether the utmm version on the VM is current or upgradable
+
+> **Login shell**: Commands on Linux/macOS run with `shell -l -c` (login mode),
+> so `$PATH`, `$HOME`, and other profile environment variables are loaded.
+> On Windows, commands run with `cmd.exe /c`.
 
 If `vm_status` returns "No VMs currently online", the other tools cannot work.
 Ask the user whether the VMs are booted and the Host is running.
 
 ### 2. `vm_exec(vm, command)` — Execute a shell command on a VM
 
-The command runs in the VM's native shell:
-- **Linux/macOS**: `/bin/sh -c "<command>"`
-- **Windows**: `cmd.exe /c "<command>"`
+**Always check `vm_status` first** to see the `shell` field for each VM, then use the correct syntax:
+
+| Shell | OS | Syntax Rules |
+|-------|-----|-------------|
+| `/bin/zsh` | macOS | zsh syntax: `&&`, `\|`, `$VAR`, single quotes preferred |
+| `/bin/bash` | Linux | bash syntax: `&&`, `\|`, `$VAR`, single quotes preferred |
+| `/bin/sh` | Linux (fallback) | POSIX sh: `&&`, `\|`, `$VAR`, single quotes preferred |
+| `cmd.exe` | Windows | `cmd /c` syntax: `&` not `&&`, `%VAR%`, no `grep`/`awk` |
 
 **Key patterns:**
 

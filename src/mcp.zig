@@ -1,8 +1,8 @@
 //! MCP (Model Context Protocol) JSON-RPC server over stdio.
 //!
 //! Two modes:
-//!   run()       — Adapter: connects to Host IPC (127.0.0.1:12347) for each tool call
-//!   runDirect() — Integrated: calls ipcHandler directly (same process, no TCP overhead)
+//!   run()       — Adapter: direct UDP+TCP for each tool call (no Host daemon needed)
+//!   runDirect() — Integrated: Host + MCP in one process
 //!
 //! Framing: LSP-style Content-Length: N\r\n\r\n<JSON>\n on stdin/stdout.
 //! Methods: initialize, notifications/initialized, ping, tools/list, tools/call.
@@ -28,8 +28,8 @@ const SERVER_INFO =
 ;
 
 const TOOLS_JSON =
-    \\[{"name":"vm_status","description":"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and whether an upgrade is available for each VM.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. Use this to run tests, check files, install packages, or debug on any VM (Linux/macOS/Windows). The VM name is the hostname (e.g. 'linuxvm', 'macvm', 'windowsvm').","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command to execute on the VM"}},"required":["vm","command"]}}]
+    \\[{"name":"vm_status","description":"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, shell (cmd.exe or /bin/sh — use this to write compatible commands), and whether an upgrade is available for each VM.","inputSchema":{"type":"object","properties":{},"required":[]}},
+    \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell: /bin/sh on Linux/macOS, cmd.exe on Windows. Check vm_status first to see each VM's shell type, then write compatible commands.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)"}},"required":["vm","command"]}}]
 ;
 
 // ── JSON value helpers ─────────────────────────────────────────────────────
@@ -170,6 +170,12 @@ fn appendJsonKv(list: *std.ArrayList(u8), alloc: std.mem.Allocator, key: []const
     if (comma) try list.appendSlice(alloc, ",");
 }
 
+/// Derive the shell from the guest's target triple.
+fn shellFromTarget(target: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, target, "windows") != null) return "cmd.exe";
+    return "/bin/sh";
+}
+
 /// Discover all guests via UDP broadcast → build JSON status.
 /// Falls back to state file if UDP port is in use (Host daemon running).
 fn discoverAndStatus(block_io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
@@ -214,6 +220,7 @@ fn discoverAndStatus(block_io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
             gpa.free(info.target);
             gpa.free(info.mac);
             gpa.free(info.version);
+            gpa.free(info.shell);
         }
 
         const src_ip = switch (msg_result.from) {
@@ -232,7 +239,8 @@ fn discoverAndStatus(block_io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
         try appendJsonKv(&json, gpa, "ip", actual_ip, true);
         try appendJsonKv(&json, gpa, "target", info.target, true);
         try appendJsonKv(&json, gpa, "mac", info.mac, true);
-        try appendJsonKv(&json, gpa, "version", info.version, false);
+        try appendJsonKv(&json, gpa, "version", info.version, true);
+        try appendJsonKv(&json, gpa, "shell", if (info.shell.len > 0) info.shell else shellFromTarget(info.target), false);
         try json.appendSlice(gpa, "}");
     }
     try json.appendSlice(gpa, "]}");
@@ -283,6 +291,7 @@ fn execOnGuest(block_io: std.Io, gpa: std.mem.Allocator, target: []const u8, cmd
                 gpa.free(info.target);
                 gpa.free(info.mac);
                 gpa.free(info.version);
+                gpa.free(info.shell);
             }
 
             if (std.mem.eql(u8, info.hostname, target)) {
@@ -362,6 +371,7 @@ fn buildStatusFromStateFile(block_io: std.Io, gpa: std.mem.Allocator) ![]const u
         const ip = fields.next() orelse continue;
         const mac = fields.next() orelse continue;
         const version = fields.next() orelse continue;
+        const shell = fields.next() orelse shellFromTarget(target); // 6th column added in v0.2.2
 
         if (!first) try json.appendSlice(gpa, ",");
         first = false;
@@ -370,7 +380,8 @@ fn buildStatusFromStateFile(block_io: std.Io, gpa: std.mem.Allocator) ![]const u
         try appendJsonKv(&json, gpa, "ip", ip, true);
         try appendJsonKv(&json, gpa, "target", target, true);
         try appendJsonKv(&json, gpa, "mac", mac, true);
-        try appendJsonKv(&json, gpa, "version", version, false);
+        try appendJsonKv(&json, gpa, "version", version, true);
+        try appendJsonKv(&json, gpa, "shell", shell, false);
         try json.appendSlice(gpa, "}");
     }
     try json.appendSlice(gpa, "]}");
@@ -446,15 +457,16 @@ fn handleVmStatus(
         const ip = getString(obj, "ip") orelse "?";
         const mac = getString(obj, "mac") orelse "?";
         const version = getString(obj, "version") orelse "?";
+        const shell = getString(obj, "shell") orelse "?";
         const upgradable = switch (obj.get("upgradable") orelse std.json.Value{ .bool = false }) {
             .bool => |b| b,
             else => false,
         };
         const status_str = if (upgradable) "⚠ upgradeable" else "✓";
 
-        try text.print(allocator, 
-            "- **{s}** — {s} | IP: {s} | MAC: {s} | v{s} | {s}\\n",
-            .{ hostname, target, ip, mac, version, status_str },
+        try text.print(allocator,
+            "- **{s}** — {s} | IP: {s} | MAC: {s} | v{s} | shell: {s} | {s}\\n",
+            .{ hostname, target, ip, mac, version, shell, status_str },
         );
     }
 

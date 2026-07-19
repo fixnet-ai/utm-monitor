@@ -79,6 +79,7 @@ mac: 16:a0:6c:ba:ae:fa
 ip: 192.168.64.2
 port: 2121
 version: 0.2.0
+shell: /bin/bash
 <blank line>
 ```
 
@@ -90,6 +91,7 @@ version: 0.2.0
 | `ip` | Physical NIC IPv4 | `192.168.64.2` |
 | `port` | TCP transport service port | `2121` |
 | `version` | Program version | `0.2.0` |
+| `shell` | Auto-detected shell binary (v0.2.2+) | `/bin/zsh`, `/bin/bash`, `cmd.exe` |
 
 **AI Agent Integration**: `--status` output directly shows each VM's `target`, allowing AI agents to use `zig build -Dtarget=<target>` for cross-compilation.
 
@@ -111,9 +113,12 @@ The Guest runs a TCP transport server on port 2121 using a binary frame protocol
 
 **Runtime model**: zio async Runtime (io_uring on Linux, kqueue on macOS, IOCP on Windows) — event-driven, single-threaded async I/O handling all connections concurrently.
 
-The shell is automatically selected based on the operating system:
-- **macOS / Linux**: `/bin/sh -c <cmd>`
-- **Windows**: `cmd /c <cmd>`
+The shell is read from `$SHELL` at Guest startup (v0.2.2+):
+- **macOS/Linux**: reads the `$SHELL` env var (e.g. `/bin/zsh`, `/bin/bash`), falls back to `/bin/sh`
+- **Windows**: `cmd.exe` (always)
+- Commands run with **login shell** (`-l` flag): `zsh -l -c`, `bash -l -c`, etc.
+  This loads the full user environment (`$PATH`, `$HOME`, profile scripts).
+- Old guests (v0.2.1-) fall back to `/bin/sh -c` (POSIX) or `cmd.exe /c` (Windows).
 
 The Host also serves FILE_REQ on port 2121 — read-only, serving `/bin/:filename` for Guest bootstrap binary downloads.
 

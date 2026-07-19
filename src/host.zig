@@ -24,6 +24,7 @@ const GuestEntry = struct {
     target: []const u8,
     mac: []const u8,
     version: []const u8,
+    shell: []const u8 = "unknown",
 };
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
@@ -394,6 +395,7 @@ fn runHostDaemon(
             gpa.free(entry.value_ptr.target);
             gpa.free(entry.value_ptr.mac);
             gpa.free(entry.value_ptr.version);
+            gpa.free(entry.value_ptr.shell);
         }
         guests.deinit();
     }
@@ -472,6 +474,7 @@ fn processAnnounce(
         gpa.free(info.target);
         gpa.free(info.mac);
         gpa.free(info.version);
+        gpa.free(info.shell);
     }
 
     // Extract source IP from UDP packet
@@ -501,6 +504,13 @@ fn processAnnounce(
             existing.version = try gpa.dupe(u8, info.version);
         }
 
+        // Update shell if changed (guest may have been reinstalled with different shell)
+        const shell = if (info.shell.len > 0) info.shell else shellFromTarget(info.target);
+        if (!std.mem.eql(u8, existing.shell, shell)) {
+            gpa.free(existing.shell);
+            existing.shell = try gpa.dupe(u8, shell);
+        }
+
         const host_version_mismatch = !std.mem.eql(u8, info.version, protocol.VERSION);
         if (ver_changed and host_version_mismatch and serve_dir != null) {
             try spawnAutoUpgrade(io, gpa, serve_dir.?, info.hostname, actual_ip, port);
@@ -508,12 +518,14 @@ fn processAnnounce(
     } else {
         std.debug.print("[host] 🆕 New guest: {s} ({s}) → {s}\n", .{ info.hostname, info.target, actual_ip });
         _ = try gpa.alloc(u8, 0); // dummy to bind allocator
+        const shell = if (info.shell.len > 0) info.shell else shellFromTarget(info.target);
         try guests.put(try gpa.dupe(u8, info.hostname), .{
             .hostname = try gpa.dupe(u8, info.hostname),
             .ip = try gpa.dupe(u8, actual_ip),
             .target = try gpa.dupe(u8, info.target),
             .mac = try gpa.dupe(u8, info.mac),
             .version = try gpa.dupe(u8, info.version),
+            .shell = try gpa.dupe(u8, shell),
         });
         try syncHostsFile(gpa, io, hosts_path, guests);
 
@@ -556,12 +568,13 @@ fn writeGuestStateFile(io: std.Io, gpa: std.mem.Allocator, guests: *std.StringHa
 
     var it = guests.iterator();
     while (it.next()) |kv| {
-        try buf.print(gpa, "{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+        try buf.print(gpa, "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
             kv.value_ptr.hostname,
             kv.value_ptr.target,
             kv.value_ptr.ip,
             kv.value_ptr.mac,
             kv.value_ptr.version,
+            kv.value_ptr.shell,
         });
     }
 
@@ -674,6 +687,12 @@ fn restartCommand(gpa: std.mem.Allocator, target: []const u8) ![]const u8 {
     );
 }
 
+/// Derive shell from target for backwards compatibility (old guests don't report shell).
+fn shellFromTarget(target: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, target, "windows") != null) return "cmd.exe";
+    return "/bin/sh";
+}
+
 /// Look up a guest's target triple from the state file.
 fn lookupGuestTargetInStateFile(io: std.Io, gpa: std.mem.Allocator, hostname: []const u8) ![]const u8 {
     const data = try std.Io.Dir.cwd().readFileAlloc(io, STATE_FILE, gpa, @enumFromInt(64 * 1024));
@@ -750,6 +769,7 @@ fn discoverGuestViaUdp(block_io: std.Io, gpa: std.mem.Allocator, port: u16, targ
             gpa.free(info.target);
             gpa.free(info.mac);
             gpa.free(info.version);
+            gpa.free(info.shell);
         }
 
         // Match by hostname or FQDN

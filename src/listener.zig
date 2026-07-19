@@ -11,6 +11,7 @@ pub const GuestState = struct {
     target: []const u8,
     mac: []const u8,
     version: []const u8,
+    shell: []const u8,
     last_seen: i96,
 
     /// Build /etc/hosts FQDN: <hostname>.<target>.utm
@@ -62,6 +63,7 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
             allocator.free(entry.value_ptr.target);
             allocator.free(entry.value_ptr.mac);
             allocator.free(entry.value_ptr.version);
+            allocator.free(entry.value_ptr.shell);
         }
         guests.deinit();
     }
@@ -141,6 +143,7 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
                     .target = existing.target,
                     .mac = existing.mac,
                     .version = existing.version,
+                    .shell = existing.shell,
                     .last_seen = existing.last_seen,
                 };
                 std.debug.print("\n[listener] ⚡ IP changed: {s} ({s})  {s} → {s}\n", .{ info.hostname, info.target, existing.ip, actual_ip });
@@ -151,7 +154,7 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
                     .ip = try allocator.dupe(u8, actual_ip),
                     .target = try allocator.dupe(u8, info.target),
                     .mac = try allocator.dupe(u8, info.mac),
-                    .http_port = info.http_port,
+                    .shell = info.shell,
                     .version = try allocator.dupe(u8, info.version),
                     .last_seen = now,
                 };
@@ -172,6 +175,7 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
                     .target = existing.target,
                     .mac = existing.mac,
                     .version = existing.version,
+                    .shell = existing.shell,
                     .last_seen = existing.last_seen,
                 };
                 if (!std.mem.eql(u8, existing.version, info.version)) {
@@ -201,7 +205,7 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
                 .ip = try allocator.dupe(u8, actual_ip),
                 .target = try allocator.dupe(u8, info.target),
                 .mac = try allocator.dupe(u8, info.mac),
-                .http_port = info.http_port,
+                .shell = info.shell,
                 .version = try allocator.dupe(u8, info.version),
                 .last_seen = now,
             };

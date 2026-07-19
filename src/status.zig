@@ -22,6 +22,7 @@ pub fn queryStatus(io: std.Io, allocator: std.mem.Allocator, port: u16) !void {
             allocator.free(g.target);
             allocator.free(g.mac);
             allocator.free(g.version);
+            allocator.free(g.shell);
         }
         guests.deinit(allocator);
     }
@@ -61,6 +62,7 @@ pub fn queryStatus(io: std.Io, allocator: std.mem.Allocator, port: u16) !void {
                     .target = info.target,
                     .mac = info.mac,
                     .version = info.version,
+                    .shell = info.shell,
                     .last_seen = std.Io.Timestamp.now(io, .real).nanoseconds,
                 });
             } else {
@@ -68,6 +70,7 @@ pub fn queryStatus(io: std.Io, allocator: std.mem.Allocator, port: u16) !void {
                 allocator.free(info.target);
                 allocator.free(info.mac);
                 allocator.free(info.version);
+                allocator.free(info.shell);
             }
         }
     }
