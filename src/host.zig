@@ -533,6 +533,7 @@ fn writeGuestStateFile(io: std.Io, gpa: std.mem.Allocator, guests: *std.StringHa
     var wb: [4096]u8 = undefined;
     var fw = file.writer(io, &wb);
     _ = fw.interface.write(buf.items) catch {};
+    fw.interface.flush() catch {};
 }
 
 fn readGuestStateFile(io: std.Io, gpa: std.mem.Allocator) ![]const u8 {

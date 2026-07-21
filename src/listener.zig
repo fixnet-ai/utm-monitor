@@ -40,7 +40,7 @@ pub fn listenLoop(io: std.Io, allocator: std.mem.Allocator, port: u16, on_ip_cha
     var socket: std.Io.net.Socket = undefined;
     var bind_ok = false;
     for (0..30) |attempt| {
-        socket = listen_addr.bind(io, .{ .mode = .dgram }) catch |err| {
+        socket = listen_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
             std.debug.print("[listener] bind port {d} failed (attempt {d}/30): {}\n", .{ port, attempt + 1, err });
             std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .real) catch {};
             continue;
