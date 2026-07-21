@@ -1,16 +1,14 @@
-# MCP config reference — the preferred method is `claude mcp add`:
+# MCP config for utmm — copy to ~/.claude/mcp.json or run:
+#   claude mcp add utmm --url http://127.0.0.1:2121/mcp
 #
-#   claude mcp add utmm -- utmm --mcp
-#
-# The --mcp flag is built into the utmm binary. Zero external dependencies.
-# `claude mcp add` writes to ~/.claude.json which Claude Code recognizes automatically.
-# The manual JSON file below is kept as a reference for alternative setups.
+# Host must be running: sudo utmm --host
+# v0.3.0 merged MCP into the unified HTTP server on port 2121.
 
 {
   "mcpServers": {
     "utmm": {
-      "command": "utmm",
-      "args": ["--mcp"]
+      "type": "streamableHttp",
+      "url": "http://127.0.0.1:2121/mcp"
     }
   }
 }

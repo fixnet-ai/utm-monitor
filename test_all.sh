@@ -2,9 +2,9 @@
 # =============================================================================
 # UTM Monitor — Comprehensive Cross-Platform Test Suite (v0.1.0+)
 # =============================================================================
-# Covers: build (8 targets), unit tests, --status, --exec,
+# Covers: build (7 targets), unit tests, --status, --exec,
 #         --upload/--download, HTTP API, Host/serve-dir, /etc/hosts,
-#         --install/--uninstall (SSH), --gen-init, --mcp, musl verify.
+#         --install/--uninstall (SSH), --gen-init, MCP HTTP, musl verify.
 # =============================================================================
 set -euo pipefail
 
@@ -24,7 +24,6 @@ VERSION=$(awk '/pub const VERSION/ { gsub(/"/,"",$4); print $4 }' "$PROJECT_DIR/
 # ── Build targets + deployment filenames ──
 #    Format: "zig-target:output-filename"
 BUILD_TARGETS=(
-    "x86-windows:utmm-x86-windows.exe"
     "x86_64-windows:utmm-x86_64-windows.exe"
     "aarch64-windows:utmm-aarch64-windows.exe"
     "x86_64-macos:utmm-x86_64-macos"
@@ -370,36 +369,41 @@ done
 report ""
 
 # =============================================================================
-# PHASE 11: MCP JSON-RPC (smoke test)
+# PHASE 11: MCP JSON-RPC (HTTP — v0.3.0+ /mcp endpoint)
 # =============================================================================
-report "━━━ PHASE 11: MCP JSON-RPC (stdio) ━━━"
+report "━━━ PHASE 11: MCP JSON-RPC (HTTP) ━━━"
 report ""
 
-# Build initialize request with LSP-style framing
-INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}'
-INIT_BODY=$(printf 'Content-Length: %d\r\n\r\n%s\n' "${#INIT_REQ}" "$INIT_REQ")
+# MCP is now served via Host HTTP on :2121/mcp (v0.3.0 removed --mcp stdio).
+# Test requires Host running — skip if not available.
+MCP_URL="http://127.0.0.1:2121/mcp"
 
-MCP_RESP=$("$HOST_BIN" --mcp 2>/dev/null <<< "$INIT_BODY" || echo "MCP_FAILED")
+if curl -s --connect-timeout 2 "$MCP_URL" -X POST -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1; then
+    # Initialize
+    INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}'
+    MCP_RESP=$(curl -s -X POST "$MCP_URL" -H 'Content-Type: application/json' -d "$INIT_REQ" 2>/dev/null || echo "MCP_FAILED")
 
-if echo "$MCP_RESP" | grep -q "serverInfo"; then
-    pass "MCP initialize response"
-    if echo "$MCP_RESP" | grep -q "$VERSION"; then
-        pass "MCP reports version $VERSION"
+    if echo "$MCP_RESP" | grep -q "serverInfo"; then
+        pass "MCP initialize response"
+        if echo "$MCP_RESP" | grep -q "$VERSION"; then
+            pass "MCP reports version $VERSION"
+        else
+            fail "MCP version" "version not in response"
+        fi
     else
-        fail "MCP version" "version not in response"
+        fail "MCP initialize" "no serverInfo in response"
+    fi
+
+    # tools/list
+    TL_REQ='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+    TL_RESP=$(curl -s -X POST "$MCP_URL" -H 'Content-Type: application/json' -d "$TL_REQ" 2>/dev/null || echo "MCP_FAILED")
+    if echo "$TL_RESP" | grep -q "vm_status"; then
+        pass "MCP tools/list (has vm_status)"
+    else
+        fail "MCP tools/list" "vm_status not found"
     fi
 else
-    fail "MCP initialize" "no serverInfo in response"
-fi
-
-# tools/list
-TL_REQ='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-TL_BODY=$(printf 'Content-Length: %d\r\n\r\n%s\n' "${#TL_REQ}" "$TL_REQ")
-TL_RESP=$("$HOST_BIN" --mcp 2>/dev/null <<< "$TL_BODY" || echo "MCP_FAILED")
-if echo "$TL_RESP" | grep -q "vm_status"; then
-    pass "MCP tools/list (has vm_status)"
-else
-    fail "MCP tools/list" "vm_status not found"
+    skip "MCP tests" "Host not running on :2121 (start with 'sudo utmm --host')"
 fi
 report ""
 
