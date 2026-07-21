@@ -4,6 +4,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
+const wsclient = @import("wsclient.zig");
+const wsproto_mod = @import("wsproto.zig");
 
 // libc network interface enumeration (getifaddrs)
 const in_addr = extern struct { s_addr: u32 };
@@ -143,7 +145,7 @@ fn getWindowsIp(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (std.mem.startsWith(u8, trimmed, "0.0.0.0")) {
-            var fields = std.mem.splitSequence(u8, trimmed, " ");
+            var fields = std.mem.tokenizeScalar(u8, trimmed, ' ');
             _ = fields.next(); // 0.0.0.0 (network)
             _ = fields.next(); // 0.0.0.0 (netmask)
             _ = fields.next(); // gateway
@@ -461,10 +463,10 @@ fn getGatewayWindows(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
         if (!found_header) {
             if (std.mem.startsWith(u8, trimmed, "0.0.0.0")) {
                 found_header = true;
-                // This line may already contain the gateway
-                var fields = std.mem.splitSequence(u8, trimmed, " ");
                 // Windows route table format: Network Netmask Gateway Interface Metric
-                // 0.0.0.0  0.0.0.0  192.168.64.1  192.168.64.2  25
+                // Uses tokenize (not splitSequence) — fields are separated by
+                // multiple spaces; splitSequence(" ") yields empty strings.
+                var fields = std.mem.tokenizeScalar(u8, trimmed, ' ');
                 _ = fields.next(); // 0.0.0.0
                 _ = fields.next(); // 0.0.0.0 (netmask)
                 if (fields.next()) |gw| {
@@ -481,271 +483,286 @@ fn getGatewayWindows(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
 
 test "getDefaultGateway - signature" { _ = getDefaultGateway; }
 
-/// Guest broadcast loop
-/// is_svc: true when running as system daemon (--svc), enables self-upgrade.
-///         false when running in foreground (user terminal), skips self-upgrade
-///         to avoid race condition with defer service restart.
-pub fn broadcastLoop(
-    io: std.Io,
-    port: u16,
-    info: SystemInfo,
-    is_svc: bool,
-) !void {
-    const broadcast_addr = try std.Io.net.IpAddress.parse("255.255.255.255", port);
+// ═══════════════════════════════════════════════════════════════════════════
+// HTTP announce loop (v0.3.0: replaces UDP broadcast + TCP server)
+// Guest POSTs /announce every 1s, processes pending commands from response.
+// ═══════════════════════════════════════════════════════════════════════════
 
-    // Bind to the physical NIC IP (not 0.0.0.0) to ensure broadcast goes out the correct interface
-    const bind_ip = if (std.mem.eql(u8, info.ip, "0.0.0.0")) "0.0.0.0" else info.ip;
-    const bind_addr = try std.Io.net.IpAddress.parse(bind_ip, 0);
-    const socket = bind_addr.bind(io, .{
-        .mode = .dgram,
-        .allow_broadcast = true,
-    }) catch |err| {
-        std.debug.print("[broadcast] Bind {s}:0 failed: {}, retrying without broadcast option\n", .{ bind_ip, err });
-        // Some platforms may not support .allow_broadcast at bind time.
-        // Fall back: bind without it, then set SO_BROADCAST manually after.
-        return broadcastLoopFallback(io, port, info, bind_addr, is_svc);
-    };
-    defer socket.close(io);
-
-    // Build message
-    const announce_info = protocol.GuestInfo{
-        .hostname = info.hostname,
-        .ip = info.ip,
-        .target = info.target,
-        .mac = info.mac,
-        .shell = info.shell,
-    };
-    var msg_buf: [1024]u8 = undefined;
-    var msg_writer: std.Io.Writer = .fixed(&msg_buf);
-    try protocol.buildAnnounce(&msg_writer, announce_info);
-    const msg = msg_writer.buffered();
-
-    while (true) {
-        // ── Self-upgrade check (daemon only) ────────────────────────
-        // Host uploads utmm.next; daemon Guest auto-detects and self-upgrades.
-        // Foreground mode skips this — the background service handles upgrades
-        // when it restarts after the user closes the terminal window.
-        if (is_svc) try checkSelfUpgrade(io, &info);
-
-        socket.send(io, &broadcast_addr, msg) catch |err| {
-            std.debug.print("[broadcast] Send failed: {}\n", .{err});
+/// Timer thread: sends periodic announce to keep Host unblocked.
+/// Used only on Windows (no poll). POSIX uses single-threaded poll loop.
+fn runTimerThread(ctx: *TimerCtx) void {
+    while (ctx.running) {
+        ctx.conn.io.sleep(std.Io.Duration.fromNanoseconds(std.time.ns_per_s), .awake) catch {};
+        if (!ctx.running) return;
+        ctx.conn.writeFrame(ctx.msg, .binary) catch {
+            ctx.running = false;
+            return;
         };
-        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {};
     }
 }
 
-/// Fallback: bind 0.0.0.0 for broadcast
-fn broadcastLoopFallback(
+const TimerCtx = struct {
+    conn: *wsclient.WsConn,
+    msg: []const u8,
+    running: bool,
+};
+
+/// WebSocket announce loop: persistent WS connection to Host.
+/// POSIX: single-threaded poll loop (no races).
+/// Windows: timer thread + mutex-protected writes.
+pub fn wsAnnounceLoop(
     io: std.Io,
-    port: u16,
+    allocator: std.mem.Allocator,
     info: SystemInfo,
-    bind_addr: std.Io.net.IpAddress,
-    is_svc: bool,
+    host_url: []const u8,
 ) !void {
-    const broadcast_addr = try std.Io.net.IpAddress.parse("255.255.255.255", port);
-    // Try with .allow_broadcast first; on some platforms this option is
-    // unsupported at bind time. Fall back to bind without it.
-    const socket = bind_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| switch (err) {
-        error.OptionUnsupported => blk: {
-            const s = try bind_addr.bind(io, .{ .mode = .dgram });
-            // Enable SO.BROADCAST manually on Windows.
-            if (builtin.os.tag == .windows) {
-                const ws2 = struct {
-                    const SOCKET = *anyopaque;
-                    extern "ws2_32" fn setsockopt(
-                        s: SOCKET,
-                        level: i32,
-                        optname: i32,
-                        optval: [*]const u8,
-                        optlen: i32,
-                    ) callconv(.winapi) i32;
+    const host: []const u8 = if (host_url.len > 0) host_url else blk: {
+        const gw = getDefaultGateway(io, allocator) catch blk2: {
+            break :blk2 try allocator.dupe(u8, "192.168.64.1");
+        };
+        break :blk gw;
+    };
+    defer if (host_url.len == 0) allocator.free(host);
+
+    std.log.info("[guest-ws] Connecting to {s}:{d}", .{ host, protocol.DEFAULT_PORT });
+
+    var conn = wsclient.WsConn.connect(io, allocator, host, protocol.DEFAULT_PORT) catch |err| {
+        std.log.err("[guest-ws] Connect failed: {}", .{err});
+        return err;
+    };
+    defer conn.close();
+
+    // Send initial announce
+    {
+        const frame = try wsproto_mod.buildAnnounce(
+            allocator, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell,
+        );
+        defer allocator.free(frame);
+        conn.writeFrame(frame, .binary) catch |err| {
+            std.log.err("[guest-ws] Announce write failed: {}", .{err});
+            return err;
+        };
+    }
+
+    std.log.info("[guest-ws] Connected and announced", .{});
+
+    // Pre-build announce message — static data, reused every second
+    const announce_msg = try wsproto_mod.buildAnnounce(
+        allocator, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell,
+    );
+    defer allocator.free(announce_msg);
+
+    var rbuf: [65536]u8 = undefined;
+
+    // Windows: start timer thread for periodic re-announce.
+    // POSIX: use single-threaded poll loop (no race).
+    var timer_ctx: if (builtin.os.tag == .windows) TimerCtx else struct {} = if (builtin.os.tag == .windows)
+        TimerCtx{ .conn = &conn, .msg = announce_msg, .running = true }
+    else
+        .{};
+    if (builtin.os.tag == .windows) {
+        const timer_thread = std.Thread.spawn(.{}, runTimerThread, .{ &timer_ctx }) catch |err| {
+            std.log.err("[guest-ws] Timer thread spawn failed: {}", .{err});
+            return err;
+        };
+        timer_thread.detach();
+    }
+    defer if (builtin.os.tag == .windows) {
+        timer_ctx.running = false;
+    };
+
+    while (true) {
+        // POSIX: poll socket with 1s timeout. Windows: timer thread handles announces.
+        if (builtin.os.tag != .windows) {
+            var fds: [1]std.posix.pollfd = .{
+                .{ .fd = conn.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            const poll_n = std.posix.poll(&fds, 1000) catch |err| {
+                std.log.err("[guest-ws] poll error: {}", .{err});
+                break;
+            };
+            if (poll_n == 0) {
+                conn.writeFrame(announce_msg, .binary) catch |err| {
+                    std.log.err("[guest-ws] Announce write failed: {}", .{err});
+                    break;
                 };
-                const enable: u32 = 1;
-                _ = ws2.setsockopt(
-                    @ptrCast(s.handle),
-                    0xffff, // SOL_SOCKET
-                    0x0020, // SO_BROADCAST
-                    @as([*]const u8, @ptrCast(&enable)),
-                    @sizeOf(u32),
-                );
+                continue;
             }
-            break :blk s;
-        },
-        else => |e| return e,
-    };
-    defer socket.close(io);
+        }
 
-    const announce_info = protocol.GuestInfo{
-        .hostname = info.hostname,
-        .ip = info.ip,
-        .target = info.target,
-        .mac = info.mac,
-        .shell = info.shell,
-    };
-    var msg_buf: [1024]u8 = undefined;
-    var msg_writer: std.Io.Writer = .fixed(&msg_buf);
-    try protocol.buildAnnounce(&msg_writer, announce_info);
-    const msg = msg_writer.buffered();
-
-    while (true) {
-        // ── Self-upgrade check (daemon only) ────────────────────────
-        if (is_svc) try checkSelfUpgrade(io, &info);
-
-        socket.send(io, &broadcast_addr, msg) catch |err| {
-            std.debug.print("[broadcast] Send failed: {}\n", .{err});
+        const frame = conn.readFrame(&rbuf) catch |err| {
+            std.log.err("[guest-ws] Read error: {}", .{err});
+            break;
         };
-        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {};
+
+        switch (frame.opcode) {
+            .binary => {
+                if (frame.data.len == 0) continue;
+                const msg_type: u8 = frame.data[0];
+                const payload = frame.data[1..];
+
+                switch (msg_type) {
+                    @intFromEnum(wsproto_mod.MsgType.exec_req) => {
+                        if (wsproto_mod.parseExecReq(payload)) |req| {
+                            std.log.debug("[guest-ws] Exec: {s}", .{req.command});
+                            const result = execLocalCommand(io, allocator, req.command) catch |err| {
+                                std.log.err("[guest-ws] Exec failed: {}", .{err});
+                                continue;
+                            };
+                            defer {
+                                allocator.free(result.stdout);
+                                allocator.free(result.stderr);
+                            }
+                            const resp = wsproto_mod.buildExecResp(
+                                allocator, req.cmd_id, result.exit, result.stdout, result.stderr,
+                            ) catch continue;
+                            defer allocator.free(resp);
+                            conn.writeFrame(resp, .binary) catch |err| {
+                                std.log.err("[guest-ws] Exec resp write failed: {}", .{err});
+                                break;
+                            };
+                        }
+                    },
+                    @intFromEnum(wsproto_mod.MsgType.upload_req) => {
+                        if (wsproto_mod.parseUploadReq(payload)) |req| {
+                            std.log.debug("[guest-ws] Upload: {s} ({d} bytes)", .{ req.path, req.file_data.len });
+                            const exit_code: i32 = writeFile(io, allocator, req.path, req.file_data) catch |err| blk: {
+                                std.log.err("[guest-ws] Upload write failed: {}", .{err});
+                                break :blk -1;
+                            };
+                            const resp = wsproto_mod.buildUploadResp(allocator, req.cmd_id, exit_code) catch continue;
+                            defer allocator.free(resp);
+                            conn.writeFrame(resp, .binary) catch |err| {
+                                std.log.err("[guest-ws] Upload resp write failed: {}", .{err});
+                                break;
+                            };
+                        }
+                    },
+                    @intFromEnum(wsproto_mod.MsgType.download_req) => {
+                        if (wsproto_mod.parseDownloadReq(payload)) |req| {
+                            std.log.debug("[guest-ws] Download: {s}", .{req.path});
+                            const file_content = readFileContent(io, allocator, req.path) catch |err| {
+                                std.log.err("[guest-ws] Download read failed: {}", .{err});
+                                const err_resp = wsproto_mod.buildDownloadResp(allocator, req.cmd_id, -1, "") catch continue;
+                                defer allocator.free(err_resp);
+                                conn.writeFrame(err_resp, .binary) catch {};
+                                continue;
+                            };
+                            defer allocator.free(file_content);
+                            const resp = wsproto_mod.buildDownloadResp(allocator, req.cmd_id, 0, file_content) catch continue;
+                            defer allocator.free(resp);
+                            conn.writeFrame(resp, .binary) catch |err| {
+                                std.log.err("[guest-ws] Download resp write failed: {}", .{err});
+                                break;
+                            };
+                        }
+                    },
+                    else => {
+                        std.log.debug("[guest-ws] Unknown msg type: {d}", .{msg_type});
+                    },
+                }
+            },
+            .pong => {
+                // Keepalive pong from Host — continue
+            },
+            .ping => {
+                // Respond with pong
+                conn.writeFrame(frame.data, .pong) catch {};
+            },
+            .close => {
+                std.log.info("[guest-ws] Host requested close", .{});
+                break;
+            },
+            else => {
+                std.log.debug("[guest-ws] Unexpected opcode: {}", .{frame.opcode});
+            },
+        }
+
     }
+
+    std.log.info("[guest-ws] Disconnected", .{});
 }
 
-/// Check for staged upgrade binary (utmm.next) and self-upgrade if found.
-/// The Host uploads the new binary as "utmm.next"; the Guest detects it
-/// on its next broadcast cycle, swaps it in safely, and restarts itself.
-///
-/// Cross-platform safe rename strategy:
-///   Linux/macOS:
-///     1. Rename old binary out of the way   (utmm → utmm.old)
-///     2. Rename new binary into place       (utmm.next → utmm)
-///     3. Spawn restart script (cleans up .old after old process exits)
-///     4. exit(0) — supervisor (launchd/systemd) restarts us
-///
-///   Windows (different strategy — .exe files are locked when running):
-///     1. Spawn batch script BEFORE we exit (so it outlives us)
-///     2. exit(0) — SCM marks service stopped, lock released
-///     3. Batch script: wait → delete old .exe → rename .next → start service
-///
-/// This works on all platforms because:
-///   Linux:   rename() is a directory op — old inode stays alive
-///   macOS:   same as Linux; SIP won't SIGKILL new binary (different inode)
-///   Windows: .exe is locked while running; script handles rename after exit
-pub fn checkSelfUpgrade(io: std.Io, info: *const SystemInfo) !void {
-    const new_name: []const u8 = if (builtin.os.tag == .windows) "utmm.next.exe" else "utmm.next";
-    const final_name: []const u8 = if (builtin.os.tag == .windows) "utmm.exe" else "utmm";
-    const old_name: []const u8 = if (builtin.os.tag == .windows) "utmm.old.exe" else "utmm.old";
-    const install_dir: []const u8 = if (builtin.os.tag == .windows) "C:\\opt\\utmm" else "/opt/utmm";
-    const bat_name: []const u8 = "_upgrade.bat";
+const ExecResult = struct {
+    stdout: []const u8,
+    stderr: []const u8,
+    exit: i32,
+};
 
-    // Open the install directory for relative-path operations.
-    // Using CWD with absolute paths breaks on Windows services (CWD is System32).
-    var dir = std.Io.Dir.cwd().openDir(io, install_dir, .{}) catch |err| {
-        std.debug.print("[broadcast] Self-upgrade: cannot open {s}: {}\n", .{ install_dir, err });
-        return;
+fn execLocalCommand(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ExecResult {
+    const shell = detectShell(allocator) catch "/bin/sh";
+    defer allocator.free(shell);
+
+    const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "cmd.exe", "/c", command }
+    else
+        &.{ shell, "-l", "-c", command };
+
+    const result = try std.process.run(allocator, io, .{ .argv = shell_args });
+
+    return ExecResult{
+        .stdout = try allocator.dupe(u8, result.stdout),
+        .stderr = try allocator.dupe(u8, result.stderr),
+        .exit = switch (result.term) {
+            .exited => |code| @intCast(code),
+            .signal, .stopped, .unknown => @as(i32, -1),
+        },
     };
+}
+
+/// Write data to file. Returns 0 on success, -1 on failure.
+fn writeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, data: []const u8) !i32 {
+    _ = allocator;
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var wb: [65536]u8 = undefined;
+    var writer = file.writer(io, &wb);
+    _ = try writer.interface.write(data);
+    try writer.interface.flush();
+    return 0;
+}
+
+/// Read file content. Caller owns returned string.
+fn readFileContent(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, @enumFromInt(50 * 1024 * 1024));
+}
+
+fn downloadAndUpgrade(io: std.Io, allocator: std.mem.Allocator, client: *std.http.Client, url_path: []const u8) !void {
+    // Download the new binary
+    var download_buf: [10 * 1024 * 1024]u8 = undefined;
+    var download_writer: std.Io.Writer = .fixed(&download_buf);
+    const result = try client.fetch(.{
+        .location = .{ .url = url_path },
+        .method = .GET,
+        .response_writer = &download_writer,
+        .keep_alive = false,
+    });
+    if (result.status != .ok) return error.DownloadFailed;
+
+    const data = download_writer.buffered();
+    if (data.len < 100 * 1024) return error.BinaryTooSmall;
+
+    // Write utmm.next
+    const install_dir = if (builtin.os.tag == .windows) "C:\\opt\\utmm" else "/opt/utmm";
+    const next_name = if (builtin.os.tag == .windows) "utmm.next.exe" else "utmm.next";
+    const next_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ install_dir, next_name });
+    defer allocator.free(next_path);
+
+    var dir = try std.Io.Dir.cwd().openDir(io, install_dir, .{});
     defer dir.close(io);
+    var file = try dir.createFile(io, next_name, .{});
+    defer file.close(io);
+    var wb: [65536]u8 = undefined;
+    var file_writer = file.writer(io, &wb);
+    _ = try file_writer.interface.write(data);
+    try file_writer.interface.flush();
 
-    // Check if staged file exists
-    const file = dir.openFile(io, new_name, .{}) catch return;
-    const file_size = file.length(io) catch 0;
-    file.close(io);
-
-    // Sanity check: file must be at least 100KB (not a partial upload)
-    if (file_size < 100 * 1024) return;
-
-    std.debug.print("[broadcast] 🔄 Self-upgrade: staged {s}/{s} ({d} bytes)\n", .{ install_dir, new_name, file_size });
-
-    // Step 1: Move old binary out of the way (utmm → utmm.old)
-    // Step 2: Place new binary at the target name (utmm.next → utmm)
-    if (builtin.os.tag == .windows) {
-        // On Windows, running .exe files are locked — we cannot rename
-        // the current binary while it's executing.  Instead we schedule
-        // everything via a batch script that runs AFTER we exit.
-        //
-        // Strategy (all in _upgrade.bat, launched detached before exit):
-        //   1. Wait for our process to die       (ping -n 3 127.0.0.1)
-        //   2. Delete stale .old if present
-        //   3. Rename current .exe → .old        (now unlocked)
-        //   4. Rename .next → .exe
-        //   5. Start the service with the new binary
-        //   6. Self-delete the batch file
-        //
-        // This avoids the "file in use" problem entirely — all renames
-        // happen after we exit, when the .exe lock is released.
-
-        const bat_full_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}\\{s}", .{ install_dir, bat_name });
-        defer std.heap.page_allocator.free(bat_full_path);
-
-        if (dir.createFile(io, bat_name, .{ .permissions = @enumFromInt(0o644) })) |bat_file| {
-            var wb: [1024]u8 = undefined;
-            var bat_writer = bat_file.writer(io, &wb);
-            bat_writer.interface.print(
-                \\@echo off
-                \\ping -n 3 127.0.0.1 >nul
-                \\cd /d {0s}
-                \\del /f {1s} 2>nul
-                \\ren {2s} {1s}
-                \\if errorlevel 1 goto :failed
-                \\ren {3s} {2s}
-                \\if errorlevel 1 goto :failed
-                \\schtasks /run /tn utmm-guest
-                \\del "%~f0" 2>nul
-                \\exit /b 0
-                \\:failed
-                \\echo Upgrade failed — .next may still be staged
-                \\del "%~f0" 2>nul
-                \\exit /b 1
-                \\
-            , .{ install_dir, old_name, final_name, new_name }) catch {};
-            bat_writer.interface.flush() catch {};
-            bat_file.close(io);
-        } else |_| {
-            std.debug.print("[broadcast] Self-upgrade: cannot write {s}\n", .{bat_name});
-            return;
-        }
-    } else {
-        // Unix: rename() is always safe (directory entry operation)
-        dir.deleteFile(io, old_name) catch {};
-        dir.rename(final_name, dir, old_name, io) catch |err| {
-            std.debug.print("[broadcast] Self-upgrade: rename {s} → {s} failed: {}\n", .{ final_name, old_name, err });
-            return;
-        };
-        dir.rename(new_name, dir, final_name, io) catch |err| {
-            std.debug.print("[broadcast] Self-upgrade: rename {s} → {s} failed: {}\n", .{ new_name, final_name, err });
-            dir.rename(old_name, dir, final_name, io) catch {};
-            return;
-        };
-    }
-
-    // Make executable and clear quarantine (Unix only)
-    if (builtin.os.tag != .windows) {
-        // Use full paths for chmod/xattr (they handle absolute paths fine)
-        const final_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, final_name }) catch return;
-        defer std.heap.page_allocator.free(final_path);
-
-        if (std.process.run(std.heap.page_allocator, io, .{
-            .argv = &.{ "chmod", "+x", final_path },
-        })) |_| {} else |_| {}
-
-        if (builtin.os.tag == .macos) {
-            if (std.process.run(std.heap.page_allocator, io, .{
-                .argv = &.{ "xattr", "-d", "com.apple.quarantine", final_path },
-            })) |_| {} else |_| {}
-        }
-    }
-
-    // Step 3: Spawn restart script (detached, survives our exit).
-    if (builtin.os.tag == .windows) {
-        // The batch file was already written above (before the renames).
-        // Now just spawn it and exit.
-        const bat_full_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}\\{s}", .{ install_dir, bat_name }) catch return;
-        defer std.heap.page_allocator.free(bat_full_path);
-        _ = std.process.spawn(io, .{
-            .argv = &.{ "cmd", "/c", bat_full_path },
-        }) catch {};
-    } else {
-        const old_full_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, old_name }) catch return;
-        defer std.heap.page_allocator.free(old_full_path);
-        const final_full_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ install_dir, final_name }) catch return;
-        defer std.heap.page_allocator.free(final_full_path);
-
-        const restart_cmd = std.fmt.allocPrint(
-            std.heap.page_allocator,
-            "nohup sh -c 'sleep 2; rm -f \"{s}\"; {s} --hostname {s} &' >/dev/null 2>&1 &",
-            .{ old_full_path, final_full_path, info.hostname },
-        ) catch return;
-        defer std.heap.page_allocator.free(restart_cmd);
-        _ = std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "sh", "-c", restart_cmd } }) catch {};
-    }
-
-    std.debug.print("[broadcast] Self-upgrade complete — restarting with new binary\n", .{});
+    // Trigger self-upgrade by restarting
+    std.log.info("[guest-http] Downloaded upgrade to {s} ({d} bytes) — restarting", .{ next_path, data.len });
+    const restart_cmd = if (builtin.os.tag == .windows)
+        "cmd /c move /Y C:\\opt\\utmm\\utmm.next.exe C:\\opt\\utmm\\utmm.exe && C:\\opt\\utmm\\utmm.exe --svc"
+    else
+        "mv /opt/utmm/utmm.next /opt/utmm/utmm && /opt/utmm/utmm --svc &";
+    _ = std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "sh", "-c", restart_cmd } }) catch {};
     std.process.exit(0);
 }

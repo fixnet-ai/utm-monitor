@@ -31,8 +31,7 @@ utmm --host       # Host mode
 |-----------|------------|-----------|
 | Runs on | Inside each VM | Host machine |
 | Count | One per VM | Only one |
-| Responsibility | UDP broadcast of its own info | Listen for broadcasts + sync /etc/hosts |
-| Ancillary Services | TCP transport server (2121): exec, upload, download, version, health | Management commands (--status/--exec) + MCP HTTP server (2122, streamableHttp) |
+| Responsibility | WebSocket connect to Host, announce info, execute commands | Unified HTTP server: guest registration, exec, upload, download, MCP, static files, /etc/hosts sync |
 | Required Privileges | Regular user | `sudo` (to write /etc/hosts) |
 
 ### 1.3 Data Flow Overview
@@ -42,85 +41,71 @@ utmm --host       # Host mode
 │                          Host (Host Machine)                          │
 │                                                                      │
 │  ┌─────────────┐    ┌──────────────────┐    ┌──────────────────┐     │
-│  │ /etc/hosts   │◄───│ hosts_file module │◄───│ listener         │     │
-│  │              │    │ (marker block     │    │ (2121 UDP)      │     │
-│  └─────────────┘    │  update)           │    └────────┬─────────┘     │
-│                     └──────────────────┘             ▲               │
-│                                          UDP broadcast (255.255.255.255:2121)
-│                                          One ANNOUNCE message per second
+│  │ /etc/hosts   │◄───│ hosts_file module │◄───│ Host HTTP :2121  │     │
+│  │              │    │ (marker block     │    │                  │     │
+│  └─────────────┘    │  update)           │    │ /ws    ← WebSocket│     │
+│                     └──────────────────┘    │ /mcp   ← AI Agent  │     │
+│                                             │ /exec  ← CLI       │     │
+│                              WebSocket (persistent, binary frames)    │
+│                              One connection per Guest                 │
 │                                    ┌──────┼──────┐                   │
 │                                    ▼      ▼      ▼                   │
 │  ┌────────────┐  ┌────────────┐  ┌────────────┐                      │
 │  │  macvm     │  │  linuxvm   │  │ windowsvm  │   ← Guest side       │
 │  │            │  │            │  │            │                      │
-│  │ broadcast  │  │ broadcast  │  │ broadcast  │   UDP broadcast       │
-│  │ TCP(2121)  │  │ TCP(2121)  │  │ TCP(2121)  │   Exec, upload, download │
+│  │ WS client  │  │ WS client  │  │ WS client  │   Persistent WS      │
 │  └────────────┘  └────────────┘  └────────────┘                      │
 │                                                                      │
 │  ┌──────────────────────────────────────────┐                        │
-│  │ Management Commands                       │  ← Host CLI             │
-│  │ --status / --exec via UDP discover + TCP │  → direct to Guest      │
-│  │ --upload / --download via TCP transport   │                        │
+│  │ CLI Management Commands                   │  ← Host CLI            │
+│  │ --status / --exec via HTTP to Host :2121  │                        │
+│  │ --upload / --download via HTTP            │                        │
 │  └──────────────────────────────────────────┘                        │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 1.4 Communication Protocols
 
-#### UDP Broadcast Messages (Guest → Host, Port 2121)
+#### WebSocket (Guest ↔ Host, Port 2121, Path /ws)
 
-The Guest sends one ANNOUNCE message per second to `255.255.255.255:2121`:
+Guest opens a persistent WebSocket connection to Host. All communication uses **binary frames**:
 
-```
-ANNOUNCE
-hostname: ubuntu
-target: aarch64-linux-musl
-mac: 16:a0:6c:ba:ae:fa
-ip: 192.168.64.2
-port: 2121
-version: 0.2.0
-shell: /bin/bash
-<blank line>
-```
-
-| Field | Description | Example Value |
-|-------|-------------|---------------|
-| `hostname` | OS hostname | `ubuntu`, `my-dev-box` |
-| `target` | Zig cross-compilation target triple | `aarch64-linux-musl`, `x86_64-windows` |
-| `mac` | Physical NIC MAC address | `1a:97:6d:38:0c:6c` |
-| `ip` | Physical NIC IPv4 | `192.168.64.2` |
-| `port` | TCP transport service port | `2121` |
-| `version` | Program version | `0.2.0` |
-| `shell` | Auto-detected shell binary (v0.2.2+) | `/bin/zsh`, `/bin/bash`, `cmd.exe` |
-
-**AI Agent Integration**: `--status` output directly shows each VM's `target`, allowing AI agents to use `zig build -Dtarget=<target>` for cross-compilation.
-
-In addition to parsing the `ip` field from the message, the Host also extracts the real IP from the **UDP packet source address**. When a Guest self-reports its IP as `0.0.0.0` or `127.x.x.x` (e.g., a Windows Guest cannot detect its own IP), the Host automatically uses the packet source address as the IP.
-
-#### TCP Transport Protocol (Port 2121)
-
-The Guest runs a TCP transport server on port 2121 using a binary frame protocol:
-
-**Frame format**: `[4B big-endian length][1B message type][N-byte payload]`
+**Frame format**: `[1-byte message type][type-specific payload]`
 
 | Message Type | Direction | Purpose |
 |-------------|-----------|---------|
-| `VERSION_REQ` / `VERSION_RESP` | Bidirectional | Version check |
-| `HEALTH_REQ` / `HEALTH_RESP` | Host → Guest | Health check |
-| `FILE_REQ` / `FILE_RESP` | Bidirectional | File download (binary serving, bootstrap) |
-| `UPLOAD_REQ` / `UPLOAD_RESP` | Host → Guest | File upload (auto-upgrade, --upload) |
-| `EXEC_REQ` / `STDOUT` / `STDERR` / `EXIT` | Host → Guest | Remote command execution |
+| `announce` (1) | Guest → Host | Advertise hostname, IP, target, MAC, version, shell |
+| `exec_req` (2) | Host → Guest | Execute a shell command |
+| `exec_resp` (3) | Guest → Host | Command result (exit code, stdout, stderr) |
+| `upload_req` (4) | Host → Guest | Upload file (path + binary data) |
+| `upload_resp` (5) | Guest → Host | Upload result (exit code) |
+| `download_req` (6) | Host → Guest | Download file (path) |
+| `download_resp` (7) | Guest → Host | File content (exit code + binary data) |
 
-**Runtime model**: `std.Thread` concurrency with `std.Io` blocking I/O — simple, portable, and reliable across all platforms.
+**Payload encoding:**
+- String fields: null-terminated (`\0` delimiter)
+- Binary fields: 4-byte big-endian length prefix + raw bytes
+- No base64, no JSON encoding — raw binary for file data
 
-The shell is read from `$SHELL` at Guest startup (v0.2.2+):
-- **macOS/Linux**: reads the `$SHELL` env var (e.g. `/bin/zsh`, `/bin/bash`), falls back to `/bin/sh`
-- **Windows**: `cmd.exe` (always)
-- Commands run with **login shell** (`-l` flag): `zsh -l -c`, `bash -l -c`, etc.
-  This loads the full user environment (`$PATH`, `$HOME`, profile scripts).
-- Old guests (v0.2.1-) fall back to `/bin/sh -c` (POSIX) or `cmd.exe /c` (Windows).
+**Periodic re-announce**: Guest re-sends announce every ~50 messages so Host always has current info.
 
-The Host also serves FILE_REQ on port 2121 — read-only, serving `/bin/:filename` for Guest bootstrap binary downloads.
+Guest auto-discovers Host IP via default gateway (UTM Host is the gateway for bridged networks). Override with `--host-ip`.
+
+#### HTTP REST (CLI → Host, Port 2121)
+
+CLI management commands use standard HTTP:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/guests` | GET | List all guests (JSON) |
+| `/exec` | POST | Enqueue exec command, wait for result |
+| `/upload` | POST | Upload file to guest |
+| `/download` | POST | Download file from guest |
+| `/mcp` | POST | MCP JSON-RPC (AI agent entry) |
+| `/bin/<file>` | GET | Static file serving (bootstrap, binaries) |
+| `/` | GET | HTML status page |
+
+CLI commands send HTTP to `127.0.0.1:2121`. Host communicates with Guest via WebSocket for actual command execution. CLI polls `tryTakeResult` with 30s timeout.
 
 #### /etc/hosts Marker Block
 
@@ -139,26 +124,6 @@ The Host maintains a marker block in `/etc/hosts`, using FQDN format `{hostname}
 
 The `target` in the FQDN is the Zig cross-compilation target triple, directly usable for `zig build -Dtarget=` for cross-compilation.
 
-#### Management Command Discovery
-
-Management commands (`--status`/`--exec`/`--upload`/`--download`) discover Guest IPs via:
-
-1. **UDP broadcast** — bind port 2121, listen for ANNOUNCE messages (1-2 seconds)
-2. **State file fallback** — when UDP port is occupied (Host daemon running), read `/tmp/utmm-guests.tsv`
-
-Once the Guest IP is discovered, management commands connect directly to the Guest via TCP transport (port 2121). No intermediate IPC layer.
-
-#### State File Format (`/tmp/utmm-guests.tsv`)
-
-The Host writes this TSV file after each `/etc/hosts` sync:
-
-```
-hostname	target	ip	mac	version	shell
-linuxvm	aarch64-linux-musl	192.168.64.2	16:a0:6c:ba:ae:fa	0.2.4	/bin/bash
-macvm	aarch64-macos	192.168.64.4	1a:97:6d:38:0c:6c	0.2.4	/bin/zsh
-windowsvm	aarch64-windows	192.168.65.2	66:DC:DA:EC:A1:59	0.2.4	cmd.exe
-```
-
 ### 1.5 Physical NIC Detection
 
 When the Guest starts, it needs to obtain the IPv4 address of the local physical NIC. The common "connect to 8.8.8.8 to get local IP" approach is easily disrupted by VPN tunnel interfaces (tun/utun/wintun), returning an incorrect IP (e.g., `198.18.0.1`).
@@ -169,7 +134,7 @@ This tool uses the `getifaddrs()` system call on **macOS / Linux** to enumerate 
 utun*, tun*, tap*, llw*, awdl*, bridge*, vmnet*, docker*, gif*, stf*, veth*, vboxnet*, virbr*, lo*
 ```
 
-On **Windows**, the Guest self-reports its IP as `0.0.0.0` (fallback value), and the Host extracts the real IP from the UDP packet source address.
+On **Windows**, the Guest self-reports its IP as `0.0.0.0` (fallback value), and the Host extracts the real IP from the TCP connection source address.
 
 ---
 
@@ -179,15 +144,15 @@ On **Windows**, the Guest self-reports its IP as `0.0.0.0` (fallback value), and
 
 | Port | Protocol | Direction | Purpose |
 |------|----------|-----------|---------|
-| 2121 | UDP + TCP | Bidirectional | UDP broadcast ANNOUNCE + TCP transport (exec/upload/download/bootstrap) |
+| 2121 | TCP | Bidirectional | HTTP server: WebSocket (guest connection) + REST (CLI) + MCP (AI agent) + static files |
 
 ### 2.2 Network Topology Requirements
 
-**Guest and Host must be on the same broadcast domain**. Specifically:
+**Guest and Host must be on the same network**. Specifically:
 
-- Guest sends UDP broadcast to `255.255.255.255:<port>`
-- Host listens on `0.0.0.0:<port>`
-- No router/NAT between them must block broadcast packets
+- Guest connects via TCP to Host on port 2121
+- Host listens on `0.0.0.0:2121`
+- Guest discovers Host IP by detecting default gateway (UTM Host is the gateway)
 
 **UTM's default network modes satisfy this requirement** (both Shared Network and Bridged Network work).
 
@@ -227,11 +192,11 @@ sudo utmm --host --install   # Install as Host system service, auto-start on boo
 
 ### 2.4 Bare-Metal Bootstrapping (First-time Guest VM Deployment)
 
-A brand-new VM has no utmm running. After the Host starts `utmm --host`, it automatically provides a TCP transport server on port 2121 (serving the cross-compiled binaries from `/opt/utmm/`). The unified `install.sh` handles both Host and Guest deployment.
+A brand-new VM has no utmm running. After the Host starts `utmm --host`, it automatically provides an HTTP server on port 2121 (serving the cross-compiled binaries from `/opt/utmm/`). The unified `install.sh` handles both Host and Guest deployment.
 
 **Deployment order is always: Host first, then Guests.**
 
-**Linux / macOS Guest** — one command (no internet needed, everything from Host TCP):
+**Linux / macOS Guest** — one command (no internet needed, everything from Host HTTP):
 
 ```bash
 # Find the gateway IP (Host's bridge address), then:
@@ -265,13 +230,7 @@ curl -o install.bat "http://<gateway>:2121/bin/install.bat" && install.bat --gue
 
 > **Prerequisite**: The Host must be running `sudo utmm --host` and the gateway must be reachable from the Guest. If the gateway detection fails, the script probes common UTM bridge IPs (192.168.64.1, 192.168.65.1, 192.168.66.1).
 
-**Other Alternative Methods** (if Host TCP is unreachable):
-
-- UTM shared folder mount `zig-out/bin/` → manual copy
-- One-time SCP: `scp utmm-{target} root@<vm>:/opt/utmm/utmm`
-- Direct `/update` endpoint: `curl -s "http://<gateway>:2121/update?name=myvm" | sh` (returns a generated shell script)
-
-After the Guest starts, it begins UDP broadcast + TCP transport server (2121). **From then on, auto-upgrade is fully automatic.**
+After the Guest starts, it establishes a WebSocket connection to the Host. **From then on, auto-upgrade is fully automatic.**
 
 ---
 
@@ -285,8 +244,8 @@ After the Guest starts, it begins UDP broadcast + TCP transport server (2121). *
 
 **Guest Side (VM):**
 - Target path must exist: `/opt/` (`C:\opt\` on Windows)
-- Bare-metal bootstrapping: Host TCP `/bin/install.sh` endpoint (see §2.4), or UTM shared folder
-- After initial bootstrapping, fully managed by automatic upgrade (Host auto-pushes new binary on version mismatch)
+- Bare-metal bootstrapping: Host HTTP `/bin/install.sh` endpoint (see §2.4), or UTM shared folder
+- After initial bootstrapping, fully managed by automatic upgrade
 
 ### 3.2 Confirm VM Architecture
 
@@ -322,8 +281,6 @@ Each release automatically builds 6 binaries for all VM scenarios, packaged as `
 
 Download URL: `https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.zip`
 
-For the Host side, using `install.sh` (§2.3) is recommended; for the Guest side, using the `/update` virtual endpoint (§2.4) is recommended.
-
 **Method 2: Local Compilation**
 
 ```bash
@@ -351,8 +308,6 @@ Build artifacts:
 - `zig-out/bin/utmm-x86_64-windows.exe` — Windows 64-bit x86
 - `zig-out/bin/utmm-aarch64-windows.exe` — Windows ARM64
 
-> **Note**: The build system (`build.zig`) automatically produces deployment filenames alongside the main binary.
-
 Run tests to confirm correctness:
 
 ```bash
@@ -361,7 +316,7 @@ zig build test --summary all
 
 **After building from source, set up the Host serve directory:**
 
-When building from source (Method 2), the `install.sh` and `install.bat` files are **not** automatically copied to the serve directory. The Guest deployment commands in §2.4 download these files from the Host TCP server. Copy them manually:
+When building from source (Method 2), the `install.sh` and `install.bat` files are **not** automatically copied to the serve directory. Copy them manually:
 
 ```bash
 # From the project root:
@@ -374,8 +329,6 @@ sudo ln -sf /opt/utmm/utmm-aarch64-macos /opt/utmm/utmm
 sudo mkdir -p /usr/local/bin
 sudo ln -sf /opt/utmm/utmm /usr/local/bin/utmm
 ```
-
-> **Note**: If you used `install.sh` (Method 1 — GitHub Release), this step is not needed — the zip file already contains `install.sh` and `install.bat` alongside all platform binaries.
 
 ### 3.4 Bare-Metal Bootstrapping (First Time)
 
@@ -435,14 +388,12 @@ utmm --gen-init windows
 # Generates a script; or install directly:
 C:\opt\utmm\utmm.exe --install
 # This creates a Windows scheduled task 'utmm-guest' (runs at boot, every 5 min).
-# The scheduled task launches utmm without --svc — the binary auto-detects
-# non-TTY mode and runs in daemon mode automatically.
 # Start immediately with:  schtasks /run /tn utmm-guest
 ```
 
 ### 3.6 Start Host Service
 
-The Host TCP server serves cross-compiled binaries from a configurable directory (defaults to `/opt/utmm/`, or `C:\opt\utmm\` on Windows). This directory must contain the platform binaries (e.g., `utmm-aarch64-linux`, `utmm-x86_64-macos`, `utmm-x86_64-windows.exe`) produced by `zig build -Dtarget=...` or extracted from `utmm.zip`.
+The Host HTTP server serves cross-compiled binaries from a configurable directory (defaults to `/opt/utmm/`, or `C:\opt\utmm\` on Windows). This directory must contain the platform binaries produced by `zig build -Dtarget=...` or extracted from `utmm.zip`.
 
 ```bash
 # Foreground (observe logs)
@@ -458,11 +409,10 @@ sudo sh -c 'nohup utmm --host > /var/log/utmm-host.log 2>&1 & disown'
 After starting, the following output indicates normal operation:
 
 ```
-[host] Starting daemon on port 2121
-[host] Hosts file: /etc/hosts
-[host] Listening on UDP 2121
-[host] 🆕 New guest: macvm (aarch64-macos) → 192.168.64.4
-[host] /etc/hosts synced (1 guests)
+[host] HTTP server on 0.0.0.0:2121
+[host] Serve dir: /opt/utmm
+[ws] Guest linuxvm connected (192.168.64.2 v0.3.0)
+[host-http] /etc/hosts synced (1 guests)
 ```
 
 Verify `/etc/hosts` has been updated:
@@ -476,10 +426,10 @@ grep -A 10 "UTM-MONITOR" /etc/hosts
 | # | Check Item | Command | Expected Result |
 |---|------------|---------|-----------------|
 | 1 | Guest process running | `utmm --exec ubuntu "ps aux \| grep utmm"` | Shows `/opt/utmm/utmm` process |
-| 2 | Host receiving broadcasts | `utmm --status` | Shows all Guests |
+| 2 | Host receiving guests | `utmm --status` | Shows all Guests |
 | 3 | /etc/hosts synced | `grep "UTM-MONITOR" /etc/hosts` | Contains entries for 3 VMs |
 | 4 | Remote command channel | `utmm --exec ubuntu "uptime"` | Returns uptime |
-| 5 | TCP transport service | `utmm --status` (shows all VMs online) | Returns guest list with versions |
+| 5 | WebSocket connected | Guest logs show `[guest-ws] Connected and announced` | Guest is online |
 
 ---
 
@@ -496,33 +446,30 @@ Mode Selection:
   --svc                  Run as daemon (launched by service mgr; non-TTY auto-detection also enables daemon mode)
 
 Guest Options:
-  --port PORT            UDP broadcast port         (default 2121)
+  --port PORT            Host port to connect to     (default 2121)
   --hostname NAME        Local hostname (auto-detect by default)
+  --host-ip IP           Host IP (default: auto-detect via default gateway)
   --log-file PATH        Log output path
 
 Host Options:
-  --port PORT            UDP listen port            (default 2121)
+  --port PORT            HTTP listen port            (default 2121)
   --hosts-file PATH      Hosts file path            (default /etc/hosts)
-  --serve-dir PATH       TCP serve directory        (default: /opt/utmm/)
+  --serve-dir PATH       Static file serve directory (default: /opt/utmm/)
   --marker TAG           Hosts marker text          (default UTM-MONITOR)
   --config PATH          Config file path
   --log-file PATH        Log output path
   --save-config          Save current configuration
 
-Management commands (discover Guest via UDP + state file fallback, then TCP connect;
-  auto-start Host daemon via service manager if not running):
+Management commands (HTTP to Host :2121):
   --status               Query online status of all Guests
   --exec TARGET CMD      Execute command on target Guest
-  --upload FILE VM       Upload a file to Guest (via TCP transport, no curl)
-  --download VM R L      Download file from Guest (via TCP transport)
+  --upload FILE VM       Upload a file to Guest
+  --download VM R L      Download file from Guest
   --gen-init PLATFORM    Generate auto-start boot script (linux/macos/windows)
   --install              Install as system service (Guest mode; add --host for Host)
   --install --user       Create desktop shortcut (UTMM) for foreground guest launcher
   --uninstall            Remove system service and stop running processes
   --uninstall --user     Remove desktop shortcut
-  --mcp                  MCP stdio adapter (legacy: direct UDP+TCP; prefer HTTP via --host)
-  --mcp --host           Integrated mode: Host + MCP stdio in one process (legacy)
-  (built-in HTTP MCP)    Host daemon auto-serves MCP HTTP on 127.0.0.1:2122 (streamableHttp)
   --save-config          Save current configuration
   --version              Display version
 ```
@@ -538,14 +485,12 @@ utmm --status
 Example output:
 
 ```
-Hostname         Target             IP               MAC                 Version   Status
+Hostname         Target             IP               MAC                 Version   Shell
 -------------------------------------------------------------------------------------
-ubuntu           aarch64-linux-musl 192.168.64.2     16:a0:6c:ba:ae:fa  v0.2.0     ✓
-macvm            aarch64-macos      192.168.64.4     1a:97:6d:38:0c:6c  v0.2.0     ✓
-WIN-PC           aarch64-windows    192.168.65.2     66:DC:DA:EC:A1:59  v0.2.0     ✓
+ubuntu           aarch64-linux-musl 192.168.64.2     16:a0:6c:ba:ae:fa  v0.3.0    /bin/bash
+macvm            aarch64-macos      192.168.64.4     1a:97:6d:38:0c:6c  v0.3.0    /bin/zsh
+WIN-PC           aarch64-windows    192.168.65.2     66:DC:DA:EC:A1:59  v0.3.0    cmd.exe
 ```
-
-If versions differ, it displays `⚠ Upgradable`, prompting you to bump ver.zig and rebuild.
 
 #### Execute Commands on a Specific VM
 
@@ -565,7 +510,7 @@ utmm --exec macvm "ps aux | head -5"
 utmm --exec linuxvm "df -h && free -m"
 ```
 
-#### Transfer Files via TCP Transport
+#### Transfer Files
 
 ```bash
 # Upload a file to Guest (built-in, no curl required)
@@ -584,26 +529,14 @@ utmm --download linuxvm remote_file ./local_file
 > utmm --exec linuxvm "cp /var/log/syslog /opt/utmm/syslog.log"
 > utmm --download linuxvm syslog.log ./syslog.log
 > ```
->
-> **Under the hood**: `--upload` uses TCP `UPLOAD_REQ` with binary payload; `--download` uses TCP `FILE_REQ`. Both use `std.Io.net.Stream` — zero external dependencies. All transfers include MD5 ETag headers for integrity verification; mismatched files are rejected.
 
-#### Automatic Upgrade (Host-Push)
+#### Version Upgrade Process
 
-The Host automatically upgrades any Guest whose version doesn't match. No Guest polling, no curl scripts.
-
-**How it works:**
-1. Guest broadcasts ANNOUNCE with its version every second
-2. Host compares Guest version with its own (`src/ver.zig`)
-3. If mismatch → Host TCP-uploads the correct binary (from serve-dir) as `utmm.next` + sends platform-specific restart EXEC_REQ
-4. Guest restarts with new version, broadcasts again → version matches, done
-
-**To trigger**: bump `src/ver.zig`, `zig build`, restart Host. All online Guests upgrade within seconds.
-
-**Debounce**: upgrades only trigger once per Guest per (guest_version, host_version) pair. Two triggers:
-- **Guest version changed** — Guest binary was upgraded (new ANNOUNCE carries updated version)
-- **Host version changed since last attempt** — Host was restarted with a new binary (covers Host-only upgrades without Guest version bump). Tracked via `last_upgrade_host_version` field.
-
-After restart, the new ANNOUNCE carries the updated version, so no repeat.
+**To release a new version:**
+1. Bump `src/ver.zig`
+2. `zig build -Doptimize=ReleaseSafe` (and cross-compile for all targets)
+3. Copy new binaries to `/opt/utmm/`
+4. Restart Host: `sudo pkill utmm && sudo utmm --host`
 
 #### Check Guest Logs
 
@@ -616,7 +549,7 @@ utmm --exec ubuntu "tail -20 /var/log/utmm-guest.log"
 If you suspect the hosts file is out of sync:
 
 ```bash
-# Restart Host listener
+# Restart Host
 sudo pkill utmm
 sudo utmm --host
 
@@ -633,65 +566,11 @@ utmm --host --save-config
 # Saves to ./utmm.conf (or custom path via --config)
 ```
 
-### 4.4 Version Upgrade Process
-
-#### Fully Automatic Upgrade (Host-Push)
-
-The **Host** detects version mismatches and pushes upgrades. When a Guest broadcasts ANNOUNCE with a version that doesn't match the Host's (`src/ver.zig`), the Host:
-1. Finds the correct binary in the serve directory by mapping the Guest's target triple to the platform filename
-2. TCP-uploads it to Guest via `UPLOAD_REQ` as `utmm.next` (or `utmm.next.exe` on Windows)
-3. Sends `EXEC_REQ` with a platform-specific restart command — the Guest atomically renames `.next` to final, spawns a detached restart, and exits
-
-**Design rationale**: The v0.1.7 design decouples upload from restart — the upload completes cleanly, and the Guest manages its own lifecycle with a cross-platform safe rename (old → .old, .next → final, spawn restart). v0.2.0 replaces HTTP with TCP transport for upload and EXEC_REQ for restart. All uploads are verified with MD5 ETag integrity checks.
-
-No Guest polling needed. The Guest just broadcasts — the Host uploads, the Guest self-upgrades.
-
-**To release a new version:**
-1. Bump `src/ver.zig`
-2. `zig build -Doptimize=ReleaseSafe` (and cross-compile for all targets)
-3. Restart Host: `sudo pkill utmm && sudo utmm --host`
-4. All online Guests auto-upgrade within seconds
-
-#### Manual Upgrade
-
-**Host Side**:
-```bash
-# Method 1: Re-run install.sh (recommended — downloads from GitHub Releases)
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
-sudo pkill utmm
-sudo utmm --host &
-
-# Method 2: Build from source
-cd utmm && git pull && zig build -Doptimize=ReleaseSafe
-sudo cp zig-out/bin/utmm /usr/local/bin/utmm
-```
-
-**Guest Side** (manual intervention — Host auto-push is preferred):
-```bash
-# Auto-upgrade (builds + uploads + restarts)
-bump ver.zig && zig build  # then restart Host
-
-# Or bootstrap: download from Host TCP and pipe to shell (one-time, needs curl)
-curl -s "http://<host-ip>:2121/update" | sh
-```
-
-#### CI Release Process (Developers)
-
-```bash
-# 1. Bump version in src/ver.zig
-# 2. Tag and push
-git tag v0.2.0
-git push origin v0.2.0
-
-# 3. Build 6 target binaries + publish GitHub Release
-# 4. Host auto-pushes upgrade to all Guests on version mismatch
-```
-
 ---
 
 ## 5. Troubleshooting
 
-### 5.1 Host Not Receiving Broadcasts
+### 5.1 Host Not Receiving Guest Connections
 
 **Symptom**: `--status` shows empty or missing a VM
 
@@ -701,17 +580,16 @@ git push origin v0.2.0
 # 1. Check if Guest process is running
 utmm --exec ubuntu "ps aux | grep utmm"
 
-# 2. Check Guest logs to confirm broadcasts are being sent
+# 2. Check Guest logs to confirm WebSocket connection
 utmm --exec ubuntu "tail -5 /var/log/utmm-guest.log"
-# Normal log line: [broadcast] Broadcast: linuxvm → 192.168.64.2
+# Normal log line: [guest-ws] Connected and announced
 
 # 3. Check if the Guest's displayed IP is the correct physical NIC IP
 # First log line shows: [broadcast] Physical NIC enp0s1: 192.168.64.2
-# If it shows a tun/utun interface, tunnel filtering is not working
 
-# 4. Use tcpdump on Host to verify packets are received
+# 4. Use tcpdump on Host to verify connections
 sudo tcpdump -i any port 2121 -n
-# Should see UDP packets from each VM
+# Should see TCP connections from each VM
 
 # 5. Check if port is occupied
 lsof -i :2121
@@ -727,7 +605,7 @@ lsof -i :2121
 1. Confirm that the `isPhysicalInterface()` function in the code has excluded that interface prefix
 2. View all interfaces on the Guest VM: `ifconfig -a` or `ip addr show`
 3. If a new tunnel interface prefix appears, add it to `exclude_prefixes` in `src/broadcast.zig`
-4. Bump ver.zig and rebuild (auto-upgrade handles the rest)
+4. Bump ver.zig and rebuild
 
 ### 5.3 --exec Command Execution Failed
 
@@ -735,10 +613,9 @@ lsof -i :2121
 
 | Error Message | Cause | Solution |
 |---------------|-------|----------|
-| `GuestNotFound` | Host has not received broadcast from this Guest | Wait a few seconds and retry; check if Guest is running |
-| `ConnectionRefused` | Guest TCP transport service (2121) not listening | Check if Guest process started normally |
-| `Timeout` | TCP connected but no response | Guest shell may be stuck; pkill and restart |
-| `FileNotFound` (Windows) | Incorrect command or shell path | Use `cmd /c` compatible commands |
+| `GuestNotFound` | Guest not connected to Host | Wait a few seconds and retry; check if Guest is running |
+| `ConnectionRefused` | Host HTTP server not running | `sudo utmm --host` |
+| `CommandTimeout` | Guest not responding (30s timeout) | Guest WebSocket may be disconnected; check Guest logs |
 | `RemoteExecFailed` | Command execution returned error | Check if command is correct (use Windows `ver` instead of `uname`) |
 
 ### 5.4 Windows Guest Process Cannot Run in Background
@@ -785,32 +662,7 @@ grep link_libc build.zig
 # Output: .link_libc = true,
 ```
 
-### 5.7 Upload Failed: File Locked / Transport Error
-
-**Symptom**: When updating a running executable via `--upload` or auto-upgrade, the upload succeeds but the file cannot be replaced because it's locked by a running process.
-
-**Cause**: The target file is being locked by a running process (mmap or already opened). Linux/Windows prohibit overwriting a running executable.
-
-**Solution**:
-```bash
-# 1. Use --exec to terminate the locking process
-utmm --exec linuxvm "pkill utmm"
-
-# 2. Re-upload and restart
-utmm --upload ./new_binary linuxvm
-utmm --exec linuxvm "/opt/utmm/utmm &"
-```
-
-**Advanced**: Auto-upgrade uploads via TCP as a `.next` temporary file. The Guest uses a cross-platform safe rename strategy: (1) rename old binary away (`utmm` → `utmm.old`), (2) rename new binary into place (`utmm.next` → `utmm`), (3) spawn restart script that cleans up `.old`, (4) macOS: clear quarantine xattr. Works on Linux (directory VFS op), macOS (new inode avoids SIP), Windows (rename but not overwrite of running exe):
-```bash
-bump ver.zig && zig build  # auto-upgrade handles the rest
-```
-
-### 5.8 Port Conflict / Host Not Running
-
-**Management commands (--status/--exec/--upload/--download) no longer conflict with the Host UDP port**. Management commands discover Guest IPs via UDP broadcast (or state file fallback when Host daemon has the port), then connect directly to Guests via TCP transport.
-
-**Auto-start Host service (v0.1.26+)**: If the Host daemon is not running when a management command is invoked, the CLI auto-starts it via the OS service manager (`launchctl bootstrap` / `systemctl start` / `sc start`) and retries.
+### 5.7 Port Conflict
 
 If port 2121 is occupied by another program, it can be changed via the `--port` parameter:
 
@@ -820,6 +672,24 @@ utmm --port 12348
 
 # Host side (ports must match Guest)
 utmm --host --port 12348
+```
+
+### 5.8 WebSocket Connection Issues
+
+**Symptom**: Guest logs show `[guest-ws] Connect failed` or `[guest-ws] Read error`
+
+**Diagnosis**:
+
+```bash
+# 1. Is Host running?
+utmm --status
+
+# 2. Can Guest reach Host?
+utmm --exec linuxvm "curl -s http://<gateway>:2121/"
+
+# 3. Check Guest default gateway detection
+# Guest should auto-detect the Host as the default gateway
+# Override with: utmm --host-ip 192.168.64.1
 ```
 
 ---
@@ -833,13 +703,9 @@ utmm/
 ├── build.zig              # Build script (zero external dependencies)
 ├── build.zig.zon          # Package manifest
 ├── install.sh             # Host one-click installation script
-├── manual.md              # This manual
 ├── README.md              # Project overview
 ├── CLAUDE.md              # Development guide
 ├── zig-codegen.md         # Zig 0.16.0 coding experience notes
-├── task_plan.md           # Task plan
-├── progress.md            # Progress log
-├── findings.md            # Research findings
 ├── .github/
 │   └── workflows/
 │       └── release.yml    # CI: auto build and publish 6-target binaries on tag
@@ -848,16 +714,17 @@ utmm/
 │   └── MANUAL.md          # This manual
 ├── src/
 │   ├── main.zig           # Entry point + CLI parsing
-│   ├── protocol.zig       # Message protocol (ANNOUNCE constants, GuestInfo)
+│   ├── protocol.zig       # Protocol constants (DEFAULT_PORT, VERSION)
 │   ├── ver.zig            # Single version source (bump to trigger auto-upgrade)
-│   ├── transport.zig      # Binary frame TCP protocol (4B len + 1B type + payload)
-│   ├── guest.zig          # Guest mode: threaded TCP server + UDP broadcast loop
-│   ├── host.zig           # Host mode: listener + auto-upgrade + management cmds + hosts sync
-│   ├── broadcast.zig      # UDP broadcast + gateway detection (getifaddrs)
-│   ├── listener.zig       # UDP listener (includes source IP extraction)
+│   ├── wsproto.zig        # Binary WebSocket protocol (1B type + payload)
+│   ├── wsclient.zig       # Guest WebSocket client (TCP + HTTP upgrade + frame I/O)
+│   ├── httpd.zig          # HTTP server core (accept loop, Router, HostState)
+│   ├── host_http.zig      # HTTP endpoint handlers (/announce, /exec, /ws, /mcp, /bin/)
+│   ├── guest.zig          # Guest mode: WebSocket announce loop
+│   ├── host.zig           # Host mode: management commands + HTTP server start
+│   ├── broadcast.zig      # Guest: getLocalIp/getHostname/getDefaultGateway + wsAnnounceLoop
 │   ├── hosts_file.zig     # /etc/hosts marker block read/write
-│   ├── status.zig         # --status query + formatStatusTable
-│   ├── mcp.zig            # MCP JSON-RPC server (stdio + HTTP streamableHttp on :2122)
+│   ├── mcp.zig            # MCP JSON-RPC handler (reads HostState directly)
 │   ├── install.zig        # --install/--uninstall + desktop shortcuts + --gen-init
 │   ├── agent.zig          # Guest foreground mode (stop service, TTY, restart on exit)
 │   └── config.zig         # Configuration persistence + logging
@@ -871,11 +738,11 @@ utmm/
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | Zig | 0.16.0 | Programming language |
+| std.http.Server | Built-in | HTTP server + WebSocket upgrade |
 | libc | System | `getifaddrs` / `gethostname` / `getenv` |
 | launchd | macOS system | macOS auto-start on boot |
 | systemd | Linux system | Linux auto-start on boot |
 | sc (schtasks) | Windows system | Windows auto-start on boot (Scheduled Task) |
-| TCP+UDP | Built-in | File transfer + remote execution + broadcast discovery |
 
 ### 6.3 Binary Packaging (6 Binaries → All VMs)
 
@@ -905,10 +772,6 @@ Each release builds 6 binaries covering all architecture+OS combinations, packag
 | Linux VM (x86_64) | `utmm-x86_64-linux` | 64-bit musl static, no glibc dependency |
 | Linux VM (aarch64) | `utmm-aarch64-linux` | aarch64 musl static |
 
-> **Install flow**: `install.sh` downloads `utmm.zip`, extracts all 6 binaries to `/opt/utmm/`, then creates a symlink `/opt/utmm/utmm` → the correct binary for the Host platform. The Host's `serve_dir` now contains all platform binaries, enabling auto-upgrade for any Guest architecture.
-
-**macOS Rosetta 2**: Available on physical Apple Silicon Macs by default; install manually if missing: `softwareupdate --install-rosetta`. NOT available inside UTM ARM macOS VMs — those must use `utmm-aarch64-macos`.
-
 ### 6.4 Zig Cross-Compilation Target Reference
 
 | Zig Target | Output Binary | Guest Platform |
@@ -931,16 +794,16 @@ utmm --exec ubuntu "uname -m"
 # View all network interfaces on VM
 utmm --exec ubuntu "ip addr show"
 
-# View Guest broadcast logs
+# View Guest logs
 utmm --exec ubuntu "head -5 /var/log/utmm-guest.log"
 
-# Capture packets to verify broadcasts
+# Capture packets to verify connections
 sudo tcpdump -i any port 2121 -n -c 10
 
 # Verify Guest is online (via Host status)
 utmm --status
 
-# View Host listener
+# View Host process
 ps aux | grep "utmm --host"
 
 # Reload /etc/hosts (macOS)
@@ -964,11 +827,10 @@ sudo killall -HUP mDNSResponder
 |---------|-------|---------|
 | `error.Unexpected` | Guest cannot obtain local IP | Check if VM has a valid network interface |
 | `error.AccessDenied` | Host not running with sudo | `sudo utmm --host` |
-| `error.ConnectionRefused` | Guest TCP server not started | Check if Guest process is running |
-| `GuestNotFound` | UDP broadcast not reaching | Check if network is on same broadcast domain |
+| `error.ConnectionRefused` | Host HTTP server not started | `sudo utmm --host` |
+| `GuestNotFound` | Guest not connected via WebSocket | Check if Guest process is running |
 | Tunnel IP detected | VPN interface interference | utun/tun added to exclusion list |
-| Windows process disappears | Direct launch without scheduled task | Use --install to install as scheduled task (autostart on boot) |
-| Upload file locked | Target file mmap'd by process | Kill process and retry |
+| Windows process disappears | Direct launch without scheduled task | Use --install to install as scheduled task |
 | `zig-out/bin/utmm` is wrong arch | `zig build` overwrites with last target | Use named file e.g. `utmm-aarch64-macos` |
 | 32-bit x86 build fails | x86-windows has linker issue (unrelated to utmm) | Use x86_64 target (all modern VMs are 64-bit) |
 
@@ -976,7 +838,7 @@ sudo killall -HUP mDNSResponder
 
 ## 7. Claude Code Integration (MCP Server)
 
-utmm can be used as a Claude Code plugin via the Model Context Protocol (MCP). This lets Claude automatically discover, execute commands on, your UTM VMs — without you typing CLI commands.
+utmm can be used as a Claude Code plugin via the Model Context Protocol (MCP). This lets Claude automatically discover and execute commands on your UTM VMs — without you typing CLI commands.
 
 ### 7.1 Architecture
 
@@ -984,18 +846,15 @@ utmm can be used as a Claude Code plugin via the Model Context Protocol (MCP). T
 Claude Code
   │ MCP (JSON-RPC over HTTP, streamableHttp transport)
   ▼
-utmm --host     ← Host daemon (UDP listener + HTTP MCP on :2122)
-  │ UDP broadcast discover + TCP transport
+utmm --host     ← Host daemon (unified HTTP server on :2121)
+  │ WebSocket (binary frames) + HTTP REST
   ▼
 Guest VMs (linuxvm, macvm, windowsvm)
   │
-  ├─ TCP transport (2121): exec, upload, download
-  └─ UDP broadcast (2121): announce hostname+IP
+  └─ WebSocket (2121): announce, exec, upload, download
 ```
 
-The Host daemon (`utmm --host`) serves MCP JSON-RPC over HTTP on `127.0.0.1:2122` using the streamableHttp transport. Claude Code connects directly via TCP — no subprocess, no stdio dependency. The Host's in-memory guest cache provides instant responses without UDP discovery per request.
-
-Legacy stdio mode (`utmm --mcp`) is still available as a fallback adapter — it discovers Guests via UDP broadcast (with `/tmp/utmm-guests.tsv` state file fallback) and connects directly via TCP transport. Use `--host --mcp` for integrated stdio mode (Host + MCP in one process).
+The Host daemon (`utmm --host`) serves MCP JSON-RPC over HTTP on `127.0.0.1:2121/mcp` using the streamableHttp transport — the same port and process as everything else. Claude Code connects directly via TCP. The Host's in-memory guest cache provides instant responses without discovery per request.
 
 ### 7.2 Full Setup Walkthrough (from zero to working)
 
@@ -1021,7 +880,6 @@ sudo chmod +x /usr/local/bin/utmm
 
 ```bash
 sudo mkdir -p /opt/utmm
-# Download utmm.zip (contains all 6 platform binaries + install scripts)
 sudo curl -fsSL \
   "https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.zip" \
   -o "/opt/utmm/utmm.zip"
@@ -1033,24 +891,18 @@ sudo chmod +x /opt/utmm/*
 
 ```bash
 cd ~/utmm
-
-# Download Skill (canonical location: utm-vm/SKILL.md)
 curl -o utm-vm/SKILL.md \
   https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/utm-vm/SKILL.md
-
-# Create symlink so Claude can find it
 mkdir -p .claude/skills
 ln -sf ../../utm-vm .claude/skills/utm-vm
 ```
-
-> No extra files needed — the MCP server is built into the `utmm` binary via `--mcp`. Zero external dependencies.
 
 **Step 4: Register MCP server with Claude Code**
 
 Configure `~/.claude/mcp.json` (or add via CLI):
 
 ```bash
-claude mcp add utm-monitor --transport streamableHttp http://127.0.0.1:2122/mcp
+claude mcp add utm-monitor --transport streamableHttp http://127.0.0.1:2121/mcp
 ```
 
 Or manually edit `~/.claude/mcp.json`:
@@ -1060,13 +912,12 @@ Or manually edit `~/.claude/mcp.json`:
   "mcpServers": {
     "utm-monitor": {
       "type": "streamableHttp",
-      "url": "http://127.0.0.1:2122/mcp"
+      "url": "http://127.0.0.1:2121/mcp"
     }
   }
 }
 ```
 
-> This configures Claude Code to connect to the Host daemon's MCP HTTP server on port 2122.
 > The Host must be running (`sudo utmm --host`) for the MCP server to be available.
 > Run `/mcp` in Claude Code to reload the MCP configuration.
 
@@ -1079,14 +930,11 @@ sudo utmm --host --serve-dir /opt/utmm
 Expected output:
 
 ```
-[host] Starting daemon on port 2121
-[host] Hosts file: /etc/hosts
-[host] Daemon running (UDP :2121, MCP HTTP :2122)
-[mcp-http] MCP HTTP server on http://127.0.0.1:2122/mcp
-[host] Listening on UDP 2121
+[host] HTTP server on 0.0.0.0:2121
+[host] Serve dir: /opt/utmm
 ```
 
-Keep this terminal open — the Host runs in the foreground. To auto-start on boot (LaunchDaemon):
+To auto-start on boot (LaunchDaemon):
 
 ```bash
 sudo utmm --host --install
@@ -1095,24 +943,17 @@ sudo utmm --host --install
 **Step 6: Verify the MCP connection**
 
 ```bash
-# Initialize MCP session via HTTP
-curl -s -X POST http://127.0.0.1:2122/mcp \
+curl -s -X POST http://127.0.0.1:2121/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
-# → {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.2.8"},"capabilities":{"tools":{}}}}
+# → {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.3.0"},"capabilities":{"tools":{}}}}
 ```
-
-> **Legacy stdio mode:** `claude mcp add utmm -- utmm --mcp` (adapter, no Host needed) or `claude mcp add utmm -- utmm --host --mcp` (integrated stdio mode). HTTP mode is preferred for persistent deployments.
-
-**Step 6: First conversation** — see §7.4 for daily usage examples with Claude Code.
-
-> **Alternative: build from source** — requires Zig 0.16.0. Clone the repo and run `zig build -Doptimize=ReleaseSafe`. The binary lands at `zig-out/bin/utmm`. Use that path in the steps above instead of `/usr/local/bin/utmm`.
 
 ### 7.3 Available Tools
 
 | Tool | What it does | Example |
 |------|-------------|---------|
-| `vm_status` | List all VMs: hostname, IP, OS/arch, MAC, version, upgradable? | `vm_status()` |
+| `vm_status` | List all VMs: hostname, IP, OS/arch, MAC, version, shell | `vm_status()` |
 | `vm_exec` | Execute a shell command on a VM | `vm_exec("linuxvm", "uname -a")` |
 
 ### 7.4 Daily Usage Examples
@@ -1124,25 +965,17 @@ curl -s -X POST http://127.0.0.1:2122/mcp \
 🤖 → vm_status()
     linuxvm:    aarch64-linux-musl 192.168.64.2   ✓
     macvm:      aarch64-macos    192.168.64.4   ✓
-    windowsvm:  aarch64-windows  192.168.65.2   ⚠ upgradable
-
-👤 "Update windowsvm to the latest version"
-🤖 → bump ver.zig, rebuild, restart Host — auto-upgrade handles the rest
-
-👤 "Verify all VMs are now on the latest version"
-🤖 → vm_status()
-    All three VMs: v0.2.0 ✓
+    windowsvm:  aarch64-windows  192.168.65.2   ✓
 ```
 
 #### Cross-platform testing
 
 ```
 👤 "I just changed the broadcast module. Test it on all platforms."
-🤖 → bump ver.zig, zig build, restart Host (auto-upgrade pushes to all VMs)
-    → vm_exec("linuxvm", "cd /opt && ./utmm --version")
+🤖 → vm_exec("linuxvm", "cd /opt && ./utmm --version")
     → vm_exec("macvm", "cd /opt && ./utmm --version")
     → vm_exec("windowsvm", "C:\\opt\\utmm.exe --version")
-    All three return v0.2.0 ✓
+    All three return v0.3.0 ✓
 ```
 
 #### Debugging a specific VM
@@ -1153,75 +986,6 @@ curl -s -X POST http://127.0.0.1:2122/mcp \
     → vm_exec("linuxvm", "free -h")                    # memory
     → vm_exec("linuxvm", "df -h")                      # disk
     → vm_exec("linuxvm", "dmesg | tail -20")           # kernel messages
-    CPU idle 95%, memory 2.1G/4G, disk 60% — looks normal.
-    But dmesg shows repeated DHCP renewals — network might be flapping.
-```
-
-#### Reading logs and restarting services
-
-```
-👤 "Check the utmm logs on all VMs for errors"
-🤖 → vm_exec("linuxvm", "journalctl -u utmm-guest -n 30 --no-pager 2>/dev/null || tail -30 /var/log/utmm-guest.log")
-    → vm_exec("macvm", "tail -30 /var/log/utmm-guest.log")
-    → vm_exec("windowsvm", "type C:\\opt\\utmm\\utmm.log")
-    All clean, no errors.
-
-👤 "Restart the guest on linuxvm"
-🤖 → vm_exec("linuxvm", "pkill utmm; sleep 1; /opt/utmm/utmm --hostname linuxvm &")
-    Restarted. vm_status confirms it's back online.
-```
-
-#### Multi-VM coordination
-
-```
-👤 "Can linuxvm reach the internet and also ping windowsvm?"
-🤖 → vm_exec("linuxvm", "ping -c 1 example.com")
-    200 — internet works
-    → vm_exec("linuxvm", "ping -c 2 windowsvm")
-    2 packets transmitted, 2 received — VM-to-VM networking works
-```
-
-#### Setting up a new VM
-
-```
-👤 "I just created a new VM called 'debian'. Help me set it up."
-🤖 To set up debian, you need to:
-    1. Build for its architecture: zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
-    2. Copy the binary to the VM via UTM shared folder:
-       cp zig-out/bin/utmm /path/to/shared/folder/
-    3. Inside the VM:
-       mkdir -p /opt/utmm && cp /mnt/shared/utmm /opt/utmm/utmm
-       chmod +x /opt/utmm/utmm
-       /opt/utmm/utmm --hostname debian --install
-       /opt/utmm/utmm --hostname debian &
-    4. Wait 3 seconds, then vm_status should show debian online.
-
-👤 (after following steps) "Check if debian is online"
-🤖 → vm_status()
-    debian:  x86_64-linux-musl  192.168.64.7  v0.2.0  ✓  — it's working!
-```
-
-#### File operations on VMs
-
-```
-👤 "Create a test script on linuxvm and run it"
-🤖 → vm_exec("linuxvm", "cat > /tmp/test.sh << 'EOF'
-#!/bin/sh
-echo \"Hello from $(uname -a)\"
-echo \"Date: $(date)\"
-EOF
-chmod +x /tmp/test.sh && /tmp/test.sh")
-    Hello from Linux ubuntu 5.15.0 aarch64
-    Date: Wed Jul 16 10:30:00 UTC 2026
-```
-
-#### Installing packages on VMs
-
-```
-👤 "Install jq on linuxvm and verify it works"
-🤖 → vm_exec("linuxvm", "apt-get update -qq && apt-get install -y -qq jq")
-    → vm_exec("linuxvm", "echo '{\"status\":\"ok\"}' | jq .status")
-    "ok" — jq installed and working
 ```
 
 ### 7.5 CLI vs MCP — When to Use Which
@@ -1240,25 +1004,21 @@ chmod +x /tmp/test.sh && /tmp/test.sh")
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| MCP tools don't appear in Claude | MCP server not registered or Host not running | Verify Host daemon running (`ps aux \| grep utmm`); check port 2122 (`curl http://127.0.0.1:2122/mcp`); run `/mcp` to reload |
+| MCP tools don't appear in Claude | MCP server not registered or Host not running | Verify Host daemon running (`ps aux \| grep utmm`); check port 2121 (`curl http://127.0.0.1:2121/mcp`); run `/mcp` to reload |
 | "No VMs online" | VMs not booted, guest not running | Boot VMs, verify `utmm` running inside each |
 | "GuestNotFound" for a VM | VM offline or hostname typo | `vm_status` to see online VMs |
-| VM marked "upgradable" | Guest binary older than Host | Host auto-upgrades within seconds — bump ver.zig and rebuild |
-| MCP connection refused (:2122) | Host daemon not running or old version | `sudo utmm --host` (v0.2.9+ needed for HTTP MCP) |
+| MCP connection refused | Host daemon not running | `sudo utmm --host` |
 | Port 2121 AddressInUse at Host start | Old `utmm` process still running | `sudo pkill -f utmm && sudo utmm --host` |
-| `--status` shows stale/duplicate entries | Guest renamed but old entry cached | Restart Host: `sudo pkill utmm && sudo utmm --host` |
-| Windows bootstrap: command not found | Old bootstrap script | Use latest install.bat from the Host |
+| WebSocket connection failed | Guest can't reach Host gateway | Check guest gateway detection; use `--host-ip` to override |
 
 ### 7.7 Complete Uninstall / Cleanup
-
-To remove utmm entirely and return to bare-metal state:
 
 **Host side**:
 ```bash
 # Stop all processes
 sudo pkill -f utmm 2>/dev/null
 
-# Remove auto-start service (v0.2.6+ uses com.utmm.host; older used com.utmm)
+# Remove auto-start service
 sudo launchctl bootout system /Library/LaunchDaemons/com.utmm.host.plist 2>/dev/null
 sudo launchctl bootout system /Library/LaunchDaemons/com.utmm.plist 2>/dev/null
 sudo rm -f /Library/LaunchDaemons/com.utmm.host.plist /Library/LaunchDaemons/com.utmm.plist
@@ -1271,30 +1031,27 @@ sudo rm -f /usr/local/bin/utmm
 sudo sed -i '' '/# UTM-MONITOR-BEGIN/,/# UTM-MONITOR-END/d' /etc/hosts
 ```
 
-**Linux Guest** (run inside VM or via SSH):
+**Linux Guest**:
 ```bash
-# IMPORTANT: When running via SSH, do systemctl stop BEFORE pkill.
-# pkill -f utmm will kill the SSH shell itself (because the command
-# arguments contain "utmm"), severing the connection mid-cleanup.
 systemctl stop utmm-guest 2>/dev/null; systemctl disable utmm-guest 2>/dev/null
-systemctl stop utmm 2>/dev/null; systemctl disable utmm 2>/dev/null  # old name
+systemctl stop utmm 2>/dev/null; systemctl disable utmm 2>/dev/null
 rm -f /etc/systemd/system/utmm-guest.service /etc/systemd/system/utmm.service
 rm -rf /opt/utmm /opt/utm-monitor /opt/utmm_*
 rm -f /var/log/utmm*.log /opt/utmm*.log
-pkill -f utmm 2>/dev/null   # do this LAST
+pkill -f utmm 2>/dev/null
 ```
 
-**macOS Guest** (run inside VM or via SSH):
+**macOS Guest**:
 ```bash
 pkill -f utmm 2>/dev/null
 launchctl bootout system /Library/LaunchDaemons/com.utmm.guest.plist 2>/dev/null
-launchctl bootout system /Library/LaunchDaemons/com.utmm.plist 2>/dev/null  # old name
+launchctl bootout system /Library/LaunchDaemons/com.utmm.plist 2>/dev/null
 rm -f /Library/LaunchDaemons/com.utmm.guest.plist /Library/LaunchDaemons/com.utmm.plist
 rm -rf /opt/utmm /opt/utm-monitor /opt/utmm_*
 rm -f /var/log/utmm*.log /opt/utmm*.log
 ```
 
-**Windows Guest** (run inside VM or via SSH):
+**Windows Guest**:
 ```cmd
 taskkill /f /im utmm.exe
 schtasks /delete /tn utmm-guest /f 2>nul
@@ -1304,7 +1061,7 @@ del C:\opt\utmm*.log 2>nul
 
 ### 7.8 Skill (Bundled)
 
-The `utm-vm/SKILL.md` file (at project root, symlinked into `.claude/skills/`) provides Claude with detailed knowledge about:
+The `utm-vm/SKILL.md` file provides Claude with detailed knowledge about:
 - When to use each tool in different debugging scenarios
 - Shell escaping patterns per platform (bash vs cmd.exe)
 - Common workflows: health checks, cross-platform testing, debugging, setup

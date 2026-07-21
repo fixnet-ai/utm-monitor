@@ -39,6 +39,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Windows: link ws2_32 for recv() in WebSocket handshake
+    if (target.result.os.tag == .windows) {
+        exe.root_module.linkSystemLibrary("ws2_32", .{});
+    }
+
     b.installArtifact(exe);
 
     // Deployment binary with unified filename (e.g. utmm-aarch64-linux, utmm-x86_64-macos, utmm-x86_64-windows.exe)

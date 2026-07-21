@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 This is a helper tool for UTM virtual machines. Because UTM VM IPs change frequently, this program notifies the host of each guest machine's real IP at all times.
 
-A self-starting Zig program that broadcasts its name and current IP every second. It is placed on each guest system to auto-start, while the host listens for these broadcast messages. When updates are detected, they are synced to the host's `/etc/hosts` file. The same binary defaults to guest mode, and `--host` switches to host mode.
+A self-starting Zig program that connects to the Host via WebSocket, announcing its name and current IP. It is placed on each guest system to auto-start, while the host runs a unified HTTP server that handles guest registration, management commands, MCP JSON-RPC, and static file serving — all on a single port. The same binary defaults to guest mode, and `--host` switches to host mode.
 
 The program is written in Zig 0.16.0, with cross-compilation on the host to build binaries for all platforms.
 Current configuration:
@@ -20,33 +20,32 @@ windowsvm: user=Administrator, passwd=111, app_path=C:\opt\
 ## Architecture Design
 
 ### Two Run Modes (Same Binary)
-- **Guest mode (default)**: Foreground mode — detects TTY, stops any background service, runs in terminal, restarts service on exit. Non-TTY invocation (e.g., scheduled tasks) falls back to daemon mode with `is_svc = true` — no `--svc` flag needed for schtasks/launchd/systemd. With `--svc`: explicit daemon mode (UDP broadcast hostname+IP + TCP transport server on port 2121). Use `--install --user` to create a desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
-- **Host mode (--host)**: UDP listener + TCP transport + /etc/hosts sync + management commands (--status/--exec etc.)
-- **MCP integrated mode (--host --mcp)**: Host + MCP HTTP server in one process on port 2122 (streamableHttp transport). No separate MCP subprocess needed — AI agents connect directly via TCP.
+- **Guest mode (default)**: Foreground mode — detects TTY, stops any background service, runs in terminal, restarts service on exit. Non-TTY invocation (e.g., scheduled tasks) falls back to daemon mode with `is_svc = true` — no `--svc` flag needed for schtasks/launchd/systemd. With `--svc`: explicit daemon mode (WebSocket connection to Host + command processing). Use `--install --user` to create a desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
+- **Host mode (--host)**: Unified HTTP server on port 2121 — guest registration (WebSocket + HTTP announce), management commands (exec/upload/download), MCP JSON-RPC, static file serving (/bin/), and /etc/hosts sync. All on one port. No separate MCP port or process.
 
 ### Complete Data Flow
 ```
-                        ┌── MCP HTTP :2122 (streamableHttp) ← AI Agent
-Guest (macvm)    ──UDP broadcast──┐                    ┌── TCP(2121) → Version, Health, Exec, Upload, Download
-Guest (linuxvm)  ──UDP broadcast──┤──→ Host listener(2121)─┼── TCP(2121) → Guest bootstrap binary serving
-Guest (windows)  ──UDP broadcast──┘                    └── hosts file sync
+                         ┌── MCP HTTP /mcp (JSON-RPC) ← AI Agent
+Guest (macvm)    ──WebSocket──┐
+Guest (linuxvm)  ──WebSocket──┤──→ Host HTTP :2121 ──┼── GET /bin/ (static file serving)
+Guest (windows)  ──WebSocket──┘                      ├── POST /exec, /upload, /download
+                         ┌── HTTP POST /announce ─────┘   (CLI management commands)
+                         │   (backward compat)        └── /etc/hosts sync
 ```
 
 ### Communication Protocol
-- **UDP broadcast** (port 2121): Guest broadcasts `ANNOUNCE\nname: X\nip: Y\n...` every second, Host listens
-- **TCP transport** (port 2121): Binary frame protocol (4B big-endian length + 1B message type + payload). Guest serves VERSION_REQ, HEALTH_REQ, EXEC_REQ, FILE_REQ, UPLOAD_REQ. Host serves FILE_REQ for Guest bootstrap.
-- **Management commands** (--status/--exec/--upload/--download): Discover Guest IP via UDP broadcast, then connect directly via TCP transport. When UDP port is occupied (Host daemon running), fall back to reading `/tmp/utmm-guests.tsv` state file.
-- **Auto-start Host service**: Management commands auto-start the Host daemon via the OS service manager when the UDP port is not bound — no manual `utmm --host` needed
-- **Auto-upgrade**: Host detects Guest version mismatch via ANNOUNCE → pushes new binary via TCP UPLOAD_REQ (ETag MD5 verified). Guest uses cross-platform safe rename (old → .old, .next → final) + detached restart via EXEC_REQ. Compatible with Linux/macOS/Windows. No Guest polling. Triggers on: (a) Guest version changed since last seen, OR (b) Host version changed since last upgrade attempt (covers Host binary update without Guest version bump). Uses `last_upgrade_host_version` field in GuestEntry for debounce; passes `target` directly from ANNOUNCE to avoid state file race.
+- **WebSocket** (port 2121, path `/ws`): Guest persistent connection to Host. Binary frames (1-byte message type + type-specific payload). Handles announce, exec, upload, download. String fields null-terminated, binary data 4-byte big-endian length prefix. No base64/JSON encoding for binary data.
+- **HTTP REST** (port 2121): CLI management commands (`--status`/`--exec`/`--upload`/`--download`) send HTTP requests to Host. Host communicates with Guest via WebSocket for command execution.
+- **MCP JSON-RPC** (port 2121, path `/mcp`): AI agent entry point. Reads guest table directly from Host memory — no UDP discovery, no state file. Single unified HTTP server.
+- **Backward compat HTTP announce** (POST `/announce`): Old guests that don't support WebSocket can still use HTTP polling. Returns pending commands in response.
 
 ### Key Design Decisions
 - Single binary, dual mode: reduces maintenance burden
-- UDP broadcast: no target address configuration needed, auto-discovery
-- IP change callback → auto-update /etc/hosts marked block
-- `std.Io` blocking I/O with `std.Thread` concurrency — simple threaded model, no async runtime
-- Binary frame TCP protocol: 4B length prefix + 1B type + payload, single connection multiplexing, zero parsing overhead
-- Zero external dependencies: no Node.js, no Python, no SSH/SCP, no curl — everything via TCP + UDP
-- Host-push auto-upgrade: version mismatch detected in ANNOUNCE → Host pushes binary + restarts Guest. No Guest polling, no shell scripts. Cross-platform safe rename: old→.old, .next→final, spawn restart. ETag MD5 integrity verified on all uploads. Debounce via `last_upgrade_host_version` (prevents re-trigger after Host restart) and `target` passthrough (avoids state file read race).
+- Unified HTTP server on single port (2121): replaces UDP broadcast + TCP binary frames + MCP :2122
+- WebSocket persistent connection: Guest→Host real-time push, no polling for commands. Binary frames for exec/upload/download — zero encoding overhead
+- `std.http.Server` with `std.Thread` concurrency — each connection gets its own thread
+- Zero external dependencies: no Node.js, no Python, no SSH/SCP, no curl — everything via HTTP + WebSocket
+- Guest auto-discovers Host via default gateway (UTM Host is the gateway)
 - **Windows child processes**: On Windows, `std.process.Init.io` is `global_single_threaded` which uses `Allocator.failing`. Use `std.Io.Threaded.init(gpa, .{})` for `std.process.run` on Windows in daemon/service contexts. In foreground mode (agent.zig), `init.io` from the desktop shortcut works directly.
 
 ## Build & Run
@@ -82,23 +81,19 @@ utmm --uninstall --user                   # Remove desktop shortcut
 ### Host End Runtime
 ```bash
 # ── Persistent Host (background daemon) ──
-sudo utmm --host                          # Continuous listener (needs sudo for /etc/hosts)
+sudo utmm --host                          # Start HTTP server on :2121 (needs sudo for /etc/hosts)
 utmm --host --install                     # Install as system service (launchd/systemd/sc)
 utmm --host --uninstall                   # Remove system service
 utmm --host --serve-dir /path/to/binaries # Custom binary serve directory
-utmm --host --mcp                         # Integrated mode: Host + MCP HTTP in one process
 
-# ── Management Commands (talk to Host/Guest via UDP discover + TCP, NO --host needed) ──
+# ── Management Commands (HTTP to Host :2121) ──
 utmm --status                             # Query all Guest status
 utmm --exec linuxvm "uname -a"            # Remote command execution
 utmm --upload file.txt linuxvm            # Upload file to Guest (no curl)
 utmm --download linuxvm f.txt ./f.txt     # Download file from Guest (no curl)
-utmm --mcp                                # Adapter mode: MCP stdio → direct UDP+TCP (legacy, use HTTP instead)
 
-# Management commands discover Guest IP via UDP broadcast + state file fallback.
-# When Host daemon is running (UDP port occupied), they read /tmp/utmm-guests.tsv.
-# (v0.1.26+: if Host service is not running, management commands auto-start it via
-#  the OS service manager — launchctl/systemctl/sc start — then retry.)
+# Management commands send HTTP requests to Host on 127.0.0.1:2121.
+# Host communicates with Guest via WebSocket for command execution.
 ```
 
 ## Project File Structure
@@ -106,15 +101,16 @@ utmm --mcp                                # Adapter mode: MCP stdio → direct U
 src/
 ├── main.zig           # Entry point, CLI parsing, mode dispatch
 ├── ver.zig            # Single source of truth for version (bump to trigger auto-upgrade)
-├── protocol.zig       # Message protocol: constants, GuestInfo, buildAnnounce/Ping/ExecReq
-├── transport.zig      # Binary frame protocol: 4B len + 1B type + payload over TCP
-├── guest.zig          # Guest orchestration: TCP transport server + broadcast loop (no version polling)
-├── host.zig           # Host orchestration: management cmd dispatch + listener loop + auto-upgrade + hosts sync
-├── broadcast.zig      # Guest: getLocalIp/getHostname/broadcastLoop + getDefaultGateway
-├── listener.zig       # Host: UDP listener, IP change detection, OnIpChanged callback
+├── protocol.zig       # Protocol constants: DEFAULT_PORT, VERSION
+├── wsproto.zig        # Binary WebSocket protocol: 1B msg type + payload (announce/exec/upload/download)
+├── wsclient.zig       # Guest WebSocket client: TCP connect + HTTP upgrade + frame I/O
+├── httpd.zig          # HTTP server core: accept loop + Router + HostState (guest table + pending queue)
+├── host_http.zig      # HTTP endpoint handlers: /announce, /exec, /upload, /download, /ws, /mcp, /bin/
+├── guest.zig          # Guest orchestration: WebSocket announce loop (no TCP server)
+├── host.zig           # Host orchestration: management cmd dispatch + HTTP server start
+├── broadcast.zig      # Guest: getLocalIp/getHostname/getDefaultGateway + wsAnnounceLoop
 ├── hosts_file.zig     # /etc/hosts marked block read/write
-├── status.zig         # Host: --status query + formatStatusTable
-├── mcp.zig            # MCP JSON-RPC server: stdio (adapter/integrated) + HTTP (streamableHttp on :2122)
+├── mcp.zig            # MCP JSON-RPC handler: processJsonRpcWithState — reads HostState directly
 ├── install.zig        # --install/--uninstall system service + --gen-init script generation + desktop shortcuts
 ├── agent.zig          # Guest: foreground mode (stop service, run in TTY, restart on exit)
 └── config.zig         # Config persistence + logging system
@@ -144,13 +140,24 @@ Before starting any work, read the following files (if they exist), then use the
 - `std.process.Child.Term` fields are lowercase: `.exited`, `.signal`, `.stopped`, `.unknown`. Combine cases: `.signal, .stopped, .unknown =>` (comma-separated, no payload capture)
 - `std.Io.Threaded.global_single_threaded` uses `Allocator.failing` — never use for `std.process.run` (causes OutOfMemory). Use `std.Io.Threaded.init(gpa, .{})` instead
 
+### Io API Patterns (0.16.0)
+- `Io.Reader` has no `.read()` method. Use `.stream(writer, limit)` to copy to a Writer, or `.streamExact(writer, n)` for exact reads
+- `Io.Writer.write()` returns `usize` (bytes written) — must discard with `_ =`
+- `Stream.Writer` has `interface: Io.Writer` — use `writer.interface.flush()` to drain buffered data
+- `Stream.Reader` has `interface: Io.Reader` — use `reader.interface.streamExact(&writer, n)` for exact reads
+
+### HTTP Server Patterns (0.16.0)
+- `http.Server.Request.upgradeRequested()` returns `UpgradeRequest` with `.websocket` field (optional `[]const u8` key)
+- `http.Server.Request.respondWebSocket(.{ .key = ws_key })` upgrades to WebSocket
+- `WebSocket.readSmallMessage()` blocks until a message arrives, returns `SmallMessage { opcode, data }`
+- `WebSocket.writeMessage(data, opcode)` writes a frame; server→client frames are unmasked
+- Client-side WebSocket frames MUST be masked (RFC 6455) — handled manually in wsclient.zig
+
 ### Threaded I/O Concurrency Patterns
 - `std.Thread.spawn(.{}, fn, .{args...})` → `thread.detach()` for fire-and-forget tasks
 - `std.Io.net.Stream` with `reader(io, &buf)` / `writer(io, &buf)` for buffered TCP I/O
-- `Stream.Writer` has `interface: Io.Writer` field — use `writer.interface.flush()` to drain buffered data before closing
-- `BufWriter` data is lost when it goes out of scope — use persistent reader/writer across calls
-- Guest: main thread runs TCP accept loop, one detached thread per connection + one detached broadcast thread
-- Host: main thread runs UDP listener, management commands connect via blocking I/O
+- Host: `std.http.Server` handles accept loop; each connection dispatched to a handler in its own thread
+- Guest: main thread runs WebSocket event loop; exec commands spawn child processes
 - On Windows daemon/service contexts, use `std.Io.Threaded.init(gpa, .{})` for `std.process.run` (not `global_single_threaded` — uses `Allocator.failing`)
 
 ### 1. Think Before Coding

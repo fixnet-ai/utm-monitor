@@ -128,36 +128,6 @@ pub const GuestInfo = struct {
     }
 };
 
-/// Build announce message
-pub fn buildAnnounce(
-    writer: *std.Io.Writer,
-    info: GuestInfo,
-) std.Io.Writer.Error!void {
-    try writer.print("ANNOUNCE\n", .{});
-    try writer.print("hostname: {s}\n", .{info.hostname});
-    try writer.print("target: {s}\n", .{info.target});
-    try writer.print("mac: {s}\n", .{info.mac});
-    try writer.print("ip: {s}\n", .{info.ip});
-    try writer.print("version: {s}\n", .{VERSION});
-    try writer.print("shell: {s}\n", .{info.shell});
-    try writer.print("\n", .{});
-    try writer.flush();
-}
-
-/// Build PING message
-pub fn buildPing(writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    try writer.print("PING\n\n", .{});
-    try writer.flush();
-}
-
-/// Build EXEC request message
-pub fn buildExecReq(writer: *std.Io.Writer, cmd: []const u8) std.Io.Writer.Error!void {
-    try writer.print("EXEC\n", .{});
-    try writer.print("cmd: {s}\n", .{cmd});
-    try writer.print("\n", .{});
-    try writer.flush();
-}
-
 // ========== Tests ==========
 
 test "GuestInfo.parse" {
@@ -201,19 +171,3 @@ test "GuestInfo.fqdn" {
     try std.testing.expectEqualStrings("mybox.aarch64-linux.utm", name);
 }
 
-test "buildAnnounce" {
-    const info = GuestInfo{
-        .hostname = "test",
-        .ip = "10.0.0.1",
-        .target = "aarch64-macos",
-        .mac = "11:22:33:44:55:66",
-    };
-    var buf: [512]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buf);
-    try buildAnnounce(&writer, info);
-    const msg = writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, msg, "ANNOUNCE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "hostname: test") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "target: aarch64-macos") != null);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "mac: 11:22:33:44:55:66") != null);
-}

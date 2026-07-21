@@ -8,6 +8,8 @@ const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const guest = @import("guest.zig");
 const host_mod = @import("host.zig");
+const httpd = @import("httpd.zig");
+const host_http = @import("host_http.zig");
 
 // ── Windows Service integration types and externs (only compiled on Windows) ──
 const windows = if (builtin.os.tag == .windows) std.os.windows else struct {
@@ -47,11 +49,8 @@ extern "advapi32" fn SetServiceStatus(hServiceStatus: ?SERVICE_STATUS_HANDLE, lp
 comptime {
     _ = @import("hosts_file.zig");
     _ = @import("broadcast.zig");
-    _ = @import("listener.zig");
-    _ = @import("transport.zig");
     _ = @import("install.zig");
     _ = @import("config.zig");
-    _ = @import("status.zig");
     _ = @import("mcp.zig");
     _ = @import("agent.zig");
 }
@@ -64,6 +63,8 @@ pub const CliArgs = struct {
     port: u16 = protocol.DEFAULT_PORT,
     /// Guest hostname (default: auto-detect hostname)
     hostname: ?[]const u8 = null,
+    /// Host IP for Guest HTTP client (default: auto-detect via default gateway)
+    host_ip: ?[]const u8 = null,
     /// hosts file path (host side)
     hosts_file: []const u8 = "/etc/hosts",
     /// hosts marker comment text
@@ -160,6 +161,11 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             }
         } else if (std.mem.eql(u8, arg, "--mcp")) {
             cli.is_mcp = true;
+        } else if (std.mem.eql(u8, arg, "--host-ip")) {
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.host_ip = args[i];
+            }
         } else if (std.mem.eql(u8, arg, "--exec")) {
             cli.cmd_exec = true;
             if (i + 1 < args.len) {
@@ -211,6 +217,7 @@ pub fn printHelp() void {
         \\
         \\Guest options:
         \\  --hostname NAME     Local hostname (auto-detect by default)
+        \\  --host-ip IP        Host IP to connect to (auto-detect via gateway by default)
         \\  --port PORT         UDP broadcast + TCP server port (default 2121)
         \\  --log-file PATH     Log file path
         \\
@@ -233,9 +240,7 @@ pub fn printHelp() void {
         \\  --install --user    Create desktop shortcut for foreground guest launcher
         \\  --uninstall         Remove system service (utmm --uninstall)
         \\  --uninstall --user  Remove desktop shortcut (utmm --uninstall --user)
-        \\  --mcp               MCP JSON-RPC stdio adapter (legacy: direct UDP+TCP;
-        \\                      Host daemon auto-serves MCP HTTP on :2122 — prefer that)
-        \\  --mcp --host        Integrated stdio mode: Host + MCP in one process (legacy)
+        \\  --mcp               Deprecated; MCP now on --host HTTP :2121/mcp
         \\  --version           Show version info
         \\
         \\NOTE: --exec/--status/--upload/--download require a running Host background
@@ -375,10 +380,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Mode dispatch
-    // --mcp alone: adapter mode (connect to Host IPC)
-    const mcp = @import("mcp.zig");
+    // --mcp alone (no --host): MCP now integrated into Host HTTP server.
+    // Redirect to --host which always serves /mcp on port 2121.
     if (cli.is_mcp and !cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_upload and !cli.cmd_download and !cli.cmd_gen_init and !cli.save_config and !cli.cmd_install and !cli.cmd_uninstall) {
-        try mcp.run(init.io, init.gpa);
+        std.log.info("[main] --mcp deprecated; MCP available via --host on port 2121. Use 'utmm --host' instead.", .{});
         return;
     }
 

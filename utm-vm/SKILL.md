@@ -35,7 +35,7 @@ auto-syncs VM IPs to `/etc/hosts`, so hostnames like `linuxvm` always resolve.
 - **Which shell to use** (`shell` field — read from `$SHELL` at Guest startup):
   - macOS/Linux: the user's configured `$SHELL` (e.g. `/bin/zsh`, `/bin/bash`), falls back to `/bin/sh`
   - Windows: `cmd.exe`
-- Whether the utmm version on the VM is current or upgradable
+- The utmm version running on each VM
 
 > **Login shell**: Commands on Linux/macOS run with `shell -l -c` (login mode),
 > so `$PATH`, `$HOME`, and other profile environment variables are loaded.
@@ -78,8 +78,6 @@ Ask the user whether the VMs are booted and the Host is running.
 - Windows: backslashes in paths work, forward slashes also work in cmd.exe
 - Single quotes are safer than double quotes for shell commands
 
-> **Auto-upgrade**: The Host uploads `utmm.next` (or `utmm.next.exe` on Windows) via TCP transport to any Guest whose version doesn't match. The Guest detects it in its 1-second broadcast loop and self-upgrades (atomic rename + detached restart). Bump `src/ver.zig` and rebuild — all online Guests upgrade within seconds.
-
 ## Core Workflows
 
 ### Workflow A: Quick health check
@@ -93,7 +91,6 @@ vm_status → see which VMs are online, their versions, IPs
 2. vm_exec("linuxvm", "./test.sh")   → run tests
 3. Repeat 2 for macvm, windowsvm
 ```
-> Bump `src/ver.zig` and rebuild before testing — Host auto-upgrades all Guests.
 
 ### Workflow C: Debugging a VM problem
 ```
@@ -110,7 +107,7 @@ vm_status → see which VMs are online, their versions, IPs
 ```
 1. Host: curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 2. Host: sudo utmm --host --install  (installs + starts as LaunchDaemon automatically)
-3. For each Guest VM, run ONE command (no internet needed — from Host TCP):
+3. For each Guest VM, run ONE command (no internet needed — from Host HTTP):
    - Linux/macOS: curl http://<gateway>:2121/bin/install.sh | sh -s -- --guest --hostname <name>
    - Windows: find gateway, download install.bat from http://<gateway>:2121/bin/install.bat, run with --guest
 4. vm_status → verify all VMs appear online
@@ -128,25 +125,23 @@ No internet access needed on Guest VMs.
 
 ## Prerequisites & Troubleshooting
 
-**The Host must be running for auto-upgrade and /etc/hosts sync:**
+**The Host must be running for everything:**
 ```bash
 sudo utmm --host
 ```
 
-**MCP connects via HTTP** — The Host daemon serves MCP JSON-RPC over HTTP (streamableHttp) on `127.0.0.1:2122`. Configure your agent's `mcp.json`:
+**MCP connects via HTTP** — The Host daemon serves MCP JSON-RPC over HTTP (streamableHttp) on `127.0.0.1:2121/mcp`. This is the same port as the HTTP server — everything on 2121. Configure your agent's `mcp.json`:
 
 ```json
-{"mcpServers": {"utm-monitor": {"type": "streamableHttp", "url": "http://127.0.0.1:2122/mcp"}}}
+{"mcpServers": {"utm-monitor": {"type": "streamableHttp", "url": "http://127.0.0.1:2121/mcp"}}}
 ```
-
-Stdio adapter mode (`utmm --mcp`) is a legacy fallback — HTTP mode is preferred.
 
 | Symptom | Likely cause | Action |
 |---------|-------------|--------|
 | "No VMs online" | VMs not booted, or guest utmm not running | Check VMs are booted; verify `utmm` is running inside each |
 | "GuestNotFound" for a VM | VM is offline or name mismatch | Run `vm_status` to see which VMs are actually online |
-| VM marked "upgradable" | Guest binary is older than Host | Host will auto-upgrade within seconds — bump ver.zig and rebuild |
-| vm_status returns empty but CLI --status shows VMs | UDP port not available, no state file | Start Host (`sudo utmm --host`) to write state file; or use `--host --mcp` for integrated mode |
+| WebSocket connection failed | Guest can't reach Host gateway | Guest auto-detects Host via default gateway; override with `--host-ip` |
+| MCP connection refused | Host daemon not running or old version | `sudo utmm --host` |
 
 **Fallback:** If MCP tools are unavailable, you can use the CLI directly:
 ```bash
@@ -164,8 +159,7 @@ utmm --exec linuxvm "uname -a"
 | Host service plist | `/Library/LaunchDaemons/com.utmm.host.plist` |
 | Guest service plist | `/Library/LaunchDaemons/com.utmm.guest.plist` |
 | Host log | `/var/log/utmm-host.log` |
-| Serve directory (TCP) | `/opt/utmm/` by default (configurable via `--serve-dir`) |
-| State file | `/tmp/utmm-guests.tsv` (TSV: hostname, target, ip, mac, version, shell) |
+| Serve directory (HTTP) | `/opt/utmm/` by default (configurable via `--serve-dir`) |
 
 ## Bootstrap Troubleshooting
 
@@ -177,20 +171,11 @@ utmm --exec linuxvm "uname -a"
 
 **Solution**: Use the bridge gateway IP directly:
 ```bash
-# Use the bridge gateway IP (192.168.64.1, 192.168.65.1, etc.) directly:
 GATEWAY=$(ip route | grep default | awk '{print $3}')
 curl -fsSL "http://$GATEWAY:2121/bin/utmm-aarch64-linux" -o /opt/utmm/utmm
 chmod +x /opt/utmm/utmm
 /opt/utmm/utmm --hostname linuxvm &
 ```
-
-### `--status` shows stale/duplicate entries after Guest restarts
-
-**Symptom**: After restarting a Guest with a new hostname, both the old and new names appear in `--status`.
-
-**Cause**: The Host's UDP listener caches Guest entries. Old entries remain until they expire.
-
-**Workaround**: Restart the Host process (`sudo pkill utmm && sudo utmm --host`). The stale entry will be gone after restart.
 
 ### Guest broadcasts with wrong hostname (OS default instead of specified name)
 
@@ -203,7 +188,7 @@ chmod +x /opt/utmm/utmm
 - Windows cmd.exe has different escaping rules than bash — test simple commands first
 
 ### Q: `--download` fails with "Guest not found" but the Guest is online
-**A**: This happens when you use a full path like `/opt/utmm/file.txt` instead of just the filename `file.txt`. The FILE_REQ endpoint only accepts simple filenames (no `/` or `\`) and only reads from `/opt/utmm/` on the Guest. Use just the basename:
+**A**: This happens when you use a full path like `/opt/utmm/file.txt` instead of just the filename `file.txt`. Use just the basename:
 ```
 # Wrong:
 utmm --download linuxvm /opt/utmm/app.log ./app.log

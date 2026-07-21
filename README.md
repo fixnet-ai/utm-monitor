@@ -34,20 +34,20 @@ This downloads all platform binaries to `/opt/utmm/` and creates the `utmm` comm
 
 ### 2. Register with your AI agent
 
-Host daemon serves MCP over HTTP on port 2122. Configure your agent to connect via `streamableHttp`:
+Host daemon serves MCP over HTTP on port 2121. Configure your agent to connect via `streamableHttp`:
 
 ```json
 {
   "mcpServers": {
     "utm-monitor": {
       "type": "streamableHttp",
-      "url": "http://127.0.0.1:2122/mcp"
+      "url": "http://127.0.0.1:2121/mcp"
     }
   }
 }
 ```
 
-> CLI: `claude mcp add utm-monitor --transport streamableHttp http://127.0.0.1:2122/mcp`
+> CLI: `claude mcp add utm-monitor --transport streamableHttp http://127.0.0.1:2121/mcp`
 
 ### 3. Start the Host
 
@@ -88,15 +88,17 @@ utmm --download linuxvm file.txt ./    # download a file
 ## How It Works
 
 ```
-Guest VMs ──UDP broadcast (name + IP)──→ Host ──→ /etc/hosts sync
-                ↑                              ├──→ MCP HTTP (streamableHttp) ← AI Agent
-                └── TCP transport (exec, upload, download, upgrade)
+Guest VMs ──WebSocket (binary frames)──→ Host HTTP :2121 ──→ /etc/hosts sync
+                ↑                                        ├──→ MCP /mcp (JSON-RPC) ← AI Agent
+                └── HTTP POST /announce (backward compat) ├──→ GET /bin/ (static files)
+                                                          └──→ /exec, /upload, /download (CLI)
 ```
 
-- **Auto-discovery**: Guests broadcast their IP every second; Host always knows where they are
-- **Auto-upgrade**: Host detects version mismatch → pushes new binary → Guest self-updates within seconds
-- **Auto-start**: Management commands auto-start the Host service when needed
-- **Zero deps**: No Python, Node.js, SSH, or external libraries — one binary, everywhere
+- **Single port**: Everything on 2121 — WebSocket, HTTP REST, MCP, static files. No UDP broadcast, no separate MCP port.
+- **WebSocket push**: Guest maintains persistent WS connection; Host pushes commands in real-time via binary frames. No polling.
+- **Binary protocol**: exec, upload, download use raw binary WebSocket frames — zero encoding overhead, no base64.
+- **Auto-discovery**: Guest connects to default gateway (UTM Host = gateway); Host always knows Guest IP from WS connection.
+- **Zero deps**: No Python, Node.js, SSH, or external libraries — one binary, everywhere.
 
 ## Docs
 
