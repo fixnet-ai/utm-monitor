@@ -13,9 +13,9 @@ The program is written in Zig 0.16.0, with cross-compilation on the host to buil
 Current configuration:
 Three VMs (macvm/windows/linux) have their IPs written to `/etc/hosts`.
 VM login credentials:
-macvm: user=root, passwd=111, app_path=/opt/
-linuxvm: user=root, passwd=111, app_path=/opt/
-windowsvm: user=Administrator, passwd=111, app_path=C:\opt\
+macvm: user=root, passwd=111, app_path=/opt/utmm/
+linuxvm: user=root, passwd=111, app_path=/opt/utmm/
+windowsvm: user=Administrator, passwd=111, app_path=C:\opt\utmm\
 
 ## Architecture Design
 

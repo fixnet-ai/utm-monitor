@@ -3,7 +3,7 @@ name: release
 description: >
   Use this skill whenever the user asks to publish a release, create a GitHub
   release, tag a version, or release a new version of utmm. Handles the full
-  pipeline: version bump → test → cross-compile 8 targets → zip → git tag →
+  pipeline: version bump → test → cross-compile 7 targets → zip → git tag →
   gh release create. Trigger on: "release", "publish", "发布", "发版", "tag".
 ---
 
@@ -45,11 +45,11 @@ Must pass. Stop and fix if any test fails.
 ./release-skill/build.sh
 ```
 
-This builds 6 targets into `release/` and creates `utmm.zip`:
+This builds 7 targets into `release/` and creates `utmm.zip`:
 `x86_64-windows`, `aarch64-windows`, `x86_64-macos`,
-`aarch64-macos`, `x86_64-linux-musl`, `aarch64-linux-musl`
+`aarch64-macos`, `x86-linux-musl`, `x86_64-linux-musl`, `aarch64-linux-musl`
 
-> **Note**: 32-bit x86-linux-musl also builds but is not in the release set — all modern VMs are 64-bit.
+> **Note**: 32-bit x86-windows has a linker issue (unrelated to utmm code) and is excluded from the release set.
 
 ### Step 5: Commit & tag
 

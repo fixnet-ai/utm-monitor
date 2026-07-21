@@ -2,4 +2,4 @@
 //! Import this from protocol.zig and anywhere else that needs the version.
 //! Bump this file to trigger auto-upgrade on all Guests.
 
-pub const VERSION = "0.3.0";
+pub const VERSION = "0.3.1";

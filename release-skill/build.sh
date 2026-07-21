@@ -1,5 +1,5 @@
 #!/bin/bash
-# Release helper — build all 8 targets and create utmm.zip
+# Release helper — build all 7 targets and create utmm.zip
 # Called by the release skill, or run standalone:
 #   ./release-skill/build.sh
 
@@ -10,7 +10,7 @@ echo "==> Running tests..."
 zig build test --summary all
 
 echo ""
-echo "==> Building all 8 targets..."
+echo "==> Building all 7 targets..."
 rm -rf release && mkdir -p release
 
 build_target() {
@@ -21,7 +21,6 @@ build_target() {
     printf "    %s  %s\n" "$(wc -c < release/$bin | tr -d ' ')" "$bin"
 }
 
-build_target x86-windows          utmm-x86-windows.exe
 build_target x86_64-windows       utmm-x86_64-windows.exe
 build_target aarch64-windows      utmm-aarch64-windows.exe
 build_target x86_64-macos         utmm-x86_64-macos

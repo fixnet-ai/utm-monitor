@@ -287,9 +287,6 @@ Download URL: `https://github.com/fixnet-ai/utm-monitor/releases/latest/download
 git clone https://github.com/fixnet-ai/utm-monitor.git
 cd utmm
 
-# Native build
-zig build -Doptimize=ReleaseSafe
-
 # Cross-compile for each platform (6 targets cover all scenarios)
 zig build -Dtarget=x86_64-linux-musl   -Doptimize=ReleaseSafe
 zig build -Dtarget=aarch64-linux-musl  -Doptimize=ReleaseSafe
@@ -297,10 +294,14 @@ zig build -Dtarget=x86_64-macos        -Doptimize=ReleaseSafe
 zig build -Dtarget=aarch64-macos       -Doptimize=ReleaseSafe
 zig build -Dtarget=x86_64-windows      -Doptimize=ReleaseSafe
 zig build -Dtarget=aarch64-windows     -Doptimize=ReleaseSafe
+
+# Rebuild native LAST — each cross-compile overwrites zig-out/bin/utmm,
+# so the final native build ensures utmm is the correct host architecture.
+zig build -Doptimize=ReleaseSafe
 ```
 
 Build artifacts:
-- `zig-out/bin/utmm` — native binary (current platform)
+- `zig-out/bin/utmm` — native binary (current platform, built last)
 - `zig-out/bin/utmm-x86_64-linux` — Linux 64-bit x86 musl static
 - `zig-out/bin/utmm-aarch64-linux` — Linux aarch64 musl static
 - `zig-out/bin/utmm-x86_64-macos` — macOS x86_64 (Intel + Apple Silicon via Rosetta 2)
@@ -314,21 +315,27 @@ Run tests to confirm correctness:
 zig build test --summary all
 ```
 
-**After building from source, set up the Host serve directory:**
+**After building from source, code-sign and set up the Host serve directory:**
 
 When building from source (Method 2), the `install.sh` and `install.bat` files are **not** automatically copied to the serve directory. Copy them manually:
 
 ```bash
 # From the project root:
+sudo mkdir -p /opt/utmm
 sudo cp install.sh install.bat zig-out/bin/utmm-* /opt/utmm/
-# The native binary (zig-out/bin/utmm) goes to the platform-specific name:
-sudo cp zig-out/bin/utmm /opt/utmm/utmm-aarch64-macos  # Apple Silicon
-# Or: sudo cp zig-out/bin/utmm /opt/utmm/utmm-x86_64-macos  # Intel Mac
 sudo chmod +x /opt/utmm/*
-sudo ln -sf /opt/utmm/utmm-aarch64-macos /opt/utmm/utmm
+# macOS: code-sign to prevent AMFI from killing the binary when run with sudo
+sudo codesign --force --sign - /opt/utmm/utmm-aarch64-macos 2>/dev/null || true
+# Create symlinks
+sudo ln -sf /opt/utmm/utmm-aarch64-macos /opt/utmm/utmm   # Apple Silicon
+# Or: sudo ln -sf /opt/utmm/utmm-x86_64-macos /opt/utmm/utmm  # Intel Mac
 sudo mkdir -p /usr/local/bin
 sudo ln -sf /opt/utmm/utmm /usr/local/bin/utmm
 ```
+
+> **Important**: After cross-compilation, `zig-out/bin/utmm` is the LAST target built (not native). Always rebuild native last to ensure the generic `utmm` binary matches your host architecture. The platform-specific named binaries (`utmm-aarch64-macos`, etc.) are correct from their respective cross-compile steps. The `sudo cp zig-out/bin/utmm-* /opt/utmm/` copies all named binaries including the correct host one — no need to copy `utmm` separately.
+
+> **macOS code signing**: On macOS, binaries run with `sudo` are subject to AMFI (Apple Mobile File Integrity). Unsigned binaries get SIGKILL. Use `codesign --force --sign -` to ad-hoc sign the binary.
 
 ### 3.4 Bare-Metal Bootstrapping (First Time)
 
@@ -425,7 +432,7 @@ grep -A 10 "UTM-MONITOR" /etc/hosts
 
 | # | Check Item | Command | Expected Result |
 |---|------------|---------|-----------------|
-| 1 | Guest process running | `utmm --exec ubuntu "ps aux \| grep utmm"` | Shows `/opt/utmm/utmm` process |
+| 1 | Guest process running | `utmm --exec ubuntu "ps aux | grep utmm"` | Shows `/opt/utmm/utmm` process |
 | 2 | Host receiving guests | `utmm --status` | Shows all Guests |
 | 3 | /etc/hosts synced | `grep "UTM-MONITOR" /etc/hosts` | Contains entries for 3 VMs |
 | 4 | Remote command channel | `utmm --exec ubuntu "uptime"` | Returns uptime |
@@ -592,7 +599,7 @@ sudo tcpdump -i any port 2121 -n
 # Should see TCP connections from each VM
 
 # 5. Check if port is occupied
-lsof -i :2121
+sudo lsof -i :2121
 ```
 
 ### 5.2 Wrong IP Detected (Tunnel/VPN Interference)
@@ -1004,7 +1011,7 @@ curl -s -X POST http://127.0.0.1:2121/mcp \
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| MCP tools don't appear in Claude | MCP server not registered or Host not running | Verify Host daemon running (`ps aux \| grep utmm`); check port 2121 (`curl http://127.0.0.1:2121/mcp`); run `/mcp` to reload |
+| MCP tools don't appear in Claude | MCP server not registered or Host not running | Verify Host daemon running (`ps aux | grep utmm`); check port 2121 (`curl http://127.0.0.1:2121/mcp`); run `/mcp` to reload |
 | "No VMs online" | VMs not booted, guest not running | Boot VMs, verify `utmm` running inside each |
 | "GuestNotFound" for a VM | VM offline or hostname typo | `vm_status` to see online VMs |
 | MCP connection refused | Host daemon not running | `sudo utmm --host` |

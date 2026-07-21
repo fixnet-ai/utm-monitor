@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Windows: link ws2_32 for recv() in WebSocket handshake
+    // Windows: link ws2_32 (may be needed by Zig runtime for socket operations)
     if (target.result.os.tag == .windows) {
         exe.root_module.linkSystemLibrary("ws2_32", .{});
     }

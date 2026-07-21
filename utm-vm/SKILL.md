@@ -22,9 +22,9 @@ auto-syncs VM IPs to `/etc/hosts`, so hostnames like `linuxvm` always resolve.
 
 | Hostname | OS | Arch | Credentials | App Path |
 |----------|-----|------|-------------|----------|
-| `linuxvm` | Linux | aarch64 | root / 111 | `/opt/` |
-| `macvm` | macOS | aarch64 | root / 111 | `/opt/` |
-| `windowsvm` | Windows | aarch64 | Administrator / 111 | `C:\opt\` |
+| `linuxvm` | Linux | aarch64 | root / 111 | `/opt/utmm/` |
+| `macvm` | macOS | aarch64 | root / 111 | `/opt/utmm/` |
+| `windowsvm` | Windows | aarch64 | Administrator / 111 | `C:\opt\utmm\` |
 
 ## Two MCP Tools
 

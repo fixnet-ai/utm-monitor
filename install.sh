@@ -30,7 +30,7 @@ print_help() {
     echo "Usage: install.sh [--guest [--hostname NAME] [--port PORT]] [--help]"
     echo ""
     echo "  (no args)    Install Host — download utmm.zip from GitHub Releases,"
-    echo "               extract all 8 platform binaries to /opt/utmm/, create symlinks"
+    echo "               extract all 7 platform binaries to /opt/utmm/, create symlinks"
     echo ""
     echo "  --guest      Install Guest — auto-detect arch/OS, download the correct"
     echo "               binary from Host HTTP at gateway:$HTTP_PORT, install service,"
