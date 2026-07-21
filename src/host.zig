@@ -678,7 +678,7 @@ fn restartCommand(gpa: std.mem.Allocator, target: []const u8) ![]const u8 {
             \\mv /opt/utmm/utmm /opt/utmm/utmm.old 2>/dev/null;
             \\mv /opt/utmm/utmm.next /opt/utmm/utmm;
             \\chmod +x /opt/utmm/utmm;
-            \\launchctl kickstart system/com.utmm.guest 2>/dev/null || pkill utmm 2>/dev/null
+            \\launchctl kickstart system/com.utmm.guest 2>/dev/null || launchctl bootstrap system /Library/LaunchDaemons/com.utmm.guest.plist 2>/dev/null || pkill utmm 2>/dev/null
         );
     }
     // Default: Linux
@@ -686,7 +686,7 @@ fn restartCommand(gpa: std.mem.Allocator, target: []const u8) ![]const u8 {
         \\mv /opt/utmm/utmm /opt/utmm/utmm.old 2>/dev/null;
         \\mv /opt/utmm/utmm.next /opt/utmm/utmm;
         \\chmod +x /opt/utmm/utmm;
-        \\systemctl restart utmm 2>/dev/null || service utmm restart 2>/dev/null
+        \\systemctl restart utmm-guest 2>/dev/null || systemctl restart utmm 2>/dev/null || service utmm restart 2>/dev/null
     );
 }
 

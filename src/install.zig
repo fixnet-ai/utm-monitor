@@ -259,8 +259,10 @@ pub fn installSelf(
     // ── System-level service install (daemon) ────────────────────────────
     switch (platform) {
         .macos => {
+            const label: []const u8 = if (is_host) "com.utmm.host" else "com.utmm.guest";
             const plist_dir = "/Library/LaunchDaemons";
-            const plist_path = "/Library/LaunchDaemons/com.utmm.plist";
+            const plist_path = try std.fmt.allocPrint(allocator, "/Library/LaunchDaemons/{s}.plist", .{label});
+            defer allocator.free(plist_path);
 
             // Create LaunchDaemons directory if needed
             std.Io.Dir.cwd().createDir(io, plist_dir, @enumFromInt(0o755)) catch |err| {
@@ -277,6 +279,8 @@ pub fn installSelf(
             var write_buf: [4096]u8 = undefined;
             var writer = file.writer(io, &write_buf);
 
+            const log_path: []const u8 = if (is_host) "/var/log/utmm-host.log" else "/var/log/utmm-guest.log";
+
             if (is_host) {
                 try writer.interface.print(
                     \\<?xml version="1.0" encoding="UTF-8"?>
@@ -285,7 +289,7 @@ pub fn installSelf(
                     \\<plist version="1.0">
                     \\<dict>
                     \\    <key>Label</key>
-                    \\    <string>com.utmm</string>
+                    \\    <string>{s}</string>
                     \\    <key>ProgramArguments</key>
                     \\    <array>
                     \\        <string>{s}</string>
@@ -296,10 +300,10 @@ pub fn installSelf(
                     \\    <key>KeepAlive</key>
                     \\    <true/>
                     \\    <key>StandardOutPath</key>
-                    \\    <string>/var/log/utmm-host.log</string>
+                    \\    <string>{s}</string>
                     \\</dict>
                     \\</plist>
-                , .{svc_exe});
+                , .{ label, svc_exe, log_path });
             } else {
                 try writer.interface.print(
                     \\<?xml version="1.0" encoding="UTF-8"?>
@@ -308,12 +312,12 @@ pub fn installSelf(
                     \\<plist version="1.0">
                     \\<dict>
                     \\    <key>Label</key>
-                    \\    <string>com.utmm</string>
+                    \\    <string>{s}</string>
                     \\    <key>ProgramArguments</key>
                     \\    <array>
                     \\        <string>{s}</string>
                     \\        <string>--svc</string>
-                , .{svc_exe});
+                , .{ label, svc_exe });
                 try writer.interface.flush();
                 if (hostname_override) |h| {
                     try writer.interface.print("        <string>--hostname</string>\n        <string>{s}</string>\n", .{h});
@@ -325,23 +329,26 @@ pub fn installSelf(
                     \\    <key>KeepAlive</key>
                     \\    <true/>
                     \\    <key>StandardOutPath</key>
-                    \\    <string>/var/log/utmm.log</string>
+                    \\    <string>{s}</string>
                     \\</dict>
                     \\</plist>
-                , .{});
+                , .{log_path});
             }
             try writer.interface.flush();
 
-            // Load the service immediately
-            if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "load", plist_path } })) |_| {
-                std.debug.print("[install] macOS: plist written + loaded: {s}\n", .{plist_path});
+            // Bootstrap the service (launchctl load is deprecated since macOS 10.10)
+            if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootstrap", "system", plist_path } })) |_| {
+                std.debug.print("[install] macOS: {s} plist bootstrapped: {s}\n", .{ label, plist_path });
             } else |_| {
                 std.debug.print("[install] macOS: plist written to {s}\n", .{plist_path});
-                std.debug.print("[install] run: sudo launchctl load {s}\n", .{plist_path});
+                std.debug.print("[install] run: sudo launchctl bootstrap system {s}\n", .{plist_path});
             }
         },
         .linux => {
-            const service_path = "/etc/systemd/system/utmm.service";
+            const svc_name: []const u8 = if (is_host) "utmm-host" else "utmm-guest";
+            const service_path = try std.fmt.allocPrint(allocator, "/etc/systemd/system/{s}.service", .{svc_name});
+            defer allocator.free(service_path);
+
             const desc: []const u8 = if (is_host) "UTM Monitor Host Service" else "UTM Monitor Guest Service";
             const extra_args: []const u8 = if (is_host) " --host" else if (hostname_override) |h|
                 try std.fmt.allocPrint(allocator, " --svc --hostname {s}", .{h})
@@ -377,19 +384,21 @@ pub fn installSelf(
 
             // Reload, enable, and start
             if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "daemon-reload" } })) |_| {} else |_| {}
-            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "enable", "utmm.service" } })) |_| {
-                std.debug.print("[install] Linux: service enabled\n", .{});
+            const full_name = try std.fmt.allocPrint(allocator, "{s}.service", .{svc_name});
+            defer allocator.free(full_name);
+            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "enable", full_name } })) |_| {
+                std.debug.print("[install] Linux: {s} enabled\n", .{svc_name});
             } else |_| {}
-            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "start", "utmm.service" } })) |_| {
-                std.debug.print("[install] Linux: service started\n", .{});
+            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "start", full_name } })) |_| {
+                std.debug.print("[install] Linux: {s} started\n", .{svc_name});
             } else |_| {
-                std.debug.print("[install] Linux: run manually: systemctl enable --now utmm\n", .{});
+                std.debug.print("[install] Linux: run manually: systemctl enable --now {s}\n", .{svc_name});
             }
         },
         .windows => {
             // Build binPath for sc create
             // sc has quirky syntax: "binPath= value" — the space after '=' is REQUIRED
-            const svc_name = "UTM-Monitor";
+            const svc_name: []const u8 = if (is_host) "UTM-Monitor-Host" else "UTM-Monitor-Guest";
             const extra_args: []const u8 = if (is_host) " --host" else if (hostname_override) |h|
                 try std.fmt.allocPrint(allocator, " --hostname {s}", .{h})
             else
@@ -425,7 +434,7 @@ pub fn installSelf(
             if (std.process.run(allocator, io, .{
                 .argv = &.{ "sc", "start", svc_name },
             })) |_| {
-                std.debug.print("[install] Windows: service started\n", .{});
+                std.debug.print("[install] Windows: {s} started\n", .{svc_name});
             } else |_| {
                 std.debug.print("[install] Windows: start manually: sc start \"{s}\"\n", .{svc_name});
             }
@@ -516,51 +525,43 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
 
     switch (platform) {
         .macos => {
-            const plist_path = "/Library/LaunchDaemons/com.utmm.plist";
-
-            // Unload the service
-            if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", "system", plist_path } })) |_| {} else |_| {}
-
-            // Remove the plist file
-            std.Io.Dir.cwd().deleteFile(io, plist_path) catch |err| {
-                if (err != error.FileNotFound) {
-                    std.debug.print("[uninstall] failed to remove plist: {}\n", .{err});
-                }
-            };
-            std.debug.print("[uninstall] macOS: service unloaded, plist removed\n", .{});
+            // Unload and remove both old (com.utmm) and new (com.utmm.host / com.utmm.guest) plists
+            const labels = [_][]const u8{ "com.utmm", "com.utmm.host", "com.utmm.guest" };
+            for (labels) |label| {
+                const plist_path = try std.fmt.allocPrint(allocator, "/Library/LaunchDaemons/{s}.plist", .{label});
+                defer allocator.free(plist_path);
+                if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", "system", plist_path } })) |_| {} else |_| {}
+                std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
+            }
+            std.debug.print("[uninstall] macOS: services unloaded, plists removed\n", .{});
         },
         .linux => {
-            const service_name = "utmm.service";
-            const service_path = "/etc/systemd/system/utmm.service";
-
-            // Stop and disable
-            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "stop", service_name } })) |_| {} else |_| {}
-            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "disable", service_name } })) |_| {} else |_| {}
-
-            // Remove the unit file
-            std.Io.Dir.cwd().deleteFile(io, service_path) catch |err| {
-                if (err != error.FileNotFound) {
-                    std.debug.print("[uninstall] failed to remove unit file: {}\n", .{err});
-                }
-            };
-
-            // Reload systemd
+            // Stop, disable, and remove both old (utmm) and new (utmm-host / utmm-guest) units
+            const svc_names = [_][]const u8{ "utmm", "utmm-host", "utmm-guest" };
+            for (svc_names) |name| {
+                const full_name = try std.fmt.allocPrint(allocator, "{s}.service", .{name});
+                defer allocator.free(full_name);
+                const unit_path = try std.fmt.allocPrint(allocator, "/etc/systemd/system/{s}", .{full_name});
+                defer allocator.free(unit_path);
+                if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "stop", full_name } })) |_| {} else |_| {}
+                if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "disable", full_name } })) |_| {} else |_| {}
+                std.Io.Dir.cwd().deleteFile(io, unit_path) catch {};
+            }
             if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "daemon-reload" } })) |_| {} else |_| {}
-
-            std.debug.print("[uninstall] Linux: service stopped, unit file removed\n", .{});
+            std.debug.print("[uninstall] Linux: services stopped, unit files removed\n", .{});
         },
         .windows => {
-            const svc_name = "UTM-Monitor";
-
-            // Stop and delete the service
-            if (std.process.run(allocator, io, .{
-                .argv = &.{ "sc", "stop", svc_name },
-            })) |_| {} else |_| {}
-            if (std.process.run(allocator, io, .{
-                .argv = &.{ "sc", "delete", svc_name },
-            })) |_| {} else |_| {}
-
-            std.debug.print("[uninstall] Windows: service stopped and removed\n", .{});
+            // Stop and delete both old (UTM-Monitor) and new (UTM-Monitor-Host / UTM-Monitor-Guest) services
+            const svc_names = [_][]const u8{ "UTM-Monitor", "UTM-Monitor-Host", "UTM-Monitor-Guest" };
+            for (svc_names) |svc_name| {
+                if (std.process.run(allocator, io, .{
+                    .argv = &.{ "sc", "stop", svc_name },
+                })) |_| {} else |_| {}
+                if (std.process.run(allocator, io, .{
+                    .argv = &.{ "sc", "delete", svc_name },
+                })) |_| {} else |_| {}
+            }
+            std.debug.print("[uninstall] Windows: services stopped and removed\n", .{});
         },
     }
 

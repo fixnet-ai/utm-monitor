@@ -220,11 +220,10 @@ All Guest binaries are already in `/opt/utmm/` after extraction — the Host's `
 Start the Host:
 
 ```bash
-sudo utmm --host --install   # Install as Host system service, auto-start on boot
-sudo utmm --host             # Start immediately
+sudo utmm --host --install   # Install as Host system service, auto-start on boot (also starts immediately)
 ```
 
-> **Note**: Use `--host --install` to generate a Host-mode service config (with `--host` flag included). Use just `--install` (without `--host`) on Guest VMs to self-install as a Guest-mode service. The same binary auto-detects the correct mode based on the presence of `--host`.
+> **Note**: Use `--host --install` to generate a Host-mode service config (with `--host` flag included, service name `com.utmm.host` / `utmm-host` / `UTM-Monitor-Host`). Use just `--install` (without `--host`) on Guest VMs to self-install as a Guest-mode service (`com.utmm.guest` / `utmm-guest` / `UTM-Monitor-Guest`). The same binary auto-detects the correct mode based on the presence of `--host`.
 
 ### 2.4 Bare-Metal Bootstrapping (First-time Guest VM Deployment)
 
@@ -415,8 +414,8 @@ utmm --exec ubuntu "/opt/utmm/utmm --install"
 ```bash
 # Execute in VM or via --exec
 utmm --gen-init macos
-# Generates plist content; place it in the VM's /Library/LaunchDaemons/com.utmm.plist
-# Then launchctl load /Library/LaunchDaemons/com.utmm.plist
+# Generates plist content; place it in the VM's /Library/LaunchDaemons/com.utmm.guest.plist
+# Then: sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmm.guest.plist
 ```
 
 **Linux — systemd**:
@@ -424,8 +423,8 @@ utmm --gen-init macos
 ```bash
 # Execute in VM or via --exec
 utmm --gen-init linux
-# Generates unit file; place it in the VM's /etc/systemd/system/utmm.service
-# Then systemctl daemon-reload && systemctl enable --now utmm
+# Generates unit file; place it in the VM's /etc/systemd/system/utmm-guest.service
+# Then: systemctl daemon-reload && systemctl enable --now utmm-guest
 ```
 
 **Windows — Scheduled Task**:
@@ -459,11 +458,11 @@ sudo sh -c 'nohup utmm --host > /var/log/utmm-host.log 2>&1 & disown'
 After starting, the following output indicates normal operation:
 
 ```
-[host] Starting to listen for Guest broadcasts...
-[listener] Listening on port 2121
-[listener] Discovered new guest: macvm (192.168.64.4)
-[listener] Discovered new guest: linuxvm (192.168.64.2)
-[listener] Discovered new guest: windowsvm (192.168.65.2)
+[host] Starting daemon on port 2121
+[host] Hosts file: /etc/hosts
+[host] Listening on UDP 2121
+[host] 🆕 New guest: macvm (aarch64-macos) → 192.168.64.4
+[host] /etc/hosts synced (1 guests)
 ```
 
 Verify `/etc/hosts` has been updated:
@@ -608,7 +607,7 @@ After restart, the new ANNOUNCE carries the updated version, so no repeat.
 #### Check Guest Logs
 
 ```bash
-utmm --exec ubuntu "tail -20 /opt/utmm/utmm.log"
+utmm --exec ubuntu "tail -20 /var/log/utmm-guest.log"
 ```
 
 #### Force Sync /etc/hosts
@@ -702,7 +701,7 @@ git push origin v0.2.0
 utmm --exec ubuntu "ps aux | grep utmm"
 
 # 2. Check Guest logs to confirm broadcasts are being sent
-utmm --exec ubuntu "tail -5 /opt/utmm/utmm.log"
+utmm --exec ubuntu "tail -5 /var/log/utmm-guest.log"
 # Normal log line: [broadcast] Broadcast: linuxvm → 192.168.64.2
 
 # 3. Check if the Guest's displayed IP is the correct physical NIC IP
@@ -810,7 +809,7 @@ bump ver.zig && zig build  # auto-upgrade handles the rest
 
 **Management commands (--status/--exec/--upload/--download) no longer conflict with the Host UDP port**. Management commands discover Guest IPs via UDP broadcast (or state file fallback when Host daemon has the port), then connect directly to Guests via TCP transport.
 
-**Auto-start Host service (v0.1.26+)**: If the Host daemon is not running when a management command is invoked, the CLI auto-starts it via the OS service manager (`launchctl load` / `systemctl start` / `sc start`) and retries.
+**Auto-start Host service (v0.1.26+)**: If the Host daemon is not running when a management command is invoked, the CLI auto-starts it via the OS service manager (`launchctl bootstrap` / `systemctl start` / `sc start`) and retries.
 
 If port 2121 is occupied by another program, it can be changed via the `--port` parameter:
 
@@ -932,7 +931,7 @@ utmm --exec ubuntu "uname -m"
 utmm --exec ubuntu "ip addr show"
 
 # View Guest broadcast logs
-utmm --exec ubuntu "head -5 /opt/utmm/utmm.log"
+utmm --exec ubuntu "head -5 /var/log/utmm-guest.log"
 
 # Capture packets to verify broadcasts
 sudo tcpdump -i any port 2121 -n -c 10
@@ -1067,15 +1066,15 @@ sudo utmm --host --serve-dir /opt/utmm
 Expected output:
 
 ```
-[host] Starting to listen for Guest broadcasts...
-[broadcast] Physical NIC en0: 192.168.3.130
-[listener] Listening on port 2121
+[host] Starting daemon on port 2121
+[host] Hosts file: /etc/hosts
+[host] Listening on UDP 2121
 ```
 
-Keep this terminal open — the Host runs in the foreground. To auto-start on boot:
+Keep this terminal open — the Host runs in the foreground. To auto-start on boot (LaunchDaemon):
 
 ```bash
-sudo utmm --install
+sudo utmm --host --install
 ```
 
 **Step 6: Verify the MCP connection**
@@ -1087,7 +1086,7 @@ printf 'Content-Length: 50\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"ping","param
 # → {"jsonrpc":"2.0","id":1,"result":{}}
 ```
 
-**Step 7: First conversation** — see next section.
+**Step 6: First conversation** — see §7.4 for daily usage examples with Claude Code.
 
 > **Alternative: build from source** — requires Zig 0.16.0. Clone the repo and run `zig build -Doptimize=ReleaseSafe`. The binary lands at `zig-out/bin/utmm`. Use that path in the steps above instead of `/usr/local/bin/utmm`.
 
@@ -1144,9 +1143,9 @@ printf 'Content-Length: 50\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"ping","param
 
 ```
 👤 "Check the utmm logs on all VMs for errors"
-🤖 → vm_exec("linuxvm", "tail -30 /var/log/utmm.log")
-    → vm_exec("macvm", "tail -30 /var/log/utmm.log")
-    → vm_exec("windowsvm", "type C:\\opt\\utmm.log")
+🤖 → vm_exec("linuxvm", "journalctl -u utmm-guest -n 30 --no-pager 2>/dev/null || tail -30 /var/log/utmm-guest.log")
+    → vm_exec("macvm", "tail -30 /var/log/utmm-guest.log")
+    → vm_exec("windowsvm", "type C:\\opt\\utmm\\utmm.log")
     All clean, no errors.
 
 👤 "Restart the guest on linuxvm"
@@ -1241,9 +1240,10 @@ To remove utmm entirely and return to bare-metal state:
 # Stop all processes
 sudo pkill -f utmm 2>/dev/null
 
-# Remove auto-start service
+# Remove auto-start service (v0.2.6+ uses com.utmm.host; older used com.utmm)
+sudo launchctl bootout system /Library/LaunchDaemons/com.utmm.host.plist 2>/dev/null
 sudo launchctl bootout system /Library/LaunchDaemons/com.utmm.plist 2>/dev/null
-sudo rm -f /Library/LaunchDaemons/com.utmm.plist
+sudo rm -f /Library/LaunchDaemons/com.utmm.host.plist /Library/LaunchDaemons/com.utmm.plist
 
 # Remove binaries
 sudo rm -rf /opt/utmm
@@ -1258,8 +1258,9 @@ sudo sed -i '' '/# UTM-MONITOR-BEGIN/,/# UTM-MONITOR-END/d' /etc/hosts
 # IMPORTANT: When running via SSH, do systemctl stop BEFORE pkill.
 # pkill -f utmm will kill the SSH shell itself (because the command
 # arguments contain "utmm"), severing the connection mid-cleanup.
-systemctl stop utmm 2>/dev/null; systemctl disable utmm 2>/dev/null
-rm -f /etc/systemd/system/utmm.service
+systemctl stop utmm-guest 2>/dev/null; systemctl disable utmm-guest 2>/dev/null
+systemctl stop utmm 2>/dev/null; systemctl disable utmm 2>/dev/null  # old name
+rm -f /etc/systemd/system/utmm-guest.service /etc/systemd/system/utmm.service
 rm -rf /opt/utmm /opt/utm-monitor /opt/utmm_*
 rm -f /var/log/utmm*.log /opt/utmm*.log
 pkill -f utmm 2>/dev/null   # do this LAST
@@ -1268,8 +1269,9 @@ pkill -f utmm 2>/dev/null   # do this LAST
 **macOS Guest** (run inside VM or via SSH):
 ```bash
 pkill -f utmm 2>/dev/null
-launchctl bootout system /Library/LaunchDaemons/com.utmm.plist 2>/dev/null
-rm -f /Library/LaunchDaemons/com.utmm.plist
+launchctl bootout system /Library/LaunchDaemons/com.utmm.guest.plist 2>/dev/null
+launchctl bootout system /Library/LaunchDaemons/com.utmm.plist 2>/dev/null  # old name
+rm -f /Library/LaunchDaemons/com.utmm.guest.plist /Library/LaunchDaemons/com.utmm.plist
 rm -rf /opt/utmm /opt/utm-monitor /opt/utmm_*
 rm -f /var/log/utmm*.log /opt/utmm*.log
 ```

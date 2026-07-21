@@ -109,7 +109,7 @@ vm_status → see which VMs are online, their versions, IPs
 
 ```
 1. Host: curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
-2. Host: sudo utmm --host --install && sudo utmm --host
+2. Host: sudo utmm --host --install  (installs + starts as LaunchDaemon automatically)
 3. For each Guest VM, run ONE command (no internet needed — from Host TCP):
    - Linux/macOS: curl http://<gateway>:2121/bin/install.sh | sh -s -- --guest --hostname <name>
    - Windows: find gateway, download install.bat from http://<gateway>:2121/bin/install.bat, run with --guest
@@ -155,7 +155,8 @@ utmm --exec linuxvm "uname -a"
 | Host binary (symlink) | `/usr/local/bin/utmm` → `/opt/utmm/utmm` |
 | Host binary (actual) | `/opt/utmm/utmm` → `/opt/utmm/utmm-aarch64-macos` |
 | All platform binaries | `/opt/utmm/utmm-*` (6 binaries from utmm.zip) |
-| Host service plist | `/Library/LaunchDaemons/com.utmm.plist` |
+| Host service plist | `/Library/LaunchDaemons/com.utmm.host.plist` |
+| Guest service plist | `/Library/LaunchDaemons/com.utmm.guest.plist` |
 | Host log | `/var/log/utmm-host.log` |
 | Serve directory (TCP) | `/opt/utmm/` by default (configurable via `--serve-dir`) |
 | State file | `/tmp/utmm-guests.tsv` (TSV: hostname, target, ip, mac, version, shell) |
