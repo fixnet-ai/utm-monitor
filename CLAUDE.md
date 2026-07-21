@@ -22,10 +22,11 @@ windowsvm: user=Administrator, passwd=111, app_path=C:\opt\
 ### Two Run Modes (Same Binary)
 - **Guest mode (default)**: Foreground mode — detects TTY, stops any background service, runs in terminal, restarts service on exit. Non-TTY invocation (e.g., scheduled tasks) falls back to daemon mode with `is_svc = true` — no `--svc` flag needed for schtasks/launchd/systemd. With `--svc`: explicit daemon mode (UDP broadcast hostname+IP + TCP transport server on port 2121). Use `--install --user` to create a desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
 - **Host mode (--host)**: UDP listener + TCP transport + /etc/hosts sync + management commands (--status/--exec etc.)
-- **MCP integrated mode (--host --mcp)**: Host + MCP JSON-RPC server in one process, no separate Host daemon needed
+- **MCP integrated mode (--host --mcp)**: Host + MCP HTTP server in one process on port 2122 (streamableHttp transport). No separate MCP subprocess needed — AI agents connect directly via TCP.
 
 ### Complete Data Flow
 ```
+                        ┌── MCP HTTP :2122 (streamableHttp) ← AI Agent
 Guest (macvm)    ──UDP broadcast──┐                    ┌── TCP(2121) → Version, Health, Exec, Upload, Download
 Guest (linuxvm)  ──UDP broadcast──┤──→ Host listener(2121)─┼── TCP(2121) → Guest bootstrap binary serving
 Guest (windows)  ──UDP broadcast──┘                    └── hosts file sync
@@ -85,14 +86,14 @@ sudo utmm --host                          # Continuous listener (needs sudo for 
 utmm --host --install                     # Install as system service (launchd/systemd/sc)
 utmm --host --uninstall                   # Remove system service
 utmm --host --serve-dir /path/to/binaries # Custom binary serve directory
-utmm --host --mcp                         # Integrated mode: Host + MCP in one process
+utmm --host --mcp                         # Integrated mode: Host + MCP HTTP in one process
 
 # ── Management Commands (talk to Host/Guest via UDP discover + TCP, NO --host needed) ──
 utmm --status                             # Query all Guest status
 utmm --exec linuxvm "uname -a"            # Remote command execution
 utmm --upload file.txt linuxvm            # Upload file to Guest (no curl)
 utmm --download linuxvm f.txt ./f.txt     # Download file from Guest (no curl)
-utmm --mcp                                # Adapter mode: MCP stdio → direct UDP+TCP
+utmm --mcp                                # Adapter mode: MCP stdio → direct UDP+TCP (legacy, use HTTP instead)
 
 # Management commands discover Guest IP via UDP broadcast + state file fallback.
 # When Host daemon is running (UDP port occupied), they read /tmp/utmm-guests.tsv.
@@ -113,7 +114,7 @@ src/
 ├── listener.zig       # Host: UDP listener, IP change detection, OnIpChanged callback
 ├── hosts_file.zig     # /etc/hosts marked block read/write
 ├── status.zig         # Host: --status query + formatStatusTable
-├── mcp.zig            # MCP JSON-RPC server (--mcp flag, stdio transport, direct UDP+TCP)
+├── mcp.zig            # MCP JSON-RPC server: stdio (adapter/integrated) + HTTP (streamableHttp on :2122)
 ├── install.zig        # --install/--uninstall system service + --gen-init script generation + desktop shortcuts
 ├── agent.zig          # Guest: foreground mode (stop service, run in TTY, restart on exit)
 └── config.zig         # Config persistence + logging system

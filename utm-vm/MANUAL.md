@@ -32,7 +32,7 @@ utmm --host       # Host mode
 | Runs on | Inside each VM | Host machine |
 | Count | One per VM | Only one |
 | Responsibility | UDP broadcast of its own info | Listen for broadcasts + sync /etc/hosts |
-| Ancillary Services | TCP transport server (2121): exec, upload, download, version, health | Management commands (--status/--exec) + MCP JSON-RPC (--mcp) |
+| Ancillary Services | TCP transport server (2121): exec, upload, download, version, health | Management commands (--status/--exec) + MCP HTTP server (2122, streamableHttp) |
 | Required Privileges | Regular user | `sudo` (to write /etc/hosts) |
 
 ### 1.3 Data Flow Overview
@@ -520,8 +520,9 @@ Management commands (discover Guest via UDP + state file fallback, then TCP conn
   --install --user       Create desktop shortcut (UTMM) for foreground guest launcher
   --uninstall            Remove system service and stop running processes
   --uninstall --user     Remove desktop shortcut
-  --mcp                  Serve MCP JSON-RPC over stdio (adapter: direct UDP+TCP)
-  --mcp --host           Integrated mode: Host + MCP in one process
+  --mcp                  MCP stdio adapter (legacy: direct UDP+TCP; prefer HTTP via --host)
+  --mcp --host           Integrated mode: Host + MCP stdio in one process (legacy)
+  (built-in HTTP MCP)    Host daemon auto-serves MCP HTTP on 127.0.0.1:2122 (streamableHttp)
   --save-config          Save current configuration
   --version              Display version
 ```
@@ -856,7 +857,7 @@ utmm/
 │   ├── listener.zig       # UDP listener (includes source IP extraction)
 │   ├── hosts_file.zig     # /etc/hosts marker block read/write
 │   ├── status.zig         # --status query + formatStatusTable
-│   ├── mcp.zig            # MCP JSON-RPC server (--mcp flag, stdio, direct UDP+TCP)
+│   ├── mcp.zig            # MCP JSON-RPC server (stdio + HTTP streamableHttp on :2122)
 │   ├── install.zig        # --install/--uninstall + desktop shortcuts + --gen-init
 │   ├── agent.zig          # Guest foreground mode (stop service, TTY, restart on exit)
 │   └── config.zig         # Configuration persistence + logging
@@ -981,9 +982,9 @@ utmm can be used as a Claude Code plugin via the Model Context Protocol (MCP). T
 
 ```
 Claude Code
-  │ MCP (JSON-RPC over stdio)
+  │ MCP (JSON-RPC over HTTP, streamableHttp transport)
   ▼
-utmm --mcp      ← built into the binary (adapter mode: direct UDP+TCP)
+utmm --host     ← Host daemon (UDP listener + HTTP MCP on :2122)
   │ UDP broadcast discover + TCP transport
   ▼
 Guest VMs (linuxvm, macvm, windowsvm)
@@ -992,9 +993,9 @@ Guest VMs (linuxvm, macvm, windowsvm)
   └─ UDP broadcast (2121): announce hostname+IP
 ```
 
-The `--mcp` flag acts as a standalone adapter — it discovers Guest IPs via UDP broadcast (with `/tmp/utmm-guests.tsv` state file fallback) and connects directly to Guests via TCP transport. No intermediate Host process needed for MCP operation.
+The Host daemon (`utmm --host`) serves MCP JSON-RPC over HTTP on `127.0.0.1:2122` using the streamableHttp transport. Claude Code connects directly via TCP — no subprocess, no stdio dependency. The Host's in-memory guest cache provides instant responses without UDP discovery per request.
 
-For a simpler all-in-one setup, use `--host --mcp` together: the Host services (UDP listener, hosts sync, auto-upgrade) run in the background while the main thread serves MCP on stdio.
+Legacy stdio mode (`utmm --mcp`) is still available as a fallback adapter — it discovers Guests via UDP broadcast (with `/tmp/utmm-guests.tsv` state file fallback) and connects directly via TCP transport. Use `--host --mcp` for integrated stdio mode (Host + MCP in one process).
 
 ### 7.2 Full Setup Walkthrough (from zero to working)
 
@@ -1046,16 +1047,28 @@ ln -sf ../../utm-vm .claude/skills/utm-vm
 
 **Step 4: Register MCP server with Claude Code**
 
+Configure `~/.claude/mcp.json` (or add via CLI):
+
 ```bash
-claude mcp add utmm -- utmm --mcp
+claude mcp add utm-monitor --transport streamableHttp http://127.0.0.1:2122/mcp
 ```
 
-> This writes to `~/.claude.json`, which is the recognized MCP config file.
->
-> Restart Claude Code (or run `/mcp` to reload). You should see `utmm` in the MCP servers list.
->
-> **Integrated mode (all-in-one):** `claude mcp add utmm -- utmm --host --mcp`
-> This runs the full Host + MCP in a single process — no separate Host daemon needed.
+Or manually edit `~/.claude/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "utm-monitor": {
+      "type": "streamableHttp",
+      "url": "http://127.0.0.1:2122/mcp"
+    }
+  }
+}
+```
+
+> This configures Claude Code to connect to the Host daemon's MCP HTTP server on port 2122.
+> The Host must be running (`sudo utmm --host`) for the MCP server to be available.
+> Run `/mcp` in Claude Code to reload the MCP configuration.
 
 **Step 5: Start the Host**
 
@@ -1068,6 +1081,8 @@ Expected output:
 ```
 [host] Starting daemon on port 2121
 [host] Hosts file: /etc/hosts
+[host] Daemon running (UDP :2121, MCP HTTP :2122)
+[mcp-http] MCP HTTP server on http://127.0.0.1:2122/mcp
 [host] Listening on UDP 2121
 ```
 
@@ -1080,11 +1095,14 @@ sudo utmm --host --install
 **Step 6: Verify the MCP connection**
 
 ```bash
-# Ping the MCP server via proper LSP-style framing
-printf 'Content-Length: 50\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}\n' | utmm --mcp
-# → Content-Length: 47
-# → {"jsonrpc":"2.0","id":1,"result":{}}
+# Initialize MCP session via HTTP
+curl -s -X POST http://127.0.0.1:2122/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+# → {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.2.8"},"capabilities":{"tools":{}}}}
 ```
+
+> **Legacy stdio mode:** `claude mcp add utmm -- utmm --mcp` (adapter, no Host needed) or `claude mcp add utmm -- utmm --host --mcp` (integrated stdio mode). HTTP mode is preferred for persistent deployments.
 
 **Step 6: First conversation** — see §7.4 for daily usage examples with Claude Code.
 
@@ -1222,11 +1240,11 @@ chmod +x /tmp/test.sh && /tmp/test.sh")
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| MCP tools don't appear in Claude | MCP server not registered or wrong path | Run `claude mcp add utmm -- utmm --mcp`, then `/mcp` to reload |
+| MCP tools don't appear in Claude | MCP server not registered or Host not running | Verify Host daemon running (`ps aux \| grep utmm`); check port 2122 (`curl http://127.0.0.1:2122/mcp`); run `/mcp` to reload |
 | "No VMs online" | VMs not booted, guest not running | Boot VMs, verify `utmm` running inside each |
 | "GuestNotFound" for a VM | VM offline or hostname typo | `vm_status` to see online VMs |
 | VM marked "upgradable" | Guest binary older than Host | Host auto-upgrades within seconds — bump ver.zig and rebuild |
-| MCP tools can't discover Guests | UDP port in use, no state file | Ensure Host is running (writes state file); or use `--host --mcp` for integrated mode |
+| MCP connection refused (:2122) | Host daemon not running or old version | `sudo utmm --host` (v0.2.9+ needed for HTTP MCP) |
 | Port 2121 AddressInUse at Host start | Old `utmm` process still running | `sudo pkill -f utmm && sudo utmm --host` |
 | `--status` shows stale/duplicate entries | Guest renamed but old entry cached | Restart Host: `sudo pkill utmm && sudo utmm --host` |
 | Windows bootstrap: command not found | Old bootstrap script | Use latest install.bat from the Host |

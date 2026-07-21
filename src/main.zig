@@ -233,8 +233,9 @@ pub fn printHelp() void {
         \\  --install --user    Create desktop shortcut for foreground guest launcher
         \\  --uninstall         Remove system service (utmm --uninstall)
         \\  --uninstall --user  Remove desktop shortcut (utmm --uninstall --user)
-        \\  --mcp               Serve MCP JSON-RPC over stdio for Claude Code integration
-        \\                      (with --host: integrated mode; without: IPC adapter)
+        \\  --mcp               MCP JSON-RPC stdio adapter (legacy: direct UDP+TCP;
+        \\                      Host daemon auto-serves MCP HTTP on :2122 — prefer that)
+        \\  --mcp --host        Integrated stdio mode: Host + MCP in one process (legacy)
         \\  --version           Show version info
         \\
         \\NOTE: --exec/--status/--upload/--download require a running Host background

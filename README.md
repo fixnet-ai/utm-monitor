@@ -34,16 +34,20 @@ This downloads all platform binaries to `/opt/utmm/` and creates the `utmm` comm
 
 ### 2. Register with your AI agent
 
-```bash
-# Claude Code
-claude mcp add utmm -- utmm --mcp
+Host daemon serves MCP over HTTP on port 2122. Configure your agent to connect via `streamableHttp`:
 
-# Other agents — configure as stdio MCP server:
-#   command: utmm
-#   args: ["--mcp"]
+```json
+{
+  "mcpServers": {
+    "utm-monitor": {
+      "type": "streamableHttp",
+      "url": "http://127.0.0.1:2122/mcp"
+    }
+  }
+}
 ```
 
-> Use `utmm --host --mcp` for all-in-one mode: Host + MCP in a single process.
+> CLI: `claude mcp add utm-monitor --transport streamableHttp http://127.0.0.1:2122/mcp`
 
 ### 3. Start the Host
 
@@ -85,7 +89,7 @@ utmm --download linuxvm file.txt ./    # download a file
 
 ```
 Guest VMs ──UDP broadcast (name + IP)──→ Host ──→ /etc/hosts sync
-                ↑                              ├──→ MCP JSON-RPC (stdio) ← AI Agent
+                ↑                              ├──→ MCP HTTP (streamableHttp) ← AI Agent
                 └── TCP transport (exec, upload, download, upgrade)
 ```
 

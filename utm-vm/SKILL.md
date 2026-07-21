@@ -133,7 +133,13 @@ No internet access needed on Guest VMs.
 sudo utmm --host
 ```
 
-**MCP adapter mode works independently** — `utmm --mcp` discovers Guests via UDP broadcast (with `/tmp/utmm-guests.tsv` state file fallback) and connects directly via TCP transport.
+**MCP connects via HTTP** — The Host daemon serves MCP JSON-RPC over HTTP (streamableHttp) on `127.0.0.1:2122`. Configure your agent's `mcp.json`:
+
+```json
+{"mcpServers": {"utm-monitor": {"type": "streamableHttp", "url": "http://127.0.0.1:2122/mcp"}}}
+```
+
+Stdio adapter mode (`utmm --mcp`) is a legacy fallback — HTTP mode is preferred.
 
 | Symptom | Likely cause | Action |
 |---------|-------------|--------|

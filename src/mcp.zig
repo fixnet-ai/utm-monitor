@@ -1,13 +1,16 @@
-//! MCP (Model Context Protocol) JSON-RPC server over stdio.
+//! MCP (Model Context Protocol) JSON-RPC server.
 //!
-//! Two modes:
-//!   run()       — Adapter: direct UDP+TCP for each tool call (no Host daemon needed)
-//!   runDirect() — Integrated: Host + MCP in one process
+//! Three modes:
+//!   run()       — Adapter: stdio, direct UDP+TCP for each tool call
+//!   runHttp()   — TCP HTTP server (streamableHttp transport, for Host daemon)
+//!   runDirect() — Integrated: stdio + direct handler (Host + MCP in one process)
 //!
 //! Framing: LSP-style Content-Length: N\r\n\r\n<JSON>\n on stdin/stdout.
+//! HTTP:    POST /mcp with JSON body → JSON response.
 //! Methods: initialize, notifications/initialized, ping, tools/list, tools/call.
 //! Tools:   vm_status, vm_exec.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const transport = @import("transport.zig");
@@ -133,10 +136,15 @@ fn sendNotificationResponse(io: std.Io, result_json: []const u8) !void {
 }
 
 fn writeMessage(io: std.Io, json: []const u8) !void {
-    var wb: [65536]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(io, &wb);
-    writer.interface.print("Content-Length: {d}\r\n\r\n{s}\n", .{ json.len, json }) catch {};
-    writer.interface.flush() catch {};
+    var header_buf: [128]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "Content-Length: {d}\r\n\r\n", .{json.len}) catch return;
+
+    var out_buf: [4096]u8 = undefined;
+    var writer = std.Io.File.stdout().writer(io, &out_buf);
+    try writer.interface.writeAll(header);
+    try writer.interface.writeAll(json);
+    try writer.interface.writeAll("\n");
+    try writer.interface.flush();
 }
 
 // ── Tool handlers ──────────────────────────────────────────────────────────
@@ -524,13 +532,13 @@ const MCPRequest = struct {
 
 /// Read one MCP request from stdin. Returns null on EndOfStream.
 /// Uses the same persistent reader for all calls (to avoid losing buffered data between requests).
-fn readRequest(allocator: std.mem.Allocator, reader: anytype) !?MCPRequest {
+fn readRequest(allocator: std.mem.Allocator, reader: *std.Io.Reader) !?MCPRequest {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
     // Read until we have a complete Content-Length header + body
     while (true) {
-        const byte = reader.interface.takeByte() catch |err| switch (err) {
+        const byte = reader.takeByte() catch |err| switch (err) {
             error.EndOfStream => {
                 if (buf.items.len == 0) return null;
                 break;
@@ -581,7 +589,7 @@ fn readRequest(allocator: std.mem.Allocator, reader: anytype) !?MCPRequest {
     }
 
     while (body.items.len < content_length) {
-        const byte = reader.interface.takeByte() catch |err| switch (err) {
+        const byte = reader.takeByte() catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
@@ -859,7 +867,10 @@ fn handleRequest(
 
 /// Adapter mode: each tool call uses direct UDP+TCP (no Host daemon needed).
 /// Blocks until stdin closes (Claude Code exits).
+/// Uses its own Threaded I/O instance to avoid global_single_threaded crash
+/// (global_single_threaded uses Allocator.failing and has cancel_protection bugs).
 pub fn run(io: std.Io, allocator: std.mem.Allocator) !void {
+    if (builtin.os.tag == .windows) return error.PlatformNotSupported;
     std.debug.print("[mcp] MCP server starting (adapter mode, direct UDP+TCP)\n", .{});
     try mcpLoop(io, allocator, null, null);
 }
@@ -867,35 +878,54 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator) !void {
 /// Integrated mode: tool calls dispatch directly to handler (no TCP roundtrip).
 /// Blocks until stdin closes (Claude Code exits).
 pub fn runDirect(io: std.Io, allocator: std.mem.Allocator, ctx: *anyopaque, handler: Handler) !void {
+    if (builtin.os.tag == .windows) return error.PlatformNotSupported;
     std.debug.print("[mcp] MCP server starting (integrated mode, direct handler)\n", .{});
     try mcpLoop(io, allocator, ctx, handler);
 }
 
 fn mcpLoop(io: std.Io, allocator: std.mem.Allocator, ctx: ?*anyopaque, handler: ?Handler) !void {
-    // Persistent buffered stdin reader — creating a new one per request causes
-    // buffered data to be lost between requests.
-    var rb: [65536]u8 = undefined;
-    var reader = std.Io.File.stdin().reader(io, &rb);
+    // stdio MCP not available on Windows (uses POSIX fd operations)
+    if (builtin.os.tag == .windows) return error.PlatformNotSupported;
+    const stdin_fd = std.Io.File.stdin().handle;
+    var stdin_buf: [65536]u8 = undefined;
+    var stdin_off: usize = 0;
+    var stdin_len: usize = 0;
 
     while (true) {
-        const req = readRequest(allocator, &reader) catch |err| switch (err) {
+        // Refill buffer if empty
+        if (stdin_off >= stdin_len) {
+            stdin_len = std.posix.read(stdin_fd, &stdin_buf) catch |err| {
+                if (err == error.WouldBlock) {
+                    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .real) catch {};
+                    continue;
+                }
+                break; // EOF or error
+            };
+            if (stdin_len == 0) break; // EOF
+            stdin_off = 0;
+        }
+
+        // Create a fixed-buffer reader over the available data
+        var fbr = std.Io.Reader.fixed(stdin_buf[stdin_off..stdin_len]);
+        const req = readRequest(allocator, &fbr) catch |err| switch (err) {
             error.EndOfStream => break,
             error.InvalidJson => {
-                // Try to send a parse error (use null id since we can't parse the actual id)
-                var wb: [4096]u8 = undefined;
-                var writer = std.Io.File.stdout().writer(io, &wb);
                 const err_msg = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}";
-                writer.interface.print("Content-Length: {d}\r\n\r\n{s}\n", .{ err_msg.len, err_msg }) catch {};
-                writer.interface.flush() catch {};
+                writeMessage(io, err_msg) catch {};
+                stdin_off = stdin_len;
                 continue;
             },
             else => {
                 std.debug.print("[mcp] Request read error: {}\n", .{err});
+                stdin_off = stdin_len;
                 continue;
             },
         };
 
-        if (req == null) break; // EndOfStream
+        // Update offset past consumed data
+        stdin_off = stdin_len - fbr.buffered().len;
+
+        if (req == null) break;
 
         handleRequest(allocator, io, ctx, handler, req.?) catch |err| {
             std.debug.print("[mcp] Request handling error: {}\n", .{err});
@@ -903,6 +933,280 @@ fn mcpLoop(io: std.Io, allocator: std.mem.Allocator, ctx: ?*anyopaque, handler: 
     }
 
     std.debug.print("[mcp] MCP server stopped (stdin closed)\n", .{});
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HTTP MCP server (streamableHttp transport)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub const MCP_HTTP_PORT: u16 = 2122;
+
+/// Build a JSON-RPC success response string.
+fn buildResponseJson(allocator: std.mem.Allocator, id: std.json.Value, result_json: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try appendId(&buf, allocator, id);
+    try buf.appendSlice(allocator, ",\"result\":");
+    try buf.appendSlice(allocator, result_json);
+    try buf.appendSlice(allocator, "}");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a JSON-RPC error response string.
+fn buildErrorJson(allocator: std.mem.Allocator, id: std.json.Value, code: i64, message: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try appendId(&buf, allocator, id);
+    try buf.print(allocator, ",\"error\":{{\"code\":{d},\"message\":\"", .{code});
+    const escaped_msg = try jsonEscape(allocator, message);
+    defer allocator.free(escaped_msg);
+    try buf.appendSlice(allocator, escaped_msg);
+    try buf.appendSlice(allocator, "\"}}");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Process a raw JSON-RPC request string and return the JSON-RPC response string.
+/// Used by the HTTP MCP server. ctx+handler for integrated mode; null for adapter mode.
+pub fn processJsonRpcString(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    ctx: ?*anyopaque,
+    handler: ?Handler,
+    json_str: []const u8,
+) ![]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{ .allocate = .alloc_always }) catch |err| {
+        return buildErrorJson(allocator, .{ .null = {} }, -32700, @errorName(err));
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    const obj = switch (root) {
+        .object => |o| o,
+        else => return buildErrorJson(allocator, .{ .null = {} }, -32600, "Invalid Request"),
+    };
+
+    const method_raw = getString(obj, "method") orelse
+        return buildErrorJson(allocator, .{ .null = {} }, -32600, "Missing method");
+
+    const id_val = if (obj.get("id")) |v| v else std.json.Value{ .null = {} };
+    const is_notification = switch (id_val) {
+        .null => true,
+        else => false,
+    };
+
+    const method = try allocator.dupe(u8, method_raw);
+    defer allocator.free(method);
+
+    if (std.mem.eql(u8, method, "initialize")) {
+        var info: std.ArrayList(u8) = .empty;
+        defer info.deinit(allocator);
+        var iter = std.mem.splitSequence(u8, SERVER_INFO, "__VERSION__");
+        var first = true;
+        while (iter.next()) |part| {
+            if (!first) try info.appendSlice(allocator, protocol.VERSION);
+            try info.appendSlice(allocator, part);
+            first = false;
+        }
+        return buildResponseJson(allocator, id_val, info.items);
+    }
+
+    if (std.mem.eql(u8, method, "notifications/initialized")) {
+        if (is_notification) return allocator.dupe(u8, "");
+        return buildResponseJson(allocator, id_val, "{}");
+    }
+
+    if (std.mem.eql(u8, method, "ping")) {
+        return buildResponseJson(allocator, id_val, "{}");
+    }
+
+    if (std.mem.eql(u8, method, "tools/list")) {
+        var tools: std.ArrayList(u8) = .empty;
+        defer tools.deinit(allocator);
+        try tools.appendSlice(allocator, "{\"tools\":");
+        var iter = std.mem.splitSequence(u8, TOOLS_JSON, "__VERSION__");
+        var first = true;
+        while (iter.next()) |part| {
+            if (!first) try tools.appendSlice(allocator, protocol.VERSION);
+            try tools.appendSlice(allocator, part);
+            first = false;
+        }
+        try tools.appendSlice(allocator, "}");
+        return buildResponseJson(allocator, id_val, tools.items);
+    }
+
+    if (std.mem.eql(u8, method, "tools/call")) {
+        const params = getNestedObject(obj, "params") orelse {
+            if (is_notification) return allocator.dupe(u8, "");
+            return buildErrorJson(allocator, id_val, -32602, "Missing params");
+        };
+
+        const tool_name = getString(params, "name") orelse {
+            if (is_notification) return allocator.dupe(u8, "");
+            return buildErrorJson(allocator, id_val, -32602, "Missing tool name");
+        };
+
+        const args = getNestedObject(params, "arguments");
+
+        if (std.mem.eql(u8, tool_name, "vm_status")) {
+            const result = handleVmStatus(allocator, io, ctx, handler) catch |err| {
+                if (is_notification) return allocator.dupe(u8, "");
+                return buildErrorJson(allocator, id_val, -32603, @errorName(err));
+            };
+            defer allocator.free(result);
+            return buildResponseJson(allocator, id_val, result);
+        }
+
+        if (std.mem.eql(u8, tool_name, "vm_exec")) {
+            if (args == null) {
+                if (is_notification) return allocator.dupe(u8, "");
+                return buildErrorJson(allocator, id_val, -32602, "Missing arguments: vm, command");
+            }
+            const vm = getString(args.?, "vm") orelse {
+                if (is_notification) return allocator.dupe(u8, "");
+                return buildErrorJson(allocator, id_val, -32602, "Missing argument: vm");
+            };
+            const command = getString(args.?, "command") orelse {
+                if (is_notification) return allocator.dupe(u8, "");
+                return buildErrorJson(allocator, id_val, -32602, "Missing argument: command");
+            };
+            const result = handleVmExec(allocator, io, ctx, handler, vm, command) catch |err| {
+                if (is_notification) return allocator.dupe(u8, "");
+                return buildErrorJson(allocator, id_val, -32603, @errorName(err));
+            };
+            defer allocator.free(result);
+            return buildResponseJson(allocator, id_val, result);
+        }
+
+        if (is_notification) return allocator.dupe(u8, "");
+        return buildErrorJson(allocator, id_val, -32601, "Unknown tool");
+    }
+
+    if (is_notification) return allocator.dupe(u8, "");
+    return buildErrorJson(allocator, id_val, -32601, "Method not found");
+}
+
+/// Streamable HTTP MCP server. Listens on 127.0.0.1:<port>/mcp.
+/// Each connection handled in a detached thread; blocks forever (accept loop).
+/// Caller must provide a dedicated I/O instance (typically from Threaded.init).
+pub fn runHttp(io: std.Io, allocator: std.mem.Allocator, port: u16) !void {
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch |err| {
+        std.debug.print("[mcp-http] Parse error: {}\n", .{err});
+        return err;
+    };
+    var server = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("[mcp-http] Listen failed on 127.0.0.1:{d}: {}\n", .{ port, err });
+        return err;
+    };
+    defer server.deinit(io);
+
+    std.debug.print("[mcp-http] MCP HTTP server on http://127.0.0.1:{d}/mcp\n", .{port});
+
+    while (true) {
+        const stream = server.accept(io) catch |err| {
+            std.debug.print("[mcp-http] Accept error: {}\n", .{err});
+            continue;
+        };
+
+        // Clone stream onto heap for detached thread
+        const conn = allocator.create(std.Io.net.Stream) catch |err| {
+            std.debug.print("[mcp-http] Alloc error: {}\n", .{err});
+            stream.close(io);
+            continue;
+        };
+        conn.* = stream;
+
+        const t = std.Thread.spawn(.{}, handleHttpConnection, .{ io, allocator, conn }) catch |err| {
+            std.debug.print("[mcp-http] Thread spawn error: {}\n", .{err});
+            conn.close(io);
+            allocator.destroy(conn);
+            continue;
+        };
+        t.detach();
+    }
+}
+
+/// Handle a single HTTP connection: read request, dispatch JSON-RPC, write response.
+fn handleHttpConnection(io: std.Io, allocator: std.mem.Allocator, stream: *std.Io.net.Stream) !void {
+    defer {
+        stream.close(io);
+        allocator.destroy(stream);
+    }
+
+    var rbuf: [65536]u8 = undefined;
+    var reader = stream.reader(io, &rbuf);
+    var wbuf: [65536]u8 = undefined;
+    var writer = stream.writer(io, &wbuf);
+
+    // Read HTTP request in one shot (MCP requests are small, < 64KB).
+    var req_buf: [65536]u8 = undefined;
+    var data = [_][]u8{&req_buf};
+    const total_read = reader.interface.readVec(data[0..]) catch |err| {
+        std.debug.print("[mcp-http] Read error: {}\n", .{err});
+        return;
+    };
+    if (total_read == 0) return;
+
+    const req_data = req_buf[0..total_read];
+
+    // Find header boundary \r\n\r\n
+    const header_end = std.mem.indexOf(u8, req_data, "\r\n\r\n") orelse {
+        const resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+        _ = writer.interface.write(resp) catch {};
+        writer.interface.flush() catch {};
+        return;
+    };
+
+    const headers_str = req_data[0..header_end];
+
+    // Parse Content-Length
+    var content_length: usize = 0;
+    if (std.mem.indexOf(u8, headers_str, "Content-Length:")) |cl_pos| {
+        const cl_start = cl_pos + "Content-Length:".len;
+        const cl_end = std.mem.indexOfScalarPos(u8, headers_str, cl_start, '\r') orelse headers_str.len;
+        const cl_str = std.mem.trim(u8, headers_str[cl_start..cl_end], " ");
+        content_length = std.fmt.parseInt(usize, cl_str, 10) catch 0;
+    }
+
+    // Extract body (starts after \r\n\r\n = header_end + 4)
+    const body_start = header_end + 4;
+    const body = if (body_start < req_data.len)
+        req_data[body_start..@min(body_start + content_length, req_data.len)]
+    else
+        &.{};
+
+    if (body.len == 0) {
+        const resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+        _ = writer.interface.write(resp) catch {};
+        writer.interface.flush() catch {};
+        return;
+    }
+
+    // Dispatch JSON-RPC
+    const response_json = processJsonRpcString(allocator, io, null, null, body) catch |err| {
+        std.debug.print("[mcp-http] JSON-RPC error: {}\n", .{err});
+        const err_body = try std.fmt.allocPrint(allocator, "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32603,\"message\":\"{s}\"}}}}", .{@errorName(err)});
+        defer allocator.free(err_body);
+        const resp = try std.fmt.allocPrint(allocator,
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ err_body.len, err_body },
+        );
+        defer allocator.free(resp);
+        _ = writer.interface.write(resp) catch {};
+        writer.interface.flush() catch {};
+        return;
+    };
+    defer allocator.free(response_json);
+
+    // Write HTTP response
+    const resp = try std.fmt.allocPrint(allocator,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ response_json.len, response_json },
+    );
+    defer allocator.free(resp);
+    _ = writer.interface.write(resp) catch {};
+    writer.interface.flush() catch {};
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

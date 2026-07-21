@@ -86,19 +86,13 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
     };
     defer if (cli.serve_dir == null) gpa.free(serve_dir);
 
-    // --host --mcp: integrated mode (Host daemon + MCP in one process)
-    if (cli.is_host and cli.is_mcp) {
-        try runHostDaemon(block_io, gpa, cli.port, cli.hosts_file, serve_dir, true);
-        return;
-    }
-
-    // --host: daemon mode
+    // --host / --host --mcp: daemon + MCP stdio server
     if (cli.is_host) {
-        try runHostDaemon(block_io, gpa, cli.port, cli.hosts_file, serve_dir, false);
+        try runHostDaemon(block_io, gpa, cli.port, cli.hosts_file, serve_dir);
         return;
     }
 
-    // --mcp alone: adapter mode
+    // --mcp alone: adapter mode (backward compat, Host daemon not needed)
     if (cli.is_mcp) {
         const mcp_mod = @import("mcp.zig");
         return mcp_mod.run(block_io, gpa);
@@ -318,7 +312,6 @@ fn runHostDaemon(
     port: u16,
     hosts_path: []const u8,
     serve_dir: ?[]const u8,
-    with_mcp: bool,
 ) !void {
     std.debug.print("[host] Starting daemon on port {d}\n", .{port});
     std.debug.print("[host] Hosts file: {s}\n", .{hosts_path});
@@ -346,19 +339,35 @@ fn runHostDaemon(
         block_io, gpa, port, hosts_path, serve_dir, &guests,
     });
 
-    // Main thread: wait (keep alive) or run MCP
-    if (with_mcp) {
-        // TODO: integrated MCP mode
-        std.debug.print("[host] Integrated MCP mode not yet implemented\n", .{});
-    }
+    // Thread 2: HTTP MCP server (TCP streamableHttp on port 2122)
+    // Stdio MCP replaced — launchd context gives stdin=/dev/null which
+    // kills stdio MCP immediately. HTTP MCP survives daemon lifetime.
+    const mcp_mod = @import("mcp.zig");
+    const mcp_thread = try std.Thread.spawn(.{}, httpMCPThread, .{ gpa, mcp_mod.MCP_HTTP_PORT });
 
-    // Keep alive — sleep 60s at a time
+    std.debug.print("[host] Daemon running (UDP :{d}, MCP HTTP :{d})\n", .{ port, mcp_mod.MCP_HTTP_PORT });
+
+    // 主线程：保持进程存活（launchd 守护进程模式）
     while (true) {
         std.Io.sleep(block_io, std.Io.Duration.fromSeconds(60), .awake) catch {};
     }
 
-    // Unreachable, but join listener thread on clean shutdown path
+    // Unreachable, but join threads on clean shutdown path
     _ = listener_thread;
+    _ = mcp_thread;
+}
+
+/// Thread: HTTP MCP server (streamableHttp transport on 127.0.0.1:2122).
+/// Runs in own thread with dedicated Threaded I/O — never returns.
+fn httpMCPThread(gpa: std.mem.Allocator, port: u16) !void {
+    // Dedicated Threaded instance for the HTTP server.
+    // global_single_threaded uses Allocator.failing — would crash on accept.
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    const http_io = threaded.io();
+    const mcp_mod = @import("mcp.zig");
+    mcp_mod.runHttp(http_io, gpa, port) catch |err| {
+        std.debug.print("[host] MCP HTTP server failed: {}\n", .{err});
+    };
 }
 
 /// Thread: UDP listener — dispatches ANNOUNCE messages to hosts_file sync and auto-upgrade
@@ -374,7 +383,7 @@ fn udpListenerThread(
         std.debug.print("[host] Parse error: {}\n", .{err});
         return err;
     };
-    var socket = listen_addr.bind(block_io, .{ .mode = .dgram }) catch |err| {
+    var socket = listen_addr.bind(block_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
         std.debug.print("[host] UDP bind failed on {d}: {}\n", .{ port, err });
         return err;
     };
