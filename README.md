@@ -38,7 +38,7 @@ Add to your MCP config (`~/.claude/mcp.json` or `.mcp.json` in project):
   "mcpServers": {
     "utm-monitor": {
       "type": "http",
-      "url": "http://192.168.64.1:2121/mcp"
+      "url": "http://127.0.0.1:2121/mcp"
     }
   }
 }
