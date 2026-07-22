@@ -375,7 +375,6 @@ fn startHttpHost(
     var router = httpd.Router{};
     // Order matters: longer prefixes first, "/" last (prefix match)
     try router.add(gpa, .GET, "/api/guests", host_http.handleApiGuests);
-    try router.add(gpa, .POST, "/exec-result", host_http.handleExecResult);
     try router.add(gpa, .POST, "/download", host_http.handleDownload);
     try router.add(gpa, .POST, "/upload", host_http.handleUpload);
     try router.add(gpa, .POST, "/kick", host_http.handleKick);

@@ -81,37 +81,26 @@ pub const GuestEntry = struct {
     last_seen: i64, // monotonic milliseconds timestamp
 };
 
-pub const CmdType = enum { exec, upgrade, upload, download };
-
-pub const CmdStatus = enum { pending, dispatched, completed, failed };
-
-pub const PendingCmd = struct {
-    id: []const u8,
-    cmd_type: CmdType,
-    /// exec: shell command; upgrade: download URL path; download: filename
-    payload: []const u8,
-    /// Set when guest posts result back
-    result: ?CmdResult = null,
-    /// Lifecycle: pending → dispatched (Guest fetched via /announce) → completed (result posted)
-    status: CmdStatus = .pending,
-    /// Accumulated stdout chunks from streaming exec (exec_stdout frames).
-    /// Caller must deinit when freeing the cmd.
-    partial_stdout: std.ArrayList(u8) = .empty,
-};
-
-pub const CmdResult = struct {
-    stdout: []const u8 = "",
-    stderr: []const u8 = "",
-    exit: i32 = 0,
+/// Tracks the state of an in-flight operation (exec/upload/download).
+pub const OpState = struct {
+    output: std.ArrayList(u8),
+    exit_code: i32 = -1,
+    done: bool = false,
 };
 
 pub const HostState = struct {
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Guest table — ArrayList with linear search (only ~3 VMs, no HashMap needed).
     guests: std.ArrayList(GuestEntry),
-    pending: std.StringHashMap(std.ArrayList(PendingCmd)),
-    /// Guests whose WebSocket connection should be closed (--kick).
-    kicked: std.StringHashMap(void),
+    /// Outgoing frame queue: hostname → FIFO of pre-built binary frames.
+    /// HTTP handlers push frames, WebSocket handler drains them.
+    outgoing_frames: std.StringHashMap(std.ArrayList([]const u8)),
+    /// Operation state tracking: cmd_id → OpState.
+    /// Used by exec/upload/download to track completion.
+    op_states: std.StringHashMap(OpState),
+    /// Close requests: hostname → present (flag set).
+    /// HTTP --kick handler sets, WebSocket handler checks and consumes.
+    close_requests: std.StringHashMap(void),
     allocator: std.mem.Allocator,
     /// I/O instance for network operations (shared across threads).
     io: ?std.Io = null,
@@ -123,8 +112,9 @@ pub const HostState = struct {
     pub fn init(allocator: std.mem.Allocator) HostState {
         return .{
             .guests = .empty,
-            .pending = std.StringHashMap(std.ArrayList(PendingCmd)).init(allocator),
-            .kicked = std.StringHashMap(void).init(allocator),
+            .outgoing_frames = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
+            .op_states = std.StringHashMap(OpState).init(allocator),
+            .close_requests = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
         };
     }
@@ -141,22 +131,37 @@ pub const HostState = struct {
         }
         self.guests.deinit(self.allocator);
 
-        // Free pending commands
-        var pit = self.pending.iterator();
-        while (pit.next()) |entry| {
-            for (entry.value_ptr.items) |*cmd| {
-                self.allocator.free(cmd.id);
-                self.allocator.free(cmd.payload);
-                cmd.partial_stdout.deinit(self.allocator);
-                if (cmd.result) |*r| {
-                    if (r.stdout.len > 0) self.allocator.free(r.stdout);
-                    if (r.stderr.len > 0) self.allocator.free(r.stderr);
+        // Free outgoing frames
+        {
+            var it = self.outgoing_frames.iterator();
+            while (it.next()) |entry| {
+                for (entry.value_ptr.items) |frame| {
+                    self.allocator.free(frame);
                 }
+                entry.value_ptr.deinit(self.allocator);
+                self.allocator.free(entry.key_ptr.*);
             }
-            entry.value_ptr.deinit(self.allocator);
+            self.outgoing_frames.deinit();
         }
-        self.pending.deinit();
-        self.kicked.deinit();
+
+        // Free op states
+        {
+            var it = self.op_states.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.output.deinit(self.allocator);
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.op_states.deinit();
+        }
+
+        // Free close requests
+        {
+            var it = self.close_requests.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.close_requests.deinit();
+        }
     }
 
     /// Find a guest by hostname. Returns index into guests.items or null.
@@ -237,187 +242,153 @@ pub const HostState = struct {
         if (entry.shell.len > 0) self.allocator.free(entry.shell);
     }
 
-    /// Enqueue a pending command for a guest. Returns the command id (caller owns).
-    pub fn enqueueCmd(self: *HostState, hostname: []const u8, cmd_type: CmdType, payload: []const u8) ![]const u8 {
+    // ══════════════════════════════════════════════════════════
+    // Outgoing frame queue (HTTP handlers push, WS handler drains)
+    // ══════════════════════════════════════════════════════════
+
+    /// Push a pre-built binary frame to a guest's outgoing queue.
+    pub fn enqueueOutgoingFrame(self: *HostState, hostname: []const u8, frame: []const u8) !void {
         self.mutex.lock(self.io.?) catch {};
         defer self.mutex.unlock(self.io.?);
 
-        const gop = try self.pending.getOrPut(hostname);
+        const gop = try self.outgoing_frames.getOrPut(hostname);
         if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, hostname);
             gop.value_ptr.* = .empty;
         }
-
-        var buf: [16]u8 = undefined;
-        const ts: i64 = @intCast(@as(i64, @intCast(@divFloor(std.Io.Timestamp.now(self.io.?, .real).nanoseconds, std.time.ns_per_ms))));
-        const id = try std.fmt.bufPrint(&buf, "{d}", .{ts});
-        const cmd = PendingCmd{
-            .id = try self.allocator.dupe(u8, id),
-            .cmd_type = cmd_type,
-            .payload = try self.allocator.dupe(u8, payload),
-        };
-        try gop.value_ptr.append(self.allocator, cmd);
-        return try self.allocator.dupe(u8, id);
+        const frame_owned = try self.allocator.dupe(u8, frame);
+        try gop.value_ptr.append(self.allocator, frame_owned);
     }
 
-    /// Return all undispatched (status=pending) commands for a guest.
-    /// Marks returned commands as dispatched. Caller owns returned slice and items.
-    pub fn drainPending(self: *HostState, hostname: []const u8) ![]PendingCmd {
+    /// Pop the next frame from a guest's outgoing queue (FIFO).
+    /// Returns null if no frames queued. Caller owns the returned frame data.
+    pub fn dequeueOutgoingFrame(self: *HostState, hostname: []const u8) ?[]const u8 {
+        self.mutex.lock(self.io.?) catch return null;
+        defer self.mutex.unlock(self.io.?);
+
+        const list = self.outgoing_frames.getPtr(hostname) orelse return null;
+        if (list.items.len == 0) return null;
+        return list.orderedRemove(0);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Operation state (tracks exec/upload/download completion)
+    // ══════════════════════════════════════════════════════════
+
+    /// Initialize an OpState for a new command. cmd_id must be unique.
+    pub fn createOpState(self: *HostState, cmd_id: []const u8) !void {
         self.mutex.lock(self.io.?) catch {};
         defer self.mutex.unlock(self.io.?);
 
-        const list = self.pending.getPtr(hostname) orelse return &.{};
-
-        // Count pending commands
-        var count: usize = 0;
-        for (list.items) |*cmd| {
-            if (cmd.status == .pending) count += 1;
+        const gop = try self.op_states.getOrPut(cmd_id);
+        if (gop.found_existing) {
+            gop.value_ptr.output.deinit(self.allocator);
+        } else {
+            gop.key_ptr.* = try self.allocator.dupe(u8, cmd_id);
         }
-        if (count == 0) return &.{};
-
-        // Collect copies, mark dispatched (use index for mutable access)
-        var result = try self.allocator.alloc(PendingCmd, count);
-        errdefer self.allocator.free(result);
-        var i: usize = 0;
-        const items_mut: []PendingCmd = @constCast(list.items);
-        for (items_mut) |*cmd| {
-            if (cmd.status == .pending) {
-                cmd.status = .dispatched;
-                result[i] = PendingCmd{
-                    .id = try self.allocator.dupe(u8, cmd.id),
-                    .cmd_type = cmd.cmd_type,
-                    .payload = try self.allocator.dupe(u8, cmd.payload),
-                    .status = .dispatched,
-                };
-                i += 1;
-            }
-        }
-        return result;
+        gop.value_ptr.* = .{ .output = .empty };
     }
 
-    /// Deliver a command result (from guest's /exec-result POST).
-    pub fn deliverResult(self: *HostState, cmd_id: []const u8, stdout: []const u8, stderr: []const u8, exit: i32) bool {
+    /// Append data to an operation's accumulated output.
+    pub fn appendOpOutput(self: *HostState, cmd_id: []const u8, data: []const u8) void {
         self.mutex.lock(self.io.?) catch {};
         defer self.mutex.unlock(self.io.?);
 
-        var pit = self.pending.iterator();
-        while (pit.next()) |entry| {
-            for (entry.value_ptr.items) |*cmd| {
-                if (std.mem.eql(u8, cmd.id, cmd_id)) {
-                    cmd.result = CmdResult{
-                        .stdout = if (stdout.len > 0) self.allocator.dupe(u8, stdout) catch stdout else "",
-                        .stderr = if (stderr.len > 0) self.allocator.dupe(u8, stderr) catch stderr else "",
-                        .exit = exit,
-                    };
-                    cmd.status = .completed;
-                    return true;
-                }
-            }
-        }
-        return false;
+        const op = self.op_states.getPtr(cmd_id) orelse return;
+        op.output.appendSlice(self.allocator, data) catch {};
     }
 
-    /// Deliver a stdout chunk from streaming exec (exec_stdout frame from Guest).
-    pub fn deliverStdoutChunk(self: *HostState, cmd_id: []const u8, chunk: []const u8) void {
+    /// Scan accumulated output for MDELIM:N\n marker.
+    /// If found, strips the marker, sets exit_code and marks done.
+    pub fn scanForMarker(self: *HostState, cmd_id: []const u8) void {
         self.mutex.lock(self.io.?) catch {};
         defer self.mutex.unlock(self.io.?);
 
-        var pit = self.pending.iterator();
-        while (pit.next()) |entry| {
-            for (entry.value_ptr.items) |*cmd| {
-                if (std.mem.eql(u8, cmd.id, cmd_id)) {
-                    cmd.partial_stdout.appendSlice(self.allocator, chunk) catch {};
-                    return;
-                }
+        const op = self.op_states.getPtr(cmd_id) orelse return;
+        if (op.done) return;
+
+        const haystack = op.output.items;
+        const marker = "MDELIM:";
+        const pos = std.mem.indexOf(u8, haystack, marker) orelse return;
+
+        // Parse exit code: digits after MDELIM: until \n
+        const after = pos + marker.len;
+        if (after >= haystack.len) return;
+
+        var ec: i32 = 0;
+        var neg = false;
+        var i: usize = after;
+        while (i < haystack.len and haystack[i] != '\n') : (i += 1) {
+            if (haystack[i] == '-') {
+                neg = true;
+            } else if (haystack[i] >= '0' and haystack[i] <= '9') {
+                ec = ec * 10 + @as(i32, @intCast(haystack[i] - '0'));
             }
         }
+        if (i >= haystack.len) return; // No newline yet, wait for more data
+        if (neg) ec = -ec;
+
+        // Strip marker + exit code + newline.
+        // Marker is always at the end (appended via "; echo MDELIM:$?\n"),
+        // so truncating at the marker position is safe.
+        op.output.shrinkRetainingCapacity(pos);
+
+        op.exit_code = ec;
+        op.done = true;
     }
 
-    /// Deliver exec_exit from streaming exec: builds result from accumulated stdout
-    /// chunks, marks command as completed. Returns false if cmd_id not found.
-    pub fn deliverExecExit(self: *HostState, cmd_id: []const u8, exit_code: i32) bool {
+    /// Mark an operation as complete with explicit exit code.
+    /// Used for upload/download responses.
+    pub fn completeOpState(self: *HostState, cmd_id: []const u8, exit_code: i32) void {
         self.mutex.lock(self.io.?) catch {};
         defer self.mutex.unlock(self.io.?);
 
-        var pit = self.pending.iterator();
-        while (pit.next()) |entry| {
-            for (entry.value_ptr.items) |*cmd| {
-                if (std.mem.eql(u8, cmd.id, cmd_id)) {
-                    const stdout_owned = cmd.partial_stdout.toOwnedSlice(self.allocator) catch "";
-                    cmd.result = CmdResult{
-                        .stdout = stdout_owned,
-                        .stderr = "",
-                        .exit = exit_code,
-                    };
-                    cmd.status = .completed;
-                    return true;
-                }
-            }
-        }
-        return false;
+        const op = self.op_states.getPtr(cmd_id) orelse return;
+        op.exit_code = exit_code;
+        op.done = true;
     }
 
-    /// Try to take a completed command result. Returns null if not yet completed.
-    /// On success, removes the command from pending and caller owns the CmdResult strings.
-    pub fn tryTakeResult(self: *HostState, cmd_id: []const u8) ?CmdResult {
-        self.mutex.lock(self.io.?) catch {};
+    /// Take the result of a completed operation. Returns null if not yet done.
+    /// On success, removes the operation state. Caller owns stdout string.
+    pub fn takeOpResult(self: *HostState, cmd_id: []const u8) ?struct { stdout: []const u8, exit: i32 } {
+        self.mutex.lock(self.io.?) catch return null;
         defer self.mutex.unlock(self.io.?);
 
-        var pit = self.pending.iterator();
-        while (pit.next()) |entry| {
-            for (entry.value_ptr.items, 0..) |cmd, j| {
-                if (std.mem.eql(u8, cmd.id, cmd_id) and (cmd.status == .completed or cmd.status == .failed)) {
-                    const result = cmd.result orelse return null;
-                    // Free cmd metadata before removing
-                    self.allocator.free(cmd.id);
-                    self.allocator.free(cmd.payload);
-                    // Remove this command from the list (swap-remove for O(1))
-                    _ = entry.value_ptr.swapRemove(j);
-                    return result;
-                }
-            }
+        const op = self.op_states.getPtr(cmd_id) orelse return null;
+        if (!op.done) return null;
+
+        const stdout_owned = op.output.toOwnedSlice(self.allocator) catch "";
+        const exit = op.exit_code;
+
+        // Remove from map
+        if (self.op_states.fetchRemove(cmd_id)) |kv| {
+            var out = kv.value.output;
+            out.deinit(self.allocator);
+            self.allocator.free(kv.key);
         }
-        return null;
+
+        return .{ .stdout = stdout_owned, .exit = exit };
     }
 
-    /// Fail all pending (status=dispatched) commands for a guest.
-    /// Called when guest disconnects — the exec shell session is gone.
-    pub fn failGuestPending(self: *HostState, hostname: []const u8) void {
+    // ══════════════════════════════════════════════════════════
+    // Close requests (--kick)
+    // ══════════════════════════════════════════════════════════
+
+    /// Mark a guest for WebSocket close (--kick).
+    pub fn requestClose(self: *HostState, hostname: []const u8) !void {
         self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
-
-        const list = self.pending.getPtr(hostname) orelse return;
-        for (list.items) |*cmd| {
-            if (cmd.status == .dispatched) {
-                cmd.status = .failed;
-                // Build error result with heap-allocated strings so
-                // callers can safely allocator.free() them (handleExec does).
-                // If allocation fails, fall back to empty strings — the
-                // result is error anyway.
-                const stdout = self.allocator.dupe(u8, "") catch "";
-                const stderr = self.allocator.dupe(u8, "disconnected") catch "";
-                cmd.result = CmdResult{
-                    .stdout = stdout,
-                    .stderr = stderr,
-                    .exit = -1,
-                };
-            }
+        const gop = try self.close_requests.getOrPut(hostname);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, hostname);
         }
-    }
-
-    /// Mark a guest to be kicked (WS connection closed) from --kick CLI.
-    pub fn markKicked(self: *HostState, hostname: []const u8) !void {
-        self.mutex.lock(self.io.?) catch return;
-        defer self.mutex.unlock(self.io.?);
-        const key = try self.allocator.dupe(u8, hostname);
-        try self.kicked.put(key, {});
     }
 
     /// Check if a guest is marked for kick, and consume the flag.
-    /// Returns true if the guest should disconnect.
-    pub fn checkKicked(self: *HostState, hostname: []const u8) bool {
+    pub fn checkCloseRequested(self: *HostState, hostname: []const u8) bool {
         self.mutex.lock(self.io.?) catch return false;
         defer self.mutex.unlock(self.io.?);
-        if (self.kicked.fetchRemove(hostname)) |kv| {
+        if (self.close_requests.fetchRemove(hostname)) |kv| {
             self.allocator.free(kv.key);
             return true;
         }

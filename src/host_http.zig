@@ -1,11 +1,14 @@
 //! Host HTTP endpoint handlers.
 //!
 //! Plugs into httpd.Router to provide:
-//!   POST /announce   — Guest heartbeat, returns pending commands
-//!   POST /exec       — Send command to guest (enqueue, wait for result)
-//!   POST /exec-result — Guest posts command execution result
+//!   POST /announce   — Guest heartbeat (backward compat, empty pending)
+//!   POST /exec       — Send command to guest via pty (enqueue pty_input, wait for MDELIM)
+//!   POST /kick       — Request guest WebSocket close
+//!   POST /upload     — Upload file to guest
+//!   POST /download   — Download file from guest
 //!   GET  /bin/<file> — Serve static binaries
 //!   GET  /           — Simple HTML status page
+//!   GET  /ws         — WebSocket upgrade (Guest persistent pty connection)
 //!   POST /mcp        — MCP JSON-RPC (delegates to mcp.zig)
 //!
 //! All handlers receive (allocator, HostState, Request, body).
@@ -18,8 +21,6 @@ const protocol = @import("protocol.zig");
 const hosts_file = @import("hosts_file.zig");
 const mcp = @import("mcp.zig");
 const wsproto = @import("wsproto.zig");
-
-// serve_dir is stored in httpd.HostState.serve_dir
 
 /// Read the request body as JSON. Caller owns the returned string.
 fn readBody(allocator: std.mem.Allocator, request: *http.Server.Request) ![]const u8 {
@@ -54,12 +55,11 @@ fn respondError(request: *http.Server.Request, status: http.Status, message: []c
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// POST /announce — Guest heartbeat
+// POST /announce — Guest heartbeat (backward compat)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn handleAnnounce(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
     _ = body;
-    // Read body (expected: JSON with hostname, ip, target, mac, version, shell)
     const body_str = readBody(allocator, request) catch {
         try respondError(request, .bad_request, "Missing or invalid body");
         return;
@@ -87,51 +87,21 @@ pub fn handleAnnounce(allocator: std.mem.Allocator, state: *httpd.HostState, req
     const version = httpd.jsonGetString(obj, "version") orelse protocol.VERSION;
     const shell = httpd.jsonGetString(obj, "shell") orelse "";
 
-    // Upsert guest
     const changed = state.upsertGuest(hostname, ip, target, mac, version, shell);
-
-    // Sync /etc/hosts if changed
     if (changed) {
         syncHostsFromState(state, allocator);
     }
 
-    // Build pending commands response
-    const pending = state.drainPending(hostname) catch &.{};
-    defer {
-        for (pending) |*cmd| {
-            allocator.free(cmd.id);
-            allocator.free(cmd.payload);
-        }
-        allocator.free(pending);
-    }
-
-    var resp: std.ArrayList(u8) = .empty;
-    defer resp.deinit(allocator);
-
-    try resp.appendSlice(allocator,"{\"pending\":[");
-    for (pending, 0..) |cmd, i| {
-        if (i > 0) try resp.appendSlice(allocator,",");
-        try resp.print(allocator,"{{\"id\":\"{s}\",\"type\":\"", .{cmd.id});
-        try resp.appendSlice(allocator,@tagName(cmd.cmd_type));
-        try resp.appendSlice(allocator,"\",\"payload\":\"");
-        // JSON-escape the payload
-        const escaped = httpd.jsonEscape(allocator, cmd.payload) catch cmd.payload;
-        defer if (escaped.ptr != cmd.payload.ptr) allocator.free(escaped);
-        try resp.appendSlice(allocator,escaped);
-        try resp.appendSlice(allocator,"\"}");
-    }
-    try resp.appendSlice(allocator,"]}");
-
-    try respondJson(request, resp.items);
+    // No pending commands in pty model — commands go via outgoing_frames through WebSocket
+    try respondJson(request, "{\"pending\":[]}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// POST /exec — Send command to guest
+// POST /exec — Send command to guest via pty
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
     _ = body;
-    std.log.info("[exec] handleExec called", .{});
     const body_str = readBody(allocator, request) catch |err| {
         std.log.err("[exec] readBody failed: {}", .{err});
         try respondError(request, .bad_request, "Missing body");
@@ -169,7 +139,7 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
         state.mutex.lock(state.io.?) catch {};
         const guest_exists = state.containsGuest(vm);
         if (!guest_exists) {
-            std.log.err("[exec] GuestNotFound: vm='{s}' len={d}, table entries:", .{ vm, vm.len });
+            std.log.err("[exec] GuestNotFound: vm='{s}'", .{vm});
             for (state.guests.items) |g| {
                 std.log.err("[exec]   hostname='{s}' ip='{s}'", .{ g.hostname, g.ip });
             }
@@ -180,26 +150,37 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
         state.mutex.unlock(state.io.?);
     }
 
-    // Enqueue command — returns command id
-    const cmd_id = try state.enqueueCmd(vm, .exec, command);
+    // Generate unique cmd_id
+    const cmd_id = blk: {
+        const ts = std.Io.Timestamp.now(state.io.?, .real).nanoseconds;
+        break :blk try std.fmt.allocPrint(allocator, "exec_{d}", .{ts});
+    };
     defer allocator.free(cmd_id);
-    std.log.info("[exec] Enqueued cmd {s} for {s}", .{ cmd_id, vm });
 
-    // Poll for result — no timeout (streaming exec may run indefinitely)
+    // Build pty_input frame: cmd_id + command + "; echo MDELIM:$?\n"
+    const cmd_with_marker = try std.fmt.allocPrint(allocator, "{s}; echo MDELIM:$?\n", .{command});
+    defer allocator.free(cmd_with_marker);
+
+    const frame = try wsproto.buildPtyInput(allocator, cmd_id, cmd_with_marker);
+    defer allocator.free(frame);
+
+    // Create operation state and enqueue frame
+    try state.createOpState(cmd_id);
+    try state.enqueueOutgoingFrame(vm, frame);
+
+    std.log.info("[exec] Enqueued pty cmd {s} for {s}", .{ cmd_id, vm });
+
+    // Poll for result — no timeout
     while (true) {
-        if (state.tryTakeResult(cmd_id)) |result| {
-            std.log.info("[exec] Result received for {s}", .{cmd_id});
-            const escaped_stdout = try httpd.jsonEscape(allocator, result.stdout);
-            defer allocator.free(escaped_stdout);
-            const escaped_stderr = try httpd.jsonEscape(allocator, result.stderr);
-            defer allocator.free(escaped_stderr);
+        if (state.takeOpResult(cmd_id)) |result| {
+            defer allocator.free(result.stdout);
+            const escaped = try httpd.jsonEscape(allocator, result.stdout);
+            defer allocator.free(escaped);
             const resp_json = try std.fmt.allocPrint(allocator,
-                "{{\"stdout\":\"{s}\",\"stderr\":\"{s}\",\"exit\":{d}}}",
-                .{ escaped_stdout, escaped_stderr, result.exit },
+                "{{\"stdout\":\"{s}\",\"stderr\":\"\",\"exit\":{d}}}",
+                .{ escaped, result.exit },
             );
             defer allocator.free(resp_json);
-            if (result.stdout.len > 0) allocator.free(result.stdout);
-            if (result.stderr.len > 0) allocator.free(result.stderr);
             try respondJson(request, resp_json);
             return;
         }
@@ -208,49 +189,7 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// POST /exec-result — Guest posts command result
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub fn handleExecResult(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
-    _ = body;
-    const body_str = readBody(allocator, request) catch {
-        try respondError(request, .bad_request, "Missing body");
-        return;
-    };
-    defer allocator.free(body_str);
-
-    const parsed = httpd.parseJson(allocator, body_str) catch {
-        try respondError(request, .bad_request, "Invalid JSON");
-        return;
-    };
-    defer parsed.deinit();
-
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else => {
-            try respondError(request, .bad_request, "Expected JSON object");
-            return;
-        },
-    };
-
-    const cmd_id = httpd.jsonGetString(obj, "id") orelse {
-        try respondError(request, .bad_request, "Missing 'id'");
-        return;
-    };
-    const stdout = httpd.jsonGetString(obj, "stdout") orelse "";
-    const stderr = httpd.jsonGetString(obj, "stderr") orelse "";
-    const exit: i32 = @intCast(httpd.jsonGetInt(obj, "exit") orelse -1);
-
-    const found = state.deliverResult(cmd_id, stdout, stderr, exit);
-    if (found) {
-        try respondJson(request, "{\"ok\":true}");
-    } else {
-        try respondError(request, .not_found, "Command id not found");
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// POST /kick — Close a guest's WebSocket connection (cancels exec)
+// POST /kick — Close a guest's WebSocket connection
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn handleKick(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
@@ -280,7 +219,7 @@ pub fn handleKick(allocator: std.mem.Allocator, state: *httpd.HostState, request
     };
 
     std.log.info("[kick] Kicking guest {s}", .{vm});
-    try state.markKicked(vm);
+    try state.requestClose(vm);
     try respondJson(request, "{\"ok\":true}");
 }
 
@@ -334,25 +273,27 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, reque
         }
     }
 
-    // Payload: path\0data
-    const payload = try allocator.alloc(u8, path.len + 1 + data.len);
-    defer allocator.free(payload);
-    @memcpy(payload[0..path.len], path);
-    payload[path.len] = 0;
-    @memcpy(payload[path.len + 1 ..], data);
-
-    const cmd_id = try state.enqueueCmd(vm, .upload, payload);
+    // Generate unique cmd_id
+    const cmd_id = blk: {
+        const ts = std.Io.Timestamp.now(state.io.?, .real).nanoseconds;
+        break :blk try std.fmt.allocPrint(allocator, "upload_{d}", .{ts});
+    };
     defer allocator.free(cmd_id);
+
+    const frame = try wsproto.buildUploadReq(allocator, cmd_id, path, data);
+    defer allocator.free(frame);
+
+    try state.createOpState(cmd_id);
+    try state.enqueueOutgoingFrame(vm, frame);
 
     // Poll for result — no timeout
     while (true) {
-        if (state.tryTakeResult(cmd_id)) |result| {
-            if (result.stdout.len > 0) allocator.free(result.stdout);
-            if (result.stderr.len > 0) allocator.free(result.stderr);
+        if (state.takeOpResult(cmd_id)) |result| {
+            defer allocator.free(result.stdout);
             if (result.exit == 0) {
                 try respondJson(request, "{\"ok\":true}");
             } else {
-                try respondJson(request, "{\"error\":\"UploadFailed\",\"exit\":0}");
+                try respondJson(request, "{\"error\":\"UploadFailed\"}");
             }
             return;
         }
@@ -406,19 +347,24 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
         }
     }
 
-    const cmd_id = try state.enqueueCmd(vm, .download, path);
+    // Generate unique cmd_id
+    const cmd_id = blk: {
+        const ts = std.Io.Timestamp.now(state.io.?, .real).nanoseconds;
+        break :blk try std.fmt.allocPrint(allocator, "download_{d}", .{ts});
+    };
     defer allocator.free(cmd_id);
 
-    // Poll for result
+    const frame = try wsproto.buildDownloadReq(allocator, cmd_id, path);
+    defer allocator.free(frame);
+
+    try state.createOpState(cmd_id);
+    try state.enqueueOutgoingFrame(vm, frame);
+
     // Poll for result — no timeout
     while (true) {
-        if (state.tryTakeResult(cmd_id)) |result| {
-            defer {
-                if (result.stdout.len > 0) allocator.free(result.stdout);
-                if (result.stderr.len > 0) allocator.free(result.stderr);
-            }
+        if (state.takeOpResult(cmd_id)) |result| {
+            defer allocator.free(result.stdout);
             if (result.exit == 0) {
-                // Return file content as JSON (escape for safety)
                 const escaped = try httpd.jsonEscape(allocator, result.stdout);
                 defer allocator.free(escaped);
                 const resp_json = try std.fmt.allocPrint(allocator,
@@ -442,7 +388,6 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
 
 pub fn handleBin(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
     _ = body;
-    // Extract filename from path: /bin/utmm-aarch64-linux
     const target = request.head.target;
     if (target.len <= "/bin/".len) {
         try respondError(request, .not_found, "No filename");
@@ -458,7 +403,6 @@ pub fn handleBin(allocator: std.mem.Allocator, state: *httpd.HostState, request:
         }
     }
 
-    // Read and serve file
     const io = state.io orelse {
         try respondError(request, .internal_server_error, "No I/O");
         return;
@@ -500,14 +444,14 @@ pub fn handleApiGuests(allocator: std.mem.Allocator, state: *httpd.HostState, re
 
     var first = true;
     for (state.guests.items) |g| {
-        if (!first) try json.appendSlice(allocator,",");
+        if (!first) try json.appendSlice(allocator, ",");
         first = false;
         try json.print(allocator,
             "{{\"hostname\":\"{s}\",\"target\":\"{s}\",\"ip\":\"{s}\",\"mac\":\"{s}\",\"version\":\"{s}\",\"shell\":\"{s}\"}}",
             .{ g.hostname, g.target, g.ip, g.mac, g.version, g.shell },
         );
     }
-    try json.appendSlice(allocator,"]");
+    try json.appendSlice(allocator, "]");
 
     try respondJson(request, json.items);
 }
@@ -538,7 +482,7 @@ pub fn handleRoot(allocator: std.mem.Allocator, state: *httpd.HostState, request
             .{ g.hostname, g.ip, g.target, g.mac, g.version, g.shell },
         );
     }
-    try html.appendSlice(allocator,"</table></body></html>");
+    try html.appendSlice(allocator, "</table></body></html>");
 
     try request.respond(html.items, .{
         .status = .ok,
@@ -562,7 +506,6 @@ pub fn handleMcp(allocator: std.mem.Allocator, state: *httpd.HostState, request:
     defer allocator.free(result);
 
     if (result.len == 0) {
-        // Notification — no response needed
         try request.respond("", .{ .status = .ok });
     } else {
         try respondJson(request, result);
@@ -570,7 +513,7 @@ pub fn handleMcp(allocator: std.mem.Allocator, state: *httpd.HostState, request:
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GET /ws — WebSocket upgrade (Guest persistent connection)
+// GET /ws — WebSocket upgrade (Guest persistent pty connection)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
@@ -584,9 +527,7 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
 
     var ws = try request.respondWebSocket(.{ .key = ws_key });
 
-    // respondWebSocket writes the 101 response to the output buffer but does
-    // NOT flush — data stays buffered. The Guest is waiting for the 101 before
-    // sending its announce. Without the flush, both sides deadlock.
+    // Flush 101 response so Guest can proceed with announce
     try ws.output.flush();
 
     // Read announce frame from guest (first message)
@@ -610,12 +551,11 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
 
     std.log.info("[ws] Guest {s} connected ({s} v{s})", .{ info.hostname, info.ip, info.version });
 
-    // Update guest table — cleaned up on exit
+    // Update guest table
     const changed = state.upsertGuest(info.hostname, info.ip, info.target, info.mac, info.version, info.shell);
     if (changed) syncHostsFromState(state, allocator);
     const ws_hostname = try allocator.dupe(u8, info.hostname);
     defer {
-        state.failGuestPending(ws_hostname);
         state.removeGuest(ws_hostname);
         syncHostsFromState(state, allocator);
         if (state.on_guest_changed) |cb| cb(state);
@@ -623,60 +563,29 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
     }
     if (state.on_guest_changed) |cb| cb(state);
 
-    // Main loop: poll for pending commands, send to guest, receive results.
-    // Guest re-announces at least once per second (WouldBlock timeout in
-    // readFrame triggers re-announce), so readSmallMessage never blocks
-    // indefinitely — it always returns with an announce or command response.
-
-    while (true) {
-        // 0. Check kicked flag (--kick CLI)
-        if (state.checkKicked(info.hostname)) {
-            std.log.info("[ws] Guest {s} kicked, closing connection", .{info.hostname});
+    // Send pty_spawn to guest — triggers ptySpawn + ptyReadLoop on guest side
+    {
+        const spawn_frame = try wsproto.buildPtySpawn(allocator);
+        defer allocator.free(spawn_frame);
+        ws.writeMessage(spawn_frame, .binary) catch |err| {
+            std.log.err("[ws] pty_spawn write failed for {s}: {}", .{ info.hostname, err });
             return;
-        }
+        };
+        std.log.info("[ws] Sent pty_spawn to {s}", .{info.hostname});
+    }
 
-        // 1. Drain pending commands and send to guest
-        const pending = state.drainPending(info.hostname) catch &.{};
-        if (pending.len > 0) {
-            std.log.info("[ws] Drained {d} pending commands for {s}", .{ pending.len, info.hostname });
-        }
-        for (pending) |cmd| {
-            const frame = try blk: {
-                switch (cmd.cmd_type) {
-                    .exec => break :blk wsproto.buildExecStart(allocator, cmd.id, cmd.payload),
-                    .upload => {
-                        const null_pos = std.mem.indexOfScalar(u8, cmd.payload, 0) orelse {
-                            allocator.free(cmd.id);
-                            allocator.free(cmd.payload);
-                            continue;
-                        };
-                        const path = cmd.payload[0..null_pos];
-                        const data = cmd.payload[null_pos + 1 ..];
-                        break :blk wsproto.buildUploadReq(allocator, cmd.id, path, data);
-                    },
-                    .download => break :blk wsproto.buildDownloadReq(allocator, cmd.id, cmd.payload),
-                    .upgrade => {
-                        allocator.free(cmd.id);
-                        allocator.free(cmd.payload);
-                        continue;
-                    },
-                }
-            };
+    // Main loop: drain outgoing frames, read guest messages, check close
+    while (true) {
+        // 1. Drain outgoing frames queue → send to guest
+        while (state.dequeueOutgoingFrame(ws_hostname)) |frame| {
             defer allocator.free(frame);
             ws.writeMessage(frame, .binary) catch |err| {
-                std.log.err("[ws] Write failed for {s}: {}", .{ info.hostname, err });
-                // Free cmd copies from drainPending
-                allocator.free(cmd.id);
-                allocator.free(cmd.payload);
+                std.log.err("[ws] Frame write failed for {s}: {}", .{ info.hostname, err });
                 return;
             };
-            // Free drainPending copies
-            allocator.free(cmd.id);
-            allocator.free(cmd.payload);
         }
 
-        // 2. Read response from guest (blocks until Guest re-announces or
-        //    sends a command response — Guest guarantees at least 1 msg/sec).
+        // 2. Read message from guest (blocks)
         const msg = ws.readSmallMessage() catch |err| {
             std.log.err("[ws] Read failed for {s}: {}", .{ info.hostname, err });
             return;
@@ -688,34 +597,26 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
             switch (resp_type) {
                 @intFromEnum(wsproto.MsgType.announce) => {
                     if (wsproto.parseAnnounce(payload)) |a| {
-                        std.log.info("[ws] Re-announce from {s}", .{a.hostname});
+                        std.log.debug("[ws] Re-announce from {s}", .{a.hostname});
                         _ = state.upsertGuest(a.hostname, a.ip, a.target, a.mac, a.version, a.shell);
                         if (state.on_guest_changed) |cb| cb(state);
                     }
                 },
-                @intFromEnum(wsproto.MsgType.exec_resp) => {
-                    if (wsproto.parseExecResp(payload)) |resp| {
-                        _ = state.deliverResult(resp.cmd_id, resp.stdout_data, resp.stderr_data, resp.exit_code);
-                    }
-                },
-                @intFromEnum(wsproto.MsgType.exec_stdout) => {
-                    if (wsproto.parseExecStdout(payload)) |chunk| {
-                        state.deliverStdoutChunk(chunk.cmd_id, chunk.chunk);
-                    }
-                },
-                @intFromEnum(wsproto.MsgType.exec_exit) => {
-                    if (wsproto.parseExecExit(payload)) |exit_msg| {
-                        _ = state.deliverExecExit(exit_msg.cmd_id, exit_msg.exit_code);
+                @intFromEnum(wsproto.MsgType.pty_output) => {
+                    if (wsproto.parsePtyOutput(payload)) |out| {
+                        state.appendOpOutput(out.cmd_id, out.data);
+                        state.scanForMarker(out.cmd_id);
                     }
                 },
                 @intFromEnum(wsproto.MsgType.upload_resp) => {
                     if (wsproto.parseUploadResp(payload)) |resp| {
-                        _ = state.deliverResult(resp.cmd_id, "", "", resp.exit_code);
+                        state.completeOpState(resp.cmd_id, resp.exit_code);
                     }
                 },
                 @intFromEnum(wsproto.MsgType.download_resp) => {
                     if (wsproto.parseDownloadResp(payload)) |resp| {
-                        _ = state.deliverResult(resp.cmd_id, resp.file_data, "", resp.exit_code);
+                        state.appendOpOutput(resp.cmd_id, resp.file_data);
+                        state.completeOpState(resp.cmd_id, resp.exit_code);
                     }
                 },
                 else => {
@@ -723,11 +624,16 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
                 },
             }
         } else if (msg.opcode == .ping) {
-            // RFC 6455: respond to ping with pong (control frame, unmasked).
-            // Guest exec thread uses ping to wake main loop on Windows.
+            // RFC 6455: respond to ping with pong
             ws.writeMessage(&.{}, .pong) catch {};
         } else if (msg.opcode == .connection_close) {
             std.log.info("[ws] Guest {s} disconnected", .{info.hostname});
+            return;
+        }
+
+        // 3. Check kick request
+        if (state.checkCloseRequested(ws_hostname)) {
+            std.log.info("[ws] Guest {s} kicked, closing connection", .{info.hostname});
             return;
         }
     }
@@ -741,7 +647,6 @@ fn syncHostsFromState(state: *httpd.HostState, allocator: std.mem.Allocator) voi
     state.mutex.lock(state.io.?) catch {};
     defer state.mutex.unlock(state.io.?);
 
-    // Build hosts entries from guest table
     var entries: std.ArrayList(hosts_file.HostEntry) = .empty;
     defer entries.deinit(allocator);
     var allocated_names: std.ArrayList([]const u8) = .empty;

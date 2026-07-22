@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const httpd = @import("httpd.zig");
+const wsproto = @import("wsproto.zig");
 
 // ── MCP protocol constants ─────────────────────────────────────────────────
 
@@ -125,7 +126,7 @@ fn handleVmStatus(allocator: std.mem.Allocator, state: *httpd.HostState) ![]cons
     return result.toOwnedSlice(allocator);
 }
 
-/// Handle vm_exec via HostState enqueue + poll (like /exec endpoint).
+/// Handle vm_exec via pty model: build pty_input, enqueue frame, poll for marker.
 fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []const u8, command: []const u8) ![]const u8 {
     // Check guest exists
     {
@@ -135,19 +136,29 @@ fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []con
         if (!exists) return error.GuestNotFound;
     }
 
-    const cmd_id = try state.enqueueCmd(vm, .exec, command);
+    // Generate unique cmd_id
+    const cmd_id = blk: {
+        const ts = std.Io.Timestamp.now(state.io.?, .real).nanoseconds;
+        break :blk try std.fmt.allocPrint(allocator, "mcp_{d}", .{ts});
+    };
     defer allocator.free(cmd_id);
 
-    // Poll for result — no timeout (streaming exec may run indefinitely)
-    while (true) {
-        if (state.tryTakeResult(cmd_id)) |result| {
-            defer {
-                if (result.stdout.len > 0) allocator.free(result.stdout);
-                if (result.stderr.len > 0) allocator.free(result.stderr);
-            }
+    // Build pty_input frame with marker
+    const cmd_with_marker = try std.fmt.allocPrint(allocator, "{s}; echo MDELIM:$?\n", .{command});
+    defer allocator.free(cmd_with_marker);
 
-            const output = if (result.stdout.len > 0) result.stdout else result.stderr;
-            const trimmed = std.mem.trim(u8, output, " \n\r");
+    const frame = try wsproto.buildPtyInput(allocator, cmd_id, cmd_with_marker);
+    defer allocator.free(frame);
+
+    try state.createOpState(cmd_id);
+    try state.enqueueOutgoingFrame(vm, frame);
+
+    // Poll for result — no timeout
+    while (true) {
+        if (state.takeOpResult(cmd_id)) |result| {
+            defer allocator.free(result.stdout);
+
+            const trimmed = std.mem.trim(u8, result.stdout, " \n\r");
             const esc_vm = try jsonEscape(allocator, vm);
             defer allocator.free(esc_vm);
             const esc_cmd = try jsonEscape(allocator, command);

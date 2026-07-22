@@ -12,18 +12,17 @@ const std = @import("std");
 
 pub const MsgType = enum(u8) {
     announce = 1, // guest→host: hostname, ip, target, mac, version, shell
-    exec_req = 2, // host→guest: cmd_id, command
-    exec_resp = 3, // guest→host: cmd_id, exit_code, stdout, stderr
     upload_req = 4, // host→guest: cmd_id, path, data
     upload_resp = 5, // guest→host: cmd_id, exit_code
     download_req = 6, // host→guest: cmd_id, path
     download_resp = 7, // guest→host: cmd_id, exit_code, data
 
-    // v0.4.0: streaming exec — WebSocket directly pipes to shell stdin/stdout+stderr
-    exec_start = 8, // host→guest: cmd_id, command (null-terminated)
-    exec_stdout = 9, // guest→host: cmd_id, chunk (stdout+stderr merged)
-    exec_stdin = 10, // host→guest: cmd_id, chunk (stdin data)
-    exec_exit = 11, // guest→host: cmd_id, exit_code
+    // v0.5.0: pty session model — persistent pty per WebSocket connection
+    pty_spawn = 12, // host→guest: spawn pty session (no payload)
+    pty_input = 13, // host→guest: cmd_id, stdin_data (raw bytes after null-term cmd_id)
+    pty_output = 14, // guest→host: cmd_id, stdout_data (raw bytes after null-term cmd_id)
+    pty_signal = 15, // host→guest: 1-byte signal (0=SIGINT/CtrlC, 1=SIGTERM, 2=SIGHUP)
+    pty_resize = 16, // host→guest: rows(u16 BE) + cols(u16 BE)
 };
 
 /// Write a null-terminated string into buf.
@@ -96,34 +95,6 @@ pub fn buildAnnounce(
     return buf.toOwnedSlice(allocator);
 }
 
-pub fn buildExecReq(allocator: std.mem.Allocator, cmd_id: []const u8, command: []const u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.append(allocator, @intFromEnum(MsgType.exec_req));
-    try writeString(&buf, allocator, cmd_id);
-    try buf.appendSlice(allocator, command);
-    return buf.toOwnedSlice(allocator);
-}
-
-pub fn buildExecResp(
-    allocator: std.mem.Allocator,
-    cmd_id: []const u8,
-    exit_code: i32,
-    stdout_data: []const u8,
-    stderr_data: []const u8,
-) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.append(allocator, @intFromEnum(MsgType.exec_resp));
-    try writeString(&buf, allocator, cmd_id);
-    var exit_buf: [4]u8 = undefined;
-    std.mem.writeInt(i32, &exit_buf, exit_code, .big);
-    try buf.appendSlice(allocator, &exit_buf);
-    try writeBlob(&buf, allocator, stdout_data);
-    try writeBlob(&buf, allocator, stderr_data);
-    return buf.toOwnedSlice(allocator);
-}
-
 pub fn buildUploadReq(allocator: std.mem.Allocator, cmd_id: []const u8, path: []const u8, data: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -167,6 +138,54 @@ pub fn buildDownloadResp(allocator: std.mem.Allocator, cmd_id: []const u8, exit_
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// v0.5.0: pty session model — build functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn buildPtySpawn(allocator: std.mem.Allocator) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.pty_spawn));
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn buildPtyInput(allocator: std.mem.Allocator, cmd_id: []const u8, data: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.pty_input));
+    try writeString(&buf, allocator, cmd_id);
+    try buf.appendSlice(allocator, data);
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn buildPtyOutput(allocator: std.mem.Allocator, cmd_id: []const u8, data: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.pty_output));
+    try writeString(&buf, allocator, cmd_id);
+    try buf.appendSlice(allocator, data);
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn buildPtySignal(allocator: std.mem.Allocator, signal: u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.pty_signal));
+    try buf.append(allocator, signal);
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn buildPtyResize(allocator: std.mem.Allocator, rows: u16, cols: u16) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.pty_resize));
+    var int_buf: [4]u8 = undefined;
+    std.mem.writeInt(u16, int_buf[0..2], rows, .big);
+    std.mem.writeInt(u16, int_buf[2..4], cols, .big);
+    try buf.appendSlice(allocator, &int_buf);
+    return buf.toOwnedSlice(allocator);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Parse functions
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -188,34 +207,6 @@ pub fn parseAnnounce(data: []const u8) ?AnnounceData {
     const version = readString(data, &pos) orelse return null;
     const shell = readString(data, &pos) orelse return null;
     return .{ .hostname = hostname, .ip = ip, .target = target, .mac = mac, .version = version, .shell = shell };
-}
-
-pub const ExecReqData = struct {
-    cmd_id: []const u8,
-    command: []const u8,
-};
-
-pub fn parseExecReq(data: []const u8) ?ExecReqData {
-    var pos: usize = 0;
-    const cmd_id = readString(data, &pos) orelse return null;
-    const command = data[pos..];
-    return .{ .cmd_id = cmd_id, .command = command };
-}
-
-pub const ExecRespData = struct {
-    cmd_id: []const u8,
-    exit_code: i32,
-    stdout_data: []const u8,
-    stderr_data: []const u8,
-};
-
-pub fn parseExecResp(data: []const u8) ?ExecRespData {
-    var pos: usize = 0;
-    const cmd_id = readString(data, &pos) orelse return null;
-    const exit_code = readI32(data, &pos) orelse return null;
-    const stdout_data = readBlob(data, &pos) orelse return null;
-    const stderr_data = readBlob(data, &pos) orelse return null;
-    return .{ .cmd_id = cmd_id, .exit_code = exit_code, .stdout_data = stdout_data, .stderr_data = stderr_data };
 }
 
 pub const UploadReqData = struct {
@@ -271,93 +262,43 @@ pub fn parseDownloadResp(data: []const u8) ?DownloadRespData {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// v0.4.0: Streaming exec — WebSocket ↔ shell stdin/stdout+stderr
+// v0.5.0: pty session model — parse functions
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub const ExecStartData = struct {
-    cmd_id: []const u8,
-    command: []const u8,
-};
-
-pub fn buildExecStart(allocator: std.mem.Allocator, cmd_id: []const u8, command: []const u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.append(allocator, @intFromEnum(MsgType.exec_start));
-    try writeString(&buf, allocator, cmd_id);
-    try writeString(&buf, allocator, command);
-    return buf.toOwnedSlice(allocator);
-}
-
-pub fn parseExecStart(data: []const u8) ?ExecStartData {
-    var pos: usize = 0;
-    const cmd_id = readString(data, &pos) orelse return null;
-    const command = readString(data, &pos) orelse return null;
-    return .{ .cmd_id = cmd_id, .command = command };
-}
-
-pub const ExecStdoutData = struct {
-    cmd_id: []const u8,
-    chunk: []const u8,
-};
-
-pub fn buildExecStdout(allocator: std.mem.Allocator, cmd_id: []const u8, chunk: []const u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.append(allocator, @intFromEnum(MsgType.exec_stdout));
-    try writeString(&buf, allocator, cmd_id);
-    try writeBlob(&buf, allocator, chunk);
-    return buf.toOwnedSlice(allocator);
-}
-
-pub fn parseExecStdout(data: []const u8) ?ExecStdoutData {
-    var pos: usize = 0;
-    const cmd_id = readString(data, &pos) orelse return null;
-    const chunk = readBlob(data, &pos) orelse return null;
-    return .{ .cmd_id = cmd_id, .chunk = chunk };
-}
-
-pub const ExecStdinData = struct {
+pub const PtyOutputData = struct {
     cmd_id: []const u8,
     data: []const u8,
 };
 
-pub fn buildExecStdin(allocator: std.mem.Allocator, cmd_id: []const u8, data: []const u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.append(allocator, @intFromEnum(MsgType.exec_stdin));
-    try writeString(&buf, allocator, cmd_id);
-    try writeBlob(&buf, allocator, data);
-    return buf.toOwnedSlice(allocator);
-}
-
-pub fn parseExecStdin(data: []const u8) ?ExecStdinData {
+pub fn parsePtyOutput(data: []const u8) ?PtyOutputData {
     var pos: usize = 0;
     const cmd_id = readString(data, &pos) orelse return null;
-    const chunk = readBlob(data, &pos) orelse return null;
-    return .{ .cmd_id = cmd_id, .data = chunk };
+    const payload = data[pos..];
+    return .{ .cmd_id = cmd_id, .data = payload };
 }
 
-pub const ExecExitData = struct {
+pub const PtyInputData = struct {
     cmd_id: []const u8,
-    exit_code: i32,
+    data: []const u8,
 };
 
-pub fn buildExecExit(allocator: std.mem.Allocator, cmd_id: []const u8, exit_code: i32) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.append(allocator, @intFromEnum(MsgType.exec_exit));
-    try writeString(&buf, allocator, cmd_id);
-    var exit_buf: [4]u8 = undefined;
-    std.mem.writeInt(i32, &exit_buf, exit_code, .big);
-    try buf.appendSlice(allocator, &exit_buf);
-    return buf.toOwnedSlice(allocator);
-}
-
-pub fn parseExecExit(data: []const u8) ?ExecExitData {
+pub fn parsePtyInput(data: []const u8) ?PtyInputData {
     var pos: usize = 0;
     const cmd_id = readString(data, &pos) orelse return null;
-    const exit_code = readI32(data, &pos) orelse return null;
-    return .{ .cmd_id = cmd_id, .exit_code = exit_code };
+    const payload = data[pos..];
+    return .{ .cmd_id = cmd_id, .data = payload };
+}
+
+pub const PtyResizeData = struct {
+    rows: u16,
+    cols: u16,
+};
+
+pub fn parsePtyResize(data: []const u8) ?PtyResizeData {
+    if (data.len < 4) return null;
+    const rows = std.mem.readInt(u16, data[0..2], .big);
+    const cols = std.mem.readInt(u16, data[2..4], .big);
+    return .{ .rows = rows, .cols = cols };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -366,7 +307,7 @@ pub fn parseExecExit(data: []const u8) ?ExecExitData {
 
 test "announce round-trip" {
     const allocator = std.testing.allocator;
-    const msg = try buildAnnounce(allocator, "testvm", "10.0.0.1", "aarch64-linux", "aa:bb:cc:dd:ee:ff", "0.3.0", "/bin/sh");
+    const msg = try buildAnnounce(allocator, "testvm", "10.0.0.1", "aarch64-linux", "aa:bb:cc:dd:ee:ff", "0.5.0", "/bin/sh");
     defer allocator.free(msg);
     try std.testing.expectEqual(@intFromEnum(MsgType.announce), msg[0]);
     const parsed = parseAnnounce(msg[1..]) orelse return error.ParseFailed;
@@ -374,39 +315,8 @@ test "announce round-trip" {
     try std.testing.expectEqualStrings("10.0.0.1", parsed.ip);
     try std.testing.expectEqualStrings("aarch64-linux", parsed.target);
     try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", parsed.mac);
-    try std.testing.expectEqualStrings("0.3.0", parsed.version);
+    try std.testing.expectEqualStrings("0.5.0", parsed.version);
     try std.testing.expectEqualStrings("/bin/sh", parsed.shell);
-}
-
-test "exec_req round-trip" {
-    const allocator = std.testing.allocator;
-    const msg = try buildExecReq(allocator, "r1", "uname -a");
-    defer allocator.free(msg);
-    try std.testing.expectEqual(@intFromEnum(MsgType.exec_req), msg[0]);
-    const parsed = parseExecReq(msg[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
-    try std.testing.expectEqualStrings("uname -a", parsed.command);
-}
-
-test "exec_resp round-trip" {
-    const allocator = std.testing.allocator;
-    const msg = try buildExecResp(allocator, "r1", 0, "Linux", "");
-    defer allocator.free(msg);
-    try std.testing.expectEqual(@intFromEnum(MsgType.exec_resp), msg[0]);
-    const parsed = parseExecResp(msg[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
-    try std.testing.expectEqual(0, parsed.exit_code);
-    try std.testing.expectEqualStrings("Linux", parsed.stdout_data);
-    try std.testing.expectEqualStrings("", parsed.stderr_data);
-}
-
-test "exec_resp with error" {
-    const allocator = std.testing.allocator;
-    const msg = try buildExecResp(allocator, "r2", 127, "", "command not found");
-    defer allocator.free(msg);
-    const parsed = parseExecResp(msg[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqual(127, parsed.exit_code);
-    try std.testing.expectEqualStrings("command not found", parsed.stderr_data);
 }
 
 test "upload round-trip with binary data" {
@@ -453,75 +363,83 @@ test "download_resp with binary data" {
     try std.testing.expectEqualSlices(u8, binary_data, parsed.file_data);
 }
 
-test "exec_start round-trip" {
+test "pty_spawn build" {
     const allocator = std.testing.allocator;
-    const msg = try buildExecStart(allocator, "r1", "uname -a");
+    const msg = try buildPtySpawn(allocator);
     defer allocator.free(msg);
-    try std.testing.expectEqual(@intFromEnum(MsgType.exec_start), msg[0]);
-    const parsed = parseExecStart(msg[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
-    try std.testing.expectEqualStrings("uname -a", parsed.command);
+    try std.testing.expectEqual(@intFromEnum(MsgType.pty_spawn), msg[0]);
+    try std.testing.expectEqual(@as(usize, 1), msg.len);
 }
 
-test "exec_stdout round-trip" {
+test "pty_input round-trip" {
     const allocator = std.testing.allocator;
-    const msg = try buildExecStdout(allocator, "r1", "hello world\n");
+    const msg = try buildPtyInput(allocator, "cmd1", "echo hello\n");
     defer allocator.free(msg);
-    try std.testing.expectEqual(@intFromEnum(MsgType.exec_stdout), msg[0]);
-    const parsed = parseExecStdout(msg[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
-    try std.testing.expectEqualStrings("hello world\n", parsed.chunk);
+    try std.testing.expectEqual(@intFromEnum(MsgType.pty_input), msg[0]);
+    const parsed = parsePtyInput(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("cmd1", parsed.cmd_id);
+    try std.testing.expectEqualStrings("echo hello\n", parsed.data);
 }
 
-test "exec_stdout with binary chunk" {
+test "pty_output round-trip with binary data" {
     const allocator = std.testing.allocator;
     const binary = &[_]u8{ 0x00, 0x01, 0xFF, 0xFE };
-    const msg = try buildExecStdout(allocator, "r2", binary);
+    const msg = try buildPtyOutput(allocator, "cmd2", binary);
     defer allocator.free(msg);
-    const parsed = parseExecStdout(msg[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqualStrings("r2", parsed.cmd_id);
-    try std.testing.expectEqualSlices(u8, binary, parsed.chunk);
+    try std.testing.expectEqual(@intFromEnum(MsgType.pty_output), msg[0]);
+    const parsed = parsePtyOutput(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("cmd2", parsed.cmd_id);
+    try std.testing.expectEqualSlices(u8, binary, parsed.data);
 }
 
-test "exec_stdin round-trip" {
+test "pty_output with MDELIM marker" {
     const allocator = std.testing.allocator;
-    const msg = try buildExecStdin(allocator, "r1", "stdin data");
+    const msg = try buildPtyOutput(allocator, "cmd3", "hello\nMDELIM:0\n");
     defer allocator.free(msg);
-    try std.testing.expectEqual(@intFromEnum(MsgType.exec_stdin), msg[0]);
-    const parsed = parseExecStdin(msg[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
-    try std.testing.expectEqualStrings("stdin data", parsed.data);
+    const parsed = parsePtyOutput(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("cmd3", parsed.cmd_id);
+    try std.testing.expectEqualStrings("hello\nMDELIM:0\n", parsed.data);
 }
 
-test "exec_exit round-trip" {
+test "pty_signal build" {
     const allocator = std.testing.allocator;
-    const msg = try buildExecExit(allocator, "r1", 42);
+    const msg = try buildPtySignal(allocator, 0); // SIGINT
     defer allocator.free(msg);
-    try std.testing.expectEqual(@intFromEnum(MsgType.exec_exit), msg[0]);
-    const parsed = parseExecExit(msg[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
-    try std.testing.expectEqual(42, parsed.exit_code);
+    try std.testing.expectEqual(@intFromEnum(MsgType.pty_signal), msg[0]);
+    try std.testing.expectEqual(@as(u8, 1), msg.len - 1);
+    try std.testing.expectEqual(@as(u8, 0), msg[1]);
 }
 
-test "exec_stream full flow: start → stdout → stdout → exit" {
+test "pty_resize round-trip" {
+    const allocator = std.testing.allocator;
+    const msg = try buildPtyResize(allocator, 80, 24);
+    defer allocator.free(msg);
+    try std.testing.expectEqual(@intFromEnum(MsgType.pty_resize), msg[0]);
+    const parsed = parsePtyResize(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqual(@as(u16, 80), parsed.rows);
+    try std.testing.expectEqual(@as(u16, 24), parsed.cols);
+}
+
+test "pty full flow: spawn → input → output → signal" {
     const allocator = std.testing.allocator;
 
-    const start = try buildExecStart(allocator, "x1", "echo hello");
-    defer allocator.free(start);
-    const parsed_start = parseExecStart(start[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqualStrings("x1", parsed_start.cmd_id);
-    try std.testing.expectEqualStrings("echo hello", parsed_start.command);
+    const spawn = try buildPtySpawn(allocator);
+    defer allocator.free(spawn);
+    try std.testing.expectEqual(@intFromEnum(MsgType.pty_spawn), spawn[0]);
 
-    const out1 = try buildExecStdout(allocator, "x1", "hello");
-    defer allocator.free(out1);
-    const parsed_out = parseExecStdout(out1[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqualStrings("hello", parsed_out.chunk);
+    const input = try buildPtyInput(allocator, "x1", "uname -a; echo MDELIM:$?\n");
+    defer allocator.free(input);
+    const parsed_input = parsePtyInput(input[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("x1", parsed_input.cmd_id);
+    try std.testing.expectEqualStrings("uname -a; echo MDELIM:$?\n", parsed_input.data);
 
-    const out2 = try buildExecStdout(allocator, "x1", " world\n");
-    defer allocator.free(out2);
+    const output = try buildPtyOutput(allocator, "x1", "Linux\nMDELIM:0\n");
+    defer allocator.free(output);
+    const parsed_out = parsePtyOutput(output[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("x1", parsed_out.cmd_id);
+    try std.testing.expectEqualStrings("Linux\nMDELIM:0\n", parsed_out.data);
 
-    const exit_msg = try buildExecExit(allocator, "x1", 0);
-    defer allocator.free(exit_msg);
-    const parsed_exit = parseExecExit(exit_msg[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqual(0, parsed_exit.exit_code);
+    const sig = try buildPtySignal(allocator, 0);
+    defer allocator.free(sig);
+    try std.testing.expectEqual(@intFromEnum(MsgType.pty_signal), sig[0]);
 }

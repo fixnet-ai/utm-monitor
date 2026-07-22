@@ -34,3 +34,4 @@ task_plan.md
 findings.md
 progress.md
 zig-codegen.md
+test_*
