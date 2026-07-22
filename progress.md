@@ -1,4 +1,22 @@
-# Progress: v0.5.0 pty Session Model
+# Progress: v0.6.1
+
+## Session 2026-07-23 (v0.6.1 完善)
+
+### v0.6.1 发布
+- **版本号**: 0.6.0 → 0.6.1 (`ver.zig`, `build.zig.zon`)
+- **Commit**: `65d8451` — 4 files changed
+
+**Phase 16: Windows 防火墙自动化**
+- `install.zig`: Windows 系统服务安装 (`--install`) 自动执行 `netsh advfirewall firewall add rule` 开放 UDP 2121 入站
+- 卸载时自动 `netsh advfirewall firewall delete rule` 清理规则
+- 根因：真机 Windows 防火墙默认拦截入站 UDP，导致 `--status` 扫不到
+- UTM VM 不受影响（桥接网络无防火墙）
+
+**文档更新**:
+- `task_plan.md`: 标题 v0.5.0 → v0.6.1，新增 Phase 16
+- `build.zig.zon`: 0.5.1 → 0.6.1（之前版本号不同步）
+
+**构建验证**: `zig build test` 全过，全部 6 目标交叉编译全过
 
 ## Session 2026-07-19 (v0.2.0 zio Architecture — superseded)
 v0.2.0 架构已完成并发布：
