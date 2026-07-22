@@ -170,6 +170,7 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
     std.log.info("[exec] Enqueued pty cmd {s} for {s}", .{ cmd_id, vm });
 
     // Wait for result — woken by WebSocket handler via wake_event
+    // 30s timeout prevents thread leak if guest disconnects
     while (true) {
         if (state.takeOpResult(cmd_id)) |result| {
             defer allocator.free(result.stdout);
@@ -183,8 +184,12 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
             try respondJson(request, resp_json);
             return;
         }
-        // Wait on wake_event — set by scanForMarker or completeOpState
-        state.wake_event.wait(state.io.?) catch {};
+        // Wait with 30s timeout — failAllPendingOps will wake sooner on disconnect
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(30), .clock = .awake } }) catch |err| {
+            std.log.err("[exec] wait timeout for {s}: {}", .{ cmd_id, err });
+            try respondJson(request, "{\"error\":\"ExecTimeout\"}");
+            return;
+        };
         state.wake_event.reset();
     }
 }
@@ -298,7 +303,11 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, reque
             }
             return;
         }
-        state.wake_event.wait(state.io.?) catch {};
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(30), .clock = .awake } }) catch |err| {
+            std.log.err("[upload] wait timeout for {s}: {}", .{ cmd_id, err });
+            try respondJson(request, "{\"error\":\"UploadTimeout\"}");
+            return;
+        };
         state.wake_event.reset();
     }
 }
@@ -380,7 +389,11 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
             }
             return;
         }
-        state.wake_event.wait(state.io.?) catch {};
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(30), .clock = .awake } }) catch |err| {
+            std.log.err("[download] wait timeout for {s}: {}", .{ cmd_id, err });
+            try respondJson(request, "{\"error\":\"DownloadTimeout\"}");
+            return;
+        };
         state.wake_event.reset();
     }
 }
@@ -559,6 +572,7 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
     if (changed) syncHostsFromState(state, allocator);
     const ws_hostname = try allocator.dupe(u8, info.hostname);
     defer {
+        state.failAllPendingOps();
         state.removeGuest(ws_hostname);
         syncHostsFromState(state, allocator);
         if (state.on_guest_changed) |cb| cb(state);

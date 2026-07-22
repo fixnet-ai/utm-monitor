@@ -642,7 +642,7 @@ fn ptySpawn(allocator: std.mem.Allocator, shell: []const u8) !PtySession {
             break :blk "/bin/sh";
         } else "/bin/sh";
 
-        const argv = [_:null]?[*:0]const u8{ shell_path.ptr, @as(?[*:0]const u8, @ptrFromInt(@intFromPtr("--login"))), null };
+        const argv = [_:null]?[*:0]const u8{ shell_path.ptr, @as(?[*:0]const u8, @ptrFromInt(@intFromPtr("-l"))), null };
         _ = std.c.execve(shell_path.ptr, &argv, &[_:null]?[*:0]const u8{null});
         @panic("pty: execve failed");
     }
@@ -794,6 +794,17 @@ fn ptyReadLoop(
                 break;
             };
 
+            // POLL.HUP: shell process exited (or never started).
+            // Poll returns immediately with HUP set, so we must handle
+            // it before the POLL.IN check — otherwise we spin at 100% CPU.
+            if (fds[0].revents & std.posix.POLL.HUP != 0) {
+                std.log.info("[guest-pty] pty hangup (shell exited)", .{});
+                pty_dead.* = true;
+                if (builtin.os.tag == .windows) {
+                    conn.writeFrame(&.{}, .ping) catch {};
+                }
+                break;
+            }
             if (fds[0].revents & std.posix.POLL.IN == 0) continue;
         }
 

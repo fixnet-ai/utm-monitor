@@ -178,7 +178,9 @@ fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []con
             );
             return buf.toOwnedSlice(allocator);
         }
-        state.wake_event.wait(state.io.?) catch {};
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(30), .clock = .awake } }) catch {
+            return error.ExecTimeout;
+        };
         state.wake_event.reset();
     }
 }

@@ -393,6 +393,25 @@ pub const HostState = struct {
         return .{ .stdout = stdout_owned, .exit = exit };
     }
 
+    /// Fail all pending operations (called on guest disconnect).
+    /// Wakes all HTTP/MCP handlers waiting on wake_event so they
+    /// can return errors instead of blocking forever.
+    pub fn failAllPendingOps(self: *HostState) void {
+        self.mutex.lock(self.io.?) catch return;
+        defer self.mutex.unlock(self.io.?);
+
+        var it = self.op_states.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.done) {
+                entry.value_ptr.output.clearRetainingCapacity();
+                entry.value_ptr.output.appendSlice(self.allocator, "guest disconnected") catch {};
+                entry.value_ptr.exit_code = -1;
+                entry.value_ptr.done = true;
+            }
+        }
+        self.wake_event.set(self.io.?);
+    }
+
     // ══════════════════════════════════════════════════════════
     // Close requests (--kick)
     // ══════════════════════════════════════════════════════════
