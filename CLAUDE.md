@@ -43,10 +43,12 @@ Guest (windows)  ──WebSocket──┘                      ├── POST /e
 - Single binary, dual mode: reduces maintenance burden
 - Unified HTTP server on single port (2121): replaces UDP broadcast + TCP binary frames + MCP :2122
 - WebSocket persistent connection: Guest→Host real-time push, no polling for commands. Binary frames for exec/upload/download — zero encoding overhead
+- **Connection = Shell Session**: Each WebSocket lifecycle is one shell session. After exec completes, Guest sends exec_exit, flushes TCP (200ms), disconnects WebSocket, and reconnects — giving Host a fresh shell session. This removes the need for exec_signal (type 12) — closing the WebSocket implicitly terminates any running command (SIGPIPE/kill on cleanup). Host-side `--kick <vm>` closes a guest's WebSocket connection, failing all pending commands with "disconnected" error.
 - `std.http.Server` with `std.Thread` concurrency — each connection gets its own thread
 - Zero external dependencies: no Node.js, no Python, no SSH/SCP, no curl — everything via HTTP + WebSocket
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
 - **Windows child processes**: On Windows, `std.process.Init.io` is `global_single_threaded` which uses `Allocator.failing`. Use `std.Io.Threaded.init(gpa, .{})` for `std.process.run` on Windows in daemon/service contexts. In foreground mode (agent.zig), `init.io` from the desktop shortcut works directly.
+- **Windows exec wakeup**: POSIX uses poll() with 1s timeout to detect exec completion. Windows has no poll() — the main loop blocks on `readFrame` forever. Solution: exec thread sends a WebSocket PING after setting `exec_done=true`. Host responds with PONG (per RFC 6455), which wakes Guest's `readSmallMessage`. The ping/pong handler is in `host_http.zig` — `readSmallMessage` does NOT auto-respond to pings.
 
 ## Build & Run
 
@@ -89,14 +91,15 @@ utmm --host --serve-dir /path/to/binaries # Custom binary serve directory
 # ── Management Commands (HTTP to Host :2121) ──
 utmm --status                             # Query all Guest status
 utmm --exec linuxvm "uname -a"            # Remote command execution (no timeout)
-utmm --exec-cancel linuxvm <cmd_id>       # Send SIGINT to running command
+utmm --kick linuxvm                      # Close guest WebSocket (cancels running exec)
 utmm --upload file.txt linuxvm            # Upload file to Guest (no curl)
 utmm --download linuxvm f.txt ./f.txt     # Download file from Guest (no curl)
 
 # Management commands send HTTP requests to Host on 127.0.0.1:2121.
 # Host communicates with Guest via WebSocket for command execution.
 # Exec uses streaming protocol: exec_start→guest spawns child→exec_stdout chunks→exec_exit.
-# No 30s timeout — commands run indefinitely until completion or --exec-cancel.
+# No 30s timeout — commands run indefinitely. exec_exit → Guest disconnects, reconnects
+# for fresh shell session (Connection = Shell Session). Use --kick to cancel.
 ```
 
 ## Project File Structure

@@ -250,10 +250,10 @@ pub fn handleExecResult(allocator: std.mem.Allocator, state: *httpd.HostState, r
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// POST /exec-signal — Send signal (Ctrl+C) to a running command on guest
+// POST /kick — Close a guest's WebSocket connection (cancels exec)
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub fn handleExecSignal(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+pub fn handleKick(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
     _ = body;
     const body_str = readBody(allocator, request) catch {
         try respondError(request, .bad_request, "Missing body");
@@ -278,13 +278,9 @@ pub fn handleExecSignal(allocator: std.mem.Allocator, state: *httpd.HostState, r
         try respondError(request, .bad_request, "Missing 'vm' field");
         return;
     };
-    const cmd_id = httpd.jsonGetString(obj, "cmd_id") orelse {
-        try respondError(request, .bad_request, "Missing 'cmd_id' field");
-        return;
-    };
 
-    std.log.info("[exec-signal] Sending SIGINT to {s} cmd={s}", .{ vm, cmd_id });
-    try state.enqueueSignal(vm, cmd_id, 0); // 0 = SIGINT
+    std.log.info("[kick] Kicking guest {s}", .{vm});
+    try state.markKicked(vm);
     try respondJson(request, "{\"ok\":true}");
 }
 
@@ -619,6 +615,7 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
     if (changed) syncHostsFromState(state, allocator);
     const ws_hostname = try allocator.dupe(u8, info.hostname);
     defer {
+        state.failGuestPending(ws_hostname);
         state.removeGuest(ws_hostname);
         syncHostsFromState(state, allocator);
         if (state.on_guest_changed) |cb| cb(state);
@@ -632,6 +629,12 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
     // indefinitely — it always returns with an announce or command response.
 
     while (true) {
+        // 0. Check kicked flag (--kick CLI)
+        if (state.checkKicked(info.hostname)) {
+            std.log.info("[ws] Guest {s} kicked, closing connection", .{info.hostname});
+            return;
+        }
+
         // 1. Drain pending commands and send to guest
         const pending = state.drainPending(info.hostname) catch &.{};
         if (pending.len > 0) {
@@ -670,28 +673,6 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
             // Free drainPending copies
             allocator.free(cmd.id);
             allocator.free(cmd.payload);
-        }
-
-        // Drain and send pending signals (exec_signal)
-        {
-            const signals = state.drainSignals(info.hostname) catch &.{};
-            if (signals.len > 0) {
-                std.log.info("[ws] Drained {d} signals for {s}", .{ signals.len, info.hostname });
-            }
-            for (signals) |sig| {
-                std.log.info("[ws] Sending signal {d} for cmd={s}", .{ sig.signal, sig.cmd_id });
-                const sig_frame = try wsproto.buildExecSignal(allocator, sig.cmd_id, sig.signal);
-                defer allocator.free(sig_frame);
-                ws.writeMessage(sig_frame, .binary) catch |err| {
-                    std.log.err("[ws] Signal write failed for {s}: {}", .{ info.hostname, err });
-                };
-                // flush to ensure signal is sent immediately
-                ws.output.flush() catch |err| {
-                    std.log.err("[ws] Signal flush failed: {}", .{err});
-                };
-                allocator.free(sig.cmd_id);
-            }
-            if (signals.len > 0) allocator.free(signals);
         }
 
         // 2. Read response from guest (blocks until Guest re-announces or
@@ -741,6 +722,10 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
                     std.log.debug("[ws] Unknown message type: {d}", .{resp_type});
                 },
             }
+        } else if (msg.opcode == .ping) {
+            // RFC 6455: respond to ping with pong (control frame, unmasked).
+            // Guest exec thread uses ping to wake main loop on Windows.
+            ws.writeMessage(&.{}, .pong) catch {};
         } else if (msg.opcode == .connection_close) {
             std.log.info("[ws] Guest {s} disconnected", .{info.hostname});
             return;

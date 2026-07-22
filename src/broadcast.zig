@@ -449,7 +449,13 @@ fn getGatewayLinux(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn getGatewayWindows(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
-    const result = try std.process.run(allocator, io, .{
+    // Use dedicated Threaded I/O — the passed-in io may be global_single_threaded
+    // (Allocator.failing) on Windows service context, causing OutOfMemory in processSpawnWindows.
+    _ = io;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    const block_io = threaded.io();
+
+    const result = try std.process.run(allocator, block_io, .{
         .argv = &[_][]const u8{ "route", "print", "0.0.0.0" },
     });
     defer {
@@ -502,6 +508,28 @@ fn runTimerThread(ctx: *TimerCtx) void {
     }
 }
 
+/// Cross-platform child process termination.
+/// POSIX: killpg(SIGTERM), fallback to kill(SIGTERM).
+/// Windows: OpenProcess + TerminateProcess (no process group concept for schtasks).
+fn killChildProcess(pid: std.posix.pid_t) void {
+    switch (builtin.os.tag) {
+        .windows => {
+            const TerminateProcess = @extern(
+                *const fn (std.os.windows.HANDLE, std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL,
+                .{ .name = "TerminateProcess", .library_name = "kernel32" },
+            );
+            _ = TerminateProcess(pid, 1);
+        },
+        .linux, .macos => {
+            const pgid = -@as(std.posix.pid_t, @intCast(pid));
+            std.posix.kill(pgid, std.posix.SIG.TERM) catch {
+                std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            };
+        },
+        else => @compileError("unsupported OS for killChildProcess"),
+    }
+}
+
 const TimerCtx = struct {
     conn: *wsclient.WsConn,
     msg: []const u8,
@@ -518,6 +546,7 @@ const ExecStdoutThreadArgs = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     cmd_id: []const u8,
+    exec_done: *bool,
 };
 
 /// Thread: poll child stdout, send exec_stdout frames. Detect child exit
@@ -563,6 +592,7 @@ fn execStdoutThread(args: *ExecStdoutThreadArgs) void {
                 std.log.err("[guest-ws] exec_exit write: {}", .{err});
             };
             std.log.debug("[guest-ws] Exec done: cmd_id={s} exit={d}", .{ args.cmd_id, exit_code });
+            args.exec_done.* = true;
             break;
         }
 
@@ -574,6 +604,76 @@ fn execStdoutThread(args: *ExecStdoutThreadArgs) void {
             };
         }
     }
+}
+
+/// Thread args for Windows exec stdout reader.
+/// Uses WaitForSingleObject + ReadFile (no POSIX poll/waitpid).
+const WindowsExecThreadArgs = struct {
+    process_handle: std.os.windows.HANDLE,
+    stdout_handle: std.os.windows.HANDLE,
+    conn: *wsclient.WsConn,
+    allocator: std.mem.Allocator,
+    cmd_id: []const u8,
+    threaded: std.Io.Threaded, // owned by thread, deinited on exit
+    exec_done: *bool,
+};
+
+/// Thread: blocking ReadFile from child stdout pipe, send exec_stdout frames.
+/// When pipe closes (child exited): WaitForSingleObject + GetExitCodeProcess,
+/// send exec_exit frame. Cleanup: close handles, deinit Threaded.
+fn windowsExecThread(args: *WindowsExecThreadArgs) void {
+    defer {
+        args.allocator.free(args.cmd_id);
+        args.threaded.deinit();
+        args.allocator.destroy(args);
+    }
+
+    const win = std.os.windows;
+    const ReadFile = @extern(
+        *const fn (win.HANDLE, [*]u8, win.DWORD, *win.DWORD, ?*anyopaque) callconv(.winapi) win.BOOL,
+        .{ .name = "ReadFile", .library_name = "kernel32" },
+    );
+    const WaitForSingleObject = @extern(
+        *const fn (win.HANDLE, win.DWORD) callconv(.winapi) win.DWORD,
+        .{ .name = "WaitForSingleObject", .library_name = "kernel32" },
+    );
+    const GetExitCodeProcess = @extern(
+        *const fn (win.HANDLE, *win.DWORD) callconv(.winapi) win.BOOL,
+        .{ .name = "GetExitCodeProcess", .library_name = "kernel32" },
+    );
+    var buf: [4096]u8 = undefined;
+
+    while (true) {
+        var bytes_read: win.DWORD = 0;
+        // Blocking read from child stdout pipe.
+        // Returns 0 when pipe is closed (child exited) or on error.
+        const result = ReadFile(args.stdout_handle, &buf, buf.len, &bytes_read, null);
+        if (@intFromEnum(result) == 0) break;
+        if (bytes_read > 0) {
+            const frame = wsproto_mod.buildExecStdout(args.allocator, args.cmd_id, buf[0..@intCast(bytes_read)]) catch break;
+            defer args.allocator.free(frame);
+            args.conn.writeFrame(frame, .binary) catch break;
+        }
+    }
+
+    // Wait for process to fully exit and retrieve exit code
+    _ = WaitForSingleObject(args.process_handle, std.math.maxInt(u32));
+    var exit_code: win.DWORD = 0;
+    _ = GetExitCodeProcess(args.process_handle, &exit_code);
+    win.CloseHandle(args.process_handle);
+    win.CloseHandle(args.stdout_handle);
+
+    const frame = wsproto_mod.buildExecExit(args.allocator, args.cmd_id, @as(i32, @bitCast(exit_code))) catch return;
+    defer args.allocator.free(frame);
+    args.conn.writeFrame(frame, .binary) catch |err| {
+        std.log.err("[guest-ws] exec_exit write (win): {}", .{err});
+    };
+    std.log.debug("[guest-ws] Exec done (win): cmd_id={s} exit={d}", .{ args.cmd_id, exit_code });
+    args.exec_done.* = true;
+    // On Windows, main loop has no poll timeout — it blocks on readFrame.
+    // Send a ping so the Host responds with a pong, waking readFrame.
+    // std.http.WebSocket.readSmallMessage auto-handles ping→pong per RFC 6455.
+    args.conn.writeFrame(&.{}, .ping) catch {};
 }
 
 /// WebSocket announce loop: persistent WS connection to Host.
@@ -653,10 +753,12 @@ pub fn wsAnnounceLoop(
     // access to child stdin pipe and pid for signal/stdin delivery.
     var active_stdin: ?std.Io.File = null;
     var active_pid: ?std.posix.pid_t = null;
+    // Set by exec thread after exec_exit sent; main loop detects and reconnects.
+    var exec_done: bool = false;
     defer {
         // Clean up child if connection lost during exec
         if (active_pid) |pid| {
-            std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+            killChildProcess(pid);
         }
     }
 
@@ -675,6 +777,12 @@ pub fn wsAnnounceLoop(
                     std.log.err("[guest-ws] Announce write failed: {}", .{err});
                     break;
                 };
+                // Check exec_done before continuing — thread may have set it during poll
+                if (exec_done) {
+                    std.log.info("[guest-ws] Exec completed (detected on poll timeout), flushing and reconnecting...", .{});
+                    std.Io.sleep(io, std.Io.Duration{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch {};
+                    break;
+                }
                 continue;
             }
             std.log.info("[guest-ws] poll returned {d}", .{poll_n});
@@ -699,7 +807,7 @@ pub fn wsAnnounceLoop(
                     @intFromEnum(wsproto_mod.MsgType.exec_start) => {
                         if (wsproto_mod.parseExecStart(payload)) |req| {
                             std.log.debug("[guest-ws] Exec stream: cmd_id={s} cmd={s}", .{ req.cmd_id, req.command });
-                            spawnExecStream(&conn, io, allocator, req.cmd_id, req.command, &active_stdin, &active_pid) catch |err| {
+                            spawnExecStream(&conn, io, allocator, req.cmd_id, req.command, &active_stdin, &active_pid, &exec_done) catch |err| {
                                 std.log.err("[guest-ws] Exec stream spawn failed: {}", .{err});
                                 // Send error exit so Host doesn't wait forever
                                 const err_frame = wsproto_mod.buildExecExit(allocator, req.cmd_id, -1) catch continue;
@@ -715,39 +823,6 @@ pub fn wsAnnounceLoop(
                                 var writer = stdin_pipe.writer(io, &wb);
                                 _ = writer.interface.write(stdin_req.data) catch {};
                                 writer.interface.flush() catch {};
-                            }
-                        }
-                    },
-                    @intFromEnum(wsproto_mod.MsgType.exec_signal) => {
-                        if (wsproto_mod.parseExecSignal(payload)) |sig| {
-                            std.log.info("[guest-ws] Received signal {d}, active_pid={?}", .{ sig.signal, active_pid });
-                            if (active_pid) |pid| {
-                                std.log.info("[guest-ws] Sending signal {d} to pid={d}", .{ sig.signal, pid });
-                                // Signal the shell child. Strategy:
-                                // 1. Try killpg(-pid, sig) — works if setpgid succeeded
-                                // 2. Fallback: direct kill(pid, sig) + kill child pg
-                                switch (sig.signal) {
-                                    0 => {
-                                        const pgid = -@as(std.posix.pid_t, @intCast(pid));
-                                        std.posix.kill(pgid, std.posix.SIG.INT) catch {
-                                            // Fallback: direct SIGTERM to shell
-                                            std.posix.kill(pid, std.posix.SIG.TERM) catch |err2| {
-                                                std.log.err("[guest-ws] kill(SIGTERM, {d}) failed: {}", .{ pid, err2 });
-                                            };
-                                        };
-                                    },
-                                    1 => {
-                                        const pgid = -@as(std.posix.pid_t, @intCast(pid));
-                                        std.posix.kill(pgid, std.posix.SIG.TERM) catch {
-                                            std.posix.kill(pid, std.posix.SIG.TERM) catch |err2| {
-                                                std.log.err("[guest-ws] kill(SIGTERM, {d}) failed: {}", .{ pid, err2 });
-                                            };
-                                        };
-                                    },
-                                    else => std.log.info("[guest-ws] Unknown signal: {d}", .{sig.signal}),
-                                }
-                            } else {
-                                std.log.info("[guest-ws] No active pid, signal ignored", .{});
                             }
                         }
                     },
@@ -806,6 +881,14 @@ pub fn wsAnnounceLoop(
             },
         }
 
+        // exec completed: flush TCP (200ms) so Host receives exec_exit,
+        // then disconnect and reconnect for fresh shell session
+        if (exec_done) {
+            std.log.info("[guest-ws] Exec completed, flushing and reconnecting...", .{});
+            std.Io.sleep(io, std.Io.Duration{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch {};
+            break;
+        }
+
         }
 
         std.log.info("[guest-ws] Disconnected, reconnecting in 3s...", .{});
@@ -817,6 +900,8 @@ pub fn wsAnnounceLoop(
 /// Spawn child process and launch stdout thread. Main loop continues
 /// to send re-announce messages (unblocking Host's readSmallMessage) and
 /// handles exec_stdin/exec_signal delivery via active_stdin/active_pid.
+/// POSIX: poll(WS+stdout) single-threaded loop.
+/// Windows: WaitForSingleObject + ReadFile in dedicated thread.
 fn spawnExecStream(
     conn: *wsclient.WsConn,
     io: std.Io,
@@ -825,6 +910,7 @@ fn spawnExecStream(
     command: []const u8,
     active_stdin: *?std.Io.File,
     active_pid: *?std.posix.pid_t,
+    exec_done: *bool,
 ) !void {
     const shell = detectShell(allocator) catch "/bin/sh";
     defer allocator.free(shell);
@@ -832,10 +918,12 @@ fn spawnExecStream(
     const merged_cmd = try std.fmt.allocPrint(allocator, "{s} 2>&1", .{command});
     defer allocator.free(merged_cmd);
 
-    const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
-        &.{ "cmd.exe", "/c", merged_cmd }
-    else
-        &.{ shell, "-l", "-c", merged_cmd };
+    if (builtin.os.tag == .windows) {
+        return spawnExecStreamWindows(conn, allocator, cmd_id, merged_cmd, active_stdin, active_pid, exec_done);
+    }
+
+    // ── POSIX path ──
+    const shell_args: []const []const u8 = &.{ shell, "-l", "-c", merged_cmd };
 
     const child = try std.process.spawn(io, .{
         .argv = shell_args,
@@ -858,12 +946,61 @@ fn spawnExecStream(
         .io = io,
         .allocator = allocator,
         .cmd_id = try allocator.dupe(u8, cmd_id),
+        .exec_done = exec_done,
     };
 
     const t = try std.Thread.spawn(.{}, execStdoutThread, .{thread_args});
     t.detach();
 
     std.log.debug("[guest-ws] Exec thread spawned: cmd_id={s}", .{cmd_id});
+}
+
+/// Windows: spawn child with Threaded I/O, launch windowsExecThread.
+/// Stderr merged into stdout via cmd.exe 2>&1 (already in merged_cmd).
+fn spawnExecStreamWindows(
+    conn: *wsclient.WsConn,
+    allocator: std.mem.Allocator,
+    cmd_id: []const u8,
+    merged_cmd: []const u8,
+    active_stdin: *?std.Io.File,
+    active_pid: *?std.posix.pid_t,
+    exec_done: *bool,
+) !void {
+    // Use dedicated Threaded I/O for process operations in service context.
+    // global_single_threaded uses Allocator.failing → OutOfMemory in processSpawnWindows.
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    const block_io = threaded.io();
+
+    const child = try std.process.spawn(block_io, .{
+        .argv = &.{ "cmd.exe", "/c", merged_cmd },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+
+    // Store handles for main loop (stdin writes, signal delivery).
+    // On Windows, pid_t is HANDLE — child.id is the process handle.
+    const process_handle = child.id orelse return error.NoProcessHandle;
+    active_stdin.* = child.stdin.?;
+    active_pid.* = process_handle;
+
+    const stdout_handle = child.stdout.?.handle;
+
+    const thread_args = try allocator.create(WindowsExecThreadArgs);
+    thread_args.* = .{
+        .process_handle = process_handle,
+        .stdout_handle = stdout_handle,
+        .conn = conn,
+        .allocator = allocator,
+        .cmd_id = try allocator.dupe(u8, cmd_id),
+        .threaded = threaded, // transferred to thread, deinited on exit
+        .exec_done = exec_done,
+    };
+
+    const t = try std.Thread.spawn(.{}, windowsExecThread, .{thread_args});
+    t.detach();
+
+    std.log.debug("[guest-ws] Exec thread spawned (win): cmd_id={s}", .{cmd_id});
 }
 
 /// Read from child stdout fd and send as exec_stdout frame. Returns bytes read.

@@ -85,7 +85,8 @@ Guest opens a persistent WebSocket connection to Host. All communication uses **
 | `exec_stdout` (9) | Guest → Host | Real-time stdout/stderr chunk (merged 2>&1) |
 | `exec_stdin` (10) | Host → Guest | Write data to child stdin (future use) |
 | `exec_exit` (11) | Guest → Host | Command finished: cmd_id + exit code (i32 BE) |
-| `exec_signal` (12) | Host → Guest | Send signal to child: cmd_id + signal (0=SIGINT, 1=SIGTERM) |
+
+**Connection = Shell Session**: After exec_exit, Guest flushes TCP (200ms), disconnects WebSocket, and reconnects — providing a fresh shell session for the next command. Closing the WebSocket implicitly terminates any running command (shell gets SIGPIPE, Guest defer cleanup sends SIGTERM). Use `--kick` CLI to cancel a running command.
 
 **Payload encoding:**
 - String fields: null-terminated (`\0` delimiter)
@@ -104,13 +105,14 @@ CLI management commands use standard HTTP:
 |----------|--------|---------|
 | `/api/guests` | GET | List all guests (JSON) |
 | `/exec` | POST | Enqueue exec command, wait for result |
+| `/kick` | POST | Close guest's WebSocket connection (cancel exec) |
 | `/upload` | POST | Upload file to guest |
 | `/download` | POST | Download file from guest |
 | `/mcp` | POST | MCP JSON-RPC (AI agent entry) |
 | `/bin/<file>` | GET | Static file serving (bootstrap, binaries) |
 | `/` | GET | HTML status page |
 
-CLI commands send HTTP to `127.0.0.1:2121`. Host communicates with Guest via WebSocket for actual command execution. Exec uses streaming protocol (exec_start → exec_stdout chunks → exec_exit) — no timeout, commands run indefinitely.
+CLI commands send HTTP to `127.0.0.1:2121`. Host communicates with Guest via WebSocket for actual command execution. Exec uses streaming protocol (exec_start → exec_stdout chunks → exec_exit) — no timeout, commands run indefinitely. After exec_exit Guest disconnects and reconnects for a fresh shell session (Connection = Shell Session). Use `--kick` to cancel a running command.
 
 #### /etc/hosts Marker Block
 
@@ -475,7 +477,7 @@ Host Options:
 Management commands (HTTP to Host :2121):
   --status               Query online status of all Guests
   --exec TARGET CMD      Execute command on target Guest (no timeout, streaming)
-  --exec-cancel TARGET ID Cancel running command on Guest (send SIGINT)
+  --kick TARGET          Close guest's WebSocket connection (cancels running exec)
   --upload FILE VM       Upload a file to Guest
   --download VM R L      Download file from Guest
   --gen-init PLATFORM    Generate auto-start boot script (linux/macos/windows)

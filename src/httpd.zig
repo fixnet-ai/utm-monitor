@@ -83,7 +83,7 @@ pub const GuestEntry = struct {
 
 pub const CmdType = enum { exec, upgrade, upload, download };
 
-pub const CmdStatus = enum { pending, dispatched, completed };
+pub const CmdStatus = enum { pending, dispatched, completed, failed };
 
 pub const PendingCmd = struct {
     id: []const u8,
@@ -105,18 +105,13 @@ pub const CmdResult = struct {
     exit: i32 = 0,
 };
 
-pub const SignalEntry = struct {
-    cmd_id: []const u8,
-    signal: u8, // 0=SIGINT, 1=SIGTERM
-};
-
 pub const HostState = struct {
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Guest table — ArrayList with linear search (only ~3 VMs, no HashMap needed).
     guests: std.ArrayList(GuestEntry),
     pending: std.StringHashMap(std.ArrayList(PendingCmd)),
-    /// Pending signals to be delivered via WebSocket. Keyed by hostname.
-    pending_signals: std.StringHashMap(std.ArrayList(SignalEntry)),
+    /// Guests whose WebSocket connection should be closed (--kick).
+    kicked: std.StringHashMap(void),
     allocator: std.mem.Allocator,
     /// I/O instance for network operations (shared across threads).
     io: ?std.Io = null,
@@ -129,7 +124,7 @@ pub const HostState = struct {
         return .{
             .guests = .empty,
             .pending = std.StringHashMap(std.ArrayList(PendingCmd)).init(allocator),
-            .pending_signals = std.StringHashMap(std.ArrayList(SignalEntry)).init(allocator),
+            .kicked = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
         };
     }
@@ -160,17 +155,8 @@ pub const HostState = struct {
             }
             entry.value_ptr.deinit(self.allocator);
         }
-        // Free pending signals
-        var sit = self.pending_signals.iterator();
-        while (sit.next()) |entry| {
-            for (entry.value_ptr.items) |*sig| {
-                self.allocator.free(sig.cmd_id);
-            }
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.pending_signals.deinit();
-
         self.pending.deinit();
+        self.kicked.deinit();
     }
 
     /// Find a guest by hostname. Returns index into guests.items or null.
@@ -379,7 +365,7 @@ pub const HostState = struct {
         var pit = self.pending.iterator();
         while (pit.next()) |entry| {
             for (entry.value_ptr.items, 0..) |cmd, j| {
-                if (std.mem.eql(u8, cmd.id, cmd_id) and cmd.status == .completed) {
+                if (std.mem.eql(u8, cmd.id, cmd_id) and (cmd.status == .completed or cmd.status == .failed)) {
                     const result = cmd.result orelse return null;
                     // Free cmd metadata before removing
                     self.allocator.free(cmd.id);
@@ -393,33 +379,49 @@ pub const HostState = struct {
         return null;
     }
 
-    /// Enqueue a signal to be sent to a guest via WebSocket.
-    pub fn enqueueSignal(self: *HostState, hostname: []const u8, cmd_id: []const u8, signal: u8) !void {
-        self.mutex.lock(self.io.?) catch {};
+    /// Fail all pending (status=dispatched) commands for a guest.
+    /// Called when guest disconnects — the exec shell session is gone.
+    pub fn failGuestPending(self: *HostState, hostname: []const u8) void {
+        self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
 
-        const gop = try self.pending_signals.getOrPut(hostname);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .empty;
+        const list = self.pending.getPtr(hostname) orelse return;
+        for (list.items) |*cmd| {
+            if (cmd.status == .dispatched) {
+                cmd.status = .failed;
+                // Build error result with heap-allocated strings so
+                // callers can safely allocator.free() them (handleExec does).
+                // If allocation fails, fall back to empty strings — the
+                // result is error anyway.
+                const stdout = self.allocator.dupe(u8, "") catch "";
+                const stderr = self.allocator.dupe(u8, "disconnected") catch "";
+                cmd.result = CmdResult{
+                    .stdout = stdout,
+                    .stderr = stderr,
+                    .exit = -1,
+                };
+            }
         }
-        try gop.value_ptr.append(self.allocator, .{
-            .cmd_id = try self.allocator.dupe(u8, cmd_id),
-            .signal = signal,
-        });
     }
 
-    /// Drain all pending signals for a hostname. Caller owns returned slice and items.
-    pub fn drainSignals(self: *HostState, hostname: []const u8) ![]SignalEntry {
-        self.mutex.lock(self.io.?) catch {};
+    /// Mark a guest to be kicked (WS connection closed) from --kick CLI.
+    pub fn markKicked(self: *HostState, hostname: []const u8) !void {
+        self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
+        const key = try self.allocator.dupe(u8, hostname);
+        try self.kicked.put(key, {});
+    }
 
-        const list = self.pending_signals.getPtr(hostname) orelse return &.{};
-        if (list.items.len == 0) return &.{};
-
-        const result = try list.toOwnedSlice(self.allocator);
-        list.deinit(self.allocator);
-        _ = self.pending_signals.remove(hostname);
-        return result;
+    /// Check if a guest is marked for kick, and consume the flag.
+    /// Returns true if the guest should disconnect.
+    pub fn checkKicked(self: *HostState, hostname: []const u8) bool {
+        self.mutex.lock(self.io.?) catch return false;
+        defer self.mutex.unlock(self.io.?);
+        if (self.kicked.fetchRemove(hostname)) |kv| {
+            self.allocator.free(kv.key);
+            return true;
+        }
+        return false;
     }
 };
 

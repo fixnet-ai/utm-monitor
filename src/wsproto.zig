@@ -24,7 +24,6 @@ pub const MsgType = enum(u8) {
     exec_stdout = 9, // guest→host: cmd_id, chunk (stdout+stderr merged)
     exec_stdin = 10, // host→guest: cmd_id, chunk (stdin data)
     exec_exit = 11, // guest→host: cmd_id, exit_code
-    exec_signal = 12, // host→guest: cmd_id, signal (0=SIGINT, 1=SIGTERM)
 };
 
 /// Write a null-terminated string into buf.
@@ -361,28 +360,6 @@ pub fn parseExecExit(data: []const u8) ?ExecExitData {
     return .{ .cmd_id = cmd_id, .exit_code = exit_code };
 }
 
-pub const ExecSignalData = struct {
-    cmd_id: []const u8,
-    signal: u8,
-};
-
-pub fn buildExecSignal(allocator: std.mem.Allocator, cmd_id: []const u8, signal: u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.append(allocator, @intFromEnum(MsgType.exec_signal));
-    try writeString(&buf, allocator, cmd_id);
-    try buf.append(allocator, signal);
-    return buf.toOwnedSlice(allocator);
-}
-
-pub fn parseExecSignal(data: []const u8) ?ExecSignalData {
-    var pos: usize = 0;
-    const cmd_id = readString(data, &pos) orelse return null;
-    if (pos >= data.len) return null;
-    const signal = data[pos];
-    return .{ .cmd_id = cmd_id, .signal = signal };
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -524,16 +501,6 @@ test "exec_exit round-trip" {
     const parsed = parseExecExit(msg[1..]) orelse return error.ParseFailed;
     try std.testing.expectEqualStrings("r1", parsed.cmd_id);
     try std.testing.expectEqual(42, parsed.exit_code);
-}
-
-test "exec_signal round-trip" {
-    const allocator = std.testing.allocator;
-    const msg = try buildExecSignal(allocator, "r1", 0); // SIGINT
-    defer allocator.free(msg);
-    try std.testing.expectEqual(@intFromEnum(MsgType.exec_signal), msg[0]);
-    const parsed = parseExecSignal(msg[1..]) orelse return error.ParseFailed;
-    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
-    try std.testing.expectEqual(@as(u8, 0), parsed.signal);
 }
 
 test "exec_stream full flow: start → stdout → stdout → exit" {
