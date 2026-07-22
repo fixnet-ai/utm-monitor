@@ -702,3 +702,52 @@ const ip_be: u32 = @byteSwap(ip); // 0x7F000001
 - Bitwise ops on LE u32 produce correct result (ip | ~netmask), but result is also in LE
 - `@byteSwap` again before extracting octets from broadcast result
 - Same applies to `bc == 0xFFFFFFFF`, `bc == 0`, `bc == ip` — byteSwap before comparison
+
+## Io.Threaded Windows: net_receive 不支持 concurrent 路径
+
+Zig 0.16.0 `Io.Threaded` 在 Windows 上的 `net_receive` 操作**不支持并发路径**。
+标准库源文件 `lib/zig/std/Io/Threaded.zig` 第 3197-3199 行有明确 TODO:
+
+```zig
+.net_receive => |*o| {
+    // TODO integrate with overlapped I/O or equivalent to avoid this error
+    if (concurrency) return error.ConcurrencyUnavailable;
+```
+
+**调用链分析:**
+
+```
+socket.receiveTimeout()           // 带超时的 receive
+  → io.operateTimeout()           // 内部创建 Batch
+    → batch.awaitConcurrent()     // concurrent=true
+      → batchDrainSubmittedWindows(t, b, true)
+        → net_receive case: if (concurrency) return ConcurrencyUnavailable
+
+socket.receive()                  // 无超时的 receive
+  → io.operate()                  // 不同路径
+    → batch.awaitAsync()          // concurrent=false
+      → batchDrainSubmittedWindows(t, b, false)
+        → net_receive case: 跳过 concurrency 检查，正常阻塞 I/O
+```
+
+**关键区别:** `receiveTimeout` 需要超时支持，走 concurrent 路径（APC + NtDelayExecution）。
+但 AFD socket 的 overlapped I/O 回调尚未与 `awaitConcurrent` 的超时机制对接。
+`receive`（无超时）走 `awaitAsync`，用 alertable wait (`waitForApcOrAlert`) 阻塞等待，
+不涉及超时逻辑，工作正常。
+
+**这是实现层面的 gap，不是架构问题:** 标准库的跨平台抽象是完整的，但 Windows 后端
+的网络 concurrent I/O 实现尚未完成。等 Zig 版本升级后标准库补上 overlapped I/O 对接，
+用 `receiveTimeout` 即可。
+
+**当前 workaround:**
+```zig
+if (builtin.os.tag == .windows) {
+    // 用阻塞 receive() + CloseHandle 解阻塞代替 receiveTimeout
+    const msg = socket.receive(io, &buf) catch |err| { ... };
+} else {
+    // POSIX 的 receiveTimeout 基于 poll，工作正常
+    const msg = socket.receiveTimeout(io, &buf, timeout) catch |err| { ... };
+}
+```
+Shutdown 时主线程通过 atomic pointer 获取 socket handle，调用 `CloseHandle` 取消
+阻塞的 `receive()`，使后台线程正常退出。

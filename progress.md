@@ -332,3 +332,46 @@ unicast 到 VM IP 有响应，子网广播 192.168.64.255 有响应，255.255.25
 - findings.md: 3 个新节（getifaddrs endianness, subnet broadcast, dedup use-after-free）
 - zig-codegen.md: s_addr endianness 规则
 - progress.md: Phase 14 记录
+
+### Phase 15: Windows UDP Listener ConcurrencyUnavailable 修复 ✅
+
+**问题**: Windows VM 的 UDP listener 启动后持续报 `error.ConcurrencyUnavailable`，
+无法响应广播。`utmm --status` 只能发现 linuxvm + macvm。
+
+**根因分析**:
+- `socket.receiveTimeout()` → `io.operateTimeout()` → `batch.awaitConcurrent()`（concurrent 路径）
+- Zig 0.16.0 `Io.Threaded` Windows 实现中，`net_receive` 的 concurrent 路径未完成
+- `Threaded.zig:3198-3199`: `if (concurrency) return error.ConcurrencyUnavailable`
+- 标准库源文件有 TODO 注释: "TODO integrate with overlapped I/O or equivalent"
+- `receive()`（无超时）走 `batchAwaitAsync` → `concurrency=false` → 正常执行
+
+**修复**:
+- Windows: 改用阻塞 `receive()`（异步/非并发路径），shutdown 时主线程通过 atomic
+  pointer 获取 socket handle 并 `CloseHandle` 解阻塞
+- POSIX: 保持 `receiveTimeout()`（poll 实现，工作正常）
+- `udpDiscoveryListener` 新增 `socket_handle_out` 参数，Windows 分支写入 handle
+- `wsAnnounceLoop` 关闭序列：`store(shutdown)` → `CloseHandle`(Windows only) → `join`
+
+**潜在问题**: Windows 关闭时可能出现 double close（主线程 CloseHandle + defer
+socket.close），第二次 CloseHandle 返回 INVALID_HANDLE 但无害。竞态窗口极小。
+
+**构建验证**: `zig build test` 全过，全部 6 目标交叉编译全过
+
+**部署验证**:
+- Windows VM 部署后 `utmm --status` 成功发现全部 3 台 VM
+- linuxvm (192.168.64.2) v0.6.0, macvm (192.168.64.4) v0.6.0, WIN-Q0JNGDDBE28 (192.168.65.2) v0.6.0
+- `utmm --exec` 在全部 3 台 VM 上正常工作
+
+### v0.6.0 发布 ✅
+
+- **版本号**: v0.5.1 → v0.6.0 (`ver.zig`)
+- **Commit**: `5005a63` — 8 files changed, 558 insertions, 42 deletions
+- **Tag**: `v0.6.0` → GitHub
+- **Release**: GitHub Release + 6 平台二进制文件 (x86_64/aarch64 × linux-musl/macos/windows)
+- **部署**: Host + linuxvm + macvm + windowsvm 全部运行 v0.6.0
+
+**文档更新**:
+- task_plan.md: 新增 Phase 15
+- findings.md: Windows ConcurrencyUnavailable 根因 + 修复
+- zig-codegen.md: Io.Threaded Windows net_receive 限制
+- progress.md: Phase 15 + v0.6.0 发布记录
