@@ -37,6 +37,33 @@ This file records compilation issues and solutions encountered while using Zig 0
 | ❌ `Stream.getLocalAddress()` | Use `stream.socket.address` |
 | ❌ `std.Io.net.getHostname()` | `std.posix.gethostname(buf)` |
 
+### UDP Datagram Operations
+
+```zig
+// Bind for broadcast send + receive
+const addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
+const socket = try addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true });
+defer socket.close(io);
+
+// Send datagram (connectionless — specify dest on every call)
+try socket.send(io, &dest_addr, data);
+
+// Receive with timeout
+const timeout: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(1), .clock = .awake } };
+const msg = socket.receiveTimeout(io, &buf, timeout) catch |err| {
+    switch (err) {
+        error.Timeout => ...,
+        else => ...,
+    }
+};
+// msg.from: IpAddress — sender address for response
+// msg.data: []u8 — received bytes, slice into caller's buffer
+```
+
+- `BindOptions.allow_broadcast = true` — required for sending (Linux+macOS) AND receiving broadcasts (macOS only). Without it on macOS, broadcast packets are silently dropped on receive.
+- `Socket.send()` — `(s, io, dest, data)` where `dest` is `*const IpAddress`.
+- `Socket.receiveTimeout()` — `(s, io, buffer, timeout)` returns `ReceiveTimeoutError!IncomingMessage` with `.from` and `.data`.
+
 ### ConnectOptions Must Specify mode
 
 ```zig
@@ -59,6 +86,16 @@ try address.connect(io, .{ .mode = .dgram });  // UDP
 | ❌ `std.Io.time.sleep()` | `std.Io.sleep(io, duration, .real)` returns error union |
 | ❌ `Duration{ .seconds = 2 }` | `Duration.fromSeconds(2)` |
 | ❌ `Duration.fromSecs(1)` | `Duration.fromSeconds(1)` |
+
+### Timestamp.now Returns Timestamp Directly (Not Error Union)
+
+```zig
+// ✅ CORRECT — now() returns Timestamp, not !Timestamp
+const start = std.Io.Timestamp.now(io, .real);
+
+// ❌ WRONG — catch on non-error-union
+const start = std.Io.Timestamp.now(io, .real) catch |err| { ... };
+```
 
 ### Timestamp.nanoseconds is i96
 
@@ -164,6 +201,18 @@ const file = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = @enumFr
 | `list.append(item)` | `list.append(gpa, item)` |
 | `list.appendSlice(items)` | `list.appendSlice(gpa, items)` |
 | `list.writer().print(...)` | `list.print(gpa, "...", .{...})` |
+
+**HashMap** (also unmanaged in 0.16.0):
+
+```zig
+// ✅ CORRECT — HashMap/StringHashMap use .init(gpa), NOT .empty
+var map = std.StringHashMap(V).init(gpa);
+defer {
+    // Free values if needed
+    map.deinit(); // no gpa param for deinit
+}
+const gop = try map.getOrPut(key); // no gpa param for getOrPut
+```
 
 ## Io.Reader / Io.Writer
 
@@ -632,3 +681,24 @@ const ReadFile = @extern(*const fn (
 - `std.os.windows.HANDLE`, `DWORD`, `BOOL` from `std.os.windows`
 - `std.math.maxInt(u32)` for `INFINITE` (instead of `win.INFINITE`)
 - `@intFromEnum(TRUE)` / `@intFromEnum(FALSE)` for BOOL comparison
+
+## Endianness: C sockaddr_in s_addr in Zig
+
+`s_addr` is `in_addr_t` (u32) stored by C in **network byte order** (big-endian).
+On little-endian systems (macOS aarch64, Linux aarch64/x86_64), Zig reads the u32
+field in **host byte order** (little-endian).
+
+```zig
+// sin.sin_addr.s_addr — u32 in host byte order on LE
+const ip: u32 = sin.sin_addr.s_addr; // 0x0100007F for 127.0.0.1 on LE (not 0x7F000001)
+// Must @byteSwap before extracting octets:
+const ip_be: u32 = @byteSwap(ip); // 0x7F000001
+// Now (ip_be >> 24) == 127 correctly identifies loopback
+```
+
+**Key rules:**
+- `@byteSwap()` before `>>24`/`>>16`/`>>8` octet extraction from s_addr
+- `Ip4Address.bytes` is `[4]u8` in **big-endian** (network byte order)
+- Bitwise ops on LE u32 produce correct result (ip | ~netmask), but result is also in LE
+- `@byteSwap` again before extracting octets from broadcast result
+- Same applies to `bc == 0xFFFFFFFF`, `bc == 0`, `bc == ip` — byteSwap before comparison

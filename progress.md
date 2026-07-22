@@ -272,4 +272,63 @@ v0.2.0 架构已完成并发布：
 **关键教训**:
 - macOS Guest 部署后必须 codesign（install.sh 现已自动处理）
 - 服务环境不应读取用户 shell 偏好，始终使用平台默认值
+
+## Session 2026-07-23 (UDP Broadcast Discovery — v0.6.0)
+
+### Phase 13: --status UDP 广播发现 ✅
+
+**目标**: `--status` 从 HTTP 本地查询改为 UDP 广播发现，扩展到局域网内所有机器。
+
+**协议**:
+- 查询: "ARE YOU OK?\r\n" → broadcast 255.255.255.255:2121
+- 响应: ANNOUNCE 文本块（复用 `GuestInfo.parse()` 格式）→ unicast 回发送者
+- 5 次广播（1 秒间隔）+ 5 秒收集窗口 → hostname 去重
+
+**代码变更**:
+- `protocol.zig`: 新增 `DISCOVERY_QUERY`、`DISCOVERY_RESPONSE_PREFIX`、`GuestInfo.deinit()`
+- `broadcast.zig`: 新增 `udpDiscoveryListener()` — Guest 侧 UDP 监听线程
+  - `std.atomic.Value(bool)` shutdown flag + `receiveTimeout(1s)` 优雅关闭
+  - 在 `wsAnnounceLoop()` 入口 spawn，defer join
+- `host.zig`: `cmdStatus()` 重写 — HTTP GET → UDP broadcast
+  - bind 随机端口，send × 5，collect 5s，parse + dedup，打印表格
+
+**构建验证**:
+- `zig build test` 全过
+- 6 目标交叉编译全过: aarch64/x86_64 × linux-musl/macos/windows
+
+**文档**:
+- task_plan.md: 新增 Phase 13
+- findings.md: ADR-6 + UDP API 模式文档
+- progress.md: 本会话记录
 - `--install` 不带 `--hostname` 会使用 OS hostname，导致 Host 端识别名变化
+
+### Phase 14: UDP 子网定向广播修复 ✅
+
+**问题**: `utmm --status` UDP broadcast 到 255.255.255.255 无响应。Python 验证：
+unicast 到 VM IP 有响应，子网广播 192.168.64.255 有响应，255.255.255.255 无响应。
+根因：limited broadcast 只走默认路由接口（en0），UTM bridge 网络收不到。
+
+**代码变更**:
+- `broadcast.zig`: 新增 `getSubnetBroadcasts()` — POSIX 用 `getifaddrs()` 枚举接口，
+  计算子网定向广播（`ip | ~netmask`，去重，过滤 loopback/32）。Windows 只返回
+  255.255.255.255。
+- `host.zig`: `cmdStatus()` 替换单一 broadcast_addr 为广播地址列表。每轮依次向
+  所有地址发送，rebind 后重试所有地址。
+
+**字节序修复**:
+- `sin.sin_addr.s_addr` 在 LE 系统为 host byte order，需 `@byteSwap` 后提取 octet
+- `Ip4Address.bytes` 为 big-endian — `@byteSwap` 后写入正确
+
+**去重 bug 修复**:
+- `found_existing` 时 deinit 旧值导致 stored key 悬空 → 后续去重失败 → 重复条目
+- 改为 first-wins：已有 hostname 则丢弃新值
+
+**构建验证**:
+- `zig build test` 全过，6 目标交叉编译全过
+- `utmm --status` 正确发现 linuxvm + macvm，无重复
+
+**文档更新**:
+- task_plan.md: 新增 Phase 14
+- findings.md: 3 个新节（getifaddrs endianness, subnet broadcast, dedup use-after-free）
+- zig-codegen.md: s_addr endianness 规则
+- progress.md: Phase 14 记录

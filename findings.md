@@ -45,9 +45,53 @@ gateway. Single port simplifies firewall and debugging.
 **Rationale**: Reduces maintenance — no need to build/distribute separate host/guest
 binaries.
 **Consequence**: All modules compiled into one binary. `comptime` block in main.zig
-ensures linker includes all modules.
+
+### ADR-6: UDP broadcast for --status discovery (v0.6.0)
+**Decision**: `utmm --status` sends UDP broadcast to 255.255.255.255:2121 instead of
+HTTP GET to 127.0.0.1. Each Guest runs a UDP listener on :2121 that responds to
+"ARE YOU OK?\r\n" with an ANNOUNCE text block. Sender collects responses for 5
+seconds, deduplicates by hostname.
+**Rationale**: Old `--status` only worked on the Host machine — it was an HTTP client
+connecting to localhost. Any machine on the LAN can now discover all UTM guests
+without knowing which machine is the Host.
+**Consequence**: Guest gets a new background thread (`udpDiscoveryListener`). The
+`--status` command no longer requires a running Host daemon. UDP port 2121 coexists
+with TCP port 2121 (Host HTTP server) on the same machine without conflict.
+**Protocol**: Query = "ARE YOU OK?\r\n" (12 bytes). Response = text block using
+existing `GuestInfo.parse()` format (ANNOUNCE header + key:value lines).
+5 broadcasts at 1-second intervals ensure delivery despite UDP unreliability.
 
 ## Platform-Specific Notes
+
+### UDP Broadcast Discovery (Zig 0.16.0)
+
+```zig
+// Bind UDP socket for broadcast send + receive
+const addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
+const socket = try addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true });
+defer socket.close(io);
+
+// Send to broadcast address
+const broadcast = try std.Io.net.IpAddress.parse("255.255.255.255", 2121);
+try socket.send(io, &broadcast, "ARE YOU OK?\r\n");
+
+// Receive with timeout
+const timeout: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(1), .clock = .awake } };
+const msg = try socket.receiveTimeout(io, &buf, timeout);
+// msg.from: IpAddress (sender address for response)
+// msg.data: []u8 (received bytes, slice into caller's buffer)
+
+// Respond to sender
+try socket.send(io, &msg.from, response);
+```
+
+- `BindOptions.allow_broadcast = true` required for: sending broadcasts (Linux + macOS),
+  receiving broadcasts (macOS only). Without it on macOS, `receiveTimeout` silently
+  ignores broadcast packets even though tcpdump shows them arriving.
+- `Socket.send()` is connectionless — specify destination on every call.
+- `Timestamp.now(io, .real)` returns `Timestamp` directly (not error union).
+- `Io.Duration.fromSeconds(n)` creates second-precision durations.
+- `StringHashMap(T).init(gpa)` — unmanaged HashMap, uses `.init` not `.empty`.
 
 ### POSIX pty
 - `posix_openpt(O_RDWR)` → `grantpt`/`unlockpt` → `fork()` → child: `setsid()`,
@@ -123,6 +167,44 @@ immediately.
 **Fix**: Added `sudo codesign --force --sign -` to `install.sh` for macOS Guest
 deployment (line 267-269). The Host binary is self-built and linker-signed (adhoc),
 so Host deployment is unaffected. Commit: `fb9f22b`.
+
+### getifaddrs endianness (v0.6.0 UDP broadcast fix)
+**Root cause**: `sin.sin_addr.s_addr` is stored by C as network byte order (big-endian).
+On little-endian systems (macOS aarch64, Linux aarch64/x86_64), Zig reads the u32 in
+host byte order. Bitwise ops (`ip | ~netmask`) produce correct result, but octet
+extraction via `>>24/>>16/>>8/&FF` on host-byte-order u32 yields reversed bytes.
+**Fix**: `@byteSwap(bc)` before extracting octets. Also filter loopback (127.0.0.0/8)
+after byteSwapping. Check `bc_be == ip_be` for /32 point-to-point detection.
+
+### Subnet-directed broadcast required for UTM bridge
+**Root cause**: `255.255.255.255` (limited broadcast) is only routed out the default
+route interface (en0). UTM bridge interfaces (bridge100 at 192.168.64.0/24) do not
+carry limited broadcasts.
+**Fix**: `getSubnetBroadcasts()` in `broadcast.zig` uses `getifaddrs()` to enumerate
+all local IPv4 interfaces, computes subnet-directed broadcast (`ip | ~netmask`) for
+each, and sends to all unique broadcast addresses. Windows keeps 255.255.255.255 only.
+
+### StringHashMap dedup use-after-free
+**Root cause**: When `found_existing` is true in `getOrPut`, old value is deinited
+(including its hostname string). But the HashMap's stored key still points to the
+freed hostname. On next `getOrPut` with the same hostname, content comparison may
+fail (dangling pointer), creating duplicate entries.
+**Fix**: First-wins strategy: if `found_existing`, discard the newly parsed value;
+only store when it's a new hostname.
+
+### Windows UDP Io.Threaded ConcurrencyUnavailable (v0.6.0)
+**Root cause**: Zig 0.16.0 `Io.Threaded` on Windows does not support concurrent
+`net_receive`. `receiveTimeout` uses `batchAwaitConcurrent` which passes `concurrency=true`
+to `batchDrainSubmittedWindows`. The `net_receive` case at Threaded.zig line 3198
+returns `ConcurrencyUnavailable` because overlapped I/O (APC-based) isn't integrated
+yet for network operations. There's an explicit TODO: "TODO integrate with overlapped
+I/O or equivalent to avoid this error".
+**Fix**: On Windows, use blocking `receive()` (async path, `concurrency=false`) instead
+of `receiveTimeout()`. The async path works — `batchDrainSubmittedWindows(t, b, false)`
+does blocking I/O via `netReceiveOneWindows`. No timeout available, so on shutdown the
+main thread closes the socket handle (`CloseHandle`) to unblock the pending receive.
+UDP listener stores socket handle in atomic pointer for main thread access. POSIX
+continues using `receiveTimeout` which works correctly (uses `poll`).
 
 ## Known Issues
 

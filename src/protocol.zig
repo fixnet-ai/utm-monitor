@@ -6,6 +6,12 @@ const ver = @import("ver.zig");
 /// Default UDP broadcast/listen + TCP message port (unified on 2121)
 pub const DEFAULT_PORT: u16 = 2121;
 
+/// UDP broadcast discovery query (sent by --status, received by Guest listener)
+pub const DISCOVERY_QUERY = "ARE YOU OK?\r\n";
+
+/// UDP broadcast discovery response prefix (Guest → sender, followed by key:value lines)
+pub const DISCOVERY_RESPONSE_PREFIX = "ANNOUNCE\r\n";
+
 /// /etc/hosts marker block
 pub const HOSTS_MARKER_BEGIN = "# UTM-MONITOR-BEGIN";
 pub const HOSTS_MARKER_END = "# UTM-MONITOR-END";
@@ -81,6 +87,17 @@ pub const GuestInfo = struct {
     mac: []const u8, // Physical NIC MAC
     version: []const u8 = VERSION,
     shell: []const u8 = "", // Detected shell binary (e.g. /bin/zsh, cmd.exe) — always heap after parse()
+
+    /// Free all heap-allocated fields. Safe to call on zero-initialized GuestInfo.
+    pub fn deinit(self: *GuestInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.hostname);
+        allocator.free(self.ip);
+        allocator.free(self.target);
+        allocator.free(self.mac);
+        allocator.free(self.version);
+        if (self.shell.len > 0) allocator.free(self.shell);
+        self.* = undefined;
+    }
 
     /// Build FQDN for /etc/hosts: <hostname>.<target>.utm
     pub fn fqdn(self: GuestInfo, allocator: std.mem.Allocator) ![]const u8 {

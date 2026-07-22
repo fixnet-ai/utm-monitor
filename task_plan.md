@@ -126,6 +126,43 @@
 - [x] **文档更新**: findings.md（2 个新 bug），progress.md（部署验证记录），task_plan.md（本 Phase）
 - **Status:** complete
 
+### Phase 13: UDP Broadcast Discovery (--status 重写) ✅ (2025-07-23)
+- [x] **13.0 前置研究**: 验证 Zig 0.16.0 `std.Io.net.Socket` UDP API
+  - `Socket.send(io, dest, data)` — 发送数据报
+  - `Socket.receiveTimeout(io, buffer, timeout)` — 带超时接收，返回 `IncomingMessage{ .from, .data }`
+  - `BindOptions.allow_broadcast = true` — macOS 收发广播均需要
+- [x] **13.1 Guest UDP 监听线程**: `broadcast.zig` 新增 `udpDiscoveryListener()`
+  - bind UDP 0.0.0.0:2121，收到 "ARE YOU OK?" 回 ANNOUNCE
+  - 重用 `protocol.GuestInfo.parse()` 格式
+  - `std.atomic.Value(bool)` shutdown flag + `receiveTimeout(1s)` 优雅关闭
+  - 在 `wsAnnounceLoop()` 入口 spawn，defer join
+- [x] **13.2 --status 重写**: `host.zig:cmdStatus()` 用 UDP broadcast 替换 HTTP GET
+  - bind 随机端口 UDP，send 5 次 broadcast 到 255.255.255.255:2121
+  - 5 秒收集窗口，`GuestInfo.parse()` 解析响应，hostname 去重
+  - 保留现有表格输出格式不变
+- [x] **13.3 协议常量**: `protocol.zig` 新增 `DISCOVERY_QUERY`、`DISCOVERY_RESPONSE_PREFIX`、`GuestInfo.deinit()`
+- [x] **构建验证**: `zig build test` 全过，6 目标交叉编译全过
+- **Status:** complete
+
+
+### Phase 14: UDP 子网定向广播修复 ✅ (2025-07-23)
+- [x] **14.1 根因定位**: 255.255.255.255 limited broadcast 只走默认路由接口（en0），UTM bridge 网络（bridge100: 192.168.64.0/24）收不到。Python 验证：子网广播 192.168.64.255 可达所有 VM，255.255.255.255 不可达。
+- [x] **14.2 getSubnetBroadcasts()**: `broadcast.zig` 新增函数，POSIX 用 `getifaddrs()` 枚举所有 IPv4 接口，计算子网定向广播地址（`ip | ~netmask`）。Windows 只返回 255.255.255.255。跳过 loopback、/32 链路、重复地址。
+- [x] **14.3 字节序修复**: `sin.sin_addr.s_addr` u32 在 macOS aarch64 (LE) 为 host byte order，需 `@byteSwap` 转为 big-endian 后提取 octet。Ip4Address.bytes 存储格式为 big-endian。
+- [x] **14.4 cmdStatus() 多广播**: 替换单一 broadcast_addr 为广播地址列表。每轮依次向所有地址发送，send/rebind 逻辑适配。
+- [x] **14.5 去重 bug 修复**: `found_existing` 时 deinit 旧值导致 stored key 悬空 → 后续 getOrPut 匹配失败 → 重复条目。改为 first-wins：已有则丢弃新值。
+- [x] **构建验证**: `zig build test` 全过，6 目标交叉编译全过。
+- [x] **运行时验证**: `utmm --status` 发现 linuxvm + macvm + windowsvm，无重复，干净输出。
+- **Status:** complete
+
+### Phase 15: Windows UDP Listener ConcurrencyUnavailable 修复 ✅ (2025-07-23)
+- [x] **15.1 根因定位**: Zig 0.16.0 `Io.Threaded` Windows 上 `net_receive` 并发路径未实现（Threaded.zig line 3198: "TODO integrate with overlapped I/O"）。`receiveTimeout` 走 `batchAwaitConcurrent` → `concurrency=true` → `net_receive` 返回 `ConcurrencyUnavailable`。
+- [x] **15.2 修复方案**: Windows 上用阻塞 `receive()`（走非并发路径，`concurrency=false`）替代 `receiveTimeout`。POSIX 保持 `receiveTimeout`。shutdown 时主线程关闭 socket handle 以解除阻塞 `receive()`。
+- [x] **15.3 实现**: `udpDiscoveryListener` 加 `socket_handle_out: *?net.Socket.Handle` 参数。Windows 分支将 handle 写入 atomic 指针供主线程关闭。`wsAnnounceLoop` 在 join 前关闭 socket handle。
+- [x] **构建验证**: `zig build test` 全过，全部 6 目标交叉编译全过。
+- [x] **运行时验证**: Windows VM 部署新二进制后 `utmm --status` 成功发现全部 3 台 VM。
+- **Status:** complete
+
 ## 已删除的组件
 
 | 组件 | 行数 | 替代 |

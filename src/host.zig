@@ -5,9 +5,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const Io = std.Io;
+const protocol = @import("protocol.zig");
 const http = std.http;
 const httpd = @import("httpd.zig");
 const host_http = @import("host_http.zig");
+const broadcast = @import("broadcast.zig");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     return runWithIo(init.io, init.gpa, cli);
@@ -85,56 +88,126 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
-    // HTTP client: GET /api/guests from Host
-    var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
-    defer client.deinit();
+    _ = port; // UDP discovery uses fixed port 2121, not the HTTP port
 
-    var resp_buf: [65536]u8 = undefined;
-    var resp_writer: std.Io.Writer = .fixed(&resp_buf);
-    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/api/guests", .{port});
-    defer gpa.free(url);
-
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
-        .response_writer = &resp_writer,
-        .keep_alive = false,
-    }) catch |err| {
-        std.debug.print("[status] HTTP request failed: {} — is Host running?\n", .{err});
+    // Bind UDP socket to random port for sending broadcasts + receiving responses
+    const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", 0) catch |err| {
+        std.debug.print("[status] Bind address parse error: {}\n", .{err});
         return err;
     };
+    var socket = bind_addr.bind(block_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
+        std.debug.print("[status] UDP bind failed: {}\n", .{err});
+        return err;
+    };
+    defer socket.close(block_io);
 
-    if (result.status != .ok) {
-        std.debug.print("[status] HTTP {d}\n", .{@intFromEnum(result.status)});
-        return error.HttpError;
+    // Collect all broadcast addresses: 255.255.255.255 + subnet-directed broadcasts
+    var broadcast_addrs = broadcast.getSubnetBroadcasts(gpa) catch {
+        std.debug.print("[status] Failed to collect broadcast addresses\n", .{});
+        return error.OutOfMemory;
+    };
+    defer broadcast_addrs.deinit(gpa);
+
+    // HashMap for dedup: hostname → GuestInfo
+    var guests = std.StringHashMap(protocol.GuestInfo).init(gpa);
+    defer {
+        var it = guests.iterator();
+        while (it.next()) |kv| {
+            kv.value_ptr.deinit(gpa);
+        }
+        guests.deinit();
     }
 
-    const body = resp_writer.buffered();
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{ .allocate = .alloc_always }) catch {
-        std.debug.print("[status] Invalid JSON response\n", .{});
-        return error.InvalidJson;
-    };
-    defer parsed.deinit();
+    std.debug.print("[status] Scanning LAN for UTM guests (UDP broadcast)...\n", .{});
 
-    const guests = switch (parsed.value) {
-        .array => |a| a,
-        else => return,
-    };
+    // Send 5 rounds of broadcasts at 1-second intervals, collect responses continuously
+    const start = std.Io.Timestamp.now(block_io, .real);
+    const deadline = start.nanoseconds + 5_000_000_000;
+    var send_count: u8 = 0;
+    var send_errors: u8 = 0;
+
+    while (true) {
+        const now = std.Io.Timestamp.now(block_io, .real);
+        if (now.nanoseconds >= deadline) break;
+
+        // Send broadcasts at t ≈ 0, 1, 2, 3, 4
+        if (send_count < 5) {
+            const elapsed = now.nanoseconds - start.nanoseconds;
+            const next_send_time = @as(i96, @intCast(send_count)) * 1_000_000_000;
+            if (elapsed >= next_send_time) {
+                // Send to all collected broadcast addresses
+                var any_failed = false;
+                for (broadcast_addrs.items) |*bc_addr| {
+                    if (socket.send(block_io, bc_addr, protocol.DISCOVERY_QUERY)) |_| {
+                    } else |_| { any_failed = true; }
+                }
+                if (any_failed) {
+                    send_errors += 1;
+                    if (send_errors == 1) {
+                        // Network changed? Rebind and retry once.
+                        std.debug.print("[status] Send error(s) — rebinding...\n", .{});
+                        socket.close(block_io);
+                        socket = bind_addr.bind(block_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err2| {
+                            std.debug.print("[status] Rebind failed: {}\n", .{err2});
+                            return err2;
+                        };
+                        // Retry all addresses after rebind
+                        for (broadcast_addrs.items) |*bc_addr| {
+                            if (socket.send(block_io, bc_addr, protocol.DISCOVERY_QUERY)) |_| {
+                                send_errors = 0;
+                            } else |err3| {
+                                std.debug.print("[status] Send failed after rebind: {}\n", .{err3});
+                                return err3;
+                            }
+                        }
+                    }
+                } else {
+                    send_errors = 0;
+                }
+                send_count += 1;
+            }
+        }
+
+        // Try receive with 1-second timeout
+        const timeout: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(1), .clock = .awake } };
+        var buf: [4096]u8 = undefined;
+        const msg = socket.receiveTimeout(block_io, &buf, timeout) catch |err| {
+            switch (err) {
+                error.Timeout => continue,
+                else => {
+                    std.debug.print("[status] Receive error: {}\n", .{err});
+                    continue;
+                },
+            }
+        };
+
+        // Parse response using existing text protocol format
+        var parsed = protocol.GuestInfo.parse(gpa, msg.data) catch continue;
+
+        // Dedup by hostname (first response wins)
+        const result = guests.getOrPut(parsed.hostname) catch {
+            parsed.deinit(gpa);
+            continue;
+        };
+        if (result.found_existing) {
+            parsed.deinit(gpa); // discard duplicate
+        } else {
+            result.value_ptr.* = parsed;
+        }
+    }
+
+    // Display table
+    if (guests.count() == 0) {
+        std.debug.print("No UTM guests found on LAN.\n\n", .{});
+        return;
+    }
 
     std.debug.print("\n{s: <16} {s: <18} {s: <16} {s: <18} {s: <10} {s}\n", .{ "Hostname", "Target", "IP", "MAC", "Version", "Shell" });
     std.debug.print("{s:-<85}\n", .{""});
-    for (guests.items) |g| {
-        const obj = switch (g) {
-            .object => |o| o,
-            else => continue,
-        };
-        const hostname = httpd.jsonGetString(obj, "hostname") orelse "?";
-        const target = httpd.jsonGetString(obj, "target") orelse "?";
-        const ip = httpd.jsonGetString(obj, "ip") orelse "?";
-        const mac = httpd.jsonGetString(obj, "mac") orelse "?";
-        const version = httpd.jsonGetString(obj, "version") orelse "?";
-        const shell = httpd.jsonGetString(obj, "shell") orelse "?";
-        std.debug.print("{s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s}\n", .{ hostname, target, ip, mac, version, shell });
+    var it = guests.iterator();
+    while (it.next()) |kv| {
+        const info = kv.value_ptr;
+        std.debug.print("{s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s}\n", .{ info.hostname, info.target, info.ip, info.mac, info.version, info.shell });
     }
     std.debug.print("\n", .{});
 }

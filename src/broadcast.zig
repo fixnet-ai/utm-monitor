@@ -3,6 +3,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const Io = std.Io;
+const net = std.Io.net;
 const protocol = @import("protocol.zig");
 const wsclient = @import("wsclient.zig");
 const wsproto_mod = @import("wsproto.zig");
@@ -45,6 +47,7 @@ const ifaddrs = extern struct {
     ifa_data: ?*anyopaque,
 };
 const AF_INET = 2; // IPv4
+const IFF_UP = 0x1;
 extern "c" fn getifaddrs(ifap: *?*ifaddrs) c_int;
 extern "c" fn freeifaddrs(ifa: ?*ifaddrs) void;
 
@@ -380,6 +383,68 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
         .iface_name = iface_name,
         .shell = shell,
     };
+}
+
+/// Collect all broadcast addresses for UDP discovery.
+/// Always includes 255.255.255.255. On POSIX, also enumerates local IPv4
+/// interfaces and computes subnet-directed broadcast addresses.
+/// Caller owns returned ArrayList (must deinit).
+pub fn getSubnetBroadcasts(allocator: std.mem.Allocator) !std.ArrayList(std.Io.net.IpAddress) {
+    var list: std.ArrayList(std.Io.net.IpAddress) = .empty;
+
+    // Always include limited broadcast
+    try list.append(allocator, std.Io.net.IpAddress{
+        .ip4 = .{ .bytes = .{ 255, 255, 255, 255 }, .port = protocol.DEFAULT_PORT },
+    });
+
+    if (builtin.os.tag == .windows) return list;
+
+    // POSIX: enumerate interfaces via getifaddrs
+    var ifap: ?*ifaddrs = undefined;
+    if (getifaddrs(&ifap) != 0) return list;
+    defer freeifaddrs(ifap);
+
+    var ifa = ifap;
+    while (ifa) |entry| : (ifa = entry.ifa_next) {
+        if (entry.ifa_addr == null or entry.ifa_netmask == null) continue;
+        if (entry.ifa_addr.?.sa_family != AF_INET) continue;
+        if (entry.ifa_flags & IFF_UP == 0) continue;
+
+        const sin = @as(*align(1) const sockaddr_in, @ptrCast(entry.ifa_addr));
+        const sin_mask = @as(*align(1) const sockaddr_in, @ptrCast(entry.ifa_netmask));
+
+        const ip: u32 = sin.sin_addr.s_addr; // host byte order (LE on macOS/Linux aarch64/x86_64)
+        const mask: u32 = sin_mask.sin_addr.s_addr;
+
+        // Skip loopback and zero addr (check in network byte order)
+        const ip_be: u32 = @byteSwap(ip);
+        if (ip == 0 or (ip_be >> 24) == 127) continue;
+
+        const bc: u32 = ip | ~mask;
+        // Normalize to big-endian for octet extraction
+        const bc_be: u32 = @byteSwap(bc);
+        if (bc_be == 0 or bc_be == 0xFFFFFFFF) continue; // invalid or already covered
+        if (bc_be == ip_be) continue; // /32 point-to-point
+
+        const bytes: [4]u8 = .{
+            @truncate((bc_be >> 24) & 0xFF),
+            @truncate((bc_be >> 16) & 0xFF),
+            @truncate((bc_be >> 8) & 0xFF),
+            @truncate(bc_be & 0xFF),
+        };
+
+        // Dedup
+        var dup = false;
+        for (list.items) |existing| {
+            if (std.mem.eql(u8, &existing.ip4.bytes, &bytes)) { dup = true; break; }
+        }
+        if (!dup) {
+            try list.append(allocator, std.Io.net.IpAddress{
+                .ip4 = .{ .bytes = bytes, .port = protocol.DEFAULT_PORT },
+            });
+        }
+    }
+    return list;
 }
 
 /// Get local default gateway IP
@@ -870,6 +935,98 @@ const TimerCtx = struct {
 /// WebSocket announce loop: persistent WS connection to Host.
 /// POSIX: single-threaded poll loop (no races).
 /// Windows: timer thread + mutex-protected writes.
+/// UDP discovery listener thread.
+/// Binds to UDP :2121, responds to "ARE YOU OK?\r\n" broadcasts with ANNOUNCE.
+/// Runs until `shutdown` is set true by the main thread.
+/// Uses its own Io.Threaded instance so I/O works from a background thread
+/// on all platforms (required on Windows where cross-thread Io ops fail).
+///
+/// On Windows, Zig 0.16.0 Io.Threaded does not support concurrent net_receive
+/// (Threaded.zig line 3198: "TODO integrate with overlapped I/O").
+/// `receiveTimeout` uses the concurrent path → returns ConcurrencyUnavailable.
+/// Workaround: use blocking `receive()` and have the main thread close the socket
+/// handle on shutdown to unblock this thread.
+fn udpDiscoveryListener(
+    caller_io: Io,
+    allocator: std.mem.Allocator,
+    info: *const SystemInfo,
+    shutdown: *std.atomic.Value(bool),
+    socket_handle_out: *?net.Socket.Handle,
+) void {
+    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+    const io = threaded.io();
+
+    const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", protocol.DEFAULT_PORT) catch |err| {
+        std.log.err("[udp-disc] Failed to parse bind addr: {}", .{err});
+        return;
+    };
+    const socket = bind_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
+        std.log.err("[udp-disc] Failed to bind UDP :{d}: {}", .{ protocol.DEFAULT_PORT, err });
+        return;
+    };
+    defer socket.close(io);
+
+    std.log.info("[udp-disc] Listening on UDP :{d}", .{protocol.DEFAULT_PORT});
+
+    var buf: [4096]u8 = undefined;
+    while (!shutdown.load(.acquire)) {
+        if (builtin.os.tag == .windows) {
+            // Store handle so main thread can close it on shutdown to unblock us
+            @atomicStore(?net.Socket.Handle, socket_handle_out, socket.handle, .release);
+            const msg = socket.receive(io, &buf) catch |err| {
+                @atomicStore(?net.Socket.Handle, socket_handle_out, null, .release);
+                if (shutdown.load(.acquire)) break;
+                std.log.err("[udp-disc] receive error: {}", .{err});
+                continue;
+            };
+            @atomicStore(?net.Socket.Handle, socket_handle_out, null, .release);
+            // Process the message
+            if (std.mem.indexOf(u8, msg.data, "ARE YOU OK?") != null) {
+                const response = std.fmt.allocPrint(allocator,
+                    "{s}hostname: {s}\r\nip: {s}\r\ntarget: {s}\r\nmac: {s}\r\nversion: {s}\r\nshell: {s}\r\n\r\n",
+                    .{ protocol.DISCOVERY_RESPONSE_PREFIX, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell },
+                ) catch {
+                    std.log.err("[udp-disc] Failed to allocate response", .{});
+                    continue;
+                };
+                defer allocator.free(response);
+                socket.send(io, &msg.from, response) catch |err| {
+                    std.log.err("[udp-disc] send response to {any}: {}", .{ msg.from.getPort(), err });
+                };
+                std.log.debug("[udp-disc] Responded to discovery query", .{});
+            }
+        } else {
+            const timeout: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(1), .clock = .awake } };
+            const msg = socket.receiveTimeout(io, &buf, timeout) catch |err| {
+                switch (err) {
+                    error.Timeout => continue,
+                    else => {
+                        std.log.err("[udp-disc] receive error: {}", .{err});
+                        continue;
+                    },
+                }
+            };
+            if (std.mem.indexOf(u8, msg.data, "ARE YOU OK?") != null) {
+                const response = std.fmt.allocPrint(allocator,
+                    "{s}hostname: {s}\r\nip: {s}\r\ntarget: {s}\r\nmac: {s}\r\nversion: {s}\r\nshell: {s}\r\n\r\n",
+                    .{ protocol.DISCOVERY_RESPONSE_PREFIX, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell },
+                ) catch {
+                    std.log.err("[udp-disc] Failed to allocate response", .{});
+                    continue;
+                };
+                defer allocator.free(response);
+                socket.send(io, &msg.from, response) catch |err| {
+                    std.log.err("[udp-disc] send response to {any}: {}", .{ msg.from.getPort(), err });
+                };
+                std.log.debug("[udp-disc] Responded to discovery query", .{});
+            }
+        }
+    }
+
+    std.log.info("[udp-disc] Shutting down", .{});
+    _ = caller_io;
+}
+
 pub fn wsAnnounceLoop(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -883,6 +1040,25 @@ pub fn wsAnnounceLoop(
         break :blk gw;
     };
     defer if (host_url.len == 0) allocator.free(host);
+
+    // Start UDP discovery listener (responds to "ARE YOU OK?" broadcasts from --status)
+    var udp_shutdown = std.atomic.Value(bool).init(false);
+    var udp_socket_handle: ?net.Socket.Handle = null;
+    const udp_thread: ?std.Thread = std.Thread.spawn(.{}, udpDiscoveryListener, .{ io, allocator, &info, &udp_shutdown, &udp_socket_handle }) catch blk: {
+        std.log.err("[guest-ws] UDP discovery listener spawn failed", .{});
+        break :blk null;
+    };
+    defer {
+        udp_shutdown.store(true, .release);
+        // On Windows, Io.Threaded receive() blocks forever — the concurrent path
+        // for net_receive is not implemented. Close the socket handle to unblock.
+        if (builtin.os.tag == .windows) {
+            if (@atomicLoad(?net.Socket.Handle, &udp_socket_handle, .acquire)) |handle| {
+                std.os.windows.CloseHandle(handle);
+            }
+        }
+        if (udp_thread) |t| t.join();
+    }
 
     // Outer reconnect loop: connect, announce, spawn pty, process messages.
     // Any connection failure or pty death causes reconnect from scratch.
@@ -1196,3 +1372,5 @@ fn downloadAndUpgrade(io: std.Io, allocator: std.mem.Allocator, client: *std.htt
     _ = std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "sh", "-c", restart_cmd } }) catch {};
     std.process.exit(0);
 }
+
+test "getSubnetBroadcasts - signature" { _ = getSubnetBroadcasts; }
