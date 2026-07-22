@@ -49,6 +49,13 @@ pub fn genInit(platform: Platform) []const u8 {
         \\    <array>
         \\        <string>/opt/utmm/utmm</string>
         \\    </array>
+        \\    <key>EnvironmentVariables</key>
+        \\    <dict>
+        \\        <key>SHELL</key>
+        \\        <string>/bin/zsh</string>
+        \\        <key>HOME</key>
+        \\        <string>/var/root</string>
+        \\    </dict>
         \\    <key>RunAtLoad</key>
         \\    <true/>
         \\    <key>KeepAlive</key>
@@ -67,6 +74,8 @@ pub fn genInit(platform: Platform) []const u8 {
         \\
         \\[Service]
         \\Type=simple
+        \\Environment=SHELL=/bin/bash
+        \\Environment=HOME=/root
         \\ExecStart=/opt/utmm/utmm
         \\Restart=always
         \\RestartSec=5
@@ -81,6 +90,37 @@ pub fn genInit(platform: Platform) []const u8 {
         \\::              sc start "UTM-Monitor"
         \\:: Remove with:  sc stop "UTM-Monitor" & sc delete "UTM-Monitor"
         ,
+    };
+}
+
+/// Detect the shell and home directory for service environment.
+/// Runs at install time — reads current $SHELL and $HOME, falls back
+/// to platform-appropriate defaults.
+pub fn detectServiceEnv(platform: Platform) struct { shell: []const u8, home: []const u8 } {
+    const sh: []const u8 = if (std.c.getenv("SHELL")) |s| blk: {
+        const slice = std.mem.sliceTo(s, 0);
+        break :blk if (slice.len > 0) slice else defaultShell(platform);
+    } else defaultShell(platform);
+    const hm: []const u8 = if (std.c.getenv("HOME")) |h| blk: {
+        const slice = std.mem.sliceTo(h, 0);
+        break :blk if (slice.len > 0) slice else defaultHome(platform);
+    } else defaultHome(platform);
+    return .{ .shell = sh, .home = hm };
+}
+
+fn defaultShell(platform: Platform) []const u8 {
+    return switch (platform) {
+        .macos => "/bin/zsh",
+        .linux => "/bin/bash",
+        .windows => "cmd.exe",
+    };
+}
+
+fn defaultHome(platform: Platform) []const u8 {
+    return switch (platform) {
+        .macos => "/var/root",
+        .linux => "/root",
+        .windows => "C:\\",
     };
 }
 
@@ -257,6 +297,7 @@ pub fn installSelf(
     }
 
     // ── System-level service install (daemon) ────────────────────────────
+    const svc_env = detectServiceEnv(platform);
     switch (platform) {
         .macos => {
             const label: []const u8 = if (is_host) "com.utmm.host" else "com.utmm.guest";
@@ -295,6 +336,13 @@ pub fn installSelf(
                     \\        <string>{s}</string>
                     \\        <string>--host</string>
                     \\    </array>
+                    \\    <key>EnvironmentVariables</key>
+                    \\    <dict>
+                    \\        <key>SHELL</key>
+                    \\        <string>{s}</string>
+                    \\        <key>HOME</key>
+                    \\        <string>{s}</string>
+                    \\    </dict>
                     \\    <key>RunAtLoad</key>
                     \\    <true/>
                     \\    <key>KeepAlive</key>
@@ -303,7 +351,7 @@ pub fn installSelf(
                     \\    <string>{s}</string>
                     \\</dict>
                     \\</plist>
-                , .{ label, svc_exe, log_path });
+                , .{ label, svc_exe, svc_env.shell, svc_env.home, log_path });
             } else {
                 try writer.interface.print(
                     \\<?xml version="1.0" encoding="UTF-8"?>
@@ -324,6 +372,13 @@ pub fn installSelf(
                 }
                 try writer.interface.print(
                     \\    </array>
+                    \\    <key>EnvironmentVariables</key>
+                    \\    <dict>
+                    \\        <key>SHELL</key>
+                    \\        <string>{s}</string>
+                    \\        <key>HOME</key>
+                    \\        <string>{s}</string>
+                    \\    </dict>
                     \\    <key>RunAtLoad</key>
                     \\    <true/>
                     \\    <key>KeepAlive</key>
@@ -332,7 +387,7 @@ pub fn installSelf(
                     \\    <string>{s}</string>
                     \\</dict>
                     \\</plist>
-                , .{log_path});
+                , .{ svc_env.shell, svc_env.home, log_path });
             }
             try writer.interface.flush();
 
@@ -361,6 +416,8 @@ pub fn installSelf(
                 \\
                 \\[Service]
                 \\Type=simple
+                \\Environment=SHELL={s}
+                \\Environment=HOME={s}
                 \\ExecStart={s}{s}
                 \\WorkingDirectory={s}
                 \\Restart=always
@@ -369,7 +426,7 @@ pub fn installSelf(
                 \\
                 \\[Install]
                 \\WantedBy=multi-user.target
-            , .{ desc, svc_exe, extra_args, exe_dir });
+            , .{ desc, svc_env.shell, svc_env.home, svc_exe, extra_args, exe_dir });
             defer allocator.free(content);
 
             std.Io.Dir.cwd().deleteFile(io, service_path) catch {};
