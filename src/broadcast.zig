@@ -121,7 +121,8 @@ fn readSysFs(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]cons
     var read_buf: [64]u8 = undefined;
     var reader = file.reader(io, &read_buf);
     const n = try reader.interface.readSliceShort(&buf);
-    return try allocator.dupe(u8, buf[0..n]);
+    const trimmed = std.mem.trimEnd(u8, buf[0..n], "\n\r");
+    return try allocator.dupe(u8, trimmed);
 }
 
 /// Windows: use route print to get the IP address of the physical NIC
@@ -255,7 +256,7 @@ fn getMacAddress(io: std.Io, allocator: std.mem.Allocator, iface_name: []const u
             std.debug.print("[broadcast] Failed to read MAC ({s}): {}\n", .{ path, err });
             return allocator.dupe(u8, "00:00:00:00:00:00");
         };
-        return std.mem.trim(u8, content, " \n\r");
+        return content;
     }
 
     // macOS: extract MAC from getifaddrs AF_LINK entries
@@ -507,6 +508,74 @@ const TimerCtx = struct {
     running: bool,
 };
 
+/// Thread args for exec stdout poll loop. Spawned as detached thread —
+/// reads child stdout, writes exec_stdout/exec_exit to WebSocket.
+/// main loop handles stdin and signal delivery via shared handles.
+const ExecStdoutThreadArgs = struct {
+    stdout_fd: std.posix.fd_t,
+    child_pid: std.posix.pid_t,
+    conn: *wsclient.WsConn,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cmd_id: []const u8,
+};
+
+/// Thread: poll child stdout, send exec_stdout frames. Detect child exit
+/// via waitpid, send exec_exit frame. Never reads WebSocket (main loop does).
+fn execStdoutThread(args: *ExecStdoutThreadArgs) void {
+    defer {
+        args.allocator.free(args.cmd_id);
+        args.allocator.destroy(args);
+    }
+
+    var stdout_buf: [4096]u8 = undefined;
+
+    while (true) {
+        var fds: [1]std.posix.pollfd = .{
+            .{ .fd = args.stdout_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        _ = std.posix.poll(&fds, 500) catch |err| {
+            std.log.err("[guest-ws] exec stdout poll: {}", .{err});
+            break;
+        };
+
+        // Non-blocking check: child exited?
+        var exit_status: i32 = 0;
+        const waited = std.c.waitpid(args.child_pid, &exit_status, std.c.W.NOHANG);
+        if (waited < 0) {
+            std.log.err("[guest-ws] exec waitpid error", .{});
+            break;
+        }
+        if (waited > 0) {
+            // Drain remaining buffered stdout
+            drainStdoutToWs(args.stdout_fd, &stdout_buf, args.conn, args.allocator, args.cmd_id) catch {};
+
+            const exit_code: i32 = if (std.c.W.IFEXITED(@bitCast(exit_status)))
+                @as(i32, std.c.W.EXITSTATUS(@bitCast(exit_status)))
+            else if (std.c.W.IFSIGNALED(@bitCast(exit_status)))
+                128 + @as(i32, @intCast(@intFromEnum(std.c.W.TERMSIG(@bitCast(exit_status)))))
+            else
+                @as(i32, -1);
+
+            const frame = wsproto_mod.buildExecExit(args.allocator, args.cmd_id, exit_code) catch break;
+            defer args.allocator.free(frame);
+            args.conn.writeFrame(frame, .binary) catch |err| {
+                std.log.err("[guest-ws] exec_exit write: {}", .{err});
+            };
+            std.log.debug("[guest-ws] Exec done: cmd_id={s} exit={d}", .{ args.cmd_id, exit_code });
+            break;
+        }
+
+        // Child stdout → exec_stdout frame to Host
+        if (fds[0].revents & std.posix.POLL.IN != 0) {
+            drainStdoutToWs(args.stdout_fd, &stdout_buf, args.conn, args.allocator, args.cmd_id) catch |err| {
+                std.log.err("[guest-ws] exec stdout read: {}", .{err});
+                break;
+            };
+        }
+    }
+}
+
 /// WebSocket announce loop: persistent WS connection to Host.
 /// POSIX: single-threaded poll loop (no races).
 /// Windows: timer thread + mutex-protected writes.
@@ -524,27 +593,36 @@ pub fn wsAnnounceLoop(
     };
     defer if (host_url.len == 0) allocator.free(host);
 
-    std.log.info("[guest-ws] Connecting to {s}:{d}", .{ host, protocol.DEFAULT_PORT });
+    // Outer reconnect loop: connect, announce, process messages.
+    // Any connection failure causes reconnect from scratch.
+    var conn: wsclient.WsConn = undefined;
+    while (true) {
+        // Connect with retry backoff
+        while (true) {
+            std.log.info("[guest-ws] Connecting to {s}:{d}", .{ host, protocol.DEFAULT_PORT });
+            conn = wsclient.WsConn.connect(io, allocator, host, protocol.DEFAULT_PORT) catch |err| {
+                std.log.err("[guest-ws] Connect failed: {} — retrying in 3s", .{err});
+                std.Io.sleep(io, std.Io.Duration.fromSeconds(3), .awake) catch {};
+                continue;
+            };
+            break;
+        }
 
-    var conn = wsclient.WsConn.connect(io, allocator, host, protocol.DEFAULT_PORT) catch |err| {
-        std.log.err("[guest-ws] Connect failed: {}", .{err});
-        return err;
-    };
-    defer conn.close();
+        // Send initial announce
+        {
+            const frame = try wsproto_mod.buildAnnounce(
+                allocator, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell,
+            );
+            defer allocator.free(frame);
+            conn.writeFrame(frame, .binary) catch |err| {
+                std.log.err("[guest-ws] Announce write failed: {}", .{err});
+                conn.close();
+                std.Io.sleep(io, std.Io.Duration.fromSeconds(3), .awake) catch {};
+                continue;
+            };
+        }
 
-    // Send initial announce
-    {
-        const frame = try wsproto_mod.buildAnnounce(
-            allocator, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell,
-        );
-        defer allocator.free(frame);
-        conn.writeFrame(frame, .binary) catch |err| {
-            std.log.err("[guest-ws] Announce write failed: {}", .{err});
-            return err;
-        };
-    }
-
-    std.log.info("[guest-ws] Connected and announced", .{});
+        std.log.info("[guest-ws] Connected and announced", .{});
 
     // Pre-build announce message — static data, reused every second
     const announce_msg = try wsproto_mod.buildAnnounce(
@@ -571,9 +649,20 @@ pub fn wsAnnounceLoop(
         timer_ctx.running = false;
     };
 
+    // Active exec state: when threaded exec is running, main loop needs
+    // access to child stdin pipe and pid for signal/stdin delivery.
+    var active_stdin: ?std.Io.File = null;
+    var active_pid: ?std.posix.pid_t = null;
+    defer {
+        // Clean up child if connection lost during exec
+        if (active_pid) |pid| {
+            std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+        }
+    }
+
     while (true) {
         // POSIX: poll socket with 1s timeout. Windows: timer thread handles announces.
-        if (builtin.os.tag != .windows) {
+        if (builtin.os.tag != .windows and conn.leftover_len == 0) {
             var fds: [1]std.posix.pollfd = .{
                 .{ .fd = conn.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
             };
@@ -588,12 +677,17 @@ pub fn wsAnnounceLoop(
                 };
                 continue;
             }
+            std.log.info("[guest-ws] poll returned {d}", .{poll_n});
         }
 
         const frame = conn.readFrame(&rbuf) catch |err| {
             std.log.err("[guest-ws] Read error: {}", .{err});
             break;
         };
+
+        if (frame.opcode == .binary and frame.data.len > 0) {
+            std.log.info("[guest-ws] Frame type={d} len={d}", .{ frame.data[0], frame.data.len });
+        }
 
         switch (frame.opcode) {
             .binary => {
@@ -602,25 +696,59 @@ pub fn wsAnnounceLoop(
                 const payload = frame.data[1..];
 
                 switch (msg_type) {
-                    @intFromEnum(wsproto_mod.MsgType.exec_req) => {
-                        if (wsproto_mod.parseExecReq(payload)) |req| {
-                            std.log.debug("[guest-ws] Exec: {s}", .{req.command});
-                            const result = execLocalCommand(io, allocator, req.command) catch |err| {
-                                std.log.err("[guest-ws] Exec failed: {}", .{err});
-                                continue;
+                    @intFromEnum(wsproto_mod.MsgType.exec_start) => {
+                        if (wsproto_mod.parseExecStart(payload)) |req| {
+                            std.log.debug("[guest-ws] Exec stream: cmd_id={s} cmd={s}", .{ req.cmd_id, req.command });
+                            spawnExecStream(&conn, io, allocator, req.cmd_id, req.command, &active_stdin, &active_pid) catch |err| {
+                                std.log.err("[guest-ws] Exec stream spawn failed: {}", .{err});
+                                // Send error exit so Host doesn't wait forever
+                                const err_frame = wsproto_mod.buildExecExit(allocator, req.cmd_id, -1) catch continue;
+                                defer allocator.free(err_frame);
+                                conn.writeFrame(err_frame, .binary) catch {};
                             };
-                            defer {
-                                allocator.free(result.stdout);
-                                allocator.free(result.stderr);
+                        }
+                    },
+                    @intFromEnum(wsproto_mod.MsgType.exec_stdin) => {
+                        if (wsproto_mod.parseExecStdin(payload)) |stdin_req| {
+                            if (active_stdin) |stdin_pipe| {
+                                var wb: [4096]u8 = undefined;
+                                var writer = stdin_pipe.writer(io, &wb);
+                                _ = writer.interface.write(stdin_req.data) catch {};
+                                writer.interface.flush() catch {};
                             }
-                            const resp = wsproto_mod.buildExecResp(
-                                allocator, req.cmd_id, result.exit, result.stdout, result.stderr,
-                            ) catch continue;
-                            defer allocator.free(resp);
-                            conn.writeFrame(resp, .binary) catch |err| {
-                                std.log.err("[guest-ws] Exec resp write failed: {}", .{err});
-                                break;
-                            };
+                        }
+                    },
+                    @intFromEnum(wsproto_mod.MsgType.exec_signal) => {
+                        if (wsproto_mod.parseExecSignal(payload)) |sig| {
+                            std.log.info("[guest-ws] Received signal {d}, active_pid={?}", .{ sig.signal, active_pid });
+                            if (active_pid) |pid| {
+                                std.log.info("[guest-ws] Sending signal {d} to pid={d}", .{ sig.signal, pid });
+                                // Signal the shell child. Strategy:
+                                // 1. Try killpg(-pid, sig) — works if setpgid succeeded
+                                // 2. Fallback: direct kill(pid, sig) + kill child pg
+                                switch (sig.signal) {
+                                    0 => {
+                                        const pgid = -@as(std.posix.pid_t, @intCast(pid));
+                                        std.posix.kill(pgid, std.posix.SIG.INT) catch {
+                                            // Fallback: direct SIGTERM to shell
+                                            std.posix.kill(pid, std.posix.SIG.TERM) catch |err2| {
+                                                std.log.err("[guest-ws] kill(SIGTERM, {d}) failed: {}", .{ pid, err2 });
+                                            };
+                                        };
+                                    },
+                                    1 => {
+                                        const pgid = -@as(std.posix.pid_t, @intCast(pid));
+                                        std.posix.kill(pgid, std.posix.SIG.TERM) catch {
+                                            std.posix.kill(pid, std.posix.SIG.TERM) catch |err2| {
+                                                std.log.err("[guest-ws] kill(SIGTERM, {d}) failed: {}", .{ pid, err2 });
+                                            };
+                                        };
+                                    },
+                                    else => std.log.info("[guest-ws] Unknown signal: {d}", .{sig.signal}),
+                                }
+                            } else {
+                                std.log.info("[guest-ws] No active pid, signal ignored", .{});
+                            }
                         }
                     },
                     @intFromEnum(wsproto_mod.MsgType.upload_req) => {
@@ -678,36 +806,253 @@ pub fn wsAnnounceLoop(
             },
         }
 
-    }
+        }
 
-    std.log.info("[guest-ws] Disconnected", .{});
+        std.log.info("[guest-ws] Disconnected, reconnecting in 3s...", .{});
+        conn.close();
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(3), .awake) catch {};
+    }
 }
 
-const ExecResult = struct {
-    stdout: []const u8,
-    stderr: []const u8,
-    exit: i32,
-};
-
-fn execLocalCommand(io: std.Io, allocator: std.mem.Allocator, command: []const u8) !ExecResult {
+/// Spawn child process and launch stdout thread. Main loop continues
+/// to send re-announce messages (unblocking Host's readSmallMessage) and
+/// handles exec_stdin/exec_signal delivery via active_stdin/active_pid.
+fn spawnExecStream(
+    conn: *wsclient.WsConn,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cmd_id: []const u8,
+    command: []const u8,
+    active_stdin: *?std.Io.File,
+    active_pid: *?std.posix.pid_t,
+) !void {
     const shell = detectShell(allocator) catch "/bin/sh";
     defer allocator.free(shell);
 
+    const merged_cmd = try std.fmt.allocPrint(allocator, "{s} 2>&1", .{command});
+    defer allocator.free(merged_cmd);
+
     const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
-        &.{ "cmd.exe", "/c", command }
+        &.{ "cmd.exe", "/c", merged_cmd }
     else
-        &.{ shell, "-l", "-c", command };
+        &.{ shell, "-l", "-c", merged_cmd };
 
-    const result = try std.process.run(allocator, io, .{ .argv = shell_args });
+    const child = try std.process.spawn(io, .{
+        .argv = shell_args,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+        .pgid = 0, // new process group → kill(-pid, sig) works
+    });
 
-    return ExecResult{
-        .stdout = try allocator.dupe(u8, result.stdout),
-        .stderr = try allocator.dupe(u8, result.stderr),
-        .exit = switch (result.term) {
-            .exited => |code| @intCast(code),
-            .signal, .stopped, .unknown => @as(i32, -1),
-        },
+    // Store handles for main loop (stdin writes, signal delivery)
+    active_stdin.* = child.stdin.?;
+    active_pid.* = child.id.?;
+
+    // Build thread args (thread owns cmd_id copy)
+    const thread_args = try allocator.create(ExecStdoutThreadArgs);
+    thread_args.* = .{
+        .stdout_fd = child.stdout.?.handle,
+        .child_pid = child.id.?,
+        .conn = conn,
+        .io = io,
+        .allocator = allocator,
+        .cmd_id = try allocator.dupe(u8, cmd_id),
     };
+
+    const t = try std.Thread.spawn(.{}, execStdoutThread, .{thread_args});
+    t.detach();
+
+    std.log.debug("[guest-ws] Exec thread spawned: cmd_id={s}", .{cmd_id});
+}
+
+/// Read from child stdout fd and send as exec_stdout frame. Returns bytes read.
+fn drainStdoutToWs(
+    fd: std.posix.fd_t,
+    buf: []u8,
+    conn: *wsclient.WsConn,
+    allocator: std.mem.Allocator,
+    cmd_id: []const u8,
+) !void {
+    const n = try std.posix.read(fd, buf);
+    if (n == 0) return; // EOF
+    const frame = try wsproto_mod.buildExecStdout(allocator, cmd_id, buf[0..n]);
+    defer allocator.free(frame);
+    try conn.writeFrame(frame, .binary);
+}
+
+/// Deprecated: replaced by spawnExecStream + execStdoutThread.
+/// Kept for reference; will be removed in cleanup.
+fn handleExecStream(
+    conn: *wsclient.WsConn,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cmd_id: []const u8,
+    command: []const u8,
+) !void {
+    const shell = detectShell(allocator) catch "/bin/sh";
+    defer allocator.free(shell);
+
+    // Merge stderr into stdout via shell redirect — ensures correct output ordering
+    const merged_cmd = try std.fmt.allocPrint(allocator, "{s} 2>&1", .{command});
+    defer allocator.free(merged_cmd);
+
+    const shell_args: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "cmd.exe", "/c", merged_cmd }
+    else
+        &.{ shell, "-l", "-c", merged_cmd };
+
+    var child = try std.process.spawn(io, .{
+        .argv = shell_args,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    var child_alive = true;
+    defer if (child_alive) child.kill(io); // clean up if we exit early (poll error, WS read error, etc.)
+
+    const stdin_pipe = child.stdin.?;
+    const stdout_pipe = child.stdout.?;
+
+    var stdout_buf: [4096]u8 = undefined;
+    var rbuf: [65536]u8 = undefined;
+    const ws_fd = conn.stream.socket.handle;
+    const stdout_fd = stdout_pipe.handle;
+
+    while (true) {
+        if (builtin.os.tag == .windows) {
+            @compileError("TODO: streaming exec on Windows — use reader thread for child pipes");
+        }
+        var fds: [2]std.posix.pollfd = .{
+            .{ .fd = ws_fd, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = stdout_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+
+        const poll_n = std.posix.poll(&fds, 1000) catch |err| {
+            std.log.err("[guest-ws] exec poll: {}", .{err});
+            break;
+        };
+        // Heartbeat on timeout: send empty exec_stdout to unblock Host's
+        // readSmallMessage so it can drain signals. Must be a .binary frame
+        // that Host processes — pong is silently consumed inside
+        // readSmallMessage, and ping is returned but skipped by dispatch.
+        if (poll_n == 0) {
+            const hb_frame = wsproto_mod.buildExecStdout(allocator, cmd_id, &.{}) catch |err| {
+                std.log.err("[guest-ws] heartbeat build failed: {}", .{err});
+                continue;
+            };
+            defer allocator.free(hb_frame);
+            conn.writeFrame(hb_frame, .binary) catch |err| {
+                std.log.err("[guest-ws] heartbeat write failed: {}", .{err});
+            };
+            continue;
+        }
+
+        // Non-blocking check: child exited?
+        var exit_status: i32 = 0;
+        const waited = std.c.waitpid(child.id.?, &exit_status, std.c.W.NOHANG);
+        if (waited < 0) {
+            std.log.err("[guest-ws] exec waitpid error", .{});
+            break;
+        }
+        if (waited > 0) {
+            child_alive = false; // child already reaped, don't kill in defer
+            // Drain remaining buffered stdout before sending exit
+            drainStdout(stdout_fd, &stdout_buf, conn, allocator, cmd_id) catch {};
+            const exit_code: i32 = if (std.c.W.IFEXITED(@bitCast(exit_status)))
+                @as(i32, std.c.W.EXITSTATUS(@bitCast(exit_status)))
+            else if (std.c.W.IFSIGNALED(@bitCast(exit_status)))
+                128 + @as(i32, @intCast(@intFromEnum(std.c.W.TERMSIG(@bitCast(exit_status)))))
+            else
+                @as(i32, -1);
+            const frame = try wsproto_mod.buildExecExit(allocator, cmd_id, exit_code);
+            defer allocator.free(frame);
+            conn.writeFrame(frame, .binary) catch |err| {
+                std.log.err("[guest-ws] exec_exit write: {}", .{err});
+                return err;
+            };
+            std.log.debug("[guest-ws] Exec done: cmd_id={s} exit={d}", .{ cmd_id, exit_code });
+            break;
+        }
+
+        // WebSocket: exec_stdin or exec_signal from Host
+        if (fds[0].revents & std.posix.POLL.IN != 0) {
+            const frame = conn.readFrame(&rbuf) catch |err| {
+                std.log.err("[guest-ws] exec ws read: {}", .{err});
+                break;
+            };
+            switch (frame.opcode) {
+                .binary => {
+                    if (frame.data.len == 0) continue;
+                    switch (frame.data[0]) {
+                        @intFromEnum(wsproto_mod.MsgType.exec_stdin) => {
+                            if (wsproto_mod.parseExecStdin(frame.data[1..])) |stdin_req| {
+                                var wb: [4096]u8 = undefined;
+                                var writer = stdin_pipe.writer(io, &wb);
+                                _ = writer.interface.write(stdin_req.data) catch {};
+                                writer.interface.flush() catch {};
+                            }
+                        },
+                        @intFromEnum(wsproto_mod.MsgType.exec_signal) => {
+                            if (wsproto_mod.parseExecSignal(frame.data[1..])) |sig| {
+                                sendSignal(io, &child, sig.signal);
+                            }
+                        },
+                        else => {},
+                    }
+                },
+                .ping => conn.writeFrame(frame.data, .pong) catch {},
+                .pong => {},
+                .close => {
+                    std.log.info("[guest-ws] Host requested close during exec", .{});
+                    break;
+                },
+                else => {},
+            }
+        }
+
+        // Child stdout → exec_stdout frame to Host
+        if (fds[1].revents & std.posix.POLL.IN != 0) {
+            drainStdout(stdout_fd, &stdout_buf, conn, allocator, cmd_id) catch |err| {
+                std.log.err("[guest-ws] exec stdout read: {}", .{err});
+                break;
+            };
+        }
+    }
+}
+
+/// Read from child stdout fd and send as exec_stdout frame. Returns bytes read.
+fn drainStdout(
+    fd: std.posix.fd_t,
+    buf: []u8,
+    conn: *wsclient.WsConn,
+    allocator: std.mem.Allocator,
+    cmd_id: []const u8,
+) !void {
+    const n = try std.posix.read(fd, buf);
+    if (n == 0) return; // EOF
+    const frame = try wsproto_mod.buildExecStdout(allocator, cmd_id, buf[0..n]);
+    defer allocator.free(frame);
+    try conn.writeFrame(frame, .binary);
+}
+
+/// Forward signal to child process.
+fn sendSignal(io: std.Io, child: *std.process.Child, signal: u8) void {
+    switch (signal) {
+        0 => { // SIGINT
+            if (builtin.os.tag != .windows) {
+                std.posix.kill(child.id.?, std.posix.SIG.INT) catch {};
+            } else {
+                child.kill(io);
+            }
+        },
+        1 => { // SIGTERM
+            child.kill(io);
+        },
+        else => {
+            std.log.debug("[guest-ws] Unknown signal: {d}", .{signal});
+        },
+    }
 }
 
 /// Write data to file. Returns 0 on success, -1 on failure.

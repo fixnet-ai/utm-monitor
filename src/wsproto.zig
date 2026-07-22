@@ -18,6 +18,13 @@ pub const MsgType = enum(u8) {
     upload_resp = 5, // guest→host: cmd_id, exit_code
     download_req = 6, // host→guest: cmd_id, path
     download_resp = 7, // guest→host: cmd_id, exit_code, data
+
+    // v0.4.0: streaming exec — WebSocket directly pipes to shell stdin/stdout+stderr
+    exec_start = 8, // host→guest: cmd_id, command (null-terminated)
+    exec_stdout = 9, // guest→host: cmd_id, chunk (stdout+stderr merged)
+    exec_stdin = 10, // host→guest: cmd_id, chunk (stdin data)
+    exec_exit = 11, // guest→host: cmd_id, exit_code
+    exec_signal = 12, // host→guest: cmd_id, signal (0=SIGINT, 1=SIGTERM)
 };
 
 /// Write a null-terminated string into buf.
@@ -265,6 +272,118 @@ pub fn parseDownloadResp(data: []const u8) ?DownloadRespData {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// v0.4.0: Streaming exec — WebSocket ↔ shell stdin/stdout+stderr
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub const ExecStartData = struct {
+    cmd_id: []const u8,
+    command: []const u8,
+};
+
+pub fn buildExecStart(allocator: std.mem.Allocator, cmd_id: []const u8, command: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.exec_start));
+    try writeString(&buf, allocator, cmd_id);
+    try writeString(&buf, allocator, command);
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn parseExecStart(data: []const u8) ?ExecStartData {
+    var pos: usize = 0;
+    const cmd_id = readString(data, &pos) orelse return null;
+    const command = readString(data, &pos) orelse return null;
+    return .{ .cmd_id = cmd_id, .command = command };
+}
+
+pub const ExecStdoutData = struct {
+    cmd_id: []const u8,
+    chunk: []const u8,
+};
+
+pub fn buildExecStdout(allocator: std.mem.Allocator, cmd_id: []const u8, chunk: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.exec_stdout));
+    try writeString(&buf, allocator, cmd_id);
+    try writeBlob(&buf, allocator, chunk);
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn parseExecStdout(data: []const u8) ?ExecStdoutData {
+    var pos: usize = 0;
+    const cmd_id = readString(data, &pos) orelse return null;
+    const chunk = readBlob(data, &pos) orelse return null;
+    return .{ .cmd_id = cmd_id, .chunk = chunk };
+}
+
+pub const ExecStdinData = struct {
+    cmd_id: []const u8,
+    data: []const u8,
+};
+
+pub fn buildExecStdin(allocator: std.mem.Allocator, cmd_id: []const u8, data: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.exec_stdin));
+    try writeString(&buf, allocator, cmd_id);
+    try writeBlob(&buf, allocator, data);
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn parseExecStdin(data: []const u8) ?ExecStdinData {
+    var pos: usize = 0;
+    const cmd_id = readString(data, &pos) orelse return null;
+    const chunk = readBlob(data, &pos) orelse return null;
+    return .{ .cmd_id = cmd_id, .data = chunk };
+}
+
+pub const ExecExitData = struct {
+    cmd_id: []const u8,
+    exit_code: i32,
+};
+
+pub fn buildExecExit(allocator: std.mem.Allocator, cmd_id: []const u8, exit_code: i32) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.exec_exit));
+    try writeString(&buf, allocator, cmd_id);
+    var exit_buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &exit_buf, exit_code, .big);
+    try buf.appendSlice(allocator, &exit_buf);
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn parseExecExit(data: []const u8) ?ExecExitData {
+    var pos: usize = 0;
+    const cmd_id = readString(data, &pos) orelse return null;
+    const exit_code = readI32(data, &pos) orelse return null;
+    return .{ .cmd_id = cmd_id, .exit_code = exit_code };
+}
+
+pub const ExecSignalData = struct {
+    cmd_id: []const u8,
+    signal: u8,
+};
+
+pub fn buildExecSignal(allocator: std.mem.Allocator, cmd_id: []const u8, signal: u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.exec_signal));
+    try writeString(&buf, allocator, cmd_id);
+    try buf.append(allocator, signal);
+    return buf.toOwnedSlice(allocator);
+}
+
+pub fn parseExecSignal(data: []const u8) ?ExecSignalData {
+    var pos: usize = 0;
+    const cmd_id = readString(data, &pos) orelse return null;
+    if (pos >= data.len) return null;
+    const signal = data[pos];
+    return .{ .cmd_id = cmd_id, .signal = signal };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -355,4 +474,87 @@ test "download_resp with binary data" {
     try std.testing.expectEqualStrings("d1", parsed.cmd_id);
     try std.testing.expectEqual(0, parsed.exit_code);
     try std.testing.expectEqualSlices(u8, binary_data, parsed.file_data);
+}
+
+test "exec_start round-trip" {
+    const allocator = std.testing.allocator;
+    const msg = try buildExecStart(allocator, "r1", "uname -a");
+    defer allocator.free(msg);
+    try std.testing.expectEqual(@intFromEnum(MsgType.exec_start), msg[0]);
+    const parsed = parseExecStart(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
+    try std.testing.expectEqualStrings("uname -a", parsed.command);
+}
+
+test "exec_stdout round-trip" {
+    const allocator = std.testing.allocator;
+    const msg = try buildExecStdout(allocator, "r1", "hello world\n");
+    defer allocator.free(msg);
+    try std.testing.expectEqual(@intFromEnum(MsgType.exec_stdout), msg[0]);
+    const parsed = parseExecStdout(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
+    try std.testing.expectEqualStrings("hello world\n", parsed.chunk);
+}
+
+test "exec_stdout with binary chunk" {
+    const allocator = std.testing.allocator;
+    const binary = &[_]u8{ 0x00, 0x01, 0xFF, 0xFE };
+    const msg = try buildExecStdout(allocator, "r2", binary);
+    defer allocator.free(msg);
+    const parsed = parseExecStdout(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("r2", parsed.cmd_id);
+    try std.testing.expectEqualSlices(u8, binary, parsed.chunk);
+}
+
+test "exec_stdin round-trip" {
+    const allocator = std.testing.allocator;
+    const msg = try buildExecStdin(allocator, "r1", "stdin data");
+    defer allocator.free(msg);
+    try std.testing.expectEqual(@intFromEnum(MsgType.exec_stdin), msg[0]);
+    const parsed = parseExecStdin(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
+    try std.testing.expectEqualStrings("stdin data", parsed.data);
+}
+
+test "exec_exit round-trip" {
+    const allocator = std.testing.allocator;
+    const msg = try buildExecExit(allocator, "r1", 42);
+    defer allocator.free(msg);
+    try std.testing.expectEqual(@intFromEnum(MsgType.exec_exit), msg[0]);
+    const parsed = parseExecExit(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
+    try std.testing.expectEqual(42, parsed.exit_code);
+}
+
+test "exec_signal round-trip" {
+    const allocator = std.testing.allocator;
+    const msg = try buildExecSignal(allocator, "r1", 0); // SIGINT
+    defer allocator.free(msg);
+    try std.testing.expectEqual(@intFromEnum(MsgType.exec_signal), msg[0]);
+    const parsed = parseExecSignal(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("r1", parsed.cmd_id);
+    try std.testing.expectEqual(@as(u8, 0), parsed.signal);
+}
+
+test "exec_stream full flow: start → stdout → stdout → exit" {
+    const allocator = std.testing.allocator;
+
+    const start = try buildExecStart(allocator, "x1", "echo hello");
+    defer allocator.free(start);
+    const parsed_start = parseExecStart(start[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("x1", parsed_start.cmd_id);
+    try std.testing.expectEqualStrings("echo hello", parsed_start.command);
+
+    const out1 = try buildExecStdout(allocator, "x1", "hello");
+    defer allocator.free(out1);
+    const parsed_out = parseExecStdout(out1[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("hello", parsed_out.chunk);
+
+    const out2 = try buildExecStdout(allocator, "x1", " world\n");
+    defer allocator.free(out2);
+
+    const exit_msg = try buildExecExit(allocator, "x1", 0);
+    defer allocator.free(exit_msg);
+    const parsed_exit = parseExecExit(exit_msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqual(0, parsed_exit.exit_code);
 }

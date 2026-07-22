@@ -104,15 +104,13 @@ fn handleVmStatus(allocator: std.mem.Allocator, state: *httpd.HostState) ![]cons
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
 
-    if (state.guests.count() == 0) {
+    if (state.guests.items.len == 0) {
         return try allocator.dupe(u8, "{\"text\":\"No VMs currently online.\"}");
     }
 
     try text.appendSlice(allocator, "**UTM Virtual Machines:**\\n");
 
-    var it = state.guests.iterator();
-    while (it.next()) |entry| {
-        const g = entry.value_ptr;
+    for (state.guests.items) |g| {
         try text.print(allocator,
             "- **{s}** — {s} | IP: {s} | MAC: {s} | v{s} | shell: {s}\\n",
             .{ g.hostname, g.target, g.ip, g.mac, g.version, if (g.shell.len > 0) g.shell else "unknown" },
@@ -132,7 +130,7 @@ fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []con
     // Check guest exists
     {
         state.mutex.lock(state.io.?) catch {};
-        const exists = state.guests.contains(vm);
+        const exists = state.containsGuest(vm);
         state.mutex.unlock(state.io.?);
         if (!exists) return error.GuestNotFound;
     }
@@ -140,9 +138,8 @@ fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []con
     const cmd_id = try state.enqueueCmd(vm, .exec, command);
     defer allocator.free(cmd_id);
 
-    // Poll for result (100ms intervals, 30s timeout)
-    const max_attempts: u16 = 300;
-    for (0..max_attempts) |_| {
+    // Poll for result — no timeout (streaming exec may run indefinitely)
+    while (true) {
         if (state.tryTakeResult(cmd_id)) |result| {
             defer {
                 if (result.stdout.len > 0) allocator.free(result.stdout);
@@ -167,8 +164,6 @@ fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []con
         }
         std.Io.sleep(state.io.?, std.Io.Duration{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
     }
-
-    return error.CommandTimeout;
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────

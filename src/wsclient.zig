@@ -26,13 +26,19 @@ pub const Frame = struct {
 pub const WsConn = struct {
     stream: std.Io.net.Stream,
     io: std.Io,
-    /// Protects writeFrame on Windows (timer thread + main thread).
-    write_mutex: if (builtin.os.tag == .windows) std.Io.Mutex else void = if (builtin.os.tag == .windows) std.Io.Mutex.init else {},
+    /// Protects writeFrame on all platforms (main thread + exec thread).
+    write_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Leftover bytes from HTTP handshake reader buffer. These are WebSocket
     /// frame bytes that the Io.Reader pre-fetched past the `\r\n\r\n` boundary.
     /// Must be consumed by the first readFrame() call before new socket reads.
     handshake_leftover: [15]u8 = [_]u8{0} ** 15,
     handshake_leftover_len: u4 = 0,
+    /// Persistent read buffer leftover: after each readFrame, any data pre-fetched
+    /// by the Io.Reader buffer (beyond the current frame) is saved here and
+    /// prepended to the next readFrame call. This prevents data loss when the
+    /// Host sends multiple frames in rapid succession.
+    leftover: [128]u8 = [_]u8{0} ** 128,
+    leftover_len: u8 = 0,
 
     /// Connect to Host and perform WebSocket upgrade handshake.
     pub fn connect(io: std.Io, allocator: std.mem.Allocator, host: []const u8, port: u16) !WsConn {
@@ -130,7 +136,7 @@ pub const WsConn = struct {
         return .{
             .stream = stream,
             .io = io,
-            .write_mutex = if (builtin.os.tag == .windows) std.Io.Mutex.init else {},
+            .write_mutex = std.Io.Mutex.init,
             .handshake_leftover = leftover_arr,
             .handshake_leftover_len = leftover_len,
         };
@@ -158,10 +164,8 @@ pub const WsConn = struct {
     /// On Windows: mutex-protected (timer thread + main thread can both write).
     /// On POSIX: single-threaded, no lock needed.
     pub fn writeFrame(self: *WsConn, data: []const u8, opcode: Opcode) !void {
-        if (builtin.os.tag == .windows) {
-            self.write_mutex.lock(self.io) catch {};
-            defer self.write_mutex.unlock(self.io);
-        }
+        self.write_mutex.lock(self.io) catch {};
+        defer self.write_mutex.unlock(self.io);
         const mask_key: [4]u8 = blk: {
             const ts: u32 = @truncate(@as(u64, @intCast(std.Io.Timestamp.now(self.io, .real).nanoseconds)));
             var k: [4]u8 = undefined;
@@ -224,12 +228,9 @@ pub const WsConn = struct {
 
     /// Read a WebSocket frame (server→client, unmasked).
     /// `buf` is caller-provided buffer. Returned `data` points into `buf`.
-    /// Uses a SINGLE persistent reader so buffered data is not lost between
-    /// the multiple sub-reads (header, extended length, mask, payload).
+    /// Preserves pre-fetched Io.Reader buffer data between calls via self.leftover,
+    /// preventing frame loss when Host sends multiple frames rapidly.
     pub fn readFrame(self: *WsConn, buf: []u8) !Frame {
-        // If we have handshake leftover bytes, prepend them to the stream by
-        // wrapping the Io.Reader. This is needed because the HTTP response
-        // reader pre-fetches bytes past \r\n\r\n into its 16-byte buffer.
         const PrefixReader = struct {
             prefix: []const u8,
             reader: *std.Io.Reader,
@@ -252,17 +253,25 @@ pub const WsConn = struct {
             }
         };
 
-        // Persistent reader — must NOT go out of scope until all sub-reads are done.
-        // Each sub-read (header, ext_len, mask, payload) goes through this reader's
-        // buffer so excess bytes are preserved for the next sub-read.
         var rbuf: [128]u8 = undefined;
         var net_reader = self.stream.reader(self.io, &rbuf);
 
-        const leftover_len = self.handshake_leftover_len;
-        self.handshake_leftover_len = 0; // consume once
+        // Build prefix from persistent + handshake leftovers
+        var prefix_buf: [143]u8 = undefined; // 128 (max persistent) + 15 (handshake)
+        var prefix_len: usize = 0;
+        if (self.leftover_len > 0) {
+            @memcpy(prefix_buf[prefix_len..][0..self.leftover_len], self.leftover[0..self.leftover_len]);
+            prefix_len += self.leftover_len;
+            self.leftover_len = 0;
+        }
+        if (self.handshake_leftover_len > 0) {
+            @memcpy(prefix_buf[prefix_len..][0..self.handshake_leftover_len], self.handshake_leftover[0..self.handshake_leftover_len]);
+            prefix_len += self.handshake_leftover_len;
+            self.handshake_leftover_len = 0;
+        }
 
         var prefixed = PrefixReader{
-            .prefix = self.handshake_leftover[0..leftover_len],
+            .prefix = prefix_buf[0..prefix_len],
             .reader = &net_reader.interface,
         };
 
@@ -301,6 +310,20 @@ pub const WsConn = struct {
         if (masked) {
             for (buf[0..payload_len], 0..) |*byte, i| {
                 byte.* ^= mask_key[i % 4];
+            }
+        }
+
+        // Save leftover bytes from Io.Reader buffer for next call.
+        // The reader pre-fetches up to rbuf.len bytes from the socket;
+        // any data beyond the current frame must be preserved.
+        const reader_buf = net_reader.interface.buffer;
+        const seek = net_reader.interface.seek;
+        const end = net_reader.interface.end;
+        if (end > seek) {
+            const remaining = end - seek;
+            if (remaining <= self.leftover.len) {
+                @memcpy(self.leftover[0..remaining], reader_buf[seek..end]);
+                self.leftover_len = @intCast(remaining);
             }
         }
 

@@ -105,6 +105,11 @@ pub const CliArgs = struct {
     download_target: ?[]const u8 = null,
     download_remote: ?[]const u8 = null,
     download_local: ?[]const u8 = null,
+
+    // exec-signal: send Ctrl+C to a running command
+    cmd_exec_signal: bool = false,
+    exec_signal_target: ?[]const u8 = null,
+    exec_signal_cmd_id: ?[]const u8 = null,
 };
 
 /// Parse command-line arguments
@@ -175,6 +180,16 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             if (i + 1 < args.len) {
                 i += 1;
                 cli.exec_cmd = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--exec-signal")) {
+            cli.cmd_exec_signal = true;
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.exec_signal_target = args[i];
+            }
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.exec_signal_cmd_id = args[i];
             }
         } else if (std.mem.eql(u8, arg, "--save-config")) {
             cli.save_config = true;
@@ -382,7 +397,7 @@ pub fn main(init: std.process.Init) !void {
     // Mode dispatch
     // --mcp alone (no --host): MCP now integrated into Host HTTP server.
     // Redirect to --host which always serves /mcp on port 2121.
-    if (cli.is_mcp and !cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_upload and !cli.cmd_download and !cli.cmd_gen_init and !cli.save_config and !cli.cmd_install and !cli.cmd_uninstall) {
+    if (cli.is_mcp and !cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_upload and !cli.cmd_download and !cli.cmd_gen_init and !cli.save_config and !cli.cmd_install and !cli.cmd_uninstall and !cli.cmd_exec_signal) {
         std.log.info("[main] --mcp deprecated; MCP available via --host on port 2121. Use 'utmm --host' instead.", .{});
         return;
     }
@@ -391,12 +406,12 @@ pub fn main(init: std.process.Init) !void {
     // used with management commands (--exec/--status/--upload/--download).
     // These commands always talk to the persistent Host via IPC first;
     // --host here would misleadingly suggest "run a new host instance".
-    if (cli.cmd_exec or cli.cmd_status or cli.cmd_upload or cli.cmd_download) {
+    if (cli.cmd_exec or cli.cmd_status or cli.cmd_upload or cli.cmd_download or cli.cmd_exec_signal) {
         cli.is_host = false;
     }
 
     // --install/--uninstall work in both host and guest mode (install.zig uses cli.is_host)
-    if (cli.is_host or cli.cmd_status or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.is_mcp) {
+    if (cli.is_host or cli.cmd_status or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.is_mcp or cli.cmd_exec_signal) {
         try host_mod.run(init, cli);
     } else if (cli.cmd_install or cli.cmd_uninstall) {
         try host_mod.run(init, cli);
