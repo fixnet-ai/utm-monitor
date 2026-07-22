@@ -4,6 +4,10 @@
 persistence, file transfer — all through natural language via MCP. One zero-dependency
 Zig binary.
 
+**v0.6.0: LAN-wide UDP broadcast discovery** — `utmm --status` works from any machine
+on the LAN, not just the Host. Discovers real machines and VMs alike, across UTM bridge
+networks. Windows, macOS, Linux guests all supported.
+
 ## AI Agent Experience
 
 Two MCP tools for AI coding agents (Claude Code, etc.):
@@ -18,6 +22,7 @@ Example prompts:
 - "Run `ls /opt/utmm` on linuxvm"
 - "Check disk space on all VMs"
 - "Is the macvm service running?"
+- "Attach lldb to my program on linuxvm, set a breakpoint at main, and show the backtrace"
 
 ## One-Time Setup
 
@@ -77,14 +82,22 @@ utmm --kick linuxvm            # Kill shell, force reconnect
 ## How It Works
 
 ```
+                         ┌── UDP broadcast discovery (--status, any LAN machine)
+                         │
 Guest (linuxvm)  ──WebSocket──┐
 Guest (macvm)    ──WebSocket──┤──→ Host HTTP :2121 ── MCP /mcp (AI agents)
 Guest (windows)  ──WebSocket──┘                      ── CLI (--status, --exec)
 ```
 
-**v0.5.0 pty model**: Each guest gets a persistent shell session. Commands run
-in the same shell — `cd /tmp` then `pwd` shows `/tmp`. `export FOO=bar` then
-`echo $FOO` shows `bar`.
+**v0.6.0 UDP broadcast discovery**: `utmm --status` sends subnet-directed UDP
+broadcasts to :2121. Each Guest runs a UDP listener that responds with its
+hostname, IP, OS, version, and shell type. Works from any machine on the LAN —
+not just the Host, and not limited to VMs. Real machines running the Guest
+binary appear alongside UTM VMs. No party needs to know anyone else's IP.
+
+**v0.5.0 pty model**: Each guest WebSocket connection gets a persistent shell
+session. Commands run in the same shell — `cd /tmp` then `pwd` shows `/tmp`.
+`export FOO=bar` then `echo $FOO` shows `bar`.
 
 - **Zero dependencies**: pure Zig, no Node.js/Python/SSH/curl
 - **Single port**: HTTP + WebSocket + MCP all on 2121
