@@ -262,6 +262,11 @@ fi
 echo "==> Installing binary..."
 sudo mv "$TMP_BIN" "$INSTALL_DIR/$GUEST_BIN"
 sudo chmod +x "$INSTALL_DIR/$GUEST_BIN"
+# macOS: codesign is required for binaries run with sudo (launchd runs as root).
+# Binaries downloaded via curl lose their code signature, so AMFI kills them.
+if [ "$GUEST_OS" = "macos" ]; then
+    sudo codesign --force --sign - "$INSTALL_DIR/$GUEST_BIN" 2>/dev/null || true
+fi
 
 # 8. Create symlinks
 echo "==> Creating symlink: $INSTALL_DIR/utmm -> $INSTALL_DIR/$GUEST_BIN"

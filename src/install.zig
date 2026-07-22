@@ -94,18 +94,11 @@ pub fn genInit(platform: Platform) []const u8 {
 }
 
 /// Detect the shell and home directory for service environment.
-/// Runs at install time — reads current $SHELL and $HOME, falls back
-/// to platform-appropriate defaults.
+/// Uses platform-appropriate defaults — service environments (systemd/launchd/schtasks)
+/// don't have user shell preferences. SSH sessions set $SHELL=/bin/sh on macOS
+/// which would give the wrong shell for the pty session.
 pub fn detectServiceEnv(platform: Platform) struct { shell: []const u8, home: []const u8 } {
-    const sh: []const u8 = if (std.c.getenv("SHELL")) |s| blk: {
-        const slice = std.mem.sliceTo(s, 0);
-        break :blk if (slice.len > 0) slice else defaultShell(platform);
-    } else defaultShell(platform);
-    const hm: []const u8 = if (std.c.getenv("HOME")) |h| blk: {
-        const slice = std.mem.sliceTo(h, 0);
-        break :blk if (slice.len > 0) slice else defaultHome(platform);
-    } else defaultHome(platform);
-    return .{ .shell = sh, .home = hm };
+    return .{ .shell = defaultShell(platform), .home = defaultHome(platform) };
 }
 
 fn defaultShell(platform: Platform) []const u8 {
