@@ -29,9 +29,6 @@ test_write.o
 test_report.txt
 http-migration-plan.md
 
-# Planning files (local, not part of the project)
-task_plan.md
-findings.md
-progress.md
-zig-codegen.md
+# Project documentation (tracked in git)
+# task_plan.md, findings.md, progress.md, zig-codegen.md are now project docs
 test_*

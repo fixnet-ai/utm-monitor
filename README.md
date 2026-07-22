@@ -1,112 +1,104 @@
 # UTM Monitor
 
-**Let AI agents manage your VMs.** Auto IP discovery, remote execution, file transfer, and seamless version upgrades — all through natural language via MCP. Built into one zero-dependency Zig binary.
+**Let AI agents manage your VMs.** Auto IP discovery, remote execution with shell
+persistence, file transfer — all through natural language via MCP. One zero-dependency
+Zig binary.
 
 ## AI Agent Experience
 
-Once installed, your AI agent gets two tools:
+Two MCP tools for AI coding agents (Claude Code, etc.):
 
-| Tool | What it does |
+| Tool | Description |
 |------|-------------|
-| `vm_status` | Discover all VMs — hostname, IP, OS, arch, version, online status |
-| `vm_exec` | Run any shell command on any VM (Linux/macOS/Windows) |
+| `vm_status` | List all VMs: hostname, IP, OS/arch, version, shell type |
+| `vm_exec` | Execute commands on a VM. Shell session persists — cd, export survive |
 
-```
-"Check the status of all VMs"
-"Run the test suite on linuxvm"
-"Show me the last 50 lines of the log on windowsvm"
-"Deploy the latest build to all VMs"
-"Upload the config file to macvm"
-"What's the network latency between linuxvm and windowsvm?"
-```
-
-Works with any MCP-compatible agent: Claude Code, Codex, Gemini CLI, and others.
+Example prompts:
+- "Check the status of all my VMs"
+- "Run `ls /opt/utmm` on linuxvm"
+- "Check disk space on all VMs"
+- "Is the macvm service running?"
 
 ## One-Time Setup
 
-### 1. Install on Host (your Mac)
+### 1. Install on Host (macOS where UTM runs)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 ```
 
-This downloads all platform binaries to `/opt/utmm/` and creates the `utmm` command.
+This installs to `/opt/utmm/` and starts the Host HTTP server on port 2121.
 
-### 2. Register with your AI agent
+### 2. Register with AI Agent
 
-Host daemon serves MCP over HTTP on port 2121. Configure your agent to connect via `streamableHttp`:
+Add to your MCP config (`~/.claude/mcp.json` or `.mcp.json` in project):
 
 ```json
 {
   "mcpServers": {
     "utm-monitor": {
-      "type": "streamableHttp",
-      "url": "http://127.0.0.1:2121/mcp"
+      "type": "http",
+      "url": "http://192.168.64.1:2121/mcp"
     }
   }
 }
 ```
 
-> CLI: `claude mcp add utm-monitor --transport streamableHttp http://127.0.0.1:2121/mcp`
-
-### 3. Start the Host
+### 3. Start Host
 
 ```bash
-sudo utmm --host --install   # auto-start on boot
-sudo utmm --host             # or run immediately
+sudo utmm --host
+# Or auto-start on boot:
+sudo utmm --host --install
 ```
 
-### 4. Install on each VM (Guest)
+### 4. Install on Each VM Guest
 
-No internet needed — Guests fetch everything from the Host over the network:
+On each VM, copy the binary to `/opt/utmm/` (or `C:\opt\utmm\` on Windows)
+and run:
 
 ```bash
-# Linux VM (as root)
-curl http://$(ip route | grep default | awk '{print $3}'):2121/bin/install.sh | sh -s -- --guest --hostname linuxvm
-
-# macOS VM (as root)
-GW=$(route -n get default 2>/dev/null | awk '/gateway/{print $2}')
-curl "http://$GW:2121/bin/install.sh" | sh -s -- --guest --hostname macvm
-
-# Windows VM (as Administrator)
-curl -o install.bat "http://<gateway>:2121/bin/install.bat" && install.bat --guest --hostname windowsvm
+utmm --install
 ```
 
-Done. Ask your AI agent: "Check the status of all VMs".
+The Guest auto-discovers the Host via the default gateway.
 
 ## CLI Quick Reference
 
-For when you're in a terminal without an agent:
-
 ```bash
-utmm --status                          # all VM status
-utmm --exec linuxvm "uname -a"         # run a command
-utmm --upload ./file.txt linuxvm       # upload a file
-utmm --download linuxvm file.txt ./    # download a file
+utmm --status                  # All VM status
+utmm --exec linuxvm "uname -a" # Run command (pty shell, cd/export persist)
+utmm --exec windowsvm "dir"    # Windows commands auto-use cmd.exe
+utmm --upload file.txt linuxvm # Upload file
+utmm --download linuxvm /path ./local  # Download file
+utmm --kick linuxvm            # Kill shell, force reconnect
 ```
 
 ## How It Works
 
 ```
-Guest VMs ──WebSocket (binary frames)──→ Host HTTP :2121 ──→ /etc/hosts sync
-                ↑                                        ├──→ MCP /mcp (JSON-RPC) ← AI Agent
-                └── HTTP POST /announce (backward compat) ├──→ GET /bin/ (static files)
-                                                          └──→ /exec, /upload, /download (CLI)
+Guest (linuxvm)  ──WebSocket──┐
+Guest (macvm)    ──WebSocket──┤──→ Host HTTP :2121 ── MCP /mcp (AI agents)
+Guest (windows)  ──WebSocket──┘                      ── CLI (--status, --exec)
 ```
 
-- **Single port**: Everything on 2121 — WebSocket, HTTP REST, MCP, static files. No UDP broadcast, no separate MCP port.
-- **WebSocket push**: Guest maintains persistent WS connection; Host pushes commands in real-time via binary frames. No polling.
-- **Binary protocol**: exec, upload, download use raw binary WebSocket frames — zero encoding overhead, no base64.
-- **Auto-discovery**: Guest connects to default gateway (UTM Host = gateway); Host always knows Guest IP from WS connection.
-- **Zero deps**: No Python, Node.js, SSH, or external libraries — one binary, everywhere.
+**v0.5.0 pty model**: Each guest gets a persistent shell session. Commands run
+in the same shell — `cd /tmp` then `pwd` shows `/tmp`. `export FOO=bar` then
+`echo $FOO` shows `bar`.
+
+- **Zero dependencies**: pure Zig, no Node.js/Python/SSH/curl
+- **Single port**: HTTP + WebSocket + MCP all on 2121
+- **Auto IP tracking**: /etc/hosts kept up to date
+- **Cross-platform**: macOS, Linux, Windows guests
+- **Auto-upgrade**: Host serves new binaries, guests self-upgrade
 
 ## Docs
 
-| For | Read |
-|-----|------|
-| Using with AI agents, troubleshooting | **[SKILL.md](./utm-vm/SKILL.md)** |
-| Full reference manual | **[MANUAL.md](./utm-vm/MANUAL.md)** |
-| Building from source, development | **[CLAUDE.md](./CLAUDE.md)** |
+| Document | For |
+|----------|-----|
+| [SKILL.md](utm-vm/SKILL.md) | AI agent instructions (MCP tool details, workflows) |
+| [MANUAL.md](utm-vm/MANUAL.md) | Full user manual (architecture, deployment, troubleshooting) |
+| [CLAUDE.md](CLAUDE.md) | Developer guide (build, architecture, Zig patterns) |
 
 ## License
 

@@ -31,7 +31,7 @@ utmm --host       # Host mode
 |-----------|------------|-----------|
 | Runs on | Inside each VM | Host machine |
 | Count | One per VM | Only one |
-| Responsibility | WebSocket connect to Host, announce info, execute commands | Unified HTTP server: guest registration, exec, upload, download, MCP, static files, /etc/hosts sync |
+| Responsibility | WebSocket connect to Host, announce info, run persistent pty shell | Unified HTTP server: guest registration, exec via pty, upload, download, MCP, static files, /etc/hosts sync |
 | Required Privileges | Regular user | `sudo` (to write /etc/hosts) |
 
 ### 1.3 Data Flow Overview
@@ -54,6 +54,7 @@ utmm --host       # Host mode
 │  │  macvm     │  │  linuxvm   │  │ windowsvm  │   ← Guest side       │
 │  │            │  │            │  │            │                      │
 │  │ WS client  │  │ WS client  │  │ WS client  │   Persistent WS      │
+│  │ + pty shell│  │ + pty shell│  │ + cmd.exe  │   + pty session      │
 │  └────────────┘  └────────────┘  └────────────┘                      │
 │                                                                      │
 │  ┌──────────────────────────────────────────┐                        │
@@ -75,25 +76,29 @@ Guest opens a persistent WebSocket connection to Host. All communication uses **
 | Message Type | Direction | Purpose |
 |-------------|-----------|---------|
 | `announce` (1) | Guest → Host | Advertise hostname, IP, target, MAC, version, shell |
-| `exec_req` (2) | Host → Guest | [deprecated] Execute a shell command (replaced by exec_start) |
-| `exec_resp` (3) | Guest → Host | [deprecated] Command result (replaced by exec_stdout+exec_exit) |
-| `upload_req` (4) | Host → Guest | Upload file (path + binary data) |
-| `upload_resp` (5) | Guest → Host | Upload result (exit code) |
-| `download_req` (6) | Host → Guest | Download file (path) |
-| `download_resp` (7) | Guest → Host | File content (exit code + binary data) |
-| `exec_start` (8) | Host → Guest | Start streaming exec: cmd_id + shell command |
-| `exec_stdout` (9) | Guest → Host | Real-time stdout/stderr chunk (merged 2>&1) |
-| `exec_stdin` (10) | Host → Guest | Write data to child stdin (future use) |
-| `exec_exit` (11) | Guest → Host | Command finished: cmd_id + exit code (i32 BE) |
+| `pty_spawn` (2) | Host → Guest | Spawn persistent shell on WS connect (no payload) |
+| `pty_input` (3) | Host → Guest | Feed command stdin: cmd_id + data (with MDELIM marker) |
+| `pty_output` (4) | Guest → Host | Shell stdout/stderr: cmd_id + output data |
+| `pty_signal` (5) | Host → Guest | Send signal to shell: 1-byte (SIGINT/SIGTERM/SIGHUP) |
+| `pty_resize` (6) | Host → Guest | Terminal resize: rows(u16 BE) + cols(u16 BE) |
+| `upload_req` (7) | Host → Guest | Upload file: path + binary data |
+| `upload_resp` (8) | Guest → Host | Upload result: exit code |
+| `download_req` (9) | Host → Guest | Download file: path |
+| `download_resp` (10) | Guest → Host | File content: exit code + binary data |
 
-**Connection = Shell Session**: After exec_exit, Guest flushes TCP (200ms), disconnects WebSocket, and reconnects — providing a fresh shell session for the next command. Closing the WebSocket implicitly terminates any running command (shell gets SIGPIPE, Guest defer cleanup sends SIGTERM). Use `--kick` CLI to cancel a running command.
+**pty Session Model (v0.5.0)**: On WebSocket connect, Guest spawns a persistent shell
+via `posix_openpt` (POSIX) or `CreatePipe` (Windows). Commands are fed via pty_input
+and output arrives via pty_output. A `MDELIM:$?\n` (POSIX) or `MDELIM:%errorlevel%\r\n`
+(Windows) exit-code marker is appended to each command for completion detection.
+The shell session lives for the entire WebSocket connection lifetime — `cd`, `export`,
+and other stateful commands persist across `vm_exec` calls.
 
 **Payload encoding:**
 - String fields: null-terminated (`\0` delimiter)
 - Binary fields: 4-byte big-endian length prefix + raw bytes
 - No base64, no JSON encoding — raw binary for file data
 
-**Periodic re-announce**: Guest re-sends announce every ~50 messages so Host always has current info.
+**Periodic re-announce**: Guest re-sends announce periodically so Host always has current info.
 
 Guest auto-discovers Host IP via default gateway (UTM Host is the gateway for bridged networks). Override with `--host-ip`.
 
@@ -104,15 +109,18 @@ CLI management commands use standard HTTP:
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/guests` | GET | List all guests (JSON) |
-| `/exec` | POST | Enqueue exec command, wait for result |
-| `/kick` | POST | Close guest's WebSocket connection (cancel exec) |
+| `/exec` | POST | Send command via pty, wait for result |
+| `/kick` | POST | Close guest's WebSocket connection (kills pty shell) |
 | `/upload` | POST | Upload file to guest |
 | `/download` | POST | Download file from guest |
 | `/mcp` | POST | MCP JSON-RPC (AI agent entry) |
 | `/bin/<file>` | GET | Static file serving (bootstrap, binaries) |
 | `/` | GET | HTML status page |
 
-CLI commands send HTTP to `127.0.0.1:2121`. Host communicates with Guest via WebSocket for actual command execution. Exec uses streaming protocol (exec_start → exec_stdout chunks → exec_exit) — no timeout, commands run indefinitely. After exec_exit Guest disconnects and reconnects for a fresh shell session (Connection = Shell Session). Use `--kick` to cancel a running command.
+CLI commands send HTTP to `127.0.0.1:2121`. Host communicates with Guest via WebSocket
+for actual command execution. Commands have a 30-second timeout — if a command runs
+longer, it will return a timeout error. Use `--kick` to forcefully close a guest's
+shell session and force reconnect.
 
 #### /etc/hosts Marker Block
 
@@ -232,7 +240,7 @@ curl -o install.bat "http://<gateway>:2121/bin/install.bat" && install.bat --gue
 3. Downloads the correct binary from `http://<gateway>:2121/bin/utmm-{arch}-{os}[.exe]`
 4. Creates `/opt/utmm/` (or `C:\opt\utmm\` on Windows) and installs the binary
 5. Creates convenience symlinks (`/usr/local/bin/utmm` on Unix)
-6. Installs auto-start service via `utmm --install`
+6. Installs auto-start service via `utmm --install` (with SHELL and HOME environment variables)
 7. Starts the Guest immediately with the given `--hostname`
 
 > **Prerequisite**: The Host must be running `sudo utmm --host` and the gateway must be reachable from the Guest. If the gateway detection fails, the script probes common UTM bridge IPs (192.168.64.1, 192.168.65.1, 192.168.66.1).
@@ -425,7 +433,7 @@ After starting, the following output indicates normal operation:
 ```
 [host] HTTP server on 0.0.0.0:2121
 [host] Serve dir: /opt/utmm
-[ws] Guest linuxvm connected (192.168.64.2 v0.3.0)
+[ws] Guest linuxvm connected (192.168.64.2 v0.5.0)
 [host-http] /etc/hosts synced (1 guests)
 ```
 
@@ -443,7 +451,8 @@ grep -A 10 "UTM-MONITOR" /etc/hosts
 | 2 | Host receiving guests | `utmm --status` | Shows all Guests |
 | 3 | /etc/hosts synced | `grep "UTM-MONITOR" /etc/hosts` | Contains entries for 3 VMs |
 | 4 | Remote command channel | `utmm --exec ubuntu "uptime"` | Returns uptime |
-| 5 | WebSocket connected | Guest logs show `[guest-ws] Connected and announced` | Guest is online |
+| 5 | Shell persistence | `utmm --exec ubuntu "cd /tmp; pwd"` | Shows `/tmp` |
+| 6 | WebSocket connected | Guest logs show `[guest-ws] Connected and announced` | Guest is online |
 
 ---
 
@@ -476,8 +485,8 @@ Host Options:
 
 Management commands (HTTP to Host :2121):
   --status               Query online status of all Guests
-  --exec TARGET CMD      Execute command on target Guest (no timeout, streaming)
-  --kick TARGET          Close guest's WebSocket connection (cancels running exec)
+  --exec TARGET CMD      Execute command on target Guest (pty shell, 30s timeout)
+  --kick TARGET          Close guest's WebSocket connection (kills pty shell)
   --upload FILE VM       Upload a file to Guest
   --download VM R L      Download file from Guest
   --gen-init PLATFORM    Generate auto-start boot script (linux/macos/windows)
@@ -502,9 +511,9 @@ Example output:
 ```
 Hostname         Target             IP               MAC                 Version   Shell
 -------------------------------------------------------------------------------------
-ubuntu           aarch64-linux-musl 192.168.64.2     16:a0:6c:ba:ae:fa  v0.3.0    /bin/bash
-macvm            aarch64-macos      192.168.64.4     1a:97:6d:38:0c:6c  v0.3.0    /bin/zsh
-WIN-PC           aarch64-windows    192.168.65.2     66:DC:DA:EC:A1:59  v0.3.0    cmd.exe
+ubuntu           aarch64-linux-musl 192.168.64.2     16:a0:6c:ba:ae:fa  v0.5.0    /bin/bash
+macvm            aarch64-macos      192.168.64.4     1a:97:6d:38:0c:6c  v0.5.0    /bin/zsh
+WIN-PC           aarch64-windows    192.168.65.2     66:DC:DA:EC:A1:59  v0.5.0    cmd.exe
 ```
 
 #### Execute Commands on a Specific VM
@@ -521,8 +530,10 @@ utmm --exec linuxvm "uptime"
 # View processes
 utmm --exec macvm "ps aux | head -5"
 
-# Execute complex commands
-utmm --exec linuxvm "df -h && free -m"
+# Shell persistence — cd and export work across commands
+utmm --exec linuxvm "cd /tmp && pwd"     # Shows /tmp
+utmm --exec linuxvm "export FOO=bar"     # Set env var
+utmm --exec linuxvm "echo $FOO"          # Shows bar (persists in same shell)
 ```
 
 #### Transfer Files
@@ -630,7 +641,8 @@ sudo lsof -i :2121
 |---------------|-------|----------|
 | `GuestNotFound` | Guest not connected to Host | Wait a few seconds and retry; check if Guest is running |
 | `ConnectionRefused` | Host HTTP server not running | `sudo utmm --host` |
-| `RemoteExecFailed` | Command execution returned error | Check if command is correct (use Windows `ver` instead of `uname`) |
+| `ExecTimeout` | Command took longer than 30s | Split into smaller commands or run in background |
+| `disconnected` | Guest WebSocket closed during execution | Guest may have crashed; check `vm_status` |
 
 ### 5.4 Windows Guest Process Cannot Run in Background
 
@@ -706,6 +718,24 @@ utmm --exec linuxvm "curl -s http://<gateway>:2121/"
 # Override with: utmm --host-ip 192.168.64.1
 ```
 
+### 5.9 Stale WebSocket After VM Suspend/Resume
+
+**Symptom**: VM was suspended and resumed, but `--status` shows it as offline or exec commands time out.
+
+**Cause**: VM suspend/resume can leave the WebSocket connection in a stale state — TCP connection appears open but the remote end is unreachable.
+
+**Solution**: Restart the utmm guest service on the affected VM:
+```bash
+# Linux
+utmm --exec linuxvm "systemctl restart utmm-guest"
+
+# macOS
+utmm --exec macvm "launchctl bootout system /Library/LaunchDaemons/com.utmm.guest.plist; launchctl bootstrap system /Library/LaunchDaemons/com.utmm.guest.plist"
+
+# Windows
+utmm --exec windowsvm "schtasks /end /tn utmm-guest & schtasks /run /tn utmm-guest"
+```
+
 ---
 
 ## 6. Reference Appendix
@@ -720,11 +750,16 @@ utmm/
 ├── README.md              # Project overview
 ├── CLAUDE.md              # Development guide
 ├── zig-codegen.md         # Zig 0.16.0 coding experience notes
+├── findings.md            # Architecture decisions and bug fixes
+├── progress.md            # Development session log
+├── task_plan.md           # Feature implementation plan
 ├── .github/
 │   └── workflows/
 │       └── release.yml    # CI: auto build and publish 6-target binaries on tag
+├── release-skill/
+│   └── SKILL.md           # Release workflow skill
 ├── utm-vm/
-│   ├── SKILL.md           # Claude Code skill
+│   ├── SKILL.md           # Claude Code skill for VM management
 │   └── MANUAL.md          # This manual
 ├── src/
 │   ├── main.zig           # Entry point + CLI parsing
@@ -733,10 +768,10 @@ utmm/
 │   ├── wsproto.zig        # Binary WebSocket protocol (1B type + payload)
 │   ├── wsclient.zig       # Guest WebSocket client (TCP + HTTP upgrade + frame I/O)
 │   ├── httpd.zig          # HTTP server core (accept loop, Router, HostState)
-│   ├── host_http.zig      # HTTP endpoint handlers (/announce, /exec, /ws, /mcp, /bin/)
-│   ├── guest.zig          # Guest mode: WebSocket announce loop
+│   ├── host_http.zig      # HTTP endpoint handlers (/ws, /exec, /mcp, /bin/, etc.)
+│   ├── guest.zig          # Guest mode: WebSocket announce loop orchestration
 │   ├── host.zig           # Host mode: management commands + HTTP server start
-│   ├── broadcast.zig      # Guest: getLocalIp/getHostname/getDefaultGateway + wsAnnounceLoop
+│   ├── broadcast.zig      # Guest: ptySpawn, ptyReadLoop, wsAnnounceLoop, getLocalIp
 │   ├── hosts_file.zig     # /etc/hosts marker block read/write
 │   ├── mcp.zig            # MCP JSON-RPC handler (reads HostState directly)
 │   ├── install.zig        # --install/--uninstall + desktop shortcuts + --gen-init
@@ -753,7 +788,7 @@ utmm/
 |-----------|---------|---------|
 | Zig | 0.16.0 | Programming language |
 | std.http.Server | Built-in | HTTP server + WebSocket upgrade |
-| libc | System | `getifaddrs` / `gethostname` / `getenv` |
+| libc | System | `getifaddrs` / `gethostname` / `getenv` / `posix_openpt` |
 | launchd | macOS system | macOS auto-start on boot |
 | systemd | Linux system | Linux auto-start on boot |
 | sc (schtasks) | Windows system | Windows auto-start on boot (Scheduled Task) |
@@ -843,10 +878,10 @@ sudo killall -HUP mDNSResponder
 | `error.AccessDenied` | Host not running with sudo | `sudo utmm --host` |
 | `error.ConnectionRefused` | Host HTTP server not started | `sudo utmm --host` |
 | `GuestNotFound` | Guest not connected via WebSocket | Check if Guest process is running |
+| `ExecTimeout` | Command exceeded 30s timeout | Split command or use `nohup ... &` |
 | Tunnel IP detected | VPN interface interference | utun/tun added to exclusion list |
 | Windows process disappears | Direct launch without scheduled task | Use --install to install as scheduled task |
 | `zig-out/bin/utmm` is wrong arch | `zig build` overwrites with last target | Use named file e.g. `utmm-aarch64-macos` |
-| 32-bit x86 build fails | x86-windows has linker issue (unrelated to utmm) | Use x86_64 target (all modern VMs are 64-bit) |
 
 ---
 
@@ -865,7 +900,7 @@ utmm --host     ← Host daemon (unified HTTP server on :2121)
   ▼
 Guest VMs (linuxvm, macvm, windowsvm)
   │
-  └─ WebSocket (2121): announce, exec, upload, download
+  └─ WebSocket (2121): pty shell session (announce, pty_input, pty_output)
 ```
 
 The Host daemon (`utmm --host`) serves MCP JSON-RPC over HTTP on `127.0.0.1:2121/mcp` using the streamableHttp transport — the same port and process as everything else. Claude Code connects directly via TCP. The Host's in-memory guest cache provides instant responses without discovery per request.
@@ -913,8 +948,6 @@ ln -sf ../../utm-vm .claude/skills/utm-vm
 
 **Step 4: Register MCP server with Claude Code**
 
-Configure `~/.claude/mcp.json` (or add via CLI):
-
 ```bash
 claude mcp add utm-monitor --transport streamableHttp http://127.0.0.1:2121/mcp
 ```
@@ -960,7 +993,7 @@ sudo utmm --host --install
 curl -s -X POST http://127.0.0.1:2121/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
-# → {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.3.0"},"capabilities":{"tools":{}}}}
+# → {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.5.0"},"capabilities":{"tools":{}}}}
 ```
 
 ### 7.3 Available Tools
@@ -968,7 +1001,7 @@ curl -s -X POST http://127.0.0.1:2121/mcp \
 | Tool | What it does | Example |
 |------|-------------|---------|
 | `vm_status` | List all VMs: hostname, IP, OS/arch, MAC, version, shell | `vm_status()` |
-| `vm_exec` | Execute a shell command on a VM | `vm_exec("linuxvm", "uname -a")` |
+| `vm_exec` | Execute a shell command on a VM (pty session, cd/export persist) | `vm_exec("linuxvm", "uname -a")` |
 
 ### 7.4 Daily Usage Examples
 
@@ -989,7 +1022,7 @@ curl -s -X POST http://127.0.0.1:2121/mcp \
 🤖 → vm_exec("linuxvm", "cd /opt && ./utmm --version")
     → vm_exec("macvm", "cd /opt && ./utmm --version")
     → vm_exec("windowsvm", "C:\\opt\\utmm.exe --version")
-    All three return v0.3.0 ✓
+    All three return v0.5.0 ✓
 ```
 
 #### Debugging a specific VM
@@ -1024,6 +1057,7 @@ curl -s -X POST http://127.0.0.1:2121/mcp \
 | MCP connection refused | Host daemon not running | `sudo utmm --host` |
 | Port 2121 AddressInUse at Host start | Old `utmm` process still running | `sudo pkill -f utmm && sudo utmm --host` |
 | WebSocket connection failed | Guest can't reach Host gateway | Check guest gateway detection; use `--host-ip` to override |
+| Command timeout | Command exceeded 30s limit | Split command or run in background with `nohup ... &` |
 
 ### 7.7 Complete Uninstall / Cleanup
 
@@ -1078,6 +1112,7 @@ del C:\opt\utmm*.log 2>nul
 The `utm-vm/SKILL.md` file provides Claude with detailed knowledge about:
 - When to use each tool in different debugging scenarios
 - Shell escaping patterns per platform (bash vs cmd.exe)
+- Shell persistence behavior (cd, export work across vm_exec calls)
 - Common workflows: health checks, cross-platform testing, debugging, setup
 - Error recovery procedures
 

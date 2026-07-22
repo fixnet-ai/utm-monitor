@@ -3,7 +3,7 @@ name: release
 description: >
   Use this skill whenever the user asks to publish a release, create a GitHub
   release, tag a version, or release a new version of utmm. Handles the full
-  pipeline: version bump → test → cross-compile 7 targets → zip → git tag →
+  pipeline: version bump → test → cross-compile 6 targets → zip → git tag →
   gh release create. Trigger on: "release", "publish", "发布", "发版", "tag".
 ---
 
@@ -20,7 +20,7 @@ description: >
 ### Step 1: Determine version
 
 Read `src/ver.zig` to get the current version. Ask the user what the next version
-should be (suggest patch bump, e.g. `0.1.1` → `0.1.2`). If the version is
+should be (suggest patch bump, e.g. `0.5.0` → `0.5.1`). If the version is
 already bumped and not yet tagged, use that.
 
 ### Step 2: Bump version (if needed)
@@ -45,11 +45,11 @@ Must pass. Stop and fix if any test fails.
 ./release-skill/build.sh
 ```
 
-This builds 7 targets into `release/` and creates `utmm.zip`:
+This builds 6 targets into `release/` and creates `utmm.zip`:
 `x86_64-windows`, `aarch64-windows`, `x86_64-macos`,
-`aarch64-macos`, `x86-linux-musl`, `x86_64-linux-musl`, `aarch64-linux-musl`
+`aarch64-macos`, `x86_64-linux-musl`, `aarch64-linux-musl`
 
-> **Note**: 32-bit x86-windows has a linker issue (unrelated to utmm code) and is excluded from the release set.
+> **Note**: 32-bit x86-linux-musl also builds but is not in the release set (all modern UTM VMs are 64-bit). 32-bit x86-windows has a linker issue (unrelated to utmm code) and is excluded.
 
 ### Step 5: Commit & tag
 
@@ -79,5 +79,6 @@ Open the release URL printed by `gh release create` and confirm:
 ## Post-release
 
 After release, the Host's HTTP server auto-serves the new binaries from
-`/opt/utmm/`. VMs that run `install.sh --guest` or `/update` will get
-the new version. The Host auto-upgrades Guests on version mismatch.
+`/opt/utmm/`. Guests auto-upgrade on version mismatch — Guest detects version
+difference, downloads new binary from Host HTTP `/bin/utmm-<target>`, and
+restarts itself.

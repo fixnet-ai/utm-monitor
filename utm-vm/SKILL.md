@@ -32,14 +32,15 @@ auto-syncs VM IPs to `/etc/hosts`, so hostnames like `linuxvm` always resolve.
 
 **Always call this FIRST** in any VM workflow. It tells you:
 - Which VMs are online, their IP, OS/arch, MAC address
-- **Which shell to use** (`shell` field — read from `$SHELL` at Guest startup):
-  - macOS/Linux: the user's configured `$SHELL` (e.g. `/bin/zsh`, `/bin/bash`), falls back to `/bin/sh`
+- **Which shell to use** (`shell` field — detected at Guest startup from `$SHELL`):
+  - macOS/Linux: the user's configured `$SHELL` (e.g. `/bin/zsh`, `/bin/bash`). Falls back to `/bin/sh`.
   - Windows: `cmd.exe`
 - The utmm version running on each VM
 
-> **Login shell**: Commands on Linux/macOS run with `shell -l -c` (login mode),
-> so `$PATH`, `$HOME`, and other profile environment variables are loaded.
-> On Windows, commands run with `cmd.exe /c`.
+> **Persistent shell session (v0.5.0)**: Each Guest runs a persistent shell via pty.
+> Commands execute in the same shell session — `cd /tmp` then `pwd` shows `/tmp`.
+> `export FOO=bar` then `echo $FOO` shows `bar`. The shell lives for the WebSocket
+> connection lifetime.
 
 If `vm_status` returns "No VMs currently online", the other tools cannot work.
 Ask the user whether the VMs are booted and the Host is running.
@@ -64,13 +65,21 @@ Ask the user whether the VMs are booted and the Host is running.
 | Check process | `vm_exec("linuxvm", "ps aux \| grep utm")` |
 | Read logs | `vm_exec("linuxvm", "tail -50 /var/log/utmm.log")` |
 | Install packages | `vm_exec("linuxvm", "apt-get install -y htop")` |
-| Restart service | `vm_exec("linuxvm", "systemctl restart utmm")` |
+| Restart service | `vm_exec("linuxvm", "systemctl restart utmm-guest")` |
 | Run a script | `vm_exec("linuxvm", "cd /opt && bash -c '...'")` |
 | Write a file | `vm_exec("linuxvm", "cat > /opt/test.sh << 'EOF'\n...\nEOF")` |
 | Check connectivity | `vm_exec("linuxvm", "ping -c 2 macvm")` |
 | Windows dir | `vm_exec("windowsvm", "dir C:\\opt\\")` |
 | Windows tasklist | `vm_exec("windowsvm", "tasklist \| findstr utm")` |
 | macOS version | `vm_exec("macvm", "sw_vers")` |
+
+**Shell persistence (v0.5.0) — cd and export now work across calls:**
+
+| Task | Example |
+|------|---------|
+| Navigate and verify | `vm_exec("linuxvm", "cd /tmp; pwd")` shows `/tmp` |
+| Set env and use | `vm_exec("linuxvm", "export FOO=bar; echo $FOO")` shows `bar` |
+| Multi-step workflow | `cd /opt/utmm` then `ls` then `./utmm --version` — all in same shell |
 
 **Shell escaping notes:**
 - Pipe characters `|` may need escaping depending on context — prefer single-line commands
@@ -142,6 +151,7 @@ sudo utmm --host
 | "GuestNotFound" for a VM | VM is offline or name mismatch | Run `vm_status` to see which VMs are actually online |
 | WebSocket connection failed | Guest can't reach Host gateway | Guest auto-detects Host via default gateway; override with `--host-ip` |
 | MCP connection refused | Host daemon not running or old version | `sudo utmm --host` |
+| Command timeout after 30s | Guest disconnected or command hung | Check `vm_status`; use `--kick` then retry |
 
 **Fallback:** If MCP tools are unavailable, you can use the CLI directly:
 ```bash
@@ -177,15 +187,12 @@ chmod +x /opt/utmm/utmm
 /opt/utmm/utmm --hostname linuxvm &
 ```
 
-### Guest broadcasts with wrong hostname (OS default instead of specified name)
-
-**A**: This was a bug in install.sh — `--install` was called without `--hostname`. Fixed in v0.1.5. If affected, restart the Guest: `pkill utmm && /opt/utmm/utmm --hostname <name> &`
-
 ## Limitations
 
 - `vm_exec` is non-interactive — you cannot run commands that require TTY input (nano, top, etc.)
 - VM IPs can change on reboot — always check `vm_status` first, don't cache IPs
 - Windows cmd.exe has different escaping rules than bash — test simple commands first
+- Command timeout is 30 seconds — if a command takes longer, it will time out
 
 ### Q: `--download` fails with "Guest not found" but the Guest is online
 **A**: This happens when you use a full path like `/opt/utmm/file.txt` instead of just the filename `file.txt`. Use just the basename:
