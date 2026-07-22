@@ -1,4 +1,4 @@
-# Task Plan: v0.5.0 pty Session Model
+# Task Plan: v0.6.1
 
 ## 目标
 用持久 pty session 替换 "Connection = Shell Session"（每命令断连重连）模型。每个 WebSocket 连接 spawn 一个持久 shell（POSIX `posix_openpt` / Windows `CreatePipe`），命令在同一个 shell 中执行。`cd` 和 `export` 真正持久化。
@@ -161,6 +161,12 @@
 - [x] **15.3 实现**: `udpDiscoveryListener` 加 `socket_handle_out: *?net.Socket.Handle` 参数。Windows 分支将 handle 写入 atomic 指针供主线程关闭。`wsAnnounceLoop` 在 join 前关闭 socket handle。
 - [x] **构建验证**: `zig build test` 全过，全部 6 目标交叉编译全过。
 - [x] **运行时验证**: Windows VM 部署新二进制后 `utmm --status` 成功发现全部 3 台 VM。
+- **Status:** complete
+
+### Phase 16: v0.6.1 完善 — Windows 防火墙 + 版本号同步 ✅ (2025-07-23)
+- [x] **16.1 Windows 防火墙自动化**: `install.zig` 的 Windows 系统服务安装流程中加入 `netsh advfirewall firewall add rule`，开放 UDP 2121 入站。卸载时自动删除规则。解决真机 Windows 部署时 `--status` 扫不到的问题（防火墙默认拦截入站 UDP）。
+- [x] **16.2 版本号统一**: `ver.zig` → 0.6.1, `build.zig.zon` → 0.6.1。
+- [x] **16.3 task_plan.md 标题更新**: v0.5.0 → v0.6.1。
 - **Status:** complete
 
 ## 已删除的组件

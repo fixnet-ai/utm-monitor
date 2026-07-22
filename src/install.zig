@@ -488,6 +488,21 @@ pub fn installSelf(
             } else |_| {
                 std.debug.print("[install] Windows: start manually: sc start \"{s}\"\n", .{svc_name});
             }
+
+            // Open UDP port 2121 in Windows Firewall for broadcast discovery.
+            // Without this, --status from other LAN machines cannot reach this guest.
+            // Delete old rule first (ignore error if it doesn't exist), then add.
+            if (std.process.run(allocator, io, .{
+                .argv = &.{ "netsh", "advfirewall", "firewall", "delete", "rule", "name=UTM Monitor UDP" },
+            })) |_| {} else |_| {}
+            if (std.process.run(allocator, io, .{
+                .argv = &.{ "netsh", "advfirewall", "firewall", "add", "rule", "name=UTM Monitor UDP", "dir=in", "action=allow", "protocol=UDP", "localport=2121" },
+            })) |_| {
+                std.debug.print("[install] Windows: firewall rule added for UDP 2121\n", .{});
+            } else |_| {
+                std.debug.print("[install] Windows: warning — failed to add firewall rule\n", .{});
+                std.debug.print("[install]   run manually: netsh advfirewall firewall add rule name=\"UTM Monitor UDP\" dir=in action=allow protocol=UDP localport=2121\n", .{});
+            }
         },
     }
 
@@ -612,6 +627,11 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                 })) |_| {} else |_| {}
             }
             std.debug.print("[uninstall] Windows: services stopped and removed\n", .{});
+
+            // Remove firewall rule (ignore error if it doesn't exist)
+            if (std.process.run(allocator, io, .{
+                .argv = &.{ "netsh", "advfirewall", "firewall", "delete", "rule", "name=UTM Monitor UDP" },
+            })) |_| {} else |_| {}
         },
     }
 
