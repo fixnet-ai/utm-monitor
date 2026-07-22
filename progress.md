@@ -244,3 +244,32 @@ v0.2.0 架构已完成并发布：
 - [x] release-skill/SKILL.md — version references update
 - [x] utm-vm/SKILL.md — pty model: shell persistence, corrected exec behavior
 - [x] utm-vm/MANUAL.md — protocol table (pty types), architecture update, deprecations removed
+
+### MANUAL.md 从零部署验证 ✅ (2025-07-21/23)
+
+按 MANUAL.md 从裸机完整部署 3 台 VM：
+
+**Host 部署** ✅
+- `curl install.sh | sh` 一键安装正常
+- `sudo utmm --host --install` 服务安装 + 启动正常
+
+**Linux Guest (linuxvm) 部署** ✅
+- `curl http://gateway:2121/bin/install.sh | sh -s -- --guest --hostname linuxvm` 正常
+- Shell = `/bin/bash` ✓，cd/export 持久化 ✓
+
+**macOS Guest (macvm) 部署** ✅
+- 初次部署后发现 Shell = `/bin/sh`（应为 `/bin/zsh`）→ 定位到 `detectServiceEnv` bug
+- **Bug fix 1**: `detectServiceEnv()` 读取 `$SHELL` 环境变量，SSH 会话中 `$SHELL=/bin/sh`
+  修复：改为始终使用平台默认值 (`/bin/zsh` / `/bin/bash` / `cmd.exe`)
+- **Bug fix 2**: curl 下载的二进制丢失代码签名，AMFI 对 sudo 进程发送 SIGKILL
+  修复：`install.sh` 增加 macOS Guest 端 `codesign --force --sign -`
+- 修复后：Shell = `/bin/zsh` ✓，cd/export 持久化 ✓
+
+**Windows Guest (windowsvm) 部署** ✅
+- pty 模型正常工作，`cmd.exe` 交互正常
+- Scheduled task 服务自动重启正常
+
+**关键教训**:
+- macOS Guest 部署后必须 codesign（install.sh 现已自动处理）
+- 服务环境不应读取用户 shell 偏好，始终使用平台默认值
+- `--install` 不带 `--hostname` 会使用 OS hostname，导致 Host 端识别名变化

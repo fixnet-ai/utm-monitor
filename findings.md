@@ -106,6 +106,24 @@ Shell spawned by service had no HOME/SHELL.
 back to platform defaults (`/bin/zsh` on macOS, `/bin/bash` on Linux). Both
 `genInit` and `installSelf` templates now include environment configuration.
 
+### detectServiceEnv reads SSH environment (bogus shell)
+**Root cause**: `detectServiceEnv()` read `$SHELL` from the environment. When install.sh
+runs via SSH, `$SHELL=/bin/sh` (SSH daemon default), not the user's configured shell.
+The service plist was generated with `/bin/sh` instead of `/bin/zsh` on macOS.
+**Fix**: Rewrote `detectServiceEnv()` to always use platform defaults (`/bin/zsh`
+macOS, `/bin/bash` Linux, `cmd.exe` Windows). Service environments (systemd/launchd/
+schtasks) have no user shell preferences — platform defaults are always correct.
+Commit: `fb9f22b`.
+
+### macOS AMFI kills unsigned binary after curl download
+**Root cause**: `curl` strips code signatures from binaries. When a launchd service
+runs the binary as root, AMFI (Apple Mobile File Integrity) sends SIGKILL. Exit code
+137. Symptom: `utmm --install` or any sudo invocation of the downloaded binary dies
+immediately.
+**Fix**: Added `sudo codesign --force --sign -` to `install.sh` for macOS Guest
+deployment (line 267-269). The Host binary is self-built and linker-signed (adhoc),
+so Host deployment is unaffected. Commit: `fb9f22b`.
+
 ## Known Issues
 
 1. **Auto-upgrade not on WebSocket**: Guest binary self-upgrade uses HTTP download
