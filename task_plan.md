@@ -113,6 +113,19 @@
 - [x] utm-vm/MANUAL.md — protocol table, architecture update
 - **Status:** complete
 
+### Phase 12: v0.5.1 裸机部署修复 ✅ (2025-07-21 ~ 2025-07-23)
+- [x] **detectServiceEnv SSH 环境污染修复**: `detectServiceEnv()` 改为始终使用平台默认值
+  (`/bin/zsh` macOS, `/bin/bash` Linux, `cmd.exe` Windows)。SSH 会话中 `$SHELL=/bin/sh`
+  会导致 macOS launchd 服务使用错误 shell。
+- [x] **macOS AMFI codesign 修复**: `install.sh` Guest 模式增加 `codesign --force --sign -`。
+  curl 下载的二进制丢失代码签名，AMFI 对 sudo 进程发送 SIGKILL (exit 137)。
+- [x] **MANUAL.md 从零部署验证**: Host + Linux Guest + macOS Guest + Windows Guest
+  全平台从头部署一次通过。cd/export 持久化验证。`/etc/hosts` 同步验证。
+- [x] **v0.5.1 发布**: 版本号 0.5.0 → 0.5.1，6 目标交叉编译 + utmm.zip，
+  GitHub Release 含修复后的 install.sh + 全部二进制。
+- [x] **文档更新**: findings.md（2 个新 bug），progress.md（部署验证记录），task_plan.md（本 Phase）
+- **Status:** complete
+
 ## 已删除的组件
 
 | 组件 | 行数 | 替代 |
