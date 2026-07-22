@@ -147,7 +147,9 @@ fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
     const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/exec", .{port});
     defer gpa.free(url);
 
-    const body = try std.fmt.allocPrint(gpa, "{{\"vm\":\"{s}\",\"command\":\"{s}\"}}", .{ target, cmd });
+    const escaped_cmd = try httpd.jsonEscape(gpa, cmd);
+    defer gpa.free(escaped_cmd);
+    const body = try std.fmt.allocPrint(gpa, "{{\"vm\":\"{s}\",\"command\":\"{s}\"}}", .{ target, escaped_cmd });
     defer gpa.free(body);
 
     var resp_buf: [65536]u8 = undefined;

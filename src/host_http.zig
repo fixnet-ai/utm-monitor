@@ -134,21 +134,20 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
 
     std.log.info("[exec] cmd for {s}: {s}", .{ vm, command });
 
-    // Check guest exists
-    {
+    // Check guest exists and get shell type
+    const guest_shell = blk: {
         state.mutex.lock(state.io.?) catch {};
-        const guest_exists = state.containsGuest(vm);
-        if (!guest_exists) {
-            std.log.err("[exec] GuestNotFound: vm='{s}'", .{vm});
-            for (state.guests.items) |g| {
-                std.log.err("[exec]   hostname='{s}' ip='{s}'", .{ g.hostname, g.ip });
+        defer state.mutex.unlock(state.io.?);
+        for (state.guests.items) |g| {
+            if (std.mem.eql(u8, g.hostname, vm)) {
+                break :blk try allocator.dupe(u8, g.shell);
             }
-            state.mutex.unlock(state.io.?);
-            try respondJson(request, "{\"error\":\"GuestNotFound\"}");
-            return;
         }
-        state.mutex.unlock(state.io.?);
-    }
+        std.log.err("[exec] GuestNotFound: vm='{s}'", .{vm});
+        try respondJson(request, "{\"error\":\"GuestNotFound\"}");
+        return;
+    };
+    defer allocator.free(guest_shell);
 
     // Generate unique cmd_id
     const cmd_id = blk: {
@@ -157,8 +156,8 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
     };
     defer allocator.free(cmd_id);
 
-    // Build pty_input frame: cmd_id + command + "; echo MDELIM:$?\n"
-    const cmd_with_marker = try std.fmt.allocPrint(allocator, "{s}; echo MDELIM:$?\n", .{command});
+    // Build pty_input frame with shell-appropriate marker
+    const cmd_with_marker = try httpd.buildCmdWithMarker(allocator, guest_shell, command);
     defer allocator.free(cmd_with_marker);
 
     const frame = try wsproto.buildPtyInput(allocator, cmd_id, cmd_with_marker);
@@ -170,7 +169,7 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
 
     std.log.info("[exec] Enqueued pty cmd {s} for {s}", .{ cmd_id, vm });
 
-    // Poll for result — no timeout
+    // Wait for result — woken by WebSocket handler via wake_event
     while (true) {
         if (state.takeOpResult(cmd_id)) |result| {
             defer allocator.free(result.stdout);
@@ -184,7 +183,9 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
             try respondJson(request, resp_json);
             return;
         }
-        std.Io.sleep(state.io.?, std.Io.Duration{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+        // Wait on wake_event — set by scanForMarker or completeOpState
+        state.wake_event.wait(state.io.?) catch {};
+        state.wake_event.reset();
     }
 }
 
@@ -286,7 +287,7 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, reque
     try state.createOpState(cmd_id);
     try state.enqueueOutgoingFrame(vm, frame);
 
-    // Poll for result — no timeout
+    // Wait for result — woken by WebSocket handler via wake_event
     while (true) {
         if (state.takeOpResult(cmd_id)) |result| {
             defer allocator.free(result.stdout);
@@ -297,7 +298,8 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, reque
             }
             return;
         }
-        std.Io.sleep(state.io.?, std.Io.Duration{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+        state.wake_event.wait(state.io.?) catch {};
+        state.wake_event.reset();
     }
 }
 
@@ -378,7 +380,8 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
             }
             return;
         }
-        std.Io.sleep(state.io.?, std.Io.Duration{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+        state.wake_event.wait(state.io.?) catch {};
+        state.wake_event.reset();
     }
 }
 

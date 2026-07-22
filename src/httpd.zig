@@ -101,6 +101,9 @@ pub const HostState = struct {
     /// Close requests: hostname → present (flag set).
     /// HTTP --kick handler sets, WebSocket handler checks and consumes.
     close_requests: std.StringHashMap(void),
+    /// Wake event: set when any OpState completes (marker found or completeOpState called).
+    /// HTTP/MCP handlers wait on this instead of busy-polling takeOpResult.
+    wake_event: std.Io.Event = .unset,
     allocator: std.mem.Allocator,
     /// I/O instance for network operations (shared across threads).
     io: ?std.Io = null,
@@ -309,23 +312,40 @@ pub const HostState = struct {
 
         const haystack = op.output.items;
         const marker = "MDELIM:";
-        const pos = std.mem.indexOf(u8, haystack, marker) orelse return;
 
-        // Parse exit code: digits after MDELIM: until \n
+        // Use lastIndexOf: the real marker is always LAST in the output stream.
+        // When pty ECHO is ON, echoed command text also contains "MDELIM:" but
+        // appears before actual command output. We validate the exit code region
+        // so echoed "$?" (non-digit) fails to match.
+        const pos = std.mem.lastIndexOf(u8, haystack, marker) orelse return;
+
+        // Validate exit code: region between MDELIM: and \n must contain
+        // only digits and optional leading '-'. Echoed text like "MDELIM:$?\n"
+        // fails this check.
         const after = pos + marker.len;
         if (after >= haystack.len) return;
 
         var ec: i32 = 0;
         var neg = false;
         var i: usize = after;
+        var has_digit = false;
         while (i < haystack.len and haystack[i] != '\n') : (i += 1) {
-            if (haystack[i] == '-') {
+            if (haystack[i] == '\r') {
+                // CR before LF — skip, part of CRLF line ending
+            } else if (haystack[i] == '-') {
+                if (has_digit) return; // '-' not at start — invalid
                 neg = true;
             } else if (haystack[i] >= '0' and haystack[i] <= '9') {
+                has_digit = true;
                 ec = ec * 10 + @as(i32, @intCast(haystack[i] - '0'));
+            } else {
+                // Non-digit, non-CR, non-dash character (e.g. '$', '?' from echoed text).
+                // This is not the real marker — wait for more data.
+                return;
             }
         }
         if (i >= haystack.len) return; // No newline yet, wait for more data
+        if (!has_digit) return;        // No digits found — invalid marker
         if (neg) ec = -ec;
 
         // Strip marker + exit code + newline.
@@ -335,6 +355,8 @@ pub const HostState = struct {
 
         op.exit_code = ec;
         op.done = true;
+        // Wake HTTP/MCP handlers waiting on takeOpResult
+        self.wake_event.set(self.io.?);
     }
 
     /// Mark an operation as complete with explicit exit code.
@@ -346,6 +368,7 @@ pub const HostState = struct {
         const op = self.op_states.getPtr(cmd_id) orelse return;
         op.exit_code = exit_code;
         op.done = true;
+        self.wake_event.set(self.io.?);
     }
 
     /// Take the result of a completed operation. Returns null if not yet done.
@@ -382,6 +405,8 @@ pub const HostState = struct {
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.allocator.dupe(u8, hostname);
         }
+        // Wake any HTTP handlers waiting on commands for this guest
+        self.wake_event.set(self.io.?);
     }
 
     /// Check if a guest is marked for kick, and consume the flag.
@@ -473,6 +498,16 @@ const ConnCtx = struct {
 
 /// Start the HTTP server. Blocks forever (accept loop).
 /// Caller must provide its own I/O instance with worker threads (Threaded.init).
+/// Build command with appropriate marker for the guest's shell.
+/// POSIX (/bin/sh, /bin/bash, ...): uses "; echo MDELIM:$?\n"
+/// Windows (cmd.exe): uses "& echo MDELIM:%errorlevel%\r\n"
+pub fn buildCmdWithMarker(allocator: std.mem.Allocator, shell: []const u8, command: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, shell, "cmd.exe") != null) {
+        return try std.fmt.allocPrint(allocator, "{s} & echo MDELIM:%errorlevel%\r\n", .{command});
+    }
+    return try std.fmt.allocPrint(allocator, "{s}; echo MDELIM:$?\n", .{command});
+}
+
 pub fn serve(
     io: std.Io,
     allocator: std.mem.Allocator,

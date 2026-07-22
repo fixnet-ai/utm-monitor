@@ -128,13 +128,18 @@ fn handleVmStatus(allocator: std.mem.Allocator, state: *httpd.HostState) ![]cons
 
 /// Handle vm_exec via pty model: build pty_input, enqueue frame, poll for marker.
 fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []const u8, command: []const u8) ![]const u8 {
-    // Check guest exists
-    {
+    // Check guest exists and get shell type
+    const guest_shell = blk: {
         state.mutex.lock(state.io.?) catch {};
-        const exists = state.containsGuest(vm);
-        state.mutex.unlock(state.io.?);
-        if (!exists) return error.GuestNotFound;
-    }
+        defer state.mutex.unlock(state.io.?);
+        for (state.guests.items) |g| {
+            if (std.mem.eql(u8, g.hostname, vm)) {
+                break :blk try allocator.dupe(u8, g.shell);
+            }
+        }
+        return error.GuestNotFound;
+    };
+    defer allocator.free(guest_shell);
 
     // Generate unique cmd_id
     const cmd_id = blk: {
@@ -143,8 +148,8 @@ fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []con
     };
     defer allocator.free(cmd_id);
 
-    // Build pty_input frame with marker
-    const cmd_with_marker = try std.fmt.allocPrint(allocator, "{s}; echo MDELIM:$?\n", .{command});
+    // Build pty_input frame with shell-appropriate marker
+    const cmd_with_marker = try httpd.buildCmdWithMarker(allocator, guest_shell, command);
     defer allocator.free(cmd_with_marker);
 
     const frame = try wsproto.buildPtyInput(allocator, cmd_id, cmd_with_marker);
@@ -153,7 +158,7 @@ fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []con
     try state.createOpState(cmd_id);
     try state.enqueueOutgoingFrame(vm, frame);
 
-    // Poll for result — no timeout
+    // Wait for result — woken by WebSocket handler via wake_event
     while (true) {
         if (state.takeOpResult(cmd_id)) |result| {
             defer allocator.free(result.stdout);
@@ -173,7 +178,8 @@ fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []con
             );
             return buf.toOwnedSlice(allocator);
         }
-        std.Io.sleep(state.io.?, std.Io.Duration{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+        state.wake_event.wait(state.io.?) catch {};
+        state.wake_event.reset();
     }
 }
 

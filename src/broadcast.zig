@@ -626,6 +626,15 @@ fn ptySpawn(allocator: std.mem.Allocator, shell: []const u8) !PtySession {
         _ = close(slave);
         _ = close(master);
 
+        // Disable pty echo on slave (fd 0) before exec.
+        // The host-side scanForMarker handles echoed text (lastIndexOf +
+        // validation), but disabling ECHO here gives cleaner output.
+        if (std.posix.tcgetattr(0)) |t| {
+            var t2 = t;
+            t2.lflag.ECHO = false;
+            std.posix.tcsetattr(0, .NOW, t2) catch {};
+        } else |_| {}
+
         // Detect shell: use user's $SHELL or fallback to /bin/sh
         const shell_path: [:0]const u8 = if (std.c.getenv("SHELL")) |sh| blk: {
             const s = std.mem.sliceTo(sh, 0);
@@ -637,6 +646,17 @@ fn ptySpawn(allocator: std.mem.Allocator, shell: []const u8) !PtySession {
         _ = std.c.execve(shell_path.ptr, &argv, &[_:null]?[*:0]const u8{null});
         @panic("pty: execve failed");
     }
+
+    // Parent: disable pty echo so commands sent via pty_input are not
+    // echoed back. Prevents MDELIM marker from matching echoed command text.
+    // On Linux the master fd supports tcsetattr. On macOS/BSD the master
+    // does not — the host-side scanForMarker handles echoed text via
+    // lastIndexOf + validation (see httpd.zig).
+    if (std.posix.tcgetattr(master)) |t| {
+        var t2 = t;
+        t2.lflag.ECHO = false;
+        std.posix.tcsetattr(master, .NOW, t2) catch {};
+    } else |_| {}
 
     // Parent: close slave, return session
     std.log.info("[guest-pty] pty spawned: master={d} shell={s} pid={d}", .{ master, shell, pid });
@@ -916,6 +936,7 @@ pub fn wsAnnounceLoop(
             std.Io.sleep(io, std.Io.Duration.fromSeconds(3), .awake) catch {};
             continue;
         };
+
         defer {
             allocator.free(pty.shell);
             killChild(pty.child_pid);
