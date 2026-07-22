@@ -88,12 +88,15 @@ utmm --host --serve-dir /path/to/binaries # Custom binary serve directory
 
 # ── Management Commands (HTTP to Host :2121) ──
 utmm --status                             # Query all Guest status
-utmm --exec linuxvm "uname -a"            # Remote command execution
+utmm --exec linuxvm "uname -a"            # Remote command execution (no timeout)
+utmm --exec-cancel linuxvm <cmd_id>       # Send SIGINT to running command
 utmm --upload file.txt linuxvm            # Upload file to Guest (no curl)
 utmm --download linuxvm f.txt ./f.txt     # Download file from Guest (no curl)
 
 # Management commands send HTTP requests to Host on 127.0.0.1:2121.
 # Host communicates with Guest via WebSocket for command execution.
+# Exec uses streaming protocol: exec_start→guest spawns child→exec_stdout chunks→exec_exit.
+# No 30s timeout — commands run indefinitely until completion or --exec-cancel.
 ```
 
 ## Project File Structure
@@ -102,7 +105,7 @@ src/
 ├── main.zig           # Entry point, CLI parsing, mode dispatch
 ├── ver.zig            # Single source of truth for version (bump to trigger auto-upgrade)
 ├── protocol.zig       # Protocol constants: DEFAULT_PORT, VERSION
-├── wsproto.zig        # Binary WebSocket protocol: 1B msg type + payload (announce/exec/upload/download)
+├── wsproto.zig        # Binary WebSocket protocol: 12 msg types (announce, exec_req/resp, upload_req/resp, download_req/resp, exec_start/stdout/stdin/exit/signal)
 ├── wsclient.zig       # Guest WebSocket client: TCP connect + HTTP upgrade + frame I/O
 ├── httpd.zig          # HTTP server core: accept loop + Router + HostState (guest table + pending queue)
 ├── host_http.zig      # HTTP endpoint handlers: /announce, /exec, /upload, /download, /ws, /mcp, /bin/

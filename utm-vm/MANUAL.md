@@ -75,12 +75,17 @@ Guest opens a persistent WebSocket connection to Host. All communication uses **
 | Message Type | Direction | Purpose |
 |-------------|-----------|---------|
 | `announce` (1) | Guest → Host | Advertise hostname, IP, target, MAC, version, shell |
-| `exec_req` (2) | Host → Guest | Execute a shell command |
-| `exec_resp` (3) | Guest → Host | Command result (exit code, stdout, stderr) |
+| `exec_req` (2) | Host → Guest | [deprecated] Execute a shell command (replaced by exec_start) |
+| `exec_resp` (3) | Guest → Host | [deprecated] Command result (replaced by exec_stdout+exec_exit) |
 | `upload_req` (4) | Host → Guest | Upload file (path + binary data) |
 | `upload_resp` (5) | Guest → Host | Upload result (exit code) |
 | `download_req` (6) | Host → Guest | Download file (path) |
 | `download_resp` (7) | Guest → Host | File content (exit code + binary data) |
+| `exec_start` (8) | Host → Guest | Start streaming exec: cmd_id + shell command |
+| `exec_stdout` (9) | Guest → Host | Real-time stdout/stderr chunk (merged 2>&1) |
+| `exec_stdin` (10) | Host → Guest | Write data to child stdin (future use) |
+| `exec_exit` (11) | Guest → Host | Command finished: cmd_id + exit code (i32 BE) |
+| `exec_signal` (12) | Host → Guest | Send signal to child: cmd_id + signal (0=SIGINT, 1=SIGTERM) |
 
 **Payload encoding:**
 - String fields: null-terminated (`\0` delimiter)
@@ -105,7 +110,7 @@ CLI management commands use standard HTTP:
 | `/bin/<file>` | GET | Static file serving (bootstrap, binaries) |
 | `/` | GET | HTML status page |
 
-CLI commands send HTTP to `127.0.0.1:2121`. Host communicates with Guest via WebSocket for actual command execution. CLI polls `tryTakeResult` with 30s timeout.
+CLI commands send HTTP to `127.0.0.1:2121`. Host communicates with Guest via WebSocket for actual command execution. Exec uses streaming protocol (exec_start → exec_stdout chunks → exec_exit) — no timeout, commands run indefinitely.
 
 #### /etc/hosts Marker Block
 
@@ -469,7 +474,8 @@ Host Options:
 
 Management commands (HTTP to Host :2121):
   --status               Query online status of all Guests
-  --exec TARGET CMD      Execute command on target Guest
+  --exec TARGET CMD      Execute command on target Guest (no timeout, streaming)
+  --exec-cancel TARGET ID Cancel running command on Guest (send SIGINT)
   --upload FILE VM       Upload a file to Guest
   --download VM R L      Download file from Guest
   --gen-init PLATFORM    Generate auto-start boot script (linux/macos/windows)
@@ -622,7 +628,6 @@ sudo lsof -i :2121
 |---------------|-------|----------|
 | `GuestNotFound` | Guest not connected to Host | Wait a few seconds and retry; check if Guest is running |
 | `ConnectionRefused` | Host HTTP server not running | `sudo utmm --host` |
-| `CommandTimeout` | Guest not responding (30s timeout) | Guest WebSocket may be disconnected; check Guest logs |
 | `RemoteExecFailed` | Command execution returned error | Check if command is correct (use Windows `ver` instead of `uname`) |
 
 ### 5.4 Windows Guest Process Cannot Run in Background
