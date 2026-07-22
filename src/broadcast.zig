@@ -643,7 +643,7 @@ fn ptySpawn(allocator: std.mem.Allocator, shell: []const u8) !PtySession {
         } else "/bin/sh";
 
         const argv = [_:null]?[*:0]const u8{ shell_path.ptr, @as(?[*:0]const u8, @ptrFromInt(@intFromPtr("-l"))), null };
-        _ = std.c.execve(shell_path.ptr, &argv, &[_:null]?[*:0]const u8{null});
+        _ = std.c.execve(shell_path.ptr, &argv, std.c.environ);
         @panic("pty: execve failed");
     }
 
