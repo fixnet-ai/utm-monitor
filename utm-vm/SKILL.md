@@ -25,9 +25,9 @@ auto-syncs VM IPs to `/etc/hosts`, so hostnames like `linuxvm` always resolve.
 | `linuxvm` | Linux | aarch64 | root / 111 | `/opt/utmm/` |
 | `macvm` | macOS | aarch64 | root / 111 | `/opt/utmm/` |
 | `windowsvm` | Windows | aarch64 | Administrator / 111 | `C:\opt\utmm\` |
-| `MODASIAIPC` | Windows | x86_64 | Administrator / 111 | `C:\opt\utmm\` |
+| `winx64` | Windows | x86_64 | Administrator / 111 | `C:\opt\utmm\` |
 
-> **SSH access**: `Administrator@192.168.3.108` (MODASIAIPC, key auth), `modasi@192.168.3.108` (MODASIAIPC, key auth).
+> **SSH access**: `Administrator@192.168.3.x` (winx64, key auth).
 
 ## Two MCP Tools
 

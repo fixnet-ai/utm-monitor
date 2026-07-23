@@ -8,10 +8,10 @@
 
 | 文件 | 改动 |
 |------|------|
-| `CLAUDE.md` | +MODASIAIPC VM 表, +v0.7.0 自动升级架构, +UDP 广播数据流, +upgrade.zig 文件结构, +全部构建目标, +完整 CLI 标志, +自动升级设计决策 |
+| `CLAUDE.md` | +winx64 VM 表, +v0.7.0 自动升级架构, +UDP 广播数据流, +upgrade.zig 文件结构, +全部构建目标, +完整 CLI 标志, +自动升级设计决策 |
 | `README.md` | 完全重写: v0.7.0 零 shell 自动升级, VM 参考表 4 台, 更新数据流图含 UDP 广播, 自动升级章节, MCP streamableHttp 配置 |
-| `utm-vm/SKILL.md` | +MODASIAIPC, +SSH 访问说明, MCP 配置更新, Windows cmd.exe 语法 |
-| `utm-vm/MANUAL.md` | 完全重写 (1120→新): 修正 WebSocket 协议帧号匹配 wsproto.zig (pty_spawn=12 非 2, 等), +MODASIAIPC, +v0.7.0 自动升级架构章节, 修正全部服务名 (com.utmm.guest 非 com.utmm, UTM-Monitor-Guest 非 schtasks), 修正 Windows 安装描述 (sc service 非计划任务), +完整 CLI 参考 (--version, --update-url, --serve-dir, --host-ip), +自动升级流程图, +x86_64 覆盖, +§7 MCP 集成完整章节, +§7.8 卸载清理 |
+| `utm-vm/SKILL.md` | +winx64, +SSH 访问说明, MCP 配置更新, Windows cmd.exe 语法 |
+| `utm-vm/MANUAL.md` | 完全重写 (1120→新): 修正 WebSocket 协议帧号匹配 wsproto.zig (pty_spawn=12 非 2, 等), +winx64, +v0.7.0 自动升级架构章节, 修正全部服务名 (com.utmm.guest 非 com.utmm, UTM-Monitor-Guest 非 schtasks), 修正 Windows 安装描述 (sc service 非计划任务), +完整 CLI 参考 (--version, --update-url, --serve-dir, --host-ip), +自动升级流程图, +x86_64 覆盖, +§7 MCP 集成完整章节, +§7.8 卸载清理 |
 
 **关键修正**:
 - WebSocket 协议帧号: pty_spawn(2→12), pty_input(3→13), pty_output(4→14), pty_signal(5→15), pty_resize(6→16), upload_req(7→4), upload_resp(8→5), download_req(9→6), download_resp(10→7)
@@ -61,7 +61,7 @@
   - WIN-Q0JNGDDBE28 (aarch64-windows): 同上 ✅
 - **Windows FileBusy bug**: `dst.close(io)` 在 `defer` 中延迟到函数返回才执行，但 `std.process.spawn` 在此之前调用，导致 `utmm-old.exe` 被自身文件句柄锁定。修复：用块作用域 `{ var dst = ...; defer dst.close(io); ... }` 确保 spawn 前关闭文件句柄。
 - **Windows 进程启动改进**: 使用 `std.process.spawn` 替代手动 `CreateProcessW`，由标准库处理 Windows 进程创建细节。
-- MODASIAIPC (x86_64 Windows, v0.6.5): 无 triggerSelfUpgrade 代码，需手动部署 v0.7.0
+- winx64 (x86_64 Windows, v0.6.5): 无 triggerSelfUpgrade 代码，需手动部署 v0.7.0
 
 ## Session 2026-07-23 (v0.6.5 自动升级端到端修复)
 
@@ -90,7 +90,7 @@ chmod +x && mv && utmm --svc & → exit(0) → systemd restart → v0.6.5 稳定
 - Host: v0.6.5
 - linuxvm: v0.6.5 (自动升级成功)
 - WIN-Q0JNGDDBE28: v0.6.3 (待升级)
-- MODASIAIPC: v0.6.3 (待升级)
+- winx64: v0.6.3 (待升级)
 - macvm: 离线 (待恢复)
 
 ---
@@ -126,7 +126,7 @@ chmod +x && mv && utmm --svc & → exit(0) → systemd restart → v0.6.5 稳定
 - linuxvm (aarch64-linux): v0.6.2 → v0.6.3 手动升级成功
 - macvm (aarch64-macos): v0.6.2 → v0.6.3 手动升级成功
 - WIN-Q0JNGDDBE28 (aarch64-windows UTM): v0.6.2 → v0.6.3 手动升级成功
-- MODASIAIPC (x86_64-windows 真机): v0.6.2 → v0.6.3 手动升级成功
+- winx64 (x86_64-windows 真机): v0.6.2 → v0.6.3 手动升级成功
 
 **已发现问题**:
 - `/opt/utmm/utmm` 在部分 VM 上是独立副本而非符号链接，`systemctl restart` 后仍运行旧版本

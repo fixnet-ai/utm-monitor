@@ -25,7 +25,7 @@ Current configuration — four VM targets tracked:
 | macOS | macvm | aarch64-macos | 192.168.64.4 | root / 111 | /opt/utmm/ |
 | Linux | linuxvm | aarch64-linux-musl | 192.168.64.2 | root / 111 | /opt/utmm/ |
 | Windows | windowsvm | aarch64-windows | 192.168.65.2 | Administrator / 111 | C:\opt\utmm\ |
-| Windows | MODASIAIPC | x86_64-windows | 192.168.3.108 | Administrator / 111 | C:\opt\utmm\ |
+| Windows | winx64 | x86_64-windows | 192.168.3.x | Administrator / 111 | C:\opt\utmm\ |
 
 ## Architecture Design
 

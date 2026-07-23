@@ -32,7 +32,7 @@ Example prompts:
 | macOS | macvm | 192.168.64.4 | root@192.168.64.4 (pass: 111) | utmm --exec macvm |
 | Linux | linuxvm | 192.168.64.2 | root@192.168.64.2 (pass: 111) | utmm --exec linuxvm |
 | Windows ARM | windowsvm | 192.168.65.2 | Administrator@192.168.65.2 (pass: 111) | utmm --exec windowsvm |
-| Windows x64 | MODASIAIPC | 192.168.3.108 | Administrator@192.168.3.108 (key auth) | utmm --exec MODASIAIPC |
+| Windows x64 | winx64 | 192.168.3.x | Administrator@192.168.3.x (key auth) | utmm --exec winx64 |
 
 ## One-Time Setup
 
@@ -100,7 +100,7 @@ utmm --version                 # Print version
 Guest (linuxvm)  ──WebSocket──┐
 Guest (macvm)    ──WebSocket──┤──→ Host HTTP :2121 ── MCP /mcp (AI agents)
 Guest (windows)  ──WebSocket──┘                      ── CLI (--status, --exec)
-Guest (MODASIAIPC)──WebSocket──┘                      ── Static files (/bin/ auto-upgrade)
+Guest (winx64)──WebSocket──┘                      ── Static files (/bin/ auto-upgrade)
 ```
 
 **v0.7.0 auto-upgrade**: Host broadcasts version via UDP every 60s. Guest UDP listener

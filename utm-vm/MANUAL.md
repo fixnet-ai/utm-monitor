@@ -63,7 +63,7 @@ utmm --host       # Host mode
 │                                    ┌────┼──────┬──────┐              │
 │                                    ▼    ▼      ▼      ▼              │
 │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐     │
-│  │  macvm     │  │  linuxvm   │  │ windowsvm  │  │ MODASIAIPC │     │
+│  │  macvm     │  │  linuxvm   │  │ windowsvm  │  │ winx64     │     │
 │  │            │  │            │  │            │  │            │     │
 │  │ WS client  │  │ WS client  │  │ WS client  │  │ WS client  │     │
 │  │ + pty shell│  │ + pty shell│  │ + cmd.exe  │  │ + cmd.exe  │     │
@@ -192,7 +192,7 @@ The Host maintains a marker block in `/etc/hosts`, using FQDN format `{hostname}
 192.168.64.2  linuxvm.aarch64-linux-musl.utm
 192.168.64.4  macvm.aarch64-macos.utm
 192.168.65.2  windowsvm.aarch64-windows.utm
-192.168.3.108 MODASIAIPC.x86_64-windows.utm
+192.168.3.x  winx64.x86_64-windows.utm
 # UTM-MONITOR-END
 ```
 
@@ -583,7 +583,7 @@ Hostname         Target             IP               MAC                Version 
 linuxvm          aarch64-linux-musl 192.168.64.2     16:a0:6c:ba:ae:fa  v0.7.0     /bin/bash
 macvm            aarch64-macos      192.168.64.4     1a:97:6d:38:0c:6c  v0.7.0     /bin/zsh
 windowsvm        aarch64-windows    192.168.65.2     66:DC:DA:EC:A1:59  v0.7.0     cmd.exe
-MODASIAIPC       x86_64-windows     192.168.3.108    00:FF:4D:91:87:0B  v0.7.0     cmd.exe
+winx64           x86_64-windows     192.168.3.x      00:FF:4D:91:87:0B  v0.7.0     cmd.exe
 ```
 
 #### Execute Commands on a Specific VM
@@ -953,7 +953,7 @@ sudo killall -HUP mDNSResponder
 | macvm | macvm | root | 111 | `/opt/utmm/utmm` | root@192.168.64.4 |
 | linuxvm | linuxvm | root | 111 | `/opt/utmm/utmm` | root@192.168.64.2 |
 | windowsvm | windowsvm | Administrator | 111 | `C:\opt\utmm\utmm.exe` | Administrator@192.168.65.2 |
-| MODASIAIPC | MODASIAIPC | Administrator | 111 | `C:\opt\utmm\utmm.exe` | Administrator@192.168.3.108 (key auth) |
+| winx64 | winx64 | Administrator | 111 | `C:\opt\utmm\utmm.exe` | Administrator@192.168.3.x (key auth) |
 
 > After the Guest starts, it is fully auto-updated; no further manual transfer is needed.
 
@@ -986,7 +986,7 @@ Claude Code
 utmm --host     ← Host daemon (unified HTTP server on :2121)
   │ WebSocket (binary frames) + HTTP REST + UDP broadcast
   ▼
-Guest VMs (linuxvm, macvm, windowsvm, MODASIAIPC)
+Guest VMs (linuxvm, macvm, windowsvm, winx64)
   │
   └─ WebSocket (2121): pty shell session (announce, pty_input, pty_output)
   └─ UDP (2121): version check → auto-upgrade trigger
@@ -1092,7 +1092,7 @@ curl -s -X POST http://127.0.0.1:2121/mcp \
     linuxvm:     aarch64-linux-musl 192.168.64.2   ✓
     macvm:       aarch64-macos    192.168.64.4   ✓
     windowsvm:   aarch64-windows  192.168.65.2   ✓
-    MODASIAIPC:  x86_64-windows   192.168.3.108  ✓
+    winx64:      x86_64-windows   192.168.3.x   ✓
 ```
 
 #### Cross-platform testing
@@ -1102,7 +1102,7 @@ curl -s -X POST http://127.0.0.1:2121/mcp \
 🤖 → vm_exec("linuxvm", "cd /opt && ./utmm --version")
     → vm_exec("macvm", "cd /opt && ./utmm --version")
     → vm_exec("windowsvm", "C:\\opt\\utmm.exe --version")
-    → vm_exec("MODASIAIPC", "C:\\opt\\utmm.exe --version")
+    → vm_exec("winx64", "C:\\opt\\utmm.exe --version")
     All four return v0.7.0 ✓
 ```
 
