@@ -1,5 +1,5 @@
 #!/bin/bash
-# Release helper — build all 7 targets and create utmm.zip
+# Release helper — build all 8 targets and create utmm.zip
 # Called by the release skill, or run standalone:
 #   ./release-skill/build.sh
 
@@ -43,3 +43,9 @@ ls -lh utmm.zip
 
 echo ""
 echo "==> Done. utmm.zip ready."
+
+# Rebuild native target so zig-out/bin/utmm is usable for local testing
+echo ""
+echo "==> Rebuilding native target for local use..."
+zig build -Doptimize=ReleaseSafe
+echo "  zig-out/bin/utmm restored to native arch"

@@ -49,7 +49,11 @@ skip()   { SKIP=$((SKIP+1)); report "  ⏭  SKIP: $1 — $2"; }
 ssh_vm() {
     local vm="$1" cmd="$2" user ip pass
     user=$(vm_user "$vm"); ip=$(vm_ip "$vm"); pass=$(vm_pass "$vm")
-    if [ "$vm" = "windowsvm" ]; then
+    # Try key-based auth first, fall back to sshpass if available
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes "$user@$ip" "$cmd" 2>&1; then
+        return 0
+    fi
+    if is_cmd sshpass; then
         sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$user@$ip" "$cmd" 2>&1
     else
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$user@$ip" "$cmd" 2>&1
@@ -438,14 +442,19 @@ report ""
 report "━━━ PHASE 13: Guest Install/Uninstall (SSH required) ━━━"
 report ""
 
-if is_cmd sshpass && is_cmd ssh; then
+if is_cmd ssh; then
     for vm in $VMS; do
         ip=$(vm_ip "$vm")
 
-        # Quick connectivity check
+        # Quick connectivity check: try key-based first, then sshpass
         if ! ssh -o ConnectTimeout=3 -o BatchMode=yes "$(vm_user "$vm")@$ip" "echo ok" >/dev/null 2>&1; then
-            if ! sshpass -p "$(vm_pass "$vm")" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 "$(vm_user "$vm")@$ip" "echo ok" >/dev/null 2>&1; then
-                skip "SSH $vm" "$ip unreachable"
+            if is_cmd sshpass; then
+                if ! sshpass -p "$(vm_pass "$vm")" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 "$(vm_user "$vm")@$ip" "echo ok" >/dev/null 2>&1; then
+                    skip "SSH $vm" "$ip unreachable"
+                    continue
+                fi
+            else
+                skip "SSH $vm" "$ip unreachable (no key auth, sshpass not installed)"
                 continue
             fi
         fi
@@ -489,7 +498,7 @@ if is_cmd sshpass && is_cmd ssh; then
         fi
     fi
 else
-    skip "SSH tests" "sshpass not installed (brew install sshpass)"
+    skip "SSH tests" "ssh not installed"
 fi
 report ""
 
