@@ -1,4 +1,4 @@
-# Task Plan: v0.8.0
+# Task Plan: v0.8.1+
 
 ## 目标
 v0.8.0: HTTP 层性能优化 — exec 输出流式传输（chunked + trailer），上传/下载二进制协议（自定义请求头 + 原始 body），消除 JSON 包装开销。
@@ -278,3 +278,32 @@ v0.8.0: HTTP 层性能优化 — exec 输出流式传输（chunked + trailer）�
 - macOS/BSD: pty master fd 不支持 tcsetattr — ECHO disable 必须在 slave 侧完成，或在 Host 侧 lastIndexOf 处理命令回显
 - Zig 0.16.0 `Io.Timeout`: `{ none, duration: { raw: Duration, clock: .awake }, deadline: Timestamp }`
 - execve 第三个参数必须是 `std.c.environ`（继承父进程环境），不能用 `{null}`（空环境）
+
+---
+
+## v0.8.1 — 文档清理 + Auto-Upgrade 修复
+
+### Phase 21: v0.8.1 发布 ✅
+- [x] ver.zig 版本号 0.8.0 → 0.8.1
+- [x] 8 目标完全重建 + GitHub Release
+- [x] 全部 4 台机器部署验证通过
+- **Status:** complete
+
+### Phase 22: 文档消噪 ✅
+- [x] README.md 重写 — 去除版本历史杂音，突出 VM+真机支持
+- [x] CLAUDE.md 清理 — 去除 v0.5.0/v0.7.0/v0.8.0 版本号打头的特性描述
+- [x] zig-codegen.md — 移除过时内容
+- [x] mcp.json.example — 添加 Claude Code MCP 安装指南
+- **Status:** complete
+
+### Phase 23: Auto-Upgrade 阻塞读取修复 ✅
+- [x] 根因: wsAnnounceLoop 阻塞在 readFrame，UDP listener 设置 upgrade.needed 后主循环无法检测
+- [x] POSIX: poll 超时路径增加 upgrade.needed 检查（1 秒内检测）
+- [x] Windows: TimerCtx 增加 upgrade 指针，timer 线程检测到升级信号时关闭 socket 唤醒 readFrame
+- [x] 测试通过 + 交叉编译验证
+- **Status:** complete
+
+### Phase 24: 待处理
+- [ ] Host LaunchDaemon serve_dir 默认解析修复
+- [ ] test_all.sh sshpass 依赖问题
+- [ ] 构建/发布脚本化 (release.sh)

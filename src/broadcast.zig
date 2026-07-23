@@ -573,6 +573,13 @@ fn runTimerThread(ctx: *TimerCtx) void {
     while (ctx.running) {
         ctx.conn.io.sleep(std.Io.Duration.fromNanoseconds(std.time.ns_per_s), .awake) catch {};
         if (!ctx.running) return;
+        // Check for auto-upgrade signal — close socket to wake main loop from readFrame
+        if (ctx.upgrade.needed.load(.acquire)) {
+            std.log.info("[upgrade] Version mismatch detected by timer thread, waking main loop", .{});
+            ctx.conn.stream.close(ctx.conn.io);
+            ctx.running = false;
+            return;
+        }
         ctx.conn.writeFrame(ctx.msg, .binary) catch {
             ctx.running = false;
             return;
@@ -938,6 +945,7 @@ const TimerCtx = struct {
     conn: *wsclient.WsConn,
     msg: []const u8,
     running: bool,
+    upgrade: *UpgradeSignal,
 };
 
 /// WebSocket announce loop: persistent WS connection to Host.
@@ -1220,7 +1228,7 @@ pub fn wsAnnounceLoop(
     // Windows: start timer thread for periodic re-announce.
     // POSIX: use single-threaded poll loop (no race).
     var timer_ctx: if (builtin.os.tag == .windows) TimerCtx else struct {} = if (builtin.os.tag == .windows)
-        TimerCtx{ .conn = &conn, .msg = announce_msg, .running = true }
+        TimerCtx{ .conn = &conn, .msg = announce_msg, .running = true, .upgrade = upgrade }
     else
         .{};
     if (builtin.os.tag == .windows) {
@@ -1249,6 +1257,15 @@ pub fn wsAnnounceLoop(
                     std.log.err("[guest-ws] Announce write failed: {}", .{err});
                     break;
                 };
+                // Check for auto-upgrade signal from UDP listener
+                if (upgrade.needed.load(.acquire)) {
+                    std.log.info("[upgrade] Version mismatch detected, triggering self-upgrade", .{});
+                    const bin_name = protocol.deploymentFilename(info.target) orelse "utmm";
+                    const upgrade_url = std.fmt.allocPrint(allocator,
+                        "http://{s}:{d}/bin/{s}", .{ host, protocol.DEFAULT_PORT, bin_name }) catch break;
+                    defer allocator.free(upgrade_url);
+                    triggerSelfUpgrade(io, allocator, upgrade_url) catch break;
+                }
                 // Check pty_dead before continuing — ptyReadLoop may have detected EOF
                 if (pty_dead) {
                     std.log.info("[guest-ws] Pty session ended (detected on poll timeout), reconnecting...", .{});

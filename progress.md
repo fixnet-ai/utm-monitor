@@ -1,4 +1,17 @@
-# Progress: v0.8.0
+# Progress: v0.8.1+
+
+## Session 2026-07-24 (文档消噪 + Auto-Upgrade 修复)
+
+### 文档清理
+- **CLAUDE.md**: 去除 v0.5.0/v0.7.0/v0.8.0 版本号打头的特性描述，替换为当前能力简述。移除章节标题中的版本标记。
+- **task_plan.md / progress.md / findings.md**: 更新至 v0.8.1，追加 Phase 21-24。
+
+### Auto-Upgrade Bug 修复
+- **根因**: `wsAnnounceLoop` 内层循环阻塞在 `readFrame`。UDP listener 线程收到版本广播后设置 `upgrade.needed = true`，但主循环无法检测——直到下一帧到达才检查。
+- **POSIX 修复**: poll 每秒超时，在超时路径中增加 `upgrade.needed` 检查，1 秒内触发升级。
+- **Windows 修复**: `TimerCtx` 增加 `upgrade` 指针，timer 线程检测到升级信号时 `stream.close()` 唤醒阻塞的 `readFrame`，主循环断开后重连并在 line 1128 触发升级。
+- **修改文件**: `src/broadcast.zig` (+15/-3 行)
+- **验证**: `zig build test` 全过，aarch64-linux-musl + x86_64-windows 交叉编译全过
 
 ## Session 2026-07-24 (文档全面同步 — v0.8.0)
 

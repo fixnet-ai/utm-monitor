@@ -6,23 +6,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-UTM Monitor (`utmm`) — helper tool for UTM virtual machines. UTM VM IPs change
-frequently; this program notifies the host of each guest's real IP at all times.
-Single Zig binary, dual mode (Guest default, Host with `--host`).
+UTM Monitor (`utmm`) — remote debugging sidekick for VMs and physical machines.
+Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabilities:
 
-**v0.8.0 streaming exec + binary protocol**: HTTP exec uses chunked streaming
-response with `x-exit-code` trailer — no JSON wrapping, no 30s timeout. Upload/
-download use raw binary HTTP body with `x-vm`/`x-path` custom headers — no
-JSON encoding overhead. 8 cross-compilation targets including 32-bit x86 Windows.
-
-**v0.7.0 auto-upgrade**: Guests detect new Host versions via UDP broadcast and
-self-upgrade through a separate `utmm-old` process. Upgrade uses `fork()+execve()`
-(POSIX) or `std.process.spawn` (Windows) — zero external shell commands.
-
-**v0.5.0 pty session model**: Each Guest WebSocket connection spawns a persistent
-shell (POSIX `posix_openpt` / Windows `CreatePipe`). Commands run in the same
-shell session — `cd`, `export`, and shell history survive across `--exec` calls.
-Completion detected via `MDELIM:$?\n` exit-code markers in pty output.
+- **Streaming exec**: HTTP chunked response with `x-exit-code` trailer — real-time
+  output, no JSON wrapping, no timeout. Upload/download use raw binary body with
+  custom headers (`x-vm`, `x-path`).
+- **Auto-upgrade**: Host broadcasts version via UDP every 60s. Guest detects
+  mismatch, spawns `utmm-old` to stop→download→replace→restart. Zero shell commands.
+- **Persistent pty per connection**: `posix_openpt` (POSIX) / `CreatePipe` (Windows).
+  Commands share one shell session — `cd`, `export`, shell history survive across calls.
+  `MDELIM:$?\n` exit-code markers embedded in pty output.
+- **MCP JSON-RPC**: AI agents control machines through `vm_status` / `vm_exec` tools.
+- **Single port**: HTTP + WebSocket + MCP + static file serving all on 2121.
+- **8 cross-compilation targets**: aarch64/x86_64/x86 × linux-musl/macos/windows.
+- **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
 
 Current configuration — four VM targets tracked:
 | VM | Hostname | OS | IP | Credentials | App Path |
@@ -59,7 +57,7 @@ Guest (windows)  ──WebSocket──┘                      ├── POST /e
 Guest UDP listener ←── UDP broadcast ──┘  (version check → auto-upgrade trigger)
 ```
 
-### How a Command Flows (pty model, v0.8.0 streaming)
+### How a Command Flows (pty model)
 
 ```
 1. CLI: utmm --exec linuxvm "ls -la"
@@ -75,11 +73,7 @@ Guest UDP listener ←── UDP broadcast ──┘  (version check → auto-up
 9. When MDELIM:N\n found: strip marker, set exit_code=N, send x-exit-code trailer
 ```
 
-**v0.8.0 change**: Step 8-9 replace old JSON `{"exit_code":0,"stdout":"..."}` response.
-Output streams in real time via chunked transfer encoding. Exit code in HTTP trailer
-`x-exit-code`. No 30s timeout — commands run as long as needed.
-
-### How Upload/Download Flows (v0.8.0 binary protocol)
+### How Upload/Download Flows
 
 ```
 Upload:

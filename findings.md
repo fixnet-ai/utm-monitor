@@ -1,4 +1,18 @@
-# Findings: v0.8.0
+# Findings: v0.8.1+
+
+## Auto-Upgrade 阻塞读取 Bug (2026-07-24)
+
+**现象**: v0.8.0 Guest 收到 Host v0.8.1 UDP 广播，版本不匹配被正确检测，但升级从未触发。
+
+**根因**: `wsAnnounceLoop` 内层循环阻塞在 `conn.readFrame(&rbuf)`（等待 Host 发送 WebSocket 帧）。UDP listener 线程收到版本广播后设置 `upgrade.needed = true`（原子标志），但主循环无法检测——WebSocket read 是无超时的阻塞操作。如果没有 exec/upload 等主动操作触发帧到达，标志永远不会被检查。
+
+**POSIX 修复**: 内层循环中 `poll()` 设置 1s 超时。在 `poll_n == 0` 路径中新增 `upgrade.needed` 检查。升级在 1 秒内检测到。
+
+**Windows 修复**: 无 poll 机制，`readFrame` 直接阻塞。利用已有的 timer 线程（每秒写 announce 帧）：`TimerCtx` 增加 `upgrade: *UpgradeSignal` 字段；timer 线程检测到 `upgrade.needed` 时关闭 `conn.stream` → `readFrame` 报错退出 → 外层重连循环在 line 1128 检测到标志并触发升级。
+
+**教训**: 跨线程信号传递必须有唤醒机制。原子标志是必要条件非充分条件——消费者必须在合理时间内检查标志。阻塞 I/O 操作需要超时或外部中断（socket close / shutdown）。
+
+## Previous Findings (v0.8.0)
 
 ## Environment
 - Host: macOS aarch64, Zig 0.16.0
