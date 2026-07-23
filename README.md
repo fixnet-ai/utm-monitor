@@ -11,7 +11,26 @@ and Windows VMs through natural language.
 and self-upgrade through a separate `utmm-old` process. No external shell commands:
 `fork()+execve()` on POSIX, `std.process.spawn` on Windows. One binary, zero dependencies.
 
-## What Can You Do With It
+
+## AI Agent Experience
+
+Same capabilities, natural language. Two MCP tools for Claude Code and other agents:
+
+| Tool | Description |
+|------|-------------|
+| `vm_status` | List all VMs: hostname, IP, OS/arch, version, shell type |
+| `vm_exec` | Execute commands on a VM. Shell session persists — cd, export survive |
+
+Example prompts your AI agent can handle:
+- "Check the status of all my VMs"
+- "linuxvm is slow — check CPU, memory, and disk IO"
+- "Attach lldb to my program on macvm, set a breakpoint at main, and show the backtrace"
+- "Is the utmm service running on all VMs?"
+- "My app crashed on windowsvm — find the crash dump and analyze it"
+- "Upload the new build to all VMs and restart the service"
+- "Profile my app on linuxvm with perf, show me the hot functions"
+
+## What Can You Do With command line
 
 ```
 # Peek inside any VM — instantly
@@ -37,23 +56,6 @@ utmm --exec linuxvm "env"     # venv still activated
 utmm --status
 ```
 
-## AI Agent Experience
-
-Same capabilities, natural language. Two MCP tools for Claude Code and other agents:
-
-| Tool | Description |
-|------|-------------|
-| `vm_status` | List all VMs: hostname, IP, OS/arch, version, shell type |
-| `vm_exec` | Execute commands on a VM. Shell session persists — cd, export survive |
-
-Example prompts your AI agent can handle:
-- "Check the status of all my VMs"
-- "linuxvm is slow — check CPU, memory, and disk IO"
-- "Attach lldb to my program on macvm, set a breakpoint at main, and show the backtrace"
-- "Is the utmm service running on all VMs?"
-- "My app crashed on windowsvm — find the crash dump and analyze it"
-- "Upload the new build to all VMs and restart the service"
-- "Profile my app on linuxvm with perf, show me the hot functions"
 
 ## VM Access Reference
 
