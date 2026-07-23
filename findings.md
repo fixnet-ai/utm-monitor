@@ -284,20 +284,21 @@ try response.flush();           // finalize chunked encoding chunk
 
 ## Known Issues
 
-1. **Auto-upgrade not on WebSocket**: Guest binary self-upgrade uses HTTP download
-   (`/bin/utmm-<target>`), not WebSocket. The `downloadAndUpgrade` function in
-   broadcast.zig does a separate HTTP request.
+1. **CLI upload/download path resolution**: Upload path on guest side is relative to
+   working directory (typically `/opt/utmm/`). Full path support would require the
+   guest to resolve absolute paths.
 
-2. **CLI upload/download path resolution**: Upload path on guest side is relative to
-   `/opt/utmm/` (CWD). Full path support would require the guest to resolve paths.
-
-3. **pty_resize is a stub**: Terminal resize message is parsed but not applied
+2. **pty_resize is a stub**: Terminal resize message is parsed but not applied
    (TIOCSWINSZ ioctl not yet called).
 
-4. **killForegroundProcess is a stub**: pty_signal supports per-signal values but
+3. **killForegroundProcess is a stub**: pty_signal supports per-signal values but
    currently only sends SIGKILL/TerminateProcess to the shell child.
 
-5. **VM suspend/resume may cause stale WebSocket**: If a VM is suspended and the
+4. **VM suspend/resume may cause stale WebSocket**: If a VM is suspended and the
    Host restarts, the guest may not detect the dead WebSocket connection until the
    next write attempt (which may hang). A TCP keepalive or application-level
    heartbeat could mitigate this.
+
+5. **std.http.Server HEAD requests return 404**: Zig's `std.http.Server.respond()`
+   doesn't automatically handle HEAD by stripping body. GET requests work fine.
+   Upstream limitation.
