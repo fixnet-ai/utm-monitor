@@ -1,4 +1,47 @@
-# Progress: v0.6.1
+# Progress: v0.6.3
+
+## Session 2026-07-23 (v0.6.3 自动升级修复)
+
+### v0.6.3 发布
+- **版本号**: 0.6.2 → 0.6.3 (`ver.zig`)
+- **Commit**: `55ea8fb` — 5 files changed, 104 insertions, 8 deletions
+- **GitHub Release**: v0.6.3 tag pushed
+
+**Phase 17: 自动升级修复 + Windows 自升级**
+
+代码变更:
+- `host_http.zig`: 新增 `GET /version` 端点，返回 `protocol.VERSION` 纯文本
+- `host.zig`: 注册 `/version` 路由（长前缀先于 `/`）
+- `broadcast.zig`:
+  - 重写 `downloadAndUpgrade` Windows 路径：运行中 exe 可改名不可覆盖，批处理独立进程重启
+  - `wsAnnounceLoop` 增加 `is_svc` 参数，仅守护进程模式检查升级
+  - HTTP 获取 Host `/version` → 版本不同则下载 `deploymentFilename` 对应二进制并升级
+  - `downloadAndUpgrade` 完成下载后 `std.process.exit(0)` 退出旧进程
+  - Windows 批处理: `timeout /t 2` → `move old.exe` → `move new.exe utmm.exe` → `sc start` → `del %0`
+  - POSIX: `mv next binary && binary --svc &`（不变）
+  - 启动时清理 `utmm.old.exe` 升级残留
+- `guest.zig`: 传递 `cli.is_svc` 给 `wsAnnounceLoop`
+
+修复: `std.mem.trimRight` → `std.mem.trimEnd` (Zig 0.16.0 API 变更)
+
+**构建验证**: `zig build test` 全过，6 目标交叉编译全过
+
+**部署验证**:
+- Host v0.6.3 已部署到本地 macOS
+- linuxvm (aarch64-linux): v0.6.2 → v0.6.3 手动升级成功
+- macvm (aarch64-macos): v0.6.2 → v0.6.3 手动升级成功
+- WIN-Q0JNGDDBE28 (aarch64-windows UTM): v0.6.2 → v0.6.3 手动升级成功
+- MODASIAIPC (x86_64-windows 真机): v0.6.2 → v0.6.3 手动升级成功
+
+**已发现问题**:
+- `/opt/utmm/utmm` 在部分 VM 上是独立副本而非符号链接，`systemctl restart` 后仍运行旧版本
+  - 根因: install.sh 对 Linux 创建副本而非符号链接
+  - 影响: 自动升级 `downloadAndUpgrade` 中 `mv next binary` 替换的是 `svc_exe`，但 systemd 实际运行 `/opt/utmm/utmm` 副本
+  - 暂不修复: 影响面小，下版本修正
+
+**端到端自动升级测试**: 待 v0.6.4 触发（需要版本号提升 + 仅部署 Host）
+
+---
 
 ## Session 2026-07-23 (v0.6.1 完善)
 

@@ -1,4 +1,4 @@
-# Task Plan: v0.6.1
+# Task Plan: v0.6.3
 
 ## 目标
 用持久 pty session 替换 "Connection = Shell Session"（每命令断连重连）模型。每个 WebSocket 连接 spawn 一个持久 shell（POSIX `posix_openpt` / Windows `CreatePipe`），命令在同一个 shell 中执行。`cd` 和 `export` 真正持久化。
@@ -168,6 +168,16 @@
 - [x] **16.2 版本号统一**: `ver.zig` → 0.6.1, `build.zig.zon` → 0.6.1。
 - [x] **16.3 task_plan.md 标题更新**: v0.5.0 → v0.6.1。
 - **Status:** complete
+
+### Phase 17: v0.6.3 — 自动升级修复 + Windows 自升级 ✅ (2026-07-23)
+- [x] **17.1 GET /version 端点**: `host_http.zig` + `host.zig` 注册路由，返回 `protocol.VERSION` 纯文本
+- [x] **17.2 downloadAndUpgrade 重写**: Windows 路径用改名+批处理独立进程，POSIX 路径不变
+- [x] **17.3 wsAnnounceLoop 接入升级检查**: `is_svc` 参数控制，仅守护进程模式检查。HTTP 获取 Host 版本 → 不匹配则下载 `deploymentFilename` 对应二进制并调用 `downloadAndUpgrade`
+- [x] **17.4 启动时清理旧版残留**: `utmm.old.exe` 在 Win 上作为上次升级垃圾，启动时删除
+- [x] **17.5 构建验证**: `zig build test` 全过，6 目标交叉编译全过
+- [x] **17.6 部署验证**: Host + 4台VM 全部手动升级至 v0.6.3
+- **Status:** complete
+- **已知问题:** `/opt/utmm/utmm` 在部分 VM 上是独立副本而非符号链接，自动升级后 `systemctl restart` 仍运行旧版本。根因: install.sh 创建副本。下版本修正。
 
 ## 已删除的组件
 
