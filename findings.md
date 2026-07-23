@@ -1,9 +1,9 @@
-# Findings: v0.5.0 pty Session Model
+# Findings: v0.8.0
 
 ## Environment
 - Host: macOS aarch64, Zig 0.16.0
-- VMs: linuxvm (aarch64-linux-musl), macvm (aarch64-macos), windowsvm (aarch64-windows)
-- Current version: v0.5.0
+- VMs: linuxvm (aarch64-linux-musl), macvm (aarch64-macos), windowsvm (aarch64-windows), winx64 (x86_64-windows)
+- Current version: v0.8.0
 
 ## Architecture Decision Records
 
@@ -205,6 +205,68 @@ does blocking I/O via `netReceiveOneWindows`. No timeout available, so on shutdo
 main thread closes the socket handle (`CloseHandle`) to unblock the pending receive.
 UDP listener stores socket handle in atomic pointer for main thread access. POSIX
 continues using `receiveTimeout` which works correctly (uses `poll`).
+
+## v0.8.0 Findings
+
+### macOS AMFI: codesign must happen in /tmp, not /opt/utmm/
+
+**Problem**: macOS AMFI (Apple Mobile File Integrity) kills unsigned binaries
+from `/opt/utmm/` with SIGKILL. `codesign --force --sign -` run directly in
+`/opt/utmm/` fails with "internal error in Code Signing subsystem".
+
+**Root cause**: `/opt/` is SIP-protected on some macOS configurations. The
+`codesign` tool cannot modify binaries in place under `/opt/utmm/` when SIP
+restrictions apply.
+
+**Fix**: Sign the binary in `/tmp/utmm-sign`, then `mv` to `/opt/utmm/`.
+`mv` (rename) preserves the valid code signature.
+
+```bash
+# Works: sign in /tmp, mv to /opt/utmm/
+cp /opt/utmm/utmm-aarch64-macos /tmp/utmm-sign
+codesign --force --sign - /tmp/utmm-sign
+sudo mv /tmp/utmm-sign /opt/utmm/utmm-aarch64-macos
+```
+
+### sendBodiless panic with chunked encoding
+
+**Problem**: `std.http.Client.Request.sendBodiless()` panics at `Client.zig:914`
+when the connection uses chunked transfer encoding. The panic hits `unreachable`
+because `r.connection.?.flush()` returns an error outside `Writer.Error` set.
+
+**Fix**: Use `req.sendBodyComplete("")` instead of `req.sendBodiless()` for
+POST requests with empty body. Works correctly with chunked encoding.
+
+### x86-windows MinGW linker warning promoted to error
+
+**Problem**: `x86-windows` target produces `lld-link: warning: Resolving _system@4
+by linking to _system` — Zig promotes linker warnings to errors.
+
+**Fix**: Use `x86-windows-gnu` target triple instead. Produces identical 32-bit
+Windows PE executable without the MinGW linker warning.
+
+### catch break ambiguity inside labeled blocks
+
+**Problem**: `catch break` inside a `blk: {}` labeled block is ambiguous — the
+compiler cannot determine which block to break from.
+
+**Fix**: Use explicit `break :blk @as(?Type, null)` instead of `catch break`
+inside labeled blocks.
+
+### Chunked encoding: writer.flush() must precede BodyWriter.flush()
+
+**Problem**: `http.BodyWriter.flush()` alone does not send chunked data.
+Data remains buffered in the underlying writer.
+
+**Fix**: Call `writer.flush()` before `BodyWriter.flush()`. The inner writer
+flush pushes buffered data to the chunked encoding layer; the outer flush
+finalizes the chunk.
+
+```zig
+// Correct order:
+try response.writer.flush();   // flush inner writer buffer
+try response.flush();           // finalize chunked encoding chunk
+```
 
 ## Known Issues
 

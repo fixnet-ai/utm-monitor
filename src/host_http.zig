@@ -22,7 +22,7 @@ const hosts_file = @import("hosts_file.zig");
 const mcp = @import("mcp.zig");
 const wsproto = @import("wsproto.zig");
 
-/// Read the request body as JSON. Caller owns the returned string.
+/// Read the request body as raw bytes. Caller owns the returned buffer.
 fn readBody(allocator: std.mem.Allocator, request: *http.Server.Request) ![]const u8 {
     const content_length = request.head.content_length orelse return error.MissingContentLength;
     if (content_length == 0) return error.EmptyBody;
@@ -32,10 +32,35 @@ fn readBody(allocator: std.mem.Allocator, request: *http.Server.Request) ![]cons
     errdefer allocator.free(buf);
 
     var body_reader = request.readerExpectNone(buf);
-    // Read the full body into buf using the body reader
     var writer: std.Io.Writer = .fixed(buf);
     try body_reader.streamExact(&writer, @intCast(content_length));
     return buf;
+}
+
+/// Read the request body as raw bytes with custom size limit.
+fn readRawBody(allocator: std.mem.Allocator, request: *http.Server.Request, max_size: usize) ![]const u8 {
+    const content_length = request.head.content_length orelse return error.MissingContentLength;
+    if (content_length == 0) return error.EmptyBody;
+    if (content_length > max_size) return error.BodyTooLarge;
+
+    const buf = try allocator.alloc(u8, @intCast(content_length));
+    errdefer allocator.free(buf);
+
+    var body_reader = request.readerExpectNone(buf);
+    var writer: std.Io.Writer = .fixed(buf);
+    try body_reader.streamExact(&writer, @intCast(content_length));
+    return buf;
+}
+
+/// Get a request header value by name (case-insensitive). Returns null if not found.
+fn getRequestHeader(request: *http.Server.Request, name: []const u8) ?[]const u8 {
+    var it = request.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) {
+            return h.value;
+        }
+    }
+    return null;
 }
 
 /// Respond with a JSON body and status 200.
@@ -320,43 +345,29 @@ pub fn handleKick(allocator: std.mem.Allocator, state: *httpd.HostState, request
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// POST /upload — Upload file to guest
+// POST /upload — Upload file to guest (binary body, x-vm + x-path headers)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
     _ = body;
-    const body_str = readBody(allocator, request) catch {
+
+    const vm = getRequestHeader(request, "x-vm") orelse {
+        try respondError(request, .bad_request, "Missing x-vm header");
+        return;
+    };
+    const path = getRequestHeader(request, "x-path") orelse {
+        try respondError(request, .bad_request, "Missing x-path header");
+        return;
+    };
+
+    // Read raw binary body (50 MB max for file upload)
+    const file_data = readRawBody(allocator, request, 50 * 1024 * 1024) catch {
         try respondError(request, .bad_request, "Missing body");
         return;
     };
-    defer allocator.free(body_str);
+    defer allocator.free(file_data);
 
-    const parsed = httpd.parseJson(allocator, body_str) catch {
-        try respondError(request, .bad_request, "Invalid JSON");
-        return;
-    };
-    defer parsed.deinit();
-
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else => {
-            try respondError(request, .bad_request, "Expected JSON object");
-            return;
-        },
-    };
-
-    const vm = httpd.jsonGetString(obj, "vm") orelse {
-        try respondError(request, .bad_request, "Missing 'vm'");
-        return;
-    };
-    const path = httpd.jsonGetString(obj, "path") orelse {
-        try respondError(request, .bad_request, "Missing 'path'");
-        return;
-    };
-    const data = httpd.jsonGetString(obj, "data") orelse {
-        try respondError(request, .bad_request, "Missing 'data'");
-        return;
-    };
+    std.log.info("[upload] {s} -> {s} ({d} bytes)", .{ vm, path, file_data.len });
 
     // Check guest exists
     {
@@ -364,7 +375,7 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, reque
         const guest_exists = state.containsGuest(vm);
         state.mutex.unlock(state.io.?);
         if (!guest_exists) {
-            try respondJson(request, "{\"error\":\"GuestNotFound\"}");
+            try respondError(request, .not_found, "GuestNotFound");
             return;
         }
     }
@@ -376,7 +387,7 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, reque
     };
     defer allocator.free(cmd_id);
 
-    const frame = try wsproto.buildUploadReq(allocator, cmd_id, path, data);
+    const frame = try wsproto.buildUploadReq(allocator, cmd_id, path, file_data);
     defer allocator.free(frame);
 
     try state.createOpState(cmd_id);
@@ -389,13 +400,13 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, reque
             if (result.exit == 0) {
                 try respondJson(request, "{\"ok\":true}");
             } else {
-                try respondJson(request, "{\"error\":\"UploadFailed\"}");
+                try respondError(request, .internal_server_error, "UploadFailed");
             }
             return;
         }
         state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(30), .clock = .awake } }) catch |err| {
             std.log.err("[upload] wait timeout for {s}: {}", .{ cmd_id, err });
-            try respondJson(request, "{\"error\":\"UploadTimeout\"}");
+            try respondError(request, .gateway_timeout, "UploadTimeout");
             return;
         };
         state.wake_event.reset();
@@ -403,39 +414,22 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, reque
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// POST /download — Download file from guest
+// POST /download — Download file from guest (x-vm + x-path headers, streaming binary response)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
     _ = body;
-    const body_str = readBody(allocator, request) catch {
-        try respondError(request, .bad_request, "Missing body");
+
+    const vm = getRequestHeader(request, "x-vm") orelse {
+        try respondError(request, .bad_request, "Missing x-vm header");
         return;
     };
-    defer allocator.free(body_str);
-
-    const parsed = httpd.parseJson(allocator, body_str) catch {
-        try respondError(request, .bad_request, "Invalid JSON");
+    const path = getRequestHeader(request, "x-path") orelse {
+        try respondError(request, .bad_request, "Missing x-path header");
         return;
-    };
-    defer parsed.deinit();
-
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else => {
-            try respondError(request, .bad_request, "Expected JSON object");
-            return;
-        },
     };
 
-    const vm = httpd.jsonGetString(obj, "vm") orelse {
-        try respondError(request, .bad_request, "Missing 'vm'");
-        return;
-    };
-    const path = httpd.jsonGetString(obj, "path") orelse {
-        try respondError(request, .bad_request, "Missing 'path'");
-        return;
-    };
+    std.log.info("[download] {s} from {s}", .{ path, vm });
 
     // Check guest exists
     {
@@ -443,7 +437,7 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
         const guest_exists = state.containsGuest(vm);
         state.mutex.unlock(state.io.?);
         if (!guest_exists) {
-            try respondJson(request, "{\"error\":\"GuestNotFound\"}");
+            try respondError(request, .not_found, "GuestNotFound");
             return;
         }
     }
@@ -461,29 +455,95 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
     try state.createOpState(cmd_id);
     try state.enqueueOutgoingFrame(vm, frame);
 
-    // Poll for result — no timeout
+    // Stream response via chunked encoding (same pattern as handleExec)
+    var stream_buf: [4096]u8 = undefined;
+    var body_writer = try request.respondStreaming(&stream_buf, .{
+        .respond_options = .{
+            .status = .ok,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+        },
+    });
+    var chunked_ended = false;
+
+    // Loop: write new output chunks as they arrive from guest
     while (true) {
-        if (state.takeOpResult(cmd_id)) |result| {
-            defer allocator.free(result.stdout);
-            if (result.exit == 0) {
-                const escaped = try httpd.jsonEscape(allocator, result.stdout);
-                defer allocator.free(escaped);
-                const resp_json = try std.fmt.allocPrint(allocator,
-                    "{{\"ok\":true,\"data\":\"{s}\",\"size\":{d}}}",
-                    .{ escaped, result.stdout.len },
-                );
-                defer allocator.free(resp_json);
-                try respondJson(request, resp_json);
-            } else {
-                try respondJson(request, "{\"error\":\"DownloadFailed\"}");
+        const new_chunk = blk: {
+            state.mutex.lock(state.io.?) catch break :blk @as(?[]const u8, null);
+            defer state.mutex.unlock(state.io.?);
+
+            const op = state.op_states.getPtr(cmd_id) orelse break :blk @as(?[]const u8, null);
+
+            if (op.output.items.len > op.sent_pos) {
+                const start = op.sent_pos;
+                op.sent_pos = op.output.items.len;
+                const data = allocator.dupe(u8, op.output.items[start..]) catch break :blk @as(?[]const u8, null);
+                break :blk data;
             }
+            break :blk @as(?[]const u8, null);
+        };
+
+        if (new_chunk) |chunk| {
+            defer allocator.free(chunk);
+            body_writer.writer.writeAll(chunk) catch |err| {
+                std.log.err("[download] write failed for {s}: {}", .{ cmd_id, err });
+                return;
+            };
+            body_writer.writer.flush() catch |err| {
+                std.log.err("[download] writer flush failed for {s}: {}", .{ cmd_id, err });
+                return;
+            };
+            body_writer.flush() catch |err| {
+                std.log.err("[download] body flush failed for {s}: {}", .{ cmd_id, err });
+                return;
+            };
+        }
+
+        const done_and_exit = blk: {
+            state.mutex.lock(state.io.?) catch break :blk @as(?i32, null);
+            defer state.mutex.unlock(state.io.?);
+
+            const op = state.op_states.getPtr(cmd_id) orelse break :blk @as(?i32, null);
+            if (op.done) break :blk op.exit_code;
+            break :blk @as(?i32, null);
+        };
+
+        if (done_and_exit) |exit_code| {
+            // Final check for remaining data
+            const final_chunk = blk: {
+                state.mutex.lock(state.io.?) catch break :blk @as(?[]const u8, null);
+                defer state.mutex.unlock(state.io.?);
+
+                const op = state.op_states.getPtr(cmd_id) orelse break :blk @as(?[]const u8, null);
+                if (op.output.items.len > op.sent_pos) {
+                    const start = op.sent_pos;
+                    op.sent_pos = op.output.items.len;
+                    const data = allocator.dupe(u8, op.output.items[start..]) catch break :blk @as(?[]const u8, null);
+                    break :blk data;
+                }
+                break :blk @as(?[]const u8, null);
+            };
+
+            if (final_chunk) |chunk| {
+                defer allocator.free(chunk);
+                body_writer.writer.writeAll(chunk) catch {};
+                body_writer.writer.flush() catch {};
+                body_writer.flush() catch {};
+            }
+
+            var exit_buf: [32]u8 = undefined;
+            const exit_str = std.fmt.bufPrint(&exit_buf, "{d}", .{exit_code}) catch "1";
+            chunked_ended = true;
+            body_writer.endChunked(.{ .trailers = &.{
+                .{ .name = "x-exit-code", .value = exit_str },
+            } }) catch |err| {
+                std.log.err("[download] endChunked failed for {s}: {}", .{ cmd_id, err });
+            };
+            state.cleanupOpState(cmd_id);
             return;
         }
-        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(30), .clock = .awake } }) catch |err| {
-            std.log.err("[download] wait timeout for {s}: {}", .{ cmd_id, err });
-            try respondJson(request, "{\"error\":\"DownloadTimeout\"}");
-            return;
-        };
+
+        // Wait for next chunk
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(3600), .clock = .awake } }) catch {};
         state.wake_event.reset();
     }
 }

@@ -339,113 +339,139 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
     const dest = try std.fmt.allocPrint(gpa, "/opt/utmm/{s}", .{basename});
     defer gpa.free(dest);
 
-    std.debug.print("[upload] Uploading {s} → {s} ({s})...\n", .{ local_file, target, dest });
+    std.debug.print("[upload] Uploading {s} -> {s} ({s}) ({d} bytes)...\n", .{ local_file, target, dest, file_data.len });
 
-    // HTTP POST to Host
+    // HTTP POST raw binary body with x-vm and x-path headers
     var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
     defer client.deinit();
 
     const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/upload", .{port});
     defer gpa.free(url);
 
-    const escaped_data = try httpd.jsonEscape(gpa, file_data);
-    defer gpa.free(escaped_data);
-    const body = try std.fmt.allocPrint(gpa,
-        "{{\"vm\":\"{s}\",\"path\":\"{s}\",\"data\":\"{s}\"}}",
-        .{ target, dest, escaped_data },
-    );
-    defer gpa.free(body);
+    var redirect_buf: [4096]u8 = undefined;
 
-    var resp_buf: [4096]u8 = undefined;
-    var resp_writer: std.Io.Writer = .fixed(&resp_buf);
+    const uri = std.Uri.parse(url) catch |err| {
+        std.debug.print("[upload] Bad URL: {s}\n", .{url});
+        return err;
+    };
 
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body,
-        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .response_writer = &resp_writer,
+    var req = client.request(.POST, uri, .{
+        .extra_headers = &.{
+            .{ .name = "x-vm", .value = target },
+            .{ .name = "x-path", .value = dest },
+            .{ .name = "Content-Type", .value = "application/octet-stream" },
+        },
         .keep_alive = false,
     }) catch |err| {
         std.debug.print("[upload] HTTP request failed: {} — is Host running?\n", .{err});
         return err;
     };
+    defer req.deinit();
 
-    const resp_body = resp_writer.buffered();
-    if (result.status == .ok) {
-        std.debug.print("[upload] OK: {s}\n", .{resp_body});
+    req.sendBodyComplete(file_data) catch |err| {
+        std.debug.print("[upload] sendBody failed: {}\n", .{err});
+        return err;
+    };
+
+    var response = req.receiveHead(&redirect_buf) catch |err| {
+        std.debug.print("[upload] receiveHead failed: {}\n", .{err});
+        return err;
+    };
+
+    if (response.head.status == .ok) {
+        std.debug.print("[upload] OK\n", .{});
     } else {
-        std.debug.print("[upload] Error: {s}\n", .{resp_body});
+        var err_body_buf: [4096]u8 = undefined;
+        var err_reader = response.reader(&err_body_buf);
+        const err_line = err_reader.takeDelimiter('\n') catch null orelse "unknown error";
+        std.debug.print("[upload] Error ({d}): {s}\n", .{ @intFromEnum(response.head.status), err_line });
         return error.UploadFailed;
     }
 }
 
 fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, remote_file: []const u8, local_path: []const u8) !void {
-    std.debug.print("[download] Downloading {s} from {s} → {s}...\n", .{ remote_file, target, local_path });
+    std.debug.print("[download] Downloading {s} from {s} -> {s}...\n", .{ remote_file, target, local_path });
 
-    // HTTP POST to Host
+    // HTTP POST with x-vm and x-path headers, stream raw binary response to file
     var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
     defer client.deinit();
 
     const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/download", .{port});
     defer gpa.free(url);
 
-    const body = try std.fmt.allocPrint(gpa, "{{\"vm\":\"{s}\",\"path\":\"{s}\"}}", .{ target, remote_file });
-    defer gpa.free(body);
+    var redirect_buf: [4096]u8 = undefined;
+    var transfer_buf: [4096]u8 = undefined;
 
-    var resp_buf: [65536]u8 = undefined;
-    var resp_writer: std.Io.Writer = .fixed(&resp_buf);
+    const uri = std.Uri.parse(url) catch |err| {
+        std.debug.print("[download] Bad URL: {s}\n", .{url});
+        return err;
+    };
 
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body,
-        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .response_writer = &resp_writer,
+    var req = client.request(.POST, uri, .{
+        .extra_headers = &.{
+            .{ .name = "x-vm", .value = target },
+            .{ .name = "x-path", .value = remote_file },
+        },
         .keep_alive = false,
     }) catch |err| {
         std.debug.print("[download] HTTP request failed: {} — is Host running?\n", .{err});
         return err;
     };
+    defer req.deinit();
 
-    const resp_body = resp_writer.buffered();
-    if (result.status != .ok) {
-        std.debug.print("[download] Error: {s}\n", .{resp_body});
+    req.sendBodyComplete("") catch |err| {
+        std.debug.print("[download] sendBody failed: {}\n", .{err});
+        return err;
+    };
+
+    var response = req.receiveHead(&redirect_buf) catch |err| {
+        std.debug.print("[download] receiveHead failed: {}\n", .{err});
+        return err;
+    };
+
+    if (response.head.status != .ok) {
+        var err_body_buf: [4096]u8 = undefined;
+        var err_reader = response.reader(&err_body_buf);
+        const err_line = err_reader.takeDelimiter('\n') catch null orelse "unknown error";
+        std.debug.print("[download] Error ({d}): {s}\n", .{ @intFromEnum(response.head.status), err_line });
         return error.DownloadFailed;
     }
 
-    // Parse result JSON for "data" field
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, resp_body, .{ .allocate = .alloc_always }) catch {
-        std.debug.print("[download] Invalid JSON response\n", .{});
-        return error.InvalidJson;
-    };
-    defer parsed.deinit();
-
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else => {
-            std.debug.print("[download] Unexpected response\n", .{});
-            return error.ProtocolError;
-        },
-    };
-
-    if (obj.get("error")) |_| {
-        std.debug.print("[download] Host error: {s}\n", .{resp_body});
-        return error.DownloadFailed;
-    }
-
-    const data = httpd.jsonGetString(obj, "data") orelse "";
-    const size = httpd.jsonGetInt(obj, "size") orelse 0;
-
-    // Write to local file
+    // Stream response body to local file
     const local_file = try std.Io.Dir.cwd().createFile(block_io, local_path, .{});
     defer local_file.close(block_io);
-    var wb: [65536]u8 = undefined;
-    var fw = local_file.writer(block_io, &wb);
-    _ = try fw.interface.write(data);
-    try fw.interface.flush();
+    var file_wb: [65536]u8 = undefined;
+    var fw = local_file.writer(block_io, &file_wb);
+    const file_iface = &fw.interface;
 
-    std.debug.print("[download] Received {d} bytes → {s}\n", .{ size, local_path });
+    var body_reader = response.reader(&transfer_buf);
+    var total_bytes: usize = 0;
+    while (true) {
+        const n = body_reader.stream(file_iface, std.Io.Limit.limited(65536)) catch |err| {
+            std.debug.print("[download] read error: {}\n", .{err});
+            break;
+        };
+        if (n == 0) break;
+        total_bytes += n;
+        file_iface.flush() catch {};
+    }
+    file_iface.flush() catch {};
+
+    // Parse x-exit-code from trailers
+    var exit_code: i32 = 1;
+    var trailers = response.iterateTrailers();
+    while (trailers.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "x-exit-code")) {
+            exit_code = std.fmt.parseInt(i32, h.value, 10) catch 1;
+        }
+    }
+
+    if (exit_code != 0) {
+        std.debug.print("[download] Guest returned error, exit code {d}\n", .{exit_code});
+        return error.DownloadFailed;
+    }
+
+    std.debug.print("[download] Received {d} bytes -> {s}\n", .{ total_bytes, local_path });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -136,9 +136,18 @@ CLI management commands use standard HTTP:
 | `/` | GET | HTML status page |
 
 CLI commands send HTTP to `127.0.0.1:2121`. Host communicates with Guest via WebSocket
-for actual command execution. Commands have a 30-second timeout — if a command runs
-longer, it will return a timeout error. Use `--kick` to forcefully close a guest's
-shell session and force reconnect.
+for actual command execution.
+
+**v0.8.0 streaming exec**: `POST /exec` returns chunked streaming plain text —
+output arrives in real time as the command runs. Exit code is delivered via
+`x-exit-code` HTTP trailer. No timeout — commands run as long as needed.
+
+**v0.8.0 binary upload/download**: `POST /upload` and `POST /download` use
+custom HTTP headers `x-vm` (target VM hostname) and `x-path` (file path on guest).
+Body is raw binary (`application/octet-stream`) — no JSON wrapping.
+Download response is chunked streaming with `x-exit-code` trailer.
+
+Use `--kick` to forcefully close a guest's shell session and force reconnect.
 
 #### UDP Broadcast Discovery (Port 2121)
 
@@ -337,18 +346,20 @@ utmm --status
 
 **Method 1: GitHub Releases (Recommended, no local compilation needed)**
 
-Each release automatically builds 6 binaries for all VM scenarios, packaged as `utmm.zip`:
+Each release automatically builds 8 binaries for all VM scenarios, packaged as `utmm.zip`:
 
 | File | Covers | Zig Target |
 |------|--------|------------|
 | `utmm-x86_64-linux` | 64-bit x86 Linux VMs | x86_64-linux-musl |
 | `utmm-aarch64-linux` | ARM64 Linux VMs | aarch64-linux-musl |
+| `utmm-x86-linux` | 32-bit x86 Linux VMs | x86-linux-musl |
 | `utmm-x86_64-macos` | Intel Mac + Apple Silicon Mac (physical) | x86_64-macos |
 | `utmm-aarch64-macos` | ARM macOS VMs (UTM guests, no Rosetta 2) | aarch64-macos |
 | `utmm-x86_64-windows.exe` | 64-bit x86 Windows VMs | x86_64-windows |
 | `utmm-aarch64-windows.exe` | ARM64 Windows VMs | aarch64-windows |
+| `utmm-x86-windows.exe` | 32-bit x86 Windows | x86-windows-gnu |
 
-> **32-bit x86 support**: x86-linux-musl builds since v0.2.5. x86-windows has a pre-existing linker issue unrelated to utmm.
+> **32-bit x86 support**: x86-linux-musl builds since v0.2.5. x86-windows uses `x86-windows-gnu` since v0.8.0 to avoid MinGW `_system@4` linker warning.
 
 > **macOS Rosetta 2 note**: Apple Silicon **physical** Macs can run `utmm-x86_64-macos` (x86_64) via Rosetta 2. However, UTM ARM macOS **VMs** lack Rosetta 2, so they need `utmm-aarch64-macos` (native aarch64). If you need Rosetta 2 on a physical Mac: `softwareupdate --install-rosetta`.
 
@@ -360,13 +371,15 @@ Download URL: `https://github.com/fixnet-ai/utm-monitor/releases/latest/download
 git clone https://github.com/fixnet-ai/utm-monitor.git
 cd utm-monitor
 
-# Cross-compile for each platform (6 targets cover all scenarios)
+# Cross-compile for each platform (8 targets cover all scenarios)
 zig build -Dtarget=x86_64-linux-musl   -Doptimize=ReleaseSafe
 zig build -Dtarget=aarch64-linux-musl  -Doptimize=ReleaseSafe
+zig build -Dtarget=x86-linux-musl      -Doptimize=ReleaseSafe
 zig build -Dtarget=x86_64-macos        -Doptimize=ReleaseSafe
 zig build -Dtarget=aarch64-macos       -Doptimize=ReleaseSafe
 zig build -Dtarget=x86_64-windows      -Doptimize=ReleaseSafe
 zig build -Dtarget=aarch64-windows     -Doptimize=ReleaseSafe
+zig build -Dtarget=x86-windows-gnu     -Doptimize=ReleaseSafe
 
 # Rebuild native LAST — each cross-compile overwrites zig-out/bin/utmm,
 # so the final native build ensures utmm is the correct host architecture.
@@ -377,10 +390,12 @@ Build artifacts:
 - `zig-out/bin/utmm` — native binary (current platform, built last)
 - `zig-out/bin/utmm-x86_64-linux` — Linux 64-bit x86 musl static
 - `zig-out/bin/utmm-aarch64-linux` — Linux aarch64 musl static
+- `zig-out/bin/utmm-x86-linux` — Linux 32-bit x86 musl static
 - `zig-out/bin/utmm-x86_64-macos` — macOS x86_64 (Intel + Apple Silicon via Rosetta 2)
 - `zig-out/bin/utmm-aarch64-macos` — macOS aarch64 (ARM VMs without Rosetta 2)
 - `zig-out/bin/utmm-x86_64-windows.exe` — Windows 64-bit x86
 - `zig-out/bin/utmm-aarch64-windows.exe` — Windows ARM64
+- `zig-out/bin/utmm-x86-windows.exe` — Windows 32-bit x86 (x86-windows-gnu)
 
 Run tests to confirm correctness:
 
@@ -408,7 +423,7 @@ sudo ln -sf /opt/utmm/utmm /usr/local/bin/utmm
 
 > **Important**: After cross-compilation, `zig-out/bin/utmm` is the LAST target built (not native). Always rebuild native last to ensure the generic `utmm` binary matches your host architecture. The platform-specific named binaries (`utmm-aarch64-macos`, etc.) are correct from their respective cross-compile steps. The `sudo cp zig-out/bin/utmm-* /opt/utmm/` copies all named binaries including the correct host one — no need to copy `utmm` separately.
 
-> **macOS code signing**: On macOS, binaries run with `sudo` are subject to AMFI (Apple Mobile File Integrity). Unsigned binaries get SIGKILL. Use `codesign --force --sign -` to ad-hoc sign the binary.
+> **macOS code signing**: On macOS, binaries run with `sudo` are subject to AMFI (Apple Mobile File Integrity). Unsigned binaries get SIGKILL. Sign in `/tmp` then `mv` to `/opt/utmm/` — signing directly in `/opt/utmm/` may fail with "internal error in Code Signing subsystem" due to SIP restrictions.
 
 ### 3.4 Start Guest Service
 
@@ -551,7 +566,7 @@ Host Options:
 
 Management Commands (HTTP to Host on 127.0.0.1:2121):
   --status               Query online status of all Guests (UDP broadcast discovery)
-  --exec TARGET CMD      Execute command on target Guest (pty shell, 30s timeout)
+  --exec TARGET CMD      Execute command on target Guest (pty shell, streaming output, no timeout)
   --kick TARGET          Close guest's WebSocket connection (kills pty shell)
   --upload FILE VM       Upload a file to Guest
   --download VM R L      Download file from Guest
@@ -609,12 +624,17 @@ utmm --exec linuxvm "echo $FOO"          # Shows bar (persists in same shell)
 #### Transfer Files
 
 ```bash
-# Upload a file to Guest (built-in, no curl required)
+# Upload a local file to Guest (raw binary HTTP, no JSON wrapping)
 utmm --upload ./local_file linuxvm
 
-# Download a file from Guest
+# Download a file from Guest (streaming chunked response)
 utmm --download linuxvm remote_file ./local_file
 ```
+
+> **v0.8.0 binary protocol**: Upload/download use raw binary HTTP body with
+> `x-vm` and `x-path` custom headers — no JSON encoding overhead. Download
+> streams via chunked transfer encoding with `x-exit-code` trailer for error
+> reporting. Verify with MD5: `utmm --exec linuxvm "md5sum file.txt"`.
 
 > **Important**: Both `--upload` and `--download` are limited to the Guest's `/opt/utmm/` directory (`C:\opt\utmm\` on Windows). The filename must be a **simple name without path separators** (`/` or `\`). For example:
 > - ✅ `utmm --download linuxvm app.log ./app.log`
@@ -626,6 +646,14 @@ utmm --download linuxvm remote_file ./local_file
 > utmm --download linuxvm syslog.log ./syslog.log
 > ```
 
+#### Verify Transfer Integrity
+
+```bash
+# Check file size and MD5 after upload/download
+utmm --exec linuxvm "ls -la /opt/utmm/file.txt && md5sum /opt/utmm/file.txt"
+md5 -q ./local_file  # macOS; use md5sum on Linux
+```
+
 #### Trigger Auto-Upgrade
 
 To release a new version:
@@ -634,10 +662,10 @@ To release a new version:
 # 1. Bump ver.zig
 echo 'pub const VERSION = "0.7.1";' > src/ver.zig
 
-# 2. Build all targets
+# 2. Build all 8 targets (or use release-skill/build.sh)
 zig build -Doptimize=ReleaseSafe
 zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
-# ... (all 6 targets)
+# ... (all 8 targets)
 
 # 3. Copy all binaries to Host serve dir
 sudo cp zig-out/bin/utmm* /opt/utmm/
@@ -725,7 +753,6 @@ sudo lsof -i :2121
 |---------------|-------|----------|
 | `GuestNotFound` | Guest not connected to Host | Wait a few seconds and retry; check if Guest is running |
 | `ConnectionRefused` | Host HTTP server not running | `sudo utmm --host` |
-| `ExecTimeout` | Command took longer than 30s | Split into smaller commands or run in background |
 | `disconnected` | Guest WebSocket closed during execution | Guest may have crashed; check `vm_status` |
 
 ### 5.4 Windows Guest Process Cannot Run in Background
@@ -879,20 +906,22 @@ utmm/
 | systemd | Linux system | Linux auto-start on boot |
 | sc | Windows system | Windows auto-start on boot (Windows Service, `--svc` flag) |
 
-### 6.3 Binary Packaging (6 Binaries → All VMs)
+### 6.3 Binary Packaging (8 Binaries → All VMs)
 
-Each release builds 6 binaries covering all architecture+OS combinations, packaged as `utmm.zip`:
+Each release builds 8 binaries covering all architecture+OS combinations, packaged as `utmm.zip`:
 
 | # | Binary | Build Target | Covers |
 |---|--------|-------------|--------|
 | 1 | `utmm-x86_64-linux` | `x86_64-linux-musl` | 64-bit x86 Linux VMs |
 | 2 | `utmm-aarch64-linux` | `aarch64-linux-musl` | ARM64 Linux VMs |
-| 3 | `utmm-x86_64-macos` | `x86_64-macos` | Intel Mac, Apple Silicon (physical, via Rosetta 2) |
-| 4 | `utmm-aarch64-macos` | `aarch64-macos` | ARM macOS VMs (UTM guests, no Rosetta 2) |
-| 5 | `utmm-x86_64-windows.exe` | `x86_64-windows` | 64-bit x86 Windows VMs |
-| 6 | `utmm-aarch64-windows.exe` | `aarch64-windows` | ARM64 Windows VMs |
+| 3 | `utmm-x86-linux` | `x86-linux-musl` | 32-bit x86 Linux VMs |
+| 4 | `utmm-x86_64-macos` | `x86_64-macos` | Intel Mac, Apple Silicon (physical, via Rosetta 2) |
+| 5 | `utmm-aarch64-macos` | `aarch64-macos` | ARM macOS VMs (UTM guests, no Rosetta 2) |
+| 6 | `utmm-x86_64-windows.exe` | `x86_64-windows` | 64-bit x86 Windows VMs |
+| 7 | `utmm-aarch64-windows.exe` | `aarch64-windows` | ARM64 Windows VMs |
+| 8 | `utmm-x86-windows.exe` | `x86-windows-gnu` | 32-bit x86 Windows |
 
-> **6 primary release targets** cover all UTM VM scenarios (aarch64 + x86_64 × linux/macos/windows). 32-bit x86-linux-musl also builds (since v0.2.5) but is not in the release set — all modern VMs are 64-bit.
+> **8 release targets** since v0.8.0. `x86-windows-gnu` used for 32-bit Windows to avoid MinGW `_system@4` linker warning that Zig promotes to error.
 
 **Compatibility matrix** — which binary to use for each VM scenario:
 
@@ -900,11 +929,13 @@ Each release builds 6 binaries covering all architecture+OS combinations, packag
 |-------------|---------------|-------|
 | Windows VM (x86_64) | `utmm-x86_64-windows.exe` | 64-bit x86 |
 | Windows VM (ARM64) | `utmm-aarch64-windows.exe` | Native ARM64 |
+| Windows VM (32-bit x86) | `utmm-x86-windows.exe` | x86-windows-gnu target |
 | macOS VM on Intel Mac (UTM) | `utmm-x86_64-macos` | Native x86_64 |
 | macOS VM on Apple Silicon (UTM) | `utmm-aarch64-macos` | UTM ARM VMs lack Rosetta 2; need native aarch64 |
 | Physical Apple Silicon Mac (Host) | `utmm-x86_64-macos` | Rosetta 2 handles x86_64 → aarch64 translation |
 | Physical Intel Mac (Host) | `utmm-x86_64-macos` | Native x86_64 |
 | Linux VM (x86_64) | `utmm-x86_64-linux` | 64-bit musl static, no glibc dependency |
+| Linux VM (x86 32-bit) | `utmm-x86-linux` | 32-bit musl static |
 | Linux VM (aarch64) | `utmm-aarch64-linux` | aarch64 musl static |
 
 ### 6.4 Zig Cross-Compilation Target Reference
@@ -913,10 +944,12 @@ Each release builds 6 binaries covering all architecture+OS combinations, packag
 |------------|---------------|----------------|
 | `x86_64-linux-musl` | `utmm-x86_64-linux` | Linux 64-bit x86 (musl static) |
 | `aarch64-linux-musl` | `utmm-aarch64-linux` | Linux aarch64 (musl static) |
+| `x86-linux-musl` | `utmm-x86-linux` | Linux 32-bit x86 (musl static) |
 | `x86_64-macos` | `utmm-x86_64-macos` | Intel Mac + Apple Silicon Mac (via Rosetta 2) |
 | `aarch64-macos` | `utmm-aarch64-macos` | ARM macOS VMs (UTM guests, no Rosetta 2) |
 | `x86_64-windows` | `utmm-x86_64-windows.exe` | Windows 64-bit x86 |
 | `aarch64-windows` | `utmm-aarch64-windows.exe` | Windows ARM64 |
+| `x86-windows-gnu` | `utmm-x86-windows.exe` | Windows 32-bit x86 |
 
 All Linux binaries are statically linked against musl — no glibc version dependency, runs on any Linux distribution.
 
@@ -965,7 +998,6 @@ sudo killall -HUP mDNSResponder
 | `error.AccessDenied` | Host not running with sudo | `sudo utmm --host` |
 | `error.ConnectionRefused` | Host HTTP server not started | `sudo utmm --host` |
 | `GuestNotFound` | Guest not connected via WebSocket | Check if Guest process is running |
-| `ExecTimeout` | Command exceeded 30s timeout | Split command or use `nohup ... &` |
 | Tunnel IP detected | VPN interface interference | utun/tun added to exclusion list |
 | Windows process disappears | Direct launch without service | Use --install to install as Windows service |
 | `zig-out/bin/utmm` is wrong arch | `zig build` overwrites with last target | Use named file e.g. `utmm-aarch64-macos` |
@@ -1138,7 +1170,7 @@ curl -s -X POST http://127.0.0.1:2121/mcp \
 | MCP connection refused | Host daemon not running | `sudo utmm --host` |
 | Port 2121 AddressInUse at Host start | Old `utmm` process still running | `sudo pkill -f utmm && sudo utmm --host` |
 | WebSocket connection failed | Guest can't reach Host gateway | Check guest gateway detection; use `--host-ip` to override |
-| Command timeout | Command exceeded 30s limit | Split command or run in background with `nohup ... &` |
+| Command hangs or produces no output | Guest disconnected mid-command or shell dead | Check `vm_status`; use `--kick` to force shell restart |
 
 ### 7.7 Complete Uninstall / Cleanup
 

@@ -10,6 +10,11 @@ UTM Monitor (`utmm`) — helper tool for UTM virtual machines. UTM VM IPs change
 frequently; this program notifies the host of each guest's real IP at all times.
 Single Zig binary, dual mode (Guest default, Host with `--host`).
 
+**v0.8.0 streaming exec + binary protocol**: HTTP exec uses chunked streaming
+response with `x-exit-code` trailer — no JSON wrapping, no 30s timeout. Upload/
+download use raw binary HTTP body with `x-vm`/`x-path` custom headers — no
+JSON encoding overhead. 8 cross-compilation targets including 32-bit x86 Windows.
+
 **v0.7.0 auto-upgrade**: Guests detect new Host versions via UDP broadcast and
 self-upgrade through a separate `utmm-old` process. Upgrade uses `fork()+execve()`
 (POSIX) or `std.process.spawn` (Windows) — zero external shell commands.
@@ -54,7 +59,7 @@ Guest (windows)  ──WebSocket──┘                      ├── POST /e
 Guest UDP listener ←── UDP broadcast ──┘  (version check → auto-upgrade trigger)
 ```
 
-### How a Command Flows (pty model)
+### How a Command Flows (pty model, v0.8.0 streaming)
 
 ```
 1. CLI: utmm --exec linuxvm "ls -la"
@@ -66,8 +71,33 @@ Guest UDP listener ←── UDP broadcast ──┘  (version check → auto-up
 6. Shell executes command → output flows through pty → ptyReadLoop sends
    pty_output frames back to Host
 7. Host WebSocket handler: appendOpOutput + scanForMarker
-8. When MDELIM:N\n found: strip marker, set exit_code=N, fire wake_event
-9. HTTP handler: takeOpResult → respond JSON with stdout
+8. Host HTTP handler: respondStreaming() sends output as it arrives (chunked)
+9. When MDELIM:N\n found: strip marker, set exit_code=N, send x-exit-code trailer
+```
+
+**v0.8.0 change**: Step 8-9 replace old JSON `{"exit_code":0,"stdout":"..."}` response.
+Output streams in real time via chunked transfer encoding. Exit code in HTTP trailer
+`x-exit-code`. No 30s timeout — commands run as long as needed.
+
+### How Upload/Download Flows (v0.8.0 binary protocol)
+
+```
+Upload:
+1. CLI: utmm --upload file.txt linuxvm
+2. HTTP POST /upload with headers: x-vm: linuxvm, x-path: file.txt
+   Body: raw file bytes (application/octet-stream)
+3. handleUpload: readRawBody() → build upload_req WS frame → enqueue
+4. Guest writes file → upload_resp → completeOpState
+5. HTTP response: plain text "OK" or error
+
+Download:
+1. CLI: utmm --download linuxvm file.txt ./local.txt
+2. HTTP POST /download with headers: x-vm: linuxvm, x-path: file.txt
+   Body: empty (sendBodyComplete(""))
+3. handleDownload: build download_req WS frame → enqueue
+4. Guest reads file → download_resp → appendOpOutput
+5. HTTP response: respondStreaming() chunked file bytes + x-exit-code trailer
+6. CLI: body_reader.stream(file_iface) → write to local file
 ```
 
 ### WebSocket Binary Protocol (wsproto.zig)
@@ -128,10 +158,12 @@ zig build -Dtarget=aarch64-macos         # → zig-out/bin/utmm-aarch64-macos
 zig build -Dtarget=x86_64-macos          # → zig-out/bin/utmm-x86_64-macos
 zig build -Dtarget=aarch64-windows       # → zig-out/bin/utmm-aarch64-windows.exe
 zig build -Dtarget=x86_64-windows        # → zig-out/bin/utmm-x86_64-windows.exe
+zig build -Dtarget=x86-windows-gnu       # → zig-out/bin/utmm-x86-windows.exe
 ```
 
-> 32-bit x86-linux-musl builds and passes tests. x86-windows has a linker issue
-> (`_system@4`) unrelated to our code.
+> 32-bit x86-linux-musl builds and passes tests. 32-bit x86-windows uses
+> `x86-windows-gnu` to avoid MinGW `_system@4` linker warning that Zig
+> promotes to error.
 
 ### Tests
 ```bash
@@ -223,6 +255,20 @@ Before starting any work, read (if they exist): `./CLAUDE.md`, `./README.md`,
   Use `lastIndexOf` in host-side marker scanning.
 - `Io.Timeout` union: `{ none, duration: Clock.Duration, deadline: Clock.Timestamp }`
   Use `.awake` clock: `.{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } }`
+
+### HTTP Patterns (v0.8.0)
+
+- **Custom request headers**: `request.iterateHeaders()` returns `HeaderIterator`,
+  call `.next()` to get `http.Header{ .name, .value }`. Use `std.ascii.eqlIgnoreCase`
+  for case-insensitive name matching.
+- **Raw body read**: `request.head.content_length` + `readerExpectNone(buf)` +
+  `body_reader.streamExact(&writer, content_length)`. Use `std.Io.Limit.limited(n)`
+  for streaming reads.
+- **Chunked streaming response**: `respondStreaming()` + `x-exit-code` trailer.
+  Must call `response.writer.flush()` before `response.flush()` for chunked data
+  to be sent.
+- **sendBodyComplete("")** not `sendBodiless()` for empty POST body — the latter
+  panics with chunked encoding (`unreachable` at Client.zig:914).
 
 ### Development Principles
 1. **Think before coding** — state assumptions, present trade-offs

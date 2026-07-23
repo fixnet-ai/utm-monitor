@@ -3,7 +3,7 @@ name: release
 description: >
   Use this skill whenever the user asks to publish a release, create a GitHub
   release, tag a version, or release a new version of utmm. Handles the full
-  pipeline: version bump → test → cross-compile 6 targets → zip → git tag →
+  pipeline: version bump → test → cross-compile 8 targets → zip → git tag →
   gh release create. Trigger on: "release", "publish", "发布", "发版", "tag".
 ---
 
@@ -45,11 +45,21 @@ Must pass. Stop and fix if any test fails.
 ./release-skill/build.sh
 ```
 
-This builds 6 targets into `release/` and creates `utmm.zip`:
-`x86_64-windows`, `aarch64-windows`, `x86_64-macos`,
-`aarch64-macos`, `x86_64-linux-musl`, `aarch64-linux-musl`
+This builds 8 targets into `release/` and creates `utmm.zip`:
 
-> **Note**: 32-bit x86-linux-musl also builds but is not in the release set (all modern UTM VMs are 64-bit). 32-bit x86-windows has a linker issue (unrelated to utmm code) and is excluded.
+| # | Target | Output Binary |
+|---|--------|---------------|
+| 1 | `x86_64-windows` | `utmm-x86_64-windows.exe` |
+| 2 | `aarch64-windows` | `utmm-aarch64-windows.exe` |
+| 3 | `x86-windows-gnu` | `utmm-x86-windows.exe` |
+| 4 | `x86_64-macos` | `utmm-x86_64-macos` |
+| 5 | `aarch64-macos` | `utmm-aarch64-macos` |
+| 6 | `x86-linux-musl` | `utmm-x86-linux` |
+| 7 | `x86_64-linux-musl` | `utmm-x86_64-linux` |
+| 8 | `aarch64-linux-musl` | `utmm-aarch64-linux` |
+
+> **Note**: `x86-windows` (32-bit) uses `x86-windows-gnu` target triple to work around
+> a MinGW linker warning (`_system@4`) that Zig promotes to an error.
 
 ### Step 5: Commit & tag
 

@@ -1,7 +1,7 @@
-# Task Plan: v0.7.0
+# Task Plan: v0.8.0
 
 ## 目标
-用持久 pty session 替换 "Connection = Shell Session"（每命令断连重连）模型。每个 WebSocket 连接 spawn 一个持久 shell（POSIX `posix_openpt` / Windows `CreatePipe`），命令在同一个 shell 中执行。`cd` 和 `export` 真正持久化。
+v0.8.0: HTTP 层性能优化 — exec 输出流式传输（chunked + trailer），上传/下载二进制协议（自定义请求头 + 原始 body），消除 JSON 包装开销。
 
 **核心变更：**
 - 每 WS 连接一个持久 shell session（非每命令一个进程）
@@ -210,6 +210,45 @@
 - [x] **utm-vm/SKILL.md**: +winx64, +SSH 访问, MCP 配置更新
 - [x] **utm-vm/MANUAL.md**: 完全重写 — 修正 WS 协议帧号, +自动升级架构, 修正全部服务名, +winx64, +x86_64, +MCP 完整章节
 - **Status:** complete
+
+### Phase 20: v0.8.0 — Streaming Exec + Binary Upload/Download ✅ (2026-07-23)
+- [x] **20.1 Streaming Exec HTTP 响应**: `handleExec` 从 JSON 包装改为 chunked streaming
+  - `respondStreaming()` + `x-exit-code` trailer（同下载模式）
+  - 移除 30s 超时 — 命令想跑多久跑多久
+  - 移除 JSON 包装 — 响应体直接是 pty 原始输出
+  - `OpState` 新增 `sent_pos` 字段追踪流式发送进度
+  - `body_reader.stream()` + `std.Io.Limit.limited(n)` 读取原始 body
+  - `request.iterateHeaders()` + `HeaderIterator.next()` 读取自定义请求头
+  - `http.BodyWriter`: 必须先 `writer.flush()` 再 `flush()`，chunked encoding 才能正常工作
+- [x] **20.2 Binary Upload Protocol**: JSON 包装 → 原始二进制 HTTP
+  - `x-vm` + `x-path` 自定义请求头，`Content-Type: application/octet-stream`
+  - `readRawBody()` helper: content-length 驱动的原始 body 读取
+  - `getRequestHeader()` helper: `request.iterateHeaders()` 不区分大小写匹配
+  - `sendBodyComplete(file_data)` 发送原始二进制
+  - 响应纯文本（非 JSON）
+- [x] **20.3 Binary Download Protocol**: JSON 包装 → 流式 chunked 响应
+  - `x-vm` + `x-path` 请求头，`sendBodyComplete("")`（不能用 `sendBodiless` — panic）
+  - `respondStreaming()` + `x-exit-code` trailer
+  - CLI 端 `body_reader.stream(file_iface, ...)` 流式写文件
+- [x] **20.4 8 目标发布构建**: +`x86-windows-gnu` 第 8 个目标
+  - `x86-windows` (MSVC) 有 MinGW linker warning (`_system@4`)，Zig 将 warning 升级为 error
+  - `x86-windows-gnu` 避免该 linker warning — 成功构建 32-bit Windows exe
+  - `release-skill/build.sh` + `SKILL.md` 从 6→7→8 目标更新
+- [x] **20.5 macOS AMFI codesign 修复**: 二进制在 `/tmp` 签名后 `mv` 到 `/opt/utmm/`
+  - AMFI 对 `/opt/utmm/` 中的无签名二进制发送 SIGKILL
+  - `codesign -s - -f` 直接在 `/opt/utmm/` 中运行失败："internal error in Code Signing subsystem"
+  - 变通方案: 在 `/tmp/utmm-sign` 签名，然后 `mv` 到 `/opt/utmm/` — `mv` 保留有效签名
+- [x] **20.6 构建验证**: `zig build test` 全过，8 目标交叉编译全过
+- [x] **20.7 部署验证**: 所有 4 台 VM 升级到 v0.8.0，上传/下载 MD5 验证通过
+- [x] **20.8 文档更新**: task_plan.md (本 Phase), progress.md, findings.md, CLAUDE.md, README.md, utm-vm/MANUAL.md, utm-vm/SKILL.md, release-skill/SKILL.md
+- **Status:** complete
+
+**架构要点:**
+- exec 响应从 `{"exit_code":0,"stdout":"..."}` 变为流式 chunked 纯文本 + `x-exit-code` HTTP trailer
+- 上传/下载不再经过 JSON 编码 — 原始二进制直接走 HTTP body，`x-vm`/`x-path` 自定义请求头标识目标
+- `sendBodiless()` 与 chunked encoding 冲突导致 panic（`unreachable` at Client.zig:914），改用 `sendBodyComplete("")`
+- macOS AMFI: 直接在 `/opt/utmm/` 中签名失败，必须在 `/tmp` 签名后 `mv`
+- 32-bit Windows: `x86-windows-gnu` 绕过 MinGW `_system@4` linker warning
 
 ## 已删除的组件
 

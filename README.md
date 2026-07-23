@@ -7,6 +7,10 @@ tracking, no context switching. Just `utmm --exec linuxvm "..."` and you're in.
 MCP integration lets AI coding agents do the same — debug across Linux, macOS,
 and Windows VMs through natural language.
 
+**v0.8.0: Streaming exec + binary protocol** — HTTP exec uses chunked streaming
+with `x-exit-code` trailer, no JSON wrapping, no timeout. Upload/download use raw
+binary HTTP body with `x-vm`/`x-path` headers — zero JSON encoding overhead.
+
 **v0.7.0: Zero-shell auto-upgrade** — Guests detect new Host versions via UDP broadcast
 and self-upgrade through a separate `utmm-old` process. No external shell commands:
 `fork()+execve()` on POSIX, `std.process.spawn` on Windows. One binary, zero dependencies.
@@ -136,6 +140,10 @@ Guest (macvm)    ──WebSocket──┤──→ Host HTTP :2121 ── MCP /m
 Guest (windows)  ──WebSocket──┘                      ── CLI (--status, --exec)
 Guest (winx64)   ──WebSocket──┘                      ── Static files (/bin/ auto-upgrade)
 ```
+
+**v0.8.0 streaming exec**: `--exec` output streams in real time via HTTP chunked
+encoding. No 30s timeout — commands run as long as needed. Exit code in `x-exit-code`
+HTTP trailer. Upload/download use raw binary HTTP body — no JSON encoding.
 
 **v0.7.0 auto-upgrade**: Host broadcasts version via UDP every 60s. Guest UDP listener
 detects version mismatch, spawns `utmm-old` process which: stops service, kills old

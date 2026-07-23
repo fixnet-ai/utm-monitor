@@ -155,7 +155,7 @@ sudo utmm --host
 | "GuestNotFound" for a VM | VM is offline or name mismatch | Run `vm_status` to see which VMs are actually online |
 | WebSocket connection failed | Guest can't reach Host gateway | Guest auto-detects Host via default gateway; override with `--host-ip` |
 | MCP connection refused | Host daemon not running or old version | `sudo utmm --host` |
-| Command timeout after 30s | Guest disconnected or command hung | Check `vm_status`; use `--kick` then retry |
+| Command hangs or produces no output | Guest disconnected mid-command or shell dead | Check `vm_status`; use `--kick` then retry |
 
 **Fallback:** If MCP tools are unavailable, you can use the CLI directly:
 ```bash
@@ -169,7 +169,7 @@ utmm --exec linuxvm "uname -a"
 |------|------|
 | Host binary (symlink) | `/usr/local/bin/utmm` → `/opt/utmm/utmm` |
 | Host binary (actual) | `/opt/utmm/utmm` → `/opt/utmm/utmm-aarch64-macos` |
-| All platform binaries | `/opt/utmm/utmm-*` (6 binaries from utmm.zip) |
+| All platform binaries | `/opt/utmm/utmm-*` (8 binaries from utmm.zip) |
 | Host service plist | `/Library/LaunchDaemons/com.utmm.host.plist` |
 | Guest service plist | `/Library/LaunchDaemons/com.utmm.guest.plist` |
 | Host log | `/var/log/utmm-host.log` |
@@ -196,7 +196,7 @@ chmod +x /opt/utmm/utmm
 - `vm_exec` is non-interactive — you cannot run commands that require TTY input (nano, top, etc.)
 - VM IPs can change on reboot — always check `vm_status` first, don't cache IPs
 - Windows cmd.exe has different escaping rules than bash — test simple commands first
-- Command timeout is 30 seconds — if a command takes longer, it will time out
+- Commands stream output in real time — no fixed timeout, but if a command hangs, use `--kick` to force shell restart
 
 ### Q: `--download` fails with "Guest not found" but the Guest is online
 **A**: This happens when you use a full path like `/opt/utmm/file.txt` instead of just the filename `file.txt`. Use just the basename:
@@ -207,6 +207,9 @@ utmm --download linuxvm /opt/utmm/app.log ./app.log
 utmm --download linuxvm app.log ./app.log
 ```
 To download files from other directories, use `--exec` to copy them to `/opt/utmm/` first.
+
+> **v0.8.0**: Upload/download now use raw binary HTTP with `x-vm`/`x-path` headers —
+> no JSON wrapping. Verify integrity with MD5 after transfer.
 
 ## Deployment FAQs (from bare-metal validation)
 

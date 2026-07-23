@@ -10,7 +10,7 @@ echo "==> Running tests..."
 zig build test --summary all
 
 echo ""
-echo "==> Building all 7 targets..."
+echo "==> Building all 8 targets..."
 rm -rf release && mkdir -p release
 
 build_target() {
@@ -23,6 +23,7 @@ build_target() {
 
 build_target x86_64-windows       utmm-x86_64-windows.exe
 build_target aarch64-windows      utmm-aarch64-windows.exe
+build_target x86-windows-gnu      utmm-x86-windows.exe
 build_target x86_64-macos         utmm-x86_64-macos
 build_target aarch64-macos        utmm-aarch64-macos
 build_target x86-linux-musl       utmm-x86-linux

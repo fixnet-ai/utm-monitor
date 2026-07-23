@@ -1,6 +1,85 @@
-# Progress: v0.7.0
+# Progress: v0.8.0
 
-## Session 2026-07-23 (文档全面同步 — 与实际代码一致)
+## Session 2026-07-24 (文档全面同步 — v0.8.0)
+
+### 文档更新完成
+- **任务**: 将 v0.8.0 全部变更同步到 7 个项目文档 + 2 个 skill 文档
+- **修改文件**:
+
+| 文件 | 改动 |
+|------|------|
+| `task_plan.md` | +Phase 20 v0.8.0 streaming exec + binary upload/download + 8-target build + AMFI codesign |
+| `progress.md` | +v0.8.0 session log (本文件) |
+| `findings.md` | +v0.8.0 findings: AMFI /tmp signing, sendBodiless panic, x86-windows-gnu, binary HTTP headers |
+| `CLAUDE.md` | +v0.8.0 streaming exec 数据流, +binary upload/download protocol, +x86-windows-gnu build, +HTTP header helpers |
+| `README.md` | v0.7.0 → v0.8.0 版本引用, +streaming exec + binary protocol 描述 |
+| `utm-vm/MANUAL.md` | +streaming exec (chunked, x-exit-code trailer, 无 30s 超时), +binary upload/download 协议, +8 构建目标, +AMFI /tmp codesign |
+| `utm-vm/SKILL.md` | -30s timeout 限制, +binary protocol 上传/下载说明 |
+| `.claude/skills/release/SKILL.md` | 6→8 目标, +x86-windows-gnu workaround |
+
+## Session 2026-07-23 (v0.8.0 Streaming Exec + Binary Upload/Download)
+
+### v0.8.0 发布
+- **版本号**: 0.7.0 → 0.8.0 (`ver.zig`)
+- **Commit**: `4a69ceb` (功能提交), 文档提交待推送
+- **改动**: host_http.zig 重写 exec/upload/download handler, host.zig CLI upload/download 重写, release skill 8 目标
+
+**核心变更**:
+
+1. **Streaming Exec (HTTP chunked response)**:
+   - `handleExec` 从 `{"exit_code":0,"stdout":"..."}` JSON 包装改为 chunked streaming 纯文本
+   - `respondStreaming()` + `x-exit-code` HTTP trailer 传递退出码
+   - 移除 30s 超时 — 长时间命令不再被截断
+   - `OpState` 新增 `sent_pos` 字段，追踪已发送输出位置
+   - `body_reader.stream()` + `std.Io.Limit.limited(n)` 读取原始请求体
+
+2. **Binary Upload Protocol**:
+   - `x-vm` + `x-path` 自定义请求头，`Content-Type: application/octet-stream`
+   - `readRawBody()` helper: content-length 驱动的原始 body 读取
+   - `getRequestHeader()` helper: `request.iterateHeaders()` 不区分大小写匹配
+   - `sendBodyComplete(file_data)` 发送原始二进制
+   - 响应纯文本，不再 JSON 包装
+
+3. **Binary Download Protocol**:
+   - `x-vm` + `x-path` 请求头，`sendBodyComplete("")` 发送空 body
+   - `respondStreaming()` 流式 chunked 响应 + `x-exit-code` trailer
+   - CLI 端 `body_reader.stream(file_iface, ...)` 流式写文件
+
+4. **8-Target Release Build**:
+   - 新增 `x86-windows-gnu` 作为第 8 个构建目标
+   - 绕过 `x86-windows` (MSVC) MinGW linker warning (`_system@4`)
+   - `release-skill/build.sh` + `SKILL.md` 更新
+
+**Bug 修复**:
+
+| Bug | 根因 | 修复 |
+|-----|------|------|
+| macOS AMFI codesign 在 `/opt/utmm/` 失败 | AMFI 对 `/opt/utmm/` 中无签名二进制 SIGKILL；`codesign -s - -f` 在该目录报 "internal error in Code Signing subsystem" | 在 `/tmp/utmm-sign` 签名后 `mv` 到 `/opt/utmm/` — mv 保留有效签名 |
+| `sendBodiless()` panic | `Client.zig:914` — `r.connection.?.flush()` 返回 error 不在 `Writer.Error` 集合中 → `unreachable` | 改用 `sendBodyComplete("")` |
+| `x86-windows` linker error | MinGW `_system@4` warning 被 Zig 提升为 error | 改用 `x86-windows-gnu` target triple |
+| `catch break` ambiguity | 在 `blk: {}` 标记块内 `catch break` 编译失败 | `break :blk @as(?Type, null)` |
+| Chunked encoding 数据未 flush | `http.BodyWriter.flush()` 前必须调用 `writer.flush()` | `writer.flush()` 先于 `flush()` |
+
+**修改文件**:
+| 文件 | 改动 |
+|------|------|
+| `src/host_http.zig` | +readRawBody, +getRequestHeader, 重写 handleExec (streaming), 重写 handleUpload (binary), 重写 handleDownload (streaming chunked) |
+| `src/host.zig` | cmdUpload 重写 (x-vm + x-path headers + sendBodyComplete), cmdDownload 重写 (streaming response + x-exit-code trailer) |
+| `src/httpd.zig` | OpState +sent_pos field |
+| `src/ver.zig` | 0.7.0 → 0.8.0 |
+| `build.zig.zon` | 版本同步 |
+| `.claude/skills/release/build.sh` | +x86-windows-gnu, 注释 7→8 |
+| `.claude/skills/release/SKILL.md` | 6→8 targets, +x86-windows-gnu note |
+
+**构建验证**: `zig build test` 全过，8 目标交叉编译 (ReleaseSafe) 全过
+
+**部署验证**:
+- linuxvm (aarch64-linux): 上线、streaming exec、binary upload/download MD5 验证通过
+- macvm (aarch64-macos): AMFI codesign 修复后上线，全部功能验证通过
+- windowsvm (aarch64-windows): 全部功能验证通过
+- winx64 (x86_64-windows): 全部功能验证通过
+
+**Host 状态**: launchd 管理 (pid 84272, ppid 1)，`sudo launchctl bootstrap system` 自动重启
 
 ### 文档更新完成
 - **任务**: 根据实际架构、代码、CLI 参数、运行模式，更新全部文档保持同步正确
