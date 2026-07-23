@@ -1,4 +1,24 @@
-# Progress: v0.8.1+
+# Progress: v0.8.2
+
+## Session 2026-07-24 (v0.8.2 发布 + 全文档同步)
+
+### v0.8.2 发布
+- **版本号**: 0.8.1 → 0.8.2 (`ver.zig`, `build.zig.zon`)
+- **Commit**: `65743ff` → tag `v0.8.2`
+- **Release**: GitHub Release + utmm.zip (8 目标, 13MB)
+- **部署**: Host + 4 台机器全部 v0.8.2
+
+**changelog**:
+- auto-upgrade 阻塞读取修复 (POSIX poll + Windows timer)
+- CLAUDE.md / README.md / SKILL.md / MANUAL.md 去版本号化
+- findings.md Known Issues 更新
+- test_all.sh sshpass 软依赖
+- release-skill/build.sh 注释修正 + native 重建
+
+### 文档全同步
+- README.md: 移除功能描述中的版本标记
+- utm-vm/SKILL.md: 移除 4 处版本标记
+- utm-vm/MANUAL.md: 功能描述去版本标记，示例版本更新至 v0.8.2
 
 ## Session 2026-07-24 (文档消噪 + Auto-Upgrade 修复)
 

@@ -40,7 +40,7 @@ auto-syncs VM IPs to `/etc/hosts`, so hostnames like `linuxvm` always resolve.
   - Windows: `cmd.exe`
 - The utmm version running on each VM
 
-> **Persistent shell session (v0.5.0)**: Each Guest runs a persistent shell via pty.
+> **Persistent shell session**: Each Guest runs a persistent shell via pty.
 > Commands execute in the same shell session — `cd /tmp` then `pwd` shows `/tmp`.
 > `export FOO=bar` then `echo $FOO` shows `bar`. The shell lives for the WebSocket
 > connection lifetime.
@@ -76,7 +76,7 @@ Ask the user whether the VMs are booted and the Host is running.
 | Windows tasklist | `vm_exec("windowsvm", "tasklist \| findstr utm")` |
 | macOS version | `vm_exec("macvm", "sw_vers")` |
 
-**Shell persistence (v0.5.0) — cd and export now work across calls:**
+**Shell persistence — cd and export work across calls:**
 
 | Task | Example |
 |------|---------|
@@ -208,7 +208,7 @@ utmm --download linuxvm app.log ./app.log
 ```
 To download files from other directories, use `--exec` to copy them to `/opt/utmm/` first.
 
-> **v0.8.0**: Upload/download now use raw binary HTTP with `x-vm`/`x-path` headers —
+> Upload/download use raw binary HTTP with `x-vm`/`x-path` headers —
 > no JSON wrapping. Verify integrity with MD5 after transfer.
 
 ## Deployment FAQs (from bare-metal validation)

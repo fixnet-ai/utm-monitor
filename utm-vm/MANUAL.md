@@ -18,7 +18,7 @@
 
 UTM virtual machines obtain IP addresses via DHCP, and the IP may change after every reboot or network change. Manually maintaining IP mappings in the Host `/etc/hosts` is tedious. This tool implements **fully automatic IP discovery and synchronization**: Guests automatically announce their IP to the Host upon startup, and the Host automatically updates `/etc/hosts` — no manual intervention required.
 
-Since v0.7.0, Guests also **auto-upgrade** themselves: the Host broadcasts its version via UDP every 60s; Guests detect a mismatch, spawn a separate `utmm-old` process, and self-upgrade without any external shell commands or dependencies.
+Guests also **auto-upgrade** themselves: the Host broadcasts its version via UDP every 60s; Guests detect a mismatch, spawn a separate `utmm-old` process, and self-upgrade without any external shell commands or dependencies.
 
 ### 1.2 Operating Modes
 
@@ -104,7 +104,7 @@ Guest opens a persistent WebSocket connection to Host. All communication uses **
 
 > **Wire values 2,3,8,9,10,11 are reserved/deprecated** — removed in v0.5.0 when pty session model replaced per-command exec model. Current wire values: announce=1, upload=4-7, pty=12-16.
 
-**pty Session Model (v0.5.0)**: On WebSocket connect, Guest spawns a persistent shell
+**pty Session Model**: On WebSocket connect, Guest spawns a persistent shell
 via `posix_openpt` (POSIX) or `CreatePipe` (Windows). Commands are fed via pty_input
 and output arrives via pty_output. A `MDELIM:$?\n` (POSIX) or `MDELIM:%errorlevel%\r\n`
 (Windows) exit-code marker is appended to each command for completion detection.
@@ -138,11 +138,11 @@ CLI management commands use standard HTTP:
 CLI commands send HTTP to `127.0.0.1:2121`. Host communicates with Guest via WebSocket
 for actual command execution.
 
-**v0.8.0 streaming exec**: `POST /exec` returns chunked streaming plain text —
+**Streaming exec**: `POST /exec` returns chunked streaming plain text —
 output arrives in real time as the command runs. Exit code is delivered via
 `x-exit-code` HTTP trailer. No timeout — commands run as long as needed.
 
-**v0.8.0 binary upload/download**: `POST /upload` and `POST /download` use
+**Binary upload/download**: `POST /upload` and `POST /download` use
 custom HTTP headers `x-vm` (target VM hostname) and `x-path` (file path on guest).
 Body is raw binary (`application/octet-stream`) — no JSON wrapping.
 Download response is chunked streaming with `x-exit-code` trailer.
@@ -164,11 +164,11 @@ Guest compares Host version with its own; if different, triggers self-upgrade.
 Old-format broadcasts ("ARE YOU OK?\r\n" without a version line) are backward-compatible:
 Guests still respond but won't trigger auto-upgrade.
 
-#### Auto-Upgrade Flow (v0.7.0)
+#### Auto-Upgrade Flow
 
 ```
-1. Host periodicBroadcastLoop: UDP "ARE YOU OK?\r\n0.7.1\r\n" to all subnets (every 60s)
-2. Guest udpDiscoveryListener: parseDiscoveryVersion → "0.7.1" != "0.7.0" → set upgrade.needed
+1. Host periodicBroadcastLoop: UDP "ARE YOU OK?\r\n0.8.2\r\n" to all subnets (every 60s)
+2. Guest udpDiscoveryListener: parseDiscoveryVersion → "0.8.2" != "0.8.1" → set upgrade.needed
 3. Guest wsAnnounceLoop: detect upgrade.needed flag
 4. Guest triggerSelfUpgrade:
    - Copy current exe → utmm-old[.exe] (same directory)
@@ -491,7 +491,7 @@ utmm --gen-init windows
 # Shows sc create command for manual setup
 ```
 
-> Since v0.7.0, --install on Windows creates a proper Windows service (`UTM-Monitor-Guest`) via `sc create`, not a scheduled task. The service runs in its own session, survives SSH disconnect, and starts automatically on boot.
+> On Windows, --install creates a proper Windows service (`UTM-Monitor-Guest`) via `sc create`, not a scheduled task. The service runs in its own session, survives SSH disconnect, and starts automatically on boot.
 
 ### 3.5 Start Host Service
 
@@ -513,7 +513,7 @@ After starting, the following output indicates normal operation:
 ```
 [host] HTTP server on 0.0.0.0:2121
 [host] Serve dir: /opt/utmm
-[ws] Guest linuxvm connected (192.168.64.2 v0.7.0)
+[ws] Guest linuxvm connected (192.168.64.2 v0.8.2)
 [host-http] /etc/hosts synced (1 guests)
 ```
 
@@ -595,10 +595,10 @@ Example output:
 ```
 Hostname         Target             IP               MAC                Version    Shell
 -------------------------------------------------------------------------------------
-linuxvm          aarch64-linux-musl 192.168.64.2     16:a0:6c:ba:ae:fa  v0.7.0     /bin/bash
-macvm            aarch64-macos      192.168.64.4     1a:97:6d:38:0c:6c  v0.7.0     /bin/zsh
-windowsvm        aarch64-windows    192.168.65.2     66:DC:DA:EC:A1:59  v0.7.0     cmd.exe
-winx64           x86_64-windows     192.168.3.x      00:FF:4D:91:87:0B  v0.7.0     cmd.exe
+linuxvm          aarch64-linux-musl 192.168.64.2     16:a0:6c:ba:ae:fa  v0.8.2     /bin/bash
+macvm            aarch64-macos      192.168.64.4     1a:97:6d:38:0c:6c  v0.8.2     /bin/zsh
+windowsvm        aarch64-windows    192.168.65.2     66:DC:DA:EC:A1:59  v0.8.2     cmd.exe
+winx64           x86_64-windows     192.168.3.x      00:FF:4D:91:87:0B  v0.8.2     cmd.exe
 ```
 
 #### Execute Commands on a Specific VM
@@ -631,7 +631,7 @@ utmm --upload ./local_file linuxvm
 utmm --download linuxvm remote_file ./local_file
 ```
 
-> **v0.8.0 binary protocol**: Upload/download use raw binary HTTP body with
+> **Binary protocol**: Upload/download use raw binary HTTP body with
 > `x-vm` and `x-path` custom headers — no JSON encoding overhead. Download
 > streams via chunked transfer encoding with `x-exit-code` trailer for error
 > reporting. Verify with MD5: `utmm --exec linuxvm "md5sum file.txt"`.
@@ -660,7 +660,7 @@ To release a new version:
 
 ```bash
 # 1. Bump ver.zig
-echo 'pub const VERSION = "0.7.1";' > src/ver.zig
+echo 'pub const VERSION = "0.8.2";' > src/ver.zig
 
 # 2. Build all 8 targets (or use release-skill/build.sh)
 zig build -Doptimize=ReleaseSafe
@@ -1135,7 +1135,7 @@ curl -s -X POST http://127.0.0.1:2121/mcp \
     → vm_exec("macvm", "cd /opt && ./utmm --version")
     → vm_exec("windowsvm", "C:\\opt\\utmm.exe --version")
     → vm_exec("winx64", "C:\\opt\\utmm.exe --version")
-    All four return v0.7.0 ✓
+    All four return v0.8.2 ✓
 ```
 
 #### Debugging a specific VM

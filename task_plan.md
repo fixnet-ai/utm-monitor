@@ -303,7 +303,10 @@ v0.8.0: HTTP 层性能优化 — exec 输出流式传输（chunked + trailer）�
 - [x] 测试通过 + 交叉编译验证
 - **Status:** complete
 
-### Phase 24: 待处理
-- [ ] Host LaunchDaemon serve_dir 默认解析修复
-- [ ] test_all.sh sshpass 依赖问题
-- [ ] 构建/发布脚本化 (release.sh)
+### Phase 24: v0.8.2 发布 ✅
+- [x] Host serve_dir 验证正常（无需修复）
+- [x] test_all.sh sshpass → 软依赖（密钥认证优先，sshpass 可选）
+- [x] release-skill/build.sh 注释修正 + native 重建
+- [x] 全 .md 文档版本引用同步至 v0.8.2
+- [x] GitHub Release + 全部 4 台机器部署
+- **Status:** complete

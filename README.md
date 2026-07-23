@@ -131,7 +131,7 @@ utmm --exec linuxvm "uname -a"     # Command (streaming output, no timeout)
 utmm --exec linuxvm "gdb ..."      # Attach debugger
 utmm --exec macvm "lldb ..."       # Same on macOS
 utmm --exec windowsvm "dir"        # Windows commands too
-utmm --upload build.zip linuxvm    # Push a build (raw binary, v0.8.0)
+utmm --upload build.zip linuxvm    # Push a build (raw binary)
 utmm --download linuxvm core ./    # Pull a core dump (streaming binary)
 utmm --kick linuxvm                # Force shell restart
 utmm --version                     # Print version
@@ -153,9 +153,9 @@ Guest (raspigw, LAN) ──WebSocket──┘                      ── Static
                          │   + periodic version broadcast (auto-upgrade trigger)
 ```
 
-- **Streaming exec** (v0.8.0): output flows in real time via HTTP chunked encoding with
+- **Streaming exec**: output flows in real time via HTTP chunked encoding with
   `x-exit-code` trailer. No JSON wrapping, no timeout. Upload/download use raw binary body.
-- **Auto-upgrade** (v0.7.0): Host broadcasts version via UDP every 60s. Guest detects
+- **Auto-upgrade**: Host broadcasts version via UDP every 60s. Guest detects
   mismatch, spawns `utmm-old` process to stop→download→replace→restart. Zero shell commands.
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
 - **Single port**: HTTP + WebSocket + MCP + binary serving all on 2121
