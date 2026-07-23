@@ -204,6 +204,13 @@
 - 不依赖外部工具，Zig `std.http.Client` 完成 HTTP 下载
 - **零外部命令**: chmod/detached launch 全部走直接系统调用（`std.c.chmod` / `fork+execve` / `CreateProcessW`），`sh`/`cmd` 不再参与升级流程
 
+### Phase 19: 文档全面同步 ✅ (2026-07-23)
+- [x] **CLAUDE.md**: +MODASIAIPC, +v0.7.0 自动升级架构, +UDP 数据流, +upgrade.zig, +全部 CLI 标志
+- [x] **README.md**: 完全重写 — v0.7.0 零 shell 自动升级, 4 VM 参考表, UDP 广播数据流图
+- [x] **utm-vm/SKILL.md**: +MODASIAIPC, +SSH 访问, MCP 配置更新
+- [x] **utm-vm/MANUAL.md**: 完全重写 — 修正 WS 协议帧号, +自动升级架构, 修正全部服务名, +MODASIAIPC, +x86_64, +MCP 完整章节
+- **Status:** complete
+
 ## 已删除的组件
 
 | 组件 | 行数 | 替代 |

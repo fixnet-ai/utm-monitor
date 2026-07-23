@@ -25,6 +25,9 @@ auto-syncs VM IPs to `/etc/hosts`, so hostnames like `linuxvm` always resolve.
 | `linuxvm` | Linux | aarch64 | root / 111 | `/opt/utmm/` |
 | `macvm` | macOS | aarch64 | root / 111 | `/opt/utmm/` |
 | `windowsvm` | Windows | aarch64 | Administrator / 111 | `C:\opt\utmm\` |
+| `MODASIAIPC` | Windows | x86_64 | Administrator / 111 | `C:\opt\utmm\` |
+
+> **SSH access**: `Administrator@192.168.3.108` (MODASIAIPC, key auth), `modasi@192.168.3.108` (MODASIAIPC, key auth).
 
 ## Two MCP Tools
 
@@ -143,6 +146,7 @@ sudo utmm --host
 
 ```json
 {"mcpServers": {"utm-monitor": {"type": "streamableHttp", "url": "http://127.0.0.1:2121/mcp"}}}
+# Or use claude mcp add: claude mcp add utm-monitor --transport streamableHttp http://127.0.0.1:2121/mcp
 ```
 
 | Symptom | Likely cause | Action |

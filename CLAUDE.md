@@ -10,17 +10,22 @@ UTM Monitor (`utmm`) — helper tool for UTM virtual machines. UTM VM IPs change
 frequently; this program notifies the host of each guest's real IP at all times.
 Single Zig binary, dual mode (Guest default, Host with `--host`).
 
+**v0.7.0 auto-upgrade**: Guests detect new Host versions via UDP broadcast and
+self-upgrade through a separate `utmm-old` process. Upgrade uses `fork()+execve()`
+(POSIX) or `std.process.spawn` (Windows) — zero external shell commands.
+
 **v0.5.0 pty session model**: Each Guest WebSocket connection spawns a persistent
 shell (POSIX `posix_openpt` / Windows `CreatePipe`). Commands run in the same
 shell session — `cd`, `export`, and shell history survive across `--exec` calls.
 Completion detected via `MDELIM:$?\n` exit-code markers in pty output.
 
-Current configuration — three VMs have their IPs written to `/etc/hosts`:
+Current configuration — four VM targets tracked:
 | VM | Hostname | OS | IP | Credentials | App Path |
 |----|----------|-----|----|-------------|----------|
 | macOS | macvm | aarch64-macos | 192.168.64.4 | root / 111 | /opt/utmm/ |
 | Linux | linuxvm | aarch64-linux-musl | 192.168.64.2 | root / 111 | /opt/utmm/ |
 | Windows | windowsvm | aarch64-windows | 192.168.65.2 | Administrator / 111 | C:\opt\utmm\ |
+| Windows | MODASIAIPC | x86_64-windows | 192.168.3.108 | Administrator / 111 | C:\opt\utmm\ |
 
 ## Architecture Design
 
@@ -29,19 +34,24 @@ Current configuration — three VMs have their IPs written to `/etc/hosts`:
 - **Guest mode (default)**: Foreground mode — stops background service, runs in
   terminal, restarts service on exit. `--svc`: daemon mode (WebSocket + pty shell).
   `--install --user`: desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
+  `--version`: print version. `--update-url`: upgrade mode (internal, launched by `utmm-old`).
 - **Host mode (`--host`)**: Unified HTTP server on port 2121 — guest registration
   (WebSocket + HTTP announce), management commands (exec/upload/download/kick),
-  MCP JSON-RPC, static file serving (/bin/), and /etc/hosts sync. All on one port.
+  MCP JSON-RPC, static file serving (/bin/), /etc/hosts sync, auto-upgrade
+  binary serving, and periodic UDP version broadcast. All on one port.
 
 ### Complete Data Flow
 
 ```
                          ┌── MCP HTTP /mcp (JSON-RPC) ← AI Agent
 Guest (macvm)    ──WebSocket──┐
-Guest (linuxvm)  ──WebSocket──┤──→ Host HTTP :2121 ──┼── GET /bin/ (static files)
+Guest (linuxvm)  ──WebSocket──┤──→ Host HTTP :2121 ──┼── GET /bin/ (static files + auto-upgrade)
 Guest (windows)  ──WebSocket──┘                      ├── POST /exec, /upload, /download
                          ┌── HTTP POST /announce ────┘   (CLI management commands)
                          │   (backward compat)        └── /etc/hosts sync
+                         │                            └── UDP broadcast (version + discovery)
+                         │
+Guest UDP listener ←── UDP broadcast ──┘  (version check → auto-upgrade trigger)
 ```
 
 ### How a Command Flows (pty model)
@@ -90,7 +100,7 @@ All handlers share one `HostState` instance, mutex-protected:
 ### Key Design Decisions
 
 - Single binary, dual mode — reduced maintenance
-- Unified port 2121 for HTTP, WebSocket, MCP — replaced UDP + separate MCP port
+- Unified port 2121 for HTTP, WebSocket, MCP, binary serving — replaced UDP + separate MCP port
 - **Persistent pty per WebSocket**: POSIX `posix_openpt` + fork + setsid + execve,
   Windows `CreatePipe` + `CreateProcessW("cmd.exe /k")`
 - **MDELIM markers**: `; echo MDELIM:$?\n` appended to each command. Host-side
@@ -98,6 +108,10 @@ All handlers share one `HostState` instance, mutex-protected:
   (where pty master doesn't support tcsetattr ECHO disable)
 - Connection = Shell Session: kick closes WebSocket → pty killed → guest reconnects
   with fresh shell
+- **Auto-upgrade via UDP broadcast**: Host broadcasts version every 60s via UDP.
+  Guest `udpDiscoveryListener` detects mismatch, spawns `utmm-old` process which
+  stops service, kills old processes, downloads new binary via HTTP, replaces, restarts.
+  Zero external shell commands — `fork()+execve()` (POSIX) / `std.process.spawn` (Windows).
 - `std.http.Server` with `std.Thread` per-connection concurrency
 - Zero external dependencies: no Node.js, Python, SSH, curl
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
@@ -108,10 +122,11 @@ All handlers share one `HostState` instance, mutex-protected:
 ```bash
 zig build                    # Native build → zig-out/bin/utmm
 zig build -Dtarget=aarch64-linux-musl    # → zig-out/bin/utmm-aarch64-linux
-zig build -Dtarget=aarch64-macos         # → zig-out/bin/utmm-aarch64-macos
-zig build -Dtarget=aarch64-windows       # → zig-out/bin/utmm-aarch64-windows.exe
 zig build -Dtarget=x86_64-linux-musl     # → zig-out/bin/utmm-x86_64-linux
+zig build -Dtarget=x86-linux-musl        # → zig-out/bin/utmm-x86-linux
+zig build -Dtarget=aarch64-macos         # → zig-out/bin/utmm-aarch64-macos
 zig build -Dtarget=x86_64-macos          # → zig-out/bin/utmm-x86_64-macos
+zig build -Dtarget=aarch64-windows       # → zig-out/bin/utmm-aarch64-windows.exe
 zig build -Dtarget=x86_64-windows        # → zig-out/bin/utmm-x86_64-windows.exe
 ```
 
@@ -128,23 +143,36 @@ zig build test
 utmm                                # Foreground (stop service, run, restart on exit)
 utmm --hostname myvm --port 2121   # Custom parameters
 utmm --svc                          # Daemon mode (for systemd/launchd/sc)
-utmm --install                      # Install system service
-utmm --install --user               # Create desktop shortcut
+utmm --host-ip IP                   # Override Host IP (default: auto-detect via gateway)
+utmm --log-file PATH                # Log file path
+utmm --version                      # Print version and exit
+utmm --install                      # Install as system service (Guest: --svc + auto-start)
+utmm --install --user               # Create desktop shortcut for foreground launcher
+utmm --uninstall                    # Remove system service
 utmm --uninstall --user             # Remove desktop shortcut
 ```
 
 ### Host Runtime
 ```bash
-sudo utmm --host                    # Start HTTP server :2121
-utmm --host --install               # Install as system service
+sudo utmm --host                    # Start HTTP server :2121 (foreground)
+utmm --host --port 2122             # Custom port
+utmm --host --serve-dir PATH        # Static file serve directory (default: exe dir)
+utmm --host --hosts-file PATH       # hosts file path (default /etc/hosts)
+utmm --host --marker TAG            # hosts marker comment text
+utmm --host --config PATH           # Config file path
+utmm --host --log-file PATH         # Log file path
+utmm --host --install               # Install as system service (Host mode)
 utmm --host --uninstall             # Remove system service
+utmm --host --save-config           # Save current parameters to config file
 
 # Management Commands (HTTP to 127.0.0.1:2121)
-utmm --status                       # All guest status
+utmm --status                       # All guest status (UDP broadcast discovery)
 utmm --exec linuxvm "uname -a"      # Remote exec (pty, env/cd persist)
 utmm --kick linuxvm                 # Kill guest shell, force reconnect
 utmm --upload file.txt linuxvm      # Upload file
 utmm --download linuxvm f.txt ./f.txt  # Download file
+utmm --gen-init linux               # Generate auto-start script (linux/macos/windows)
+utmm --version                      # Print version and exit
 ```
 
 ## Project File Structure
@@ -152,18 +180,19 @@ utmm --download linuxvm f.txt ./f.txt  # Download file
 ```
 src/
 ├── main.zig           # Entry point, CLI parsing, mode dispatch, Windows service
-├── ver.zig            # Single source of truth for version
-├── protocol.zig       # Text protocol constants, deployment filename mapping
+├── ver.zig            # Single source of truth for version (bump to trigger auto-upgrade)
+├── protocol.zig       # Text protocol constants, UDP discovery, deployment filename mapping
 ├── wsproto.zig        # Binary WebSocket protocol: 10 msg types, build/parse
 ├── wsclient.zig       # Guest WebSocket client: TCP connect + HTTP upgrade + frame I/O
 ├── httpd.zig          # HTTP server core: accept loop + Router + HostState
 ├── host_http.zig      # HTTP endpoint handlers: /announce, /exec, /ws, /mcp, /bin/
-├── host.zig           # Host orchestration: cmd dispatch + HTTP server start
-├── guest.zig          # Guest entry: system info + wsAnnounceLoop start
-├── broadcast.zig      # Guest core: system info, ptySpawn, ptyReadLoop, wsAnnounceLoop
+├── host.zig           # Host orchestration: cmd dispatch + HTTP server start + periodic UDP broadcast
+├── guest.zig          # Guest entry: system info + UpgradeSignal + wsAnnounceLoop start
+├── broadcast.zig      # Guest core: system info, ptySpawn, ptyReadLoop, wsAnnounceLoop, triggerSelfUpgrade
+├── upgrade.zig        # Auto-upgrade: utmm-old process (stop→kill→download→replace→start)
 ├── hosts_file.zig     # /etc/hosts marked block read/write
 ├── mcp.zig            # MCP JSON-RPC: processJsonRpcWithState — reads HostState
-├── install.zig        # Service install/uninstall + desktop shortcuts
+├── install.zig        # Service install/uninstall + desktop shortcuts + --gen-init
 ├── agent.zig          # Foreground guest: stop service, run TTY, restart on exit
 └── config.zig         # Config persistence + file logger
 ```

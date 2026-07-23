@@ -1,12 +1,13 @@
 # UTM Monitor
 
 **Let AI agents manage your VMs.** Auto IP discovery, remote execution with shell
-persistence, file transfer — all through natural language via MCP. One zero-dependency
-Zig binary.
+persistence, file transfer, auto-upgrade — all through natural language via MCP.
+One zero-dependency Zig binary.
 
-**v0.6.0: LAN-wide UDP broadcast discovery** — `utmm --status` works from any machine
-on the LAN, not just the Host. Discovers real machines and VMs alike, across UTM bridge
-networks. Windows, macOS, Linux guests all supported.
+**v0.7.0: Zero-shell auto-upgrade** — Guests detect new Host versions via UDP broadcast
+and self-upgrade through a separate `utmm-old` process. No external shell commands:
+`fork()+execve()` on POSIX, `std.process.spawn` on Windows. Service stop/kill/download/
+replace/start — all in pure Zig.
 
 ## AI Agent Experience
 
@@ -22,7 +23,16 @@ Example prompts:
 - "Run `ls /opt/utmm` on linuxvm"
 - "Check disk space on all VMs"
 - "Is the macvm service running?"
-- "Attach lldb to my program on linuxvm, set a breakpoint at main, and show the backtrace"
+- "Deploy v0.7.0 to all VMs and verify auto-upgrade"
+
+## VM Access Reference
+
+| VM | Hostname | IP | SSH | utmm |
+|----|----------|-----|-----|------|
+| macOS | macvm | 192.168.64.4 | root@192.168.64.4 (pass: 111) | utmm --exec macvm |
+| Linux | linuxvm | 192.168.64.2 | root@192.168.64.2 (pass: 111) | utmm --exec linuxvm |
+| Windows ARM | windowsvm | 192.168.65.2 | Administrator@192.168.65.2 (pass: 111) | utmm --exec windowsvm |
+| Windows x64 | MODASIAIPC | 192.168.3.108 | Administrator@192.168.3.108 (key auth) | utmm --exec MODASIAIPC |
 
 ## One-Time Setup
 
@@ -42,7 +52,7 @@ Add to your MCP config (`~/.claude/mcp.json` or `.mcp.json` in project):
 {
   "mcpServers": {
     "utm-monitor": {
-      "type": "http",
+      "type": "streamableHttp",
       "url": "http://127.0.0.1:2121/mcp"
     }
   }
@@ -71,39 +81,46 @@ The Guest auto-discovers the Host via the default gateway.
 ## CLI Quick Reference
 
 ```bash
-utmm --status                  # All VM status
+utmm --status                  # All VM status (UDP broadcast discovery)
 utmm --exec linuxvm "uname -a" # Run command (pty shell, cd/export persist)
 utmm --exec windowsvm "dir"    # Windows commands auto-use cmd.exe
 utmm --upload file.txt linuxvm # Upload file
-utmm --download linuxvm /path ./local  # Download file
+utmm --download linuxvm path ./local  # Download file
 utmm --kick linuxvm            # Kill shell, force reconnect
+utmm --gen-init linux          # Generate auto-start script
+utmm --version                 # Print version
 ```
 
 ## How It Works
 
 ```
                          ┌── UDP broadcast discovery (--status, any LAN machine)
+                         │   + periodic version broadcast (auto-upgrade trigger)
                          │
 Guest (linuxvm)  ──WebSocket──┐
 Guest (macvm)    ──WebSocket──┤──→ Host HTTP :2121 ── MCP /mcp (AI agents)
 Guest (windows)  ──WebSocket──┘                      ── CLI (--status, --exec)
+Guest (MODASIAIPC)──WebSocket──┘                      ── Static files (/bin/ auto-upgrade)
 ```
+
+**v0.7.0 auto-upgrade**: Host broadcasts version via UDP every 60s. Guest UDP listener
+detects version mismatch, spawns `utmm-old` process which: stops service → kills old
+processes → HTTP downloads new binary → replaces on disk → starts service → exits.
+Zero external shell commands, pure Zig throughout.
 
 **v0.6.0 UDP broadcast discovery**: `utmm --status` sends subnet-directed UDP
 broadcasts to :2121. Each Guest runs a UDP listener that responds with its
-hostname, IP, OS, version, and shell type. Works from any machine on the LAN —
-not just the Host, and not limited to VMs. Real machines running the Guest
-binary appear alongside UTM VMs. No party needs to know anyone else's IP.
+hostname, IP, OS, version, and shell type. Works from any machine on the LAN.
 
 **v0.5.0 pty model**: Each guest WebSocket connection gets a persistent shell
 session. Commands run in the same shell — `cd /tmp` then `pwd` shows `/tmp`.
 `export FOO=bar` then `echo $FOO` shows `bar`.
 
 - **Zero dependencies**: pure Zig, no Node.js/Python/SSH/curl
-- **Single port**: HTTP + WebSocket + MCP all on 2121
+- **Single port**: HTTP + WebSocket + MCP + binary serving all on 2121
 - **Auto IP tracking**: /etc/hosts kept up to date
-- **Cross-platform**: macOS, Linux, Windows guests
-- **Auto-upgrade**: Host serves new binaries, guests self-upgrade
+- **Cross-platform**: macOS, Linux, Windows guests (aarch64 + x86_64)
+- **Auto-upgrade**: Host serves new binaries, guests self-upgrade via UDP version detection
 
 ## Docs
 
