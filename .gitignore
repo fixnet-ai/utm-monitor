@@ -1,34 +1,45 @@
-# Zig build artifacts
+# =============================================================================
+# UTM Monitor — .gitignore
+# =============================================================================
+
+# ── Zig build artifacts ──────────────────────────────────────────────────
 .zig-cache/
 zig-out/
 
-# Release artifacts (built locally or by CI)
+# ── Release artifacts ────────────────────────────────────────────────────
 release/
 utmm.zip
 
-# IDE
+# ── IDE / editor ─────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
-# OS
+# ── OS files ─────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 
-# Config
+# ── Local dev files (not tracked) ────────────────────────────────────────
 utm-monitor.conf
-
-# Local Claude Code config (mcp.json + skills symlinks)
-.claude/
-
 gw.txt
 mcp.json
 .playwright-mcp/
-test_write.o
-test_report.txt
 http-migration-plan.md
 
-# Project documentation (tracked in git)
-# task_plan.md, findings.md, progress.md, zig-codegen.md are now project docs
-test_*
+# ── Test outputs (generated at runtime, not tracked) ─────────────────────
+# test_all.sh produces test_report.txt; other test artifacts match test_*
+test_report.txt
+test_write.o
+
+# ── Claude Code local config ─────────────────────────────────────────────
+# .claude/ contains mcp.json symlinks + session data — local-only
+.claude/
+
+# ═════════════════════════════════════════════════════════════════════════
+# NOTE: test_all.sh is TRACKED (build verification script).
+#       task_plan.md, findings.md, progress.md are TRACKED (project docs).
+#       Do NOT add wildcard patterns that would ignore tracked files —
+#       git won't ignore them, but it creates confusion.
+# ═════════════════════════════════════════════════════════════════════════

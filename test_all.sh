@@ -2,7 +2,7 @@
 # =============================================================================
 # UTM Monitor — Comprehensive Cross-Platform Test Suite (v0.1.0+)
 # =============================================================================
-# Covers: build (7 targets), unit tests, --status, --exec,
+# Covers: build (8 targets), unit tests, --status, --exec,
 #         --upload/--download, HTTP API, Host/serve-dir, /etc/hosts,
 #         --install/--uninstall (SSH), --gen-init, MCP HTTP, musl verify.
 # =============================================================================
@@ -26,6 +26,7 @@ VERSION=$(awk '/pub const VERSION/ { gsub(/"/,"",$4); print $4 }' "$PROJECT_DIR/
 BUILD_TARGETS=(
     "x86_64-windows:utmm-x86_64-windows.exe"
     "aarch64-windows:utmm-aarch64-windows.exe"
+    "x86-windows-gnu:utmm-x86-windows.exe"
     "x86_64-macos:utmm-x86_64-macos"
     "aarch64-macos:utmm-aarch64-macos"
     "x86-linux-musl:utmm-x86-linux"
@@ -88,7 +89,7 @@ fi
 report ""
 
 # =============================================================================
-# PHASE 2: CROSS-COMPILE ALL 5 TARGETS
+# PHASE 2: CROSS-COMPILE ALL 8 TARGETS
 # =============================================================================
 report "━━━ PHASE 2: Cross-Compilation (8 targets) ━━━"
 report ""
@@ -194,7 +195,7 @@ report ""
 report "━━━ PHASE 5: VM Discovery (--status) ━━━"
 report ""
 
-STATUS_OUT=$("$HOST_BIN" --host --status 2>&1 || true)
+STATUS_OUT=$("$HOST_BIN" --status 2>&1 || true)
 report "$(echo "$STATUS_OUT" | head -20)"
 
 ONLINE_VMS=""
@@ -234,7 +235,7 @@ for vm in $ONLINE_VMS; do
         windowsvm)     cmd="ver" ;;
     esac
 
-    EXEC_OUT=$("$HOST_BIN" --host --exec "$vm" "$cmd" 2>&1 || true)
+    EXEC_OUT=$("$HOST_BIN" --exec "$vm" "$cmd" 2>&1 || true)
     if echo "$EXEC_OUT" | grep -qi "GuestNotFound\|exec failed\|refused"; then
         fail "--exec $vm" "$(echo "$EXEC_OUT" | head -1)"
     else
@@ -255,13 +256,13 @@ TEST_FILE="/tmp/utm-test-upload.txt"
 echo "$TEST_DATA" > "$TEST_FILE"
 
 for vm in $ONLINE_VMS; do
-    # Upload via built-in --upload (no curl needed)
-    if "$HOST_BIN" --host --upload "$TEST_FILE" "$vm" 2>&1 | grep -qi "OK"; then
-        # Download via built-in --download
+    # Upload via built-in --upload (raw binary HTTP, no JSON)
+    if "$HOST_BIN" --upload "$TEST_FILE" "$vm" 2>&1 | grep -qi "OK"; then
+        # Download via built-in --download (streaming binary, v0.8.0)
         DL_FILE="/tmp/utm-test-download-$vm.txt"
-        if "$HOST_BIN" --host --download "$vm" "test_upload.txt" "$DL_FILE" 2>&1 | grep -qi "OK"; then
+        if "$HOST_BIN" --download "$vm" "utm-test-upload.txt" "$DL_FILE" 2>&1; then
             if grep -q "UTM test suite" "$DL_FILE" 2>/dev/null; then
-                pass "--upload + --download $vm"
+                pass "--upload + --download $vm (binary protocol)"
             else
                 fail "--download $vm" "content mismatch"
             fi
@@ -303,20 +304,21 @@ for vm in $ONLINE_VMS; do
 done
 report ""
 
-# --- HTTP /exec ---
-report "9.1 HTTP POST /exec"
+# --- HTTP /exec (v0.8.0 streaming: raw text body, chunked response) ---
+report "9.1 HTTP POST /exec (streaming)"
 for vm in $ONLINE_VMS; do
     ip=$(vm_ip "$vm")
     case $vm in
-        linuxvm|macvm) cmd='{"cmd":"uname -m"}' ;;
-        windowsvm)     cmd='{"cmd":"echo ok"}' ;;
+        linuxvm|macvm) cmd_body="uname -m" ;;
+        windowsvm)     cmd_body="ver" ;;
     esac
 
-    EXEC=$(http_post "http://$ip:2121/exec" "$cmd" || echo "FAILED")
-    if [ "$EXEC" != "FAILED" ] && [ -n "$EXEC" ]; then
-        pass "HTTP /exec $vm"
+    # v0.8.0: POST raw command text, response is chunked streaming text+vx-exit-code trailer
+    EXEC=$(curl -s --connect-timeout 10 -X POST --data-binary "$cmd_body" -H "Content-Type: text/plain" "http://$ip:2121/exec" -o /dev/null -w "%{http_code}" 2>/dev/null || echo "000")
+    if [ "$EXEC" = "200" ]; then
+        pass "HTTP /exec $vm (HTTP $EXEC)"
     else
-        fail "HTTP /exec $vm" "no response"
+        fail "HTTP /exec $vm" "HTTP $EXEC"
     fi
 done
 report ""
@@ -347,7 +349,7 @@ report "━━━ PHASE 10: Init Script Generation (--gen-init) ━━━"
 report ""
 
 for plat in linux macos windows; do
-    INIT=$("$HOST_BIN" --host --gen-init "$plat" 2>&1 || true)
+    INIT=$("$HOST_BIN" --gen-init "$plat" 2>&1 || true)
     case $plat in
         linux)
             echo "$INIT" | grep -q "multi-user.target" \

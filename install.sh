@@ -30,7 +30,7 @@ print_help() {
     echo "Usage: install.sh [--guest [--hostname NAME] [--port PORT]] [--help]"
     echo ""
     echo "  (no args)    Install Host — download utmm.zip from GitHub Releases,"
-    echo "               extract all 7 platform binaries to /opt/utmm/, create symlinks"
+    echo "               extract all 8 platform binaries to /opt/utmm/, create symlinks"
     echo ""
     echo "  --guest      Install Guest — auto-detect arch/OS, download the correct"
     echo "               binary from Host HTTP at gateway:$HTTP_PORT, install service,"
@@ -109,28 +109,19 @@ if [ "$MODE" = "host" ]; then
     case "$HOST_OS" in
         darwin) HOST_OS="macos" ;;
         linux)  HOST_OS="linux" ;;
-        mingw*|msys*|cygwin*) HOST_OS="windows" ;;
         *) echo "Error: unsupported OS: $HOST_OS"; exit 1 ;;
     esac
 
     HOST_BIN="utmm-${HOST_ARCH}-${HOST_OS}"
-    if [ "$HOST_OS" = "windows" ]; then
-        HOST_BIN="${HOST_BIN}.exe"
-    fi
 
     # Create symlink: /opt/utmm/utmm -> utmm-{arch}-{os}
     echo "==> Creating symlink: $INSTALL_DIR/utmm -> $INSTALL_DIR/$HOST_BIN"
     sudo ln -sf "$INSTALL_DIR/$HOST_BIN" "$INSTALL_DIR/utmm"
-    if [ "$HOST_OS" = "windows" ]; then
-        sudo ln -sf "$INSTALL_DIR/$HOST_BIN" "$INSTALL_DIR/utmm.exe"
-    fi
 
-    # Convenience symlink to /usr/local/bin (macOS/Linux only)
-    if [ "$HOST_OS" != "windows" ]; then
-        sudo mkdir -p /usr/local/bin
-        sudo ln -sf "$INSTALL_DIR/utmm" /usr/local/bin/utmm
-        echo "==> Symlink: /usr/local/bin/utmm -> $INSTALL_DIR/utmm"
-    fi
+    # Convenience symlink to /usr/local/bin
+    sudo mkdir -p /usr/local/bin
+    sudo ln -sf "$INSTALL_DIR/utmm" /usr/local/bin/utmm
+    echo "==> Symlink: /usr/local/bin/utmm -> $INSTALL_DIR/utmm"
 
     echo ""
     echo "==> Host installation complete!"
@@ -170,7 +161,6 @@ GUEST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 case "$GUEST_OS" in
     darwin) GUEST_OS="macos" ;;
     linux)  GUEST_OS="linux" ;;
-    mingw*|msys*|cygwin*) GUEST_OS="windows" ;;
     *)
         echo "Error: unsupported OS: $GUEST_OS"
         echo "Supported: linux, macos"
@@ -260,13 +250,18 @@ fi
 
 # 7. Install binary (keep it with the deployment name, create utmm symlink)
 echo "==> Installing binary..."
-sudo mv "$TMP_BIN" "$INSTALL_DIR/$GUEST_BIN"
-sudo chmod +x "$INSTALL_DIR/$GUEST_BIN"
 # macOS: codesign is required for binaries run with sudo (launchd runs as root).
-# Binaries downloaded via curl lose their code signature, so AMFI kills them.
+# Binaries downloaded via curl lose their code signature, so AMFI sends SIGKILL.
+# Must sign in /tmp then mv — signing directly in /opt/utmm/ fails with
+# "internal error in Code Signing subsystem" due to SIP restrictions.
 if [ "$GUEST_OS" = "macos" ]; then
-    sudo codesign --force --sign - "$INSTALL_DIR/$GUEST_BIN" 2>/dev/null || true
+    cp "$TMP_BIN" /tmp/utmm-sign
+    sudo codesign --force --sign - /tmp/utmm-sign 2>/dev/null || true
+    sudo mv /tmp/utmm-sign "$INSTALL_DIR/$GUEST_BIN"
+else
+    sudo mv "$TMP_BIN" "$INSTALL_DIR/$GUEST_BIN"
 fi
+sudo chmod +x "$INSTALL_DIR/$GUEST_BIN"
 
 # 8. Create symlinks
 echo "==> Creating symlink: $INSTALL_DIR/utmm -> $INSTALL_DIR/$GUEST_BIN"

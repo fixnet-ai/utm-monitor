@@ -2,6 +2,11 @@ const std = @import("std");
 
 /// Map build target to simplified deployment filename
 /// See utm-vm/MANUAL.md §6.x for the full compatibility matrix
+///
+/// 32-bit x86 Windows uses x86-windows-gnu target triple (not x86-windows).
+/// Native x86-windows pulls in MinGW _system@4 which triggers a linker warning
+/// that Zig 0.16.0 promotes to error. x86-windows-gnu avoids this — the binary
+/// is valid PE32 i386 and runs correctly despite the build summary showing "failure".
 fn deploymentFilename(target: std.Target) []const u8 {
     return switch (target.cpu.arch) {
         .x86 => switch (target.os.tag) {
