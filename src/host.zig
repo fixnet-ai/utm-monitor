@@ -217,7 +217,6 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
 }
 
 fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, cmd: []const u8) !void {
-    // HTTP client: POST /exec to Host
     var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
     defer client.deinit();
 
@@ -229,54 +228,70 @@ fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
     const body = try std.fmt.allocPrint(gpa, "{{\"vm\":\"{s}\",\"command\":\"{s}\"}}", .{ target, escaped_cmd });
     defer gpa.free(body);
 
-    var resp_buf: [65536]u8 = undefined;
-    var resp_writer: std.Io.Writer = .fixed(&resp_buf);
+    var redirect_buf: [4096]u8 = undefined;
+    var transfer_buf: [4096]u8 = undefined;
 
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body,
+    const uri = std.Uri.parse(url) catch |err| {
+        std.debug.print("[exec] Bad URL: {s}\n", .{url});
+        return err;
+    };
+
+    var req = client.request(.POST, uri, .{
         .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .response_writer = &resp_writer,
         .keep_alive = false,
     }) catch |err| {
         std.debug.print("[exec] HTTP request failed: {} — is Host running?\n", .{err});
         return err;
     };
+    defer req.deinit();
 
-    const resp_body = resp_writer.buffered();
-    if (result.status != .ok) {
-        std.debug.print("[exec] Error: {s}\n", .{resp_body});
+    req.sendBodyComplete(body) catch |err| {
+        std.debug.print("[exec] sendBody failed: {}\n", .{err});
+        return err;
+    };
+
+    var response = req.receiveHead(&redirect_buf) catch |err| {
+        std.debug.print("[exec] receiveHead failed: {}\n", .{err});
+        return err;
+    };
+
+    if (response.head.status != .ok) {
+        var err_body_buf: [4096]u8 = undefined;
+        var err_reader = response.reader(&err_body_buf);
+        const err_line = err_reader.takeDelimiter('\n') catch null orelse "unknown error";
+        std.debug.print("[exec] Error ({d}): {s}\n", .{ @intFromEnum(response.head.status), err_line });
         return error.ExecFailed;
     }
 
-    // Parse result JSON
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, resp_body, .{ .allocate = .alloc_always }) catch {
-        std.debug.print("{s}", .{resp_body});
-        return;
-    };
-    defer parsed.deinit();
+    // Stream response body to stdout in real-time
+    var body_reader = response.reader(&transfer_buf);
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(block_io, &stdout_buf);
+    const stdout = &stdout_writer.interface;
 
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else => {
-            std.debug.print("{s}", .{resp_body});
-            return;
-        },
-    };
+    // Pump chunks from HTTP body to stdout until EOF
+    while (true) {
+        const n = body_reader.stream(stdout, std.Io.Limit.limited(4096)) catch |err| {
+            std.debug.print("[exec] read error: {}\n", .{err});
+            break;
+        };
+        if (n == 0) break;
+        stdout.flush() catch {};
+    }
+    stdout.flush() catch {};
 
-    if (obj.get("error")) |_| {
-        std.debug.print("[exec] Error: {s}\n", .{resp_body});
-        return error.ExecFailed;
+    // Parse x-exit-code from trailers
+    var exit_code: i32 = 0;
+    var trailers = response.iterateTrailers();
+    while (trailers.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "x-exit-code")) {
+            exit_code = std.fmt.parseInt(i32, h.value, 10) catch 0;
+        }
     }
 
-    const stdout_str = httpd.jsonGetString(obj, "stdout") orelse "";
-    const stderr_str = httpd.jsonGetString(obj, "stderr") orelse "";
-    const exit_code = httpd.jsonGetInt(obj, "exit") orelse 0;
-
-    if (stdout_str.len > 0) std.debug.print("{s}", .{stdout_str});
-    if (stderr_str.len > 0) std.debug.print("{s}", .{stderr_str});
-    if (exit_code != 0) std.process.exit(if (exit_code < 0) @as(u8, 1) else @intCast(exit_code));
+    if (exit_code != 0) {
+        std.process.exit(if (exit_code < 0) @as(u8, 1) else @intCast(exit_code));
+    }
 }
 
 fn cmdKick(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8) !void {

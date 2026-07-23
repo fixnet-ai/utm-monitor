@@ -86,6 +86,8 @@ pub const OpState = struct {
     output: std.ArrayList(u8),
     exit_code: i32 = -1,
     done: bool = false,
+    /// Bytes already sent to streaming HTTP response.
+    sent_pos: usize = 0,
 };
 
 pub const HostState = struct {
@@ -353,6 +355,12 @@ pub const HostState = struct {
         // so truncating at the marker position is safe.
         op.output.shrinkRetainingCapacity(pos);
 
+        // After shrinking, sent_pos might point past the new end.
+        // Clamp it so the streaming handler doesn't miss the remaining data.
+        if (op.sent_pos > op.output.items.len) {
+            op.sent_pos = op.output.items.len;
+        }
+
         op.exit_code = ec;
         op.done = true;
         // Wake HTTP/MCP handlers waiting on takeOpResult
@@ -391,6 +399,19 @@ pub const HostState = struct {
         }
 
         return .{ .stdout = stdout_owned, .exit = exit };
+    }
+
+    /// Remove an operation state entry, freeing all memory.
+    /// Safe to call on non-existent cmd_id (no-op).
+    pub fn cleanupOpState(self: *HostState, cmd_id: []const u8) void {
+        self.mutex.lock(self.io.?) catch return;
+        defer self.mutex.unlock(self.io.?);
+
+        if (self.op_states.fetchRemove(cmd_id)) |kv| {
+            var output = kv.value.output;
+            output.deinit(self.allocator);
+            self.allocator.free(kv.key);
+        }
     }
 
     /// Fail all pending operations (called on guest disconnect).

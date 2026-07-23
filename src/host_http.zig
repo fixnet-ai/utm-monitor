@@ -97,7 +97,7 @@ pub fn handleAnnounce(allocator: std.mem.Allocator, state: *httpd.HostState, req
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// POST /exec — Send command to guest via pty
+// POST /exec — Send command to guest via pty, stream output back
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
@@ -144,7 +144,7 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
             }
         }
         std.log.err("[exec] GuestNotFound: vm='{s}'", .{vm});
-        try respondJson(request, "{\"error\":\"GuestNotFound\"}");
+        try respondError(request, .not_found, "GuestNotFound");
         return;
     };
     defer allocator.free(guest_shell);
@@ -169,27 +169,117 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
 
     std.log.info("[exec] Enqueued pty cmd {s} for {s}", .{ cmd_id, vm });
 
-    // Wait for result — woken by WebSocket handler via wake_event
-    // 30s timeout prevents thread leak if guest disconnects
+    // Stream response using chunked transfer encoding
+    var stream_buf: [4096]u8 = undefined;
+    var body_writer = try request.respondStreaming(&stream_buf, .{
+        .respond_options = .{
+            .status = .ok,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+        },
+    });
+    // Track whether we called endChunked — defer fires end() only as fallback
+    var chunked_ended = false;
+
+    // Loop: write new output chunks as they arrive
     while (true) {
-        if (state.takeOpResult(cmd_id)) |result| {
-            defer allocator.free(result.stdout);
-            const escaped = try httpd.jsonEscape(allocator, result.stdout);
-            defer allocator.free(escaped);
-            const resp_json = try std.fmt.allocPrint(allocator,
-                "{{\"stdout\":\"{s}\",\"stderr\":\"\",\"exit\":{d}}}",
-                .{ escaped, result.exit },
-            );
-            defer allocator.free(resp_json);
-            try respondJson(request, resp_json);
+        // Check for new data under mutex
+        const new_chunk = blk: {
+            state.mutex.lock(state.io.?) catch {
+                break :blk @as(?[]const u8, null);
+            };
+            defer state.mutex.unlock(state.io.?);
+
+            const op = state.op_states.getPtr(cmd_id) orelse {
+                break :blk @as(?[]const u8, null);
+            };
+
+            if (op.output.items.len > op.sent_pos) {
+                const start = op.sent_pos;
+                op.sent_pos = op.output.items.len;
+                const data = allocator.dupe(u8, op.output.items[start..]) catch {
+                    break :blk @as(?[]const u8, null);
+                };
+                break :blk data;
+            }
+            break :blk @as(?[]const u8, null);
+        };
+
+        if (new_chunk) |chunk| {
+            defer allocator.free(chunk);
+            body_writer.writer.writeAll(chunk) catch |err| {
+                std.log.err("[exec] body write failed for {s}: {}", .{ cmd_id, err });
+                return;
+            };
+            // writer.flush() encodes the chunk → http_protocol_output
+            body_writer.writer.flush() catch |err| {
+                std.log.err("[exec] writer flush failed for {s}: {}", .{ cmd_id, err });
+                return;
+            };
+            // body_writer.flush() sends http_protocol_output → network
+            body_writer.flush() catch |err| {
+                std.log.err("[exec] body flush failed for {s}: {}", .{ cmd_id, err });
+                return;
+            };
+        }
+
+        const done_and_exit = blk: {
+            state.mutex.lock(state.io.?) catch {
+                break :blk @as(?i32, null);
+            };
+            defer state.mutex.unlock(state.io.?);
+
+            const op = state.op_states.getPtr(cmd_id) orelse {
+                break :blk @as(?i32, null);
+            };
+            if (op.done) {
+                break :blk op.exit_code;
+            }
+            break :blk @as(?i32, null);
+        };
+
+        if (done_and_exit) |exit_code| {
+            // One last check: scanForMarker may have stripped the marker
+            // after we last checked for data, leaving unsent data behind.
+            const final_chunk = blk: {
+                state.mutex.lock(state.io.?) catch break :blk @as(?[]const u8, null);
+                defer state.mutex.unlock(state.io.?);
+
+                const op = state.op_states.getPtr(cmd_id) orelse break :blk @as(?[]const u8, null);
+                if (op.output.items.len > op.sent_pos) {
+                    const start = op.sent_pos;
+                    op.sent_pos = op.output.items.len;
+                    const data = allocator.dupe(u8, op.output.items[start..]) catch break :blk @as(?[]const u8, null);
+                    break :blk data;
+                }
+                break :blk @as(?[]const u8, null);
+            };
+
+            if (final_chunk) |chunk| {
+                defer allocator.free(chunk);
+                body_writer.writer.writeAll(chunk) catch |err| {
+                    std.log.err("[exec] final write failed for {s}: {}", .{ cmd_id, err });
+                    return;
+                };
+                body_writer.writer.flush() catch {};
+                body_writer.flush() catch {};
+            }
+
+            // Write exit code as HTTP trailer
+            var exit_buf: [32]u8 = undefined;
+            const exit_str = std.fmt.bufPrint(&exit_buf, "{d}", .{exit_code}) catch "1";
+            chunked_ended = true;
+            body_writer.endChunked(.{ .trailers = &.{
+                .{ .name = "x-exit-code", .value = exit_str },
+            } }) catch |err| {
+                std.log.err("[exec] endChunked failed for {s}: {}", .{ cmd_id, err });
+            };
+            // Clean up op_state
+            state.cleanupOpState(cmd_id);
             return;
         }
-        // Wait with 30s timeout — failAllPendingOps will wake sooner on disconnect
-        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(30), .clock = .awake } }) catch |err| {
-            std.log.err("[exec] wait timeout for {s}: {}", .{ cmd_id, err });
-            try respondJson(request, "{\"error\":\"ExecTimeout\"}");
-            return;
-        };
+
+        // Wait for next chunk (woken by WebSocket handler on each pty_output)
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(3600), .clock = .awake } }) catch {};
         state.wake_event.reset();
     }
 }
@@ -637,6 +727,8 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
                     if (wsproto.parsePtyOutput(payload)) |out| {
                         state.appendOpOutput(out.cmd_id, out.data);
                         state.scanForMarker(out.cmd_id);
+                        // Wake streaming HTTP handlers even if marker not yet found
+                        state.wake_event.set(state.io.?);
                     }
                 },
                 @intFromEnum(wsproto.MsgType.upload_resp) => {
