@@ -187,7 +187,7 @@ const file = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = @enumFr
 | Old API | New API (0.16.0) |
 |--------|----------------|
 | `RunOptions.stdout = .pipe` | ❌ Field doesn't exist, stdout always piped |
-| `executablePath(allocator)` | `executablePath(io, &buf)` returns usize |
+| `executablePath(allocator)` | `executablePath(io, &buf)` returns `!usize` (error union) |
 | `getEnvVarOwned(allocator, "HOME")` | Use `std.c.getenv("HOME")` returns `?[*:0]u8` |
 
 ## ArrayList (std.ArrayList)
@@ -262,15 +262,12 @@ defer mutex.unlock(io);
 ## Other/Miscellaneous
 
 - `std.Thread.spawn(.{}, fn, .{args})` returns `!Thread`, use `.detach()` to detach
-- `comptime { _ = @import("..."); }` at top level to include modules
 - Juicy Main: `pub fn main(init: std.process.Init) !void`
 - args type: `[]const [:0]const u8`
 - Container initialization: `.empty` (collections), `.init` (stateful types)
 - `usingnamespace` removed
-- `@cImport` will fail to compile, use Zig native API instead
-- `std.process.getCwd()` doesn't exist, use `std.process.currentPath(io, &buf)` or `std.c.getcwd(buf, size)`
-- In threads, `std.process.currentPath` (IO vtable) may return `error.FileNotFound`, use `std.c.getcwd` for direct libc call to bypass
-- `std.process.max_path_bytes` not pub, use `std.fs.max_path_bytes` instead
+- `@cImport` is deprecated — use `b.addTranslateC()` in build.zig instead
+- `std.process.getEnvVarOwned` removed — use `std.c.getenv("HOME")` returns `?[*:0]u8`
 
 ## ReleaseSafe Error Handling Patterns
 
@@ -305,25 +302,9 @@ mutex.lock(io) catch {};
 - `|_|` discard capture is OK in ReleaseSafe (unlike `_ = err` which discards error set)
 - The `if/else` without trailing `;` returns void, matching the block's expected type
 
-## TCP Transport Protocol Patterns (v0.2.0 — historical, deleted in v0.3.0)
+## TCP Transport Protocol Patterns (v0.2.0 — deleted in v0.3.0)
 
-v0.2.0 used a custom binary frame TCP transport protocol (`transport.zig`). In v0.2.5, zio async Runtime was removed in favor of `std.Thread` + `std.Io` blocking I/O. In v0.3.0, the TCP transport layer was fully replaced by WebSocket binary frames (`wsproto.zig` + `wsclient.zig`). This section is kept for historical reference only.
-
-### Key Transport Protocol Patterns (historical)
-- **Frame format**: `[4B big-endian length][1B message type][N-byte payload]`
-- **Message types**: VERSION_REQ/RESP, HEALTH_REQ/RESP, FILE_REQ/RESP, UPLOAD_REQ/RESP, EXEC_REQ/STDOUT/STDERR/EXIT, ERROR, EOF
-- `sendMessage(writer, msg_type, payload)` — writes framed message to any writer
-- `recvMessage(reader, allocator)` — reads framed message, returns `?{.msg_type, .payload}`
-
-### Threaded I/O Concurrency Patterns (v0.2.5 — partially superseded)
-- `std.Thread.spawn(.{}, fn, .{args...})` → `thread.detach()` for fire-and-forget tasks
-- `Io.net.Stream` with `reader(io, &buf)` / `writer(io, &buf)` for buffered TCP I/O
-- `Stream.Writer` has `interface: Io.Writer` field — use `writer.interface.flush()` to drain buffered data before closing
-- `BufWriter` data is lost when it goes out of scope — use persistent reader/writer across calls
-- `Io.net.IpAddress.parse(ip, port)` for address parsing (std.Io, no wrapper needed)
-- `addr.connect(io, .{ .mode = .stream })` for TCP connect (blocking)
-- Guest: v0.2.0 ran TCP accept loop; v0.3.0 uses WebSocket client only (no server)
-- Host: v0.2.0 ran UDP listener + TCP binary; v0.3.0 uses unified HTTP server on :2121
+v0.2.0 used a custom binary frame TCP transport protocol (`transport.zig`). Removed in v0.3.0: TCP transport layer replaced by WebSocket binary frames (`wsproto.zig` + `wsclient.zig`). Frame format was `[4B BE length][1B type][N-byte payload]` with sendMessage/recvMessage helpers. v0.2.5 removed zio async Runtime in favor of `std.Thread` + `std.Io` blocking I/O.
 
 ### errdefer + Manual Cleanup = Double-Free
 
@@ -594,21 +575,26 @@ dash, bash, zsh.
 const argv = [_][*:0]const u8{ shell_path.ptr, "-l", null };
 ```
 
-### WebSocket PING Wakeup for Windows
+### Custom wsproto PING Frame for Windows Wakeup (pty model)
 
-Windows has no `poll()` — the main loop blocks on `readFrame` forever. To wake it
-when async work completes (e.g., exec thread finishes), send a WebSocket PING:
+Windows has no `poll()` — the main loop blocks on `readFrame` forever. When the
+pty read thread detects shell exit (EOF or HUP), it sends a custom wsproto `.ping`
+frame (type 9) to wake the main loop from `readFrame`:
 
 ```zig
-// exec thread: after setting exec_done = true
-ws.writeMessage(&.{}, .ping) catch {};
+// pty read thread: after detecting EOF/HUP, wake main loop
+if (builtin.os.tag == .windows) {
+    conn.writeFrame(&.{}, .ping) catch {};
+}
 
-// main loop: readSmallMessage returns .ping, Host responds with pong
-if (msg.opcode == .ping) {
-    ws.writeMessage(&.{}, .pong) catch {};
-    continue;
+// main loop: handle custom ping frame
+.ping => {
+    // pty thread signaled completion — check pty_dead, reconnect if needed
 }
 ```
+
+This is distinct from RFC 6455 WebSocket ping/pong (handled separately in host_http.zig
+for protocol compliance per §5.5.2).
 
 ### WebSocket Frame Queue for Cross-Thread Communication
 
@@ -642,24 +628,32 @@ fn drainOutgoingFrames(state: *HostState, hostname: []const u8, ws: *WebSocket) 
 }
 ```
 
-### OpState + wake_event for Command Completion
+### OpState + Io.Event for Command Completion
 
-HTTP handlers need to block until a command completes on the Guest. Use a per-command
-`wake_event` with timeout:
+HTTP handlers need to block until a command completes on the Guest. The Host uses a
+shared `std.Io.Event` to wake all waiting HTTP handlers when any op completes:
 
 ```zig
-// HTTP handler
-const cmd_id = generateId();
-var op = try state.createOpState(cmd_id); // creates wake_event
-try state.enqueueOutgoingFrame(vm, buildPtyInput(cmd_id, command));
-defer state.cleanupOpState(cmd_id);
+// HostState
+wake_event: std.Io.Event = .unset,
+op_states: std.StringHashMap(OpState),  // keyed by cmd_id
 
-// Block with 30s timeout
-const result = op.takeOpResult(state, &op, 30_000_000_000); // 30s in ns
-if (result == null) return error.ExecTimeout;
+// HTTP handler: enqueue frame, then block with timeout
+try state.enqueueOutgoingFrame(hostname, frame);
+state.wake_event.waitTimeout(io, .{ .duration = .{
+    .raw = std.Io.Duration.fromSeconds(30), .clock = .awake
+} }) catch |err| { ... };
+state.wake_event.reset();
+// Check op state: if done, extract exit_code + output
 
-// WS handler: on pty_output, appendOpOutput → scanForMarker → if done, completeOpState fires wake_event
+// WS handler: on pty_output, appendOpOutput → scanForMarker → if done,
+// set exit_code + done flag → wake_event.set(io)
 ```
+
+Key points:
+- Single shared `Io.Event` wakes all HTTP handlers; each checks its own cmd_id state
+- `.unset` initial state, `.set(io)` to signal, `.waitTimeout(io, timeout)` to block, `.reset()` to clear
+- `Io.Event` replaces old `std.Thread.ResetEvent` (removed in 0.16.0)
 
 ### `@extern` for Win32 API Functions
 
