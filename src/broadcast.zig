@@ -1131,7 +1131,9 @@ pub fn wsAnnounceLoop(
                         }
                     }
                 }
-            } else |_| {}
+            } else |err| {
+                std.log.err("[upgrade] HTTP fetch failed: {}", .{err});
+            }
         }
 
         // Wait for pty_spawn from Host
@@ -1377,9 +1379,11 @@ fn readFileContent(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !
 }
 
 fn downloadAndUpgrade(io: std.Io, allocator: std.mem.Allocator, client: *std.http.Client, url_path: []const u8) !void {
-    // Download the new binary
-    var download_buf: [10 * 1024 * 1024]u8 = undefined;
-    var download_writer: std.Io.Writer = .fixed(&download_buf);
+    // Download the new binary — use heap buffer (binaries ~10-12MB, won't fit on stack)
+    const max_download = 20 * 1024 * 1024;
+    const download_buf = try allocator.alloc(u8, max_download);
+    defer allocator.free(download_buf);
+    var download_writer: std.Io.Writer = .fixed(download_buf);
     const result = try client.fetch(.{
         .location = .{ .url = url_path },
         .method = .GET,
@@ -1390,6 +1394,7 @@ fn downloadAndUpgrade(io: std.Io, allocator: std.mem.Allocator, client: *std.htt
 
     const data = download_writer.buffered();
     if (data.len < 100 * 1024) return error.BinaryTooSmall;
+    if (data.len >= max_download) return error.BufferFull;
 
     // Write utmm.next
     const install_dir = if (builtin.os.tag == .windows) "C:\\opt\\utmm" else "/opt/utmm";
@@ -1441,9 +1446,10 @@ fn downloadAndUpgrade(io: std.Io, allocator: std.mem.Allocator, client: *std.htt
     } else {
         // POSIX: mv can replace a running binary (old inode stays mapped).
         // Shell runs new binary in background (&), then exits.
+        // chmod +x needed: createFile doesn't set exec bit by default.
         const restart_cmd = try std.fmt.allocPrint(allocator,
-            "mv {s} {s} && {s} --svc &",
-            .{ next_path, svc_exe, svc_exe });
+            "chmod +x {s} && mv {s} {s} && {s} --svc &",
+            .{ next_path, next_path, svc_exe, svc_exe });
         defer allocator.free(restart_cmd);
         _ = std.process.run(std.heap.page_allocator, io, .{
             .argv = &.{ "sh", "-c", restart_cmd },
