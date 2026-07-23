@@ -1,8 +1,51 @@
-# MCP config for utmm — copy to ~/.claude/mcp.json or run:
+# MCP Server Configuration for UTM Monitor
+# =============================================================================
+# This file lets Claude Code (or any MCP client) control UTM VMs via the utmm
+# Host daemon.  Copy this file and the Host handles the rest.
+#
+# PREREQUISITES
+# -----------------------------------------------------------------------------
+# 1. The utmm Host daemon MUST be running on the local machine:
+#       sudo utmm --host
+#
+# 2. Verify it's reachable (should return version):
+#       curl http://127.0.0.1:2121/version
+#
+# QUICK INSTALL (Claude Code / Claude Desktop)
+# -----------------------------------------------------------------------------
+# Option A — claude CLI (recommended):
 #   claude mcp add utmm --url http://127.0.0.1:2121/mcp
 #
-# Host must be running: sudo utmm --host
-# v0.3.0 merged MCP into the unified HTTP server on port 2121.
+# Option B — manual, copy this file:
+#   cp mcp.json.example ~/.claude/mcp.json
+#
+#   If you already have other MCP servers in ~/.claude/mcp.json, merge just
+#   the "utmm" entry below into your existing "mcpServers" block instead.
+#
+# Option C — Claude Desktop (VS Code / JetBrains plugin):
+#   Copy the JSON below into your Claude Desktop config file:
+#     macOS:   ~/Library/Application Support/Claude/claude_desktop_config.json
+#     Windows: %APPDATA%\Claude\claude_desktop_config.json
+#
+# VERIFY
+# -----------------------------------------------------------------------------
+# After installation, ask Claude:
+#   "Run vm_status to check which VMs are online"
+#
+# If Claude says the tool is not available, check:
+#   - Host daemon is running: sudo utmm --host
+#   - Port 2121 is not blocked by firewall
+#   - curl http://127.0.0.1:2121/version returns a version string
+#
+# TROUBLESHOOTING
+# -----------------------------------------------------------------------------
+# | Symptom                              | Fix                                |
+# |--------------------------------------|------------------------------------|
+# | "No VMs online"                      | Boot the VMs, start utmm inside each |
+# | "Connection refused"                 | sudo utmm --host                    |
+# | MCP tools not showing in Claude      | Reload MCP config (restart Claude)  |
+# | curl works but MCP fails             | Check URL ends with /mcp            |
+# =============================================================================
 
 {
   "mcpServers": {
