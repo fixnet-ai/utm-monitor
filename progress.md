@@ -1,4 +1,36 @@
-# Progress: v0.6.3
+# Progress: v0.6.5
+
+## Session 2026-07-23 (v0.6.5 自动升级端到端修复)
+
+### v0.6.5 发布
+- **版本号**: 0.6.3 → 0.6.5（v0.6.4 为测试中间版本）
+- **Commit**: `5d4aa73` — 2 files changed, tag v0.6.5 pushed
+
+**v0.6.4 → v0.6.5 修复:**
+
+端到端测试发现两个问题:
+1. **下载缓冲区溢出**: `download_buf` 栈分配 10MB，二进制 ~10.5MB 超出。`fixed()` writer 满后返回 `WriteFailed`。
+   - 修复: 改用堆分配 `allocator.alloc(u8, 20MB)`，添加 `BufferFull` 截断检测
+2. **执行权限丢失**: `createFile` 不给执行位，`mv` 后 systemd 报 `Permission denied` (exit 203/EXEC)。
+   - 修复: POSIX restart_cmd 加 `chmod +x` 前置步骤
+
+3. HTTP fetch 失败时新增错误日志（之前静默吞咽 `} else |_| {}`）
+
+**端到端验证 (linuxvm)**:
+```
+v0.6.4 Guest → 检测 Host v0.6.5 → 下载 11040608 bytes → 
+chmod +x && mv && utmm --svc & → exit(0) → systemd restart → v0.6.5 稳定运行
+```
+日志链路完整: `[upgrade] checking → Host=0.6.5 Guest=0.6.4 → Downloaded → restarting → 新进程 v0.6.5`
+
+**当前部署状态**:
+- Host: v0.6.5
+- linuxvm: v0.6.5 (自动升级成功)
+- WIN-Q0JNGDDBE28: v0.6.3 (待升级)
+- MODASIAIPC: v0.6.3 (待升级)
+- macvm: 离线 (待恢复)
+
+---
 
 ## Session 2026-07-23 (v0.6.3 自动升级修复)
 
