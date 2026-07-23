@@ -1,4 +1,4 @@
-# Task Plan: v0.6.3
+# Task Plan: v0.7.0
 
 ## 目标
 用持久 pty session 替换 "Connection = Shell Session"（每命令断连重连）模型。每个 WebSocket 连接 spawn 一个持久 shell（POSIX `posix_openpt` / Windows `CreatePipe`），命令在同一个 shell 中执行。`cd` 和 `export` 真正持久化。
@@ -177,7 +177,24 @@
 - [x] **17.5 构建验证**: `zig build test` 全过，6 目标交叉编译全过
 - [x] **17.6 部署验证**: Host + 4台VM 全部手动升级至 v0.6.3
 - **Status:** complete
-- **已知问题:** `/opt/utmm/utmm` 在部分 VM 上是独立副本而非符号链接，自动升级后 `systemctl restart` 仍运行旧版本。根因: install.sh 创建副本。下版本修正。
+- **已知问题:** `/opt/utmm/utmm` 在部分 VM 上是独立副本而非符号链接，自动升级后 `systemctl restart` 仍运行旧版本。根因: install.sh 创建副本。v0.7.0 重设计修复。
+
+### Phase 18: v0.7.0 — 自动升级架构重设计 ✅ (2026-07-23)
+- [x] **18.1 UDP 广播协议扩展**: `protocol.zig` 新增 `buildDiscoveryQuery()` + `parseDiscoveryVersion()`，广播携带 Host 版本号，向后兼容旧格式
+- [x] **18.2 升级模式模块**: `upgrade.zig` — utmm-old 进程核心逻辑：停止服务 → 杀进程 → HTTP 下载 → 替换二进制 → 启动服务。三平台统一控制流
+- [x] **18.3 CLI + 启动检测**: `main.zig` 新增 `--update-url` 参数，`isOldMode()` 检测 exe 名含 `-old`，启动时路由到 `upgrade.run()`
+- [x] **18.4 Guest UDP 升级检测**: `broadcast.zig` 新增 `UpgradeSignal` 原子标志，`udpDiscoveryListener` 解析版本号检测不匹配，`wsAnnounceLoop` 检查标志触发 `triggerSelfUpgrade`
+- [x] **18.5 triggerSelfUpgrade**: 复制自身为 `utmm-old[.exe]`，chmod +x，独立进程启动 `utmm-old --update-url=...`，退出
+- [x] **18.6 删除旧代码**: 移除 `downloadAndUpgrade`（~80行）、`wsAnnounceLoop` HTTP 升级检查（~50行）、`is_svc` 参数
+- [x] **18.7 Host 定期广播**: `host.zig` 新增 `periodicBroadcastLoop`，每 60s 向所有子网广播带版本号的发现查询，`cmdStatus` 使用 `buildDiscoveryQuery`
+- [x] **18.8 构建验证**: `zig build test` 全过，7 目标交叉编译全过，版本号 0.7.0
+- **Status:** complete
+
+**架构要点:**
+- UDP 广播版本检测替代 HTTP GET /version，消除 WebSocket+HTTP 共用端口导致的 `HttpConnectionClosing` 竞态
+- utmm-old 独立进程：停止服务、杀进程、下载、替换、启动服务，不依赖 curl
+- `pkill -x utmm`（POSIX）/ `taskkill /im utmm.exe`（Windows）精确匹配，不误杀 utmm-old
+- 不依赖外部工具，Zig `std.http.Client` 完成 HTTP 下载
 
 ## 已删除的组件
 

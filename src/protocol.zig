@@ -12,6 +12,44 @@ pub const DISCOVERY_QUERY = "ARE YOU OK?\r\n";
 /// UDP broadcast discovery response prefix (Guest → sender, followed by key:value lines)
 pub const DISCOVERY_RESPONSE_PREFIX = "ANNOUNCE\r\n";
 
+/// Build a discovery query with Host version appended.
+/// Format: "ARE YOU OK?\r\n{version}\r\n"
+/// Backward-compatible: old Guests that don't parse the version line still respond to "ARE YOU OK?".
+pub fn buildDiscoveryQuery(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "{s}{s}\r\n", .{ DISCOVERY_QUERY, version });
+}
+
+/// Parse Host version from a discovery query.
+/// New format: "ARE YOU OK?\r\n0.7.0\r\n" → returns "0.7.0"
+/// Old format: "ARE YOU OK?\r\n" → returns null (no version line)
+/// Returns null if the data doesn't contain a second line after "ARE YOU OK?".
+pub fn parseDiscoveryVersion(data: []const u8) ?[]const u8 {
+    // Must start with "ARE YOU OK?"
+    const query_needle = "ARE YOU OK?";
+    if (!std.mem.startsWith(u8, data, query_needle)) return null;
+
+    // Skip the query and optional \r\n
+    var rest = data[query_needle.len..];
+    if (rest.len >= 2 and std.mem.eql(u8, rest[0..2], "\r\n")) {
+        rest = rest[2..];
+    } else if (rest.len >= 1 and rest[0] == '\n') {
+        rest = rest[1..];
+    } else {
+        // No line ending after query — old format, no version
+        return null;
+    }
+
+    // Extract version line (up to \r or \n)
+    const version_end = std.mem.indexOfAny(u8, rest, "\r\n") orelse rest.len;
+    if (version_end == 0) return null;
+
+    // Version should look like "0.7.0" — basic sanity check
+    const version = rest[0..version_end];
+    if (version.len < 3) return null;
+
+    return version;
+}
+
 /// /etc/hosts marker block
 pub const HOSTS_MARKER_BEGIN = "# UTM-MONITOR-BEGIN";
 pub const HOSTS_MARKER_END = "# UTM-MONITOR-END";
@@ -186,5 +224,40 @@ test "GuestInfo.fqdn" {
     const name = try info.fqdn(allocator);
     defer allocator.free(name);
     try std.testing.expectEqualStrings("mybox.aarch64-linux.utm", name);
+}
+
+test "buildDiscoveryQuery and parseDiscoveryVersion — new format" {
+    const allocator = std.testing.allocator;
+    const query = try buildDiscoveryQuery(allocator, "0.7.0");
+    defer allocator.free(query);
+
+    // Should contain both the query and the version
+    try std.testing.expect(std.mem.startsWith(u8, query, "ARE YOU OK?\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, query, "0.7.0") != null);
+
+    // Parse back
+    const version = parseDiscoveryVersion(query);
+    try std.testing.expect(version != null);
+    try std.testing.expectEqualStrings("0.7.0", version.?);
+}
+
+test "parseDiscoveryVersion — old format (no version)" {
+    const version = parseDiscoveryVersion("ARE YOU OK?\r\n");
+    try std.testing.expectEqual(@as(?[]const u8, null), version);
+}
+
+test "parseDiscoveryVersion — old format with just newline" {
+    const version = parseDiscoveryVersion("ARE YOU OK?\n");
+    try std.testing.expectEqual(@as(?[]const u8, null), version);
+}
+
+test "parseDiscoveryVersion — not a discovery query" {
+    const version = parseDiscoveryVersion("ANNOUNCE\r\nhostname: vm\r\n");
+    try std.testing.expectEqual(@as(?[]const u8, null), version);
+}
+
+test "parseDiscoveryVersion — empty version line" {
+    const version = parseDiscoveryVersion("ARE YOU OK?\r\n\r\n");
+    try std.testing.expectEqual(@as(?[]const u8, null), version);
 }
 

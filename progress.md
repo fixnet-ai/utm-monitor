@@ -1,4 +1,32 @@
-# Progress: v0.6.5
+# Progress: v0.7.0
+
+## Session 2026-07-23 (v0.7.0 自动升级架构重设计)
+
+### v0.7.0 发布
+- **版本号**: 0.6.6 → 0.7.0
+- **改动**: 8 files changed, 293 insertions, 125 deletions + 202 new lines (upgrade.zig)
+
+**核心变更**:
+- UDP 广播携带 Host 版本号，Guest `udpDiscoveryListener` 检测版本不匹配
+- 升级由独立 `utmm-old` 进程完成：停止服务 → 杀进程 → HTTP 下载 → 替换 → 启动服务
+- 消除旧 HTTP GET /version 的 `HttpConnectionClosing` 竞态
+- 三平台统一控制流：`upgrade.zig` 编译时分支，运行时一致
+- Host 定期 60s 广播，Guest 自动检测升级（无需手动 `--status`）
+- 不依赖 curl 等外部工具，全部 Zig 内置实现
+
+**修改文件**:
+| 文件 | 改动 |
+|------|------|
+| `src/ver.zig` | 0.6.6 → 0.7.0 |
+| `src/protocol.zig` | +buildDiscoveryQuery, +parseDiscoveryVersion, +5 tests |
+| `src/upgrade.zig` | 新文件: run(), stopService, killUtmmProcesses, downloadBinary, replaceBinary, startService |
+| `src/main.zig` | +update_url, +isOldMode, 启动时升级模式检测 |
+| `src/broadcast.zig` | +UpgradeSignal, udpDiscoveryListener 版本解析, +triggerSelfUpgrade, -downloadAndUpgrade, -HTTP 升级检查 |
+| `src/guest.zig` | UpgradeSignal 替代 is_svc 参数 |
+| `src/host.zig` | cmdStatus 用 buildDiscoveryQuery, +periodicBroadcastLoop |
+| `build.zig.zon` | 版本号同步 |
+
+**构建验证**: `zig build test` 全过，7 目标交叉编译（ReleaseSafe）全过
 
 ## Session 2026-07-23 (v0.6.5 自动升级端到端修复)
 

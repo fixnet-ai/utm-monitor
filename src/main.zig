@@ -10,6 +10,7 @@ const guest = @import("guest.zig");
 const host_mod = @import("host.zig");
 const httpd = @import("httpd.zig");
 const host_http = @import("host_http.zig");
+const upgrade = @import("upgrade.zig");
 
 // ── Windows Service integration types and externs (only compiled on Windows) ──
 const windows = if (builtin.os.tag == .windows) std.os.windows else struct {
@@ -109,6 +110,9 @@ pub const CliArgs = struct {
     // kick: close guest's WebSocket connection (cancels exec)
     cmd_kick: bool = false,
     kick_target: ?[]const u8 = null,
+
+    // Internal: upgrade URL passed by utmm-old process (--update-url)
+    update_url: ?[]const u8 = null,
 };
 
 /// Parse command-line arguments
@@ -137,6 +141,9 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             cli.is_user = true;
         } else if (std.mem.eql(u8, arg, "--svc")) {
             cli.is_svc = true;
+        } else if (std.mem.eql(u8, arg, "--update-url")) {
+            i += 1;
+            if (i < args.len) cli.update_url = args[i];
         } else if (std.mem.eql(u8, arg, "--uninstall")) {
             cli.cmd_uninstall = true;
         } else if (std.mem.eql(u8, arg, "--upload")) {
@@ -361,9 +368,29 @@ fn winServiceRun(io: std.Io, gpa: std.mem.Allocator, cli: CliArgs) !void {
     }
 }
 
+/// Check if the current executable name contains "-old" (utmm-old / utmm-old.exe).
+fn isOldMode(io: std.Io) bool {
+    var exe_buf: [4096]u8 = undefined;
+    const exe_len = std.process.executablePath(io, &exe_buf) catch return false;
+    const exe_path = exe_buf[0..exe_len];
+    const exe_name = std.fs.path.basename(exe_path);
+    return std.mem.indexOf(u8, exe_name, "-old") != null;
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var cli = try parseArgs(args);
+
+    // Check if running as utmm-old (upgrade mode).
+    // Triggered by --update-url flag OR executable name containing "-old".
+    if (cli.update_url != null or isOldMode(init.io)) {
+        const url = cli.update_url orelse {
+            std.log.err("[upgrade] --update-url required in upgrade mode", .{});
+            return error.MissingUpdateUrl;
+        };
+        try upgrade.run(init, url);
+        return;
+    }
 
     // --svc (internal): run as system daemon — no service stop/restart.
     // On Windows this registers with SCM; on POSIX it just runs guest directly.

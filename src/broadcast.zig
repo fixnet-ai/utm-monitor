@@ -9,6 +9,13 @@ const protocol = @import("protocol.zig");
 const wsclient = @import("wsclient.zig");
 const wsproto_mod = @import("wsproto.zig");
 
+/// Shared signal between udpDiscoveryListener (background thread) and
+/// wsAnnounceLoop (main thread). When the UDP listener detects a version
+/// mismatch from the Host broadcast, it sets `needed` to true.
+pub const UpgradeSignal = struct {
+    needed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
 // libc network interface enumeration (getifaddrs)
 const in_addr = extern struct { s_addr: u32 };
 
@@ -952,6 +959,7 @@ fn udpDiscoveryListener(
     info: *const SystemInfo,
     shutdown: *std.atomic.Value(bool),
     socket_handle_out: *?net.Socket.Handle,
+    upgrade: *UpgradeSignal,
 ) void {
     var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
     const io = threaded.io();
@@ -982,6 +990,17 @@ fn udpDiscoveryListener(
             @atomicStore(?net.Socket.Handle, socket_handle_out, null, .release);
             // Process the message
             if (std.mem.indexOf(u8, msg.data, "ARE YOU OK?") != null) {
+                // Check for version mismatch (auto-upgrade detection)
+                if (!upgrade.needed.load(.acquire)) {
+                    if (protocol.parseDiscoveryVersion(msg.data)) |host_version| {
+                        if (!std.mem.eql(u8, host_version, protocol.VERSION)) {
+                            std.log.info("[udp-disc] Version mismatch: host={s} guest={s} — signalling upgrade", .{ host_version, protocol.VERSION });
+                            upgrade.needed.store(true, .release);
+                            continue; // Skip response — stop accepting broadcasts
+                        }
+                    }
+                }
+                // Version matches or old format (no version line) — respond normally
                 const response = std.fmt.allocPrint(allocator,
                     "{s}hostname: {s}\r\nip: {s}\r\ntarget: {s}\r\nmac: {s}\r\nversion: {s}\r\nshell: {s}\r\n\r\n",
                     .{ protocol.DISCOVERY_RESPONSE_PREFIX, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell },
@@ -1007,6 +1026,17 @@ fn udpDiscoveryListener(
                 }
             };
             if (std.mem.indexOf(u8, msg.data, "ARE YOU OK?") != null) {
+                // Check for version mismatch (auto-upgrade detection)
+                if (!upgrade.needed.load(.acquire)) {
+                    if (protocol.parseDiscoveryVersion(msg.data)) |host_version| {
+                        if (!std.mem.eql(u8, host_version, protocol.VERSION)) {
+                            std.log.info("[udp-disc] Version mismatch: host={s} guest={s} — signalling upgrade", .{ host_version, protocol.VERSION });
+                            upgrade.needed.store(true, .release);
+                            continue; // Skip response — stop accepting broadcasts
+                        }
+                    }
+                }
+                // Version matches or old format (no version line) — respond normally
                 const response = std.fmt.allocPrint(allocator,
                     "{s}hostname: {s}\r\nip: {s}\r\ntarget: {s}\r\nmac: {s}\r\nversion: {s}\r\nshell: {s}\r\n\r\n",
                     .{ protocol.DISCOVERY_RESPONSE_PREFIX, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell },
@@ -1032,7 +1062,7 @@ pub fn wsAnnounceLoop(
     allocator: std.mem.Allocator,
     info: SystemInfo,
     host_url: []const u8,
-    is_svc: bool,
+    upgrade: *UpgradeSignal,
 ) !void {
     const host: []const u8 = if (host_url.len > 0) host_url else blk: {
         const gw = getDefaultGateway(io, allocator) catch blk2: {
@@ -1042,16 +1072,11 @@ pub fn wsAnnounceLoop(
     };
     defer if (host_url.len == 0) allocator.free(host);
 
-    // Clean up leftover from a previous self-upgrade (Windows: old .exe renamed out of the way)
-    if (builtin.os.tag == .windows) {
-        const old_exe = "C:\\opt\\utmm\\utmm.old.exe";
-        std.Io.Dir.cwd().deleteFile(io, old_exe) catch {};
-    }
-
-    // Start UDP discovery listener (responds to "ARE YOU OK?" broadcasts from --status)
+    // Start UDP discovery listener (responds to "ARE YOU OK?" broadcasts from --status,
+    // detects version mismatch for auto-upgrade)
     var udp_shutdown = std.atomic.Value(bool).init(false);
     var udp_socket_handle: ?net.Socket.Handle = null;
-    const udp_thread: ?std.Thread = std.Thread.spawn(.{}, udpDiscoveryListener, .{ io, allocator, &info, &udp_shutdown, &udp_socket_handle }) catch blk: {
+    const udp_thread: ?std.Thread = std.Thread.spawn(.{}, udpDiscoveryListener, .{ io, allocator, &info, &udp_shutdown, &udp_socket_handle, upgrade }) catch blk: {
         std.log.err("[guest-ws] UDP discovery listener spawn failed", .{});
         break :blk null;
     };
@@ -1098,42 +1123,15 @@ pub fn wsAnnounceLoop(
 
         std.log.info("[guest-ws] Connected and announced", .{});
 
-        // Auto-upgrade check (svc mode only — foreground guest is ephemeral).
-        if (is_svc) {
-            // Check Host version via HTTP GET /version
-            const version_url = try std.fmt.allocPrint(allocator,
-                "http://{s}:{d}/version", .{ host, protocol.DEFAULT_PORT });
-            defer allocator.free(version_url);
-
-            var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
-            var ver_buf: [64]u8 = undefined;
-            var ver_writer: std.Io.Writer = .fixed(&ver_buf);
-            if (http_client.fetch(.{
-                .location = .{ .url = version_url },
-                .method = .GET,
-                .response_writer = &ver_writer,
-                .keep_alive = false,
-            })) |ver_result| {
-                if (ver_result.status == .ok) {
-                    const host_version = std.mem.trimEnd(u8, ver_writer.buffered(), &std.ascii.whitespace);
-                    if (!std.mem.eql(u8, host_version, protocol.VERSION)) {
-                        std.log.info("[upgrade] Host={s} Guest={s} — downloading new binary...", .{ host_version, protocol.VERSION });
-                        if (protocol.deploymentFilename(info.target)) |bin_filename| {
-                            const bin_url = try std.fmt.allocPrint(allocator,
-                                "http://{s}:{d}/bin/{s}", .{ host, protocol.DEFAULT_PORT, bin_filename });
-                            defer allocator.free(bin_url);
-                            downloadAndUpgrade(io, allocator, &http_client, bin_url) catch |err| {
-                                std.log.err("[upgrade] Download failed: {}", .{err});
-                            };
-                            // downloadAndUpgrade calls std.process.exit(0) on success
-                        } else {
-                            std.log.warn("[upgrade] Unknown target '{s}' — skip upgrade", .{info.target});
-                        }
-                    }
-                }
-            } else |err| {
-                std.log.err("[upgrade] HTTP fetch failed: {}", .{err});
-            }
+        // Check if UDP listener detected a version mismatch
+        if (upgrade.needed.load(.acquire)) {
+            std.log.info("[upgrade] Version mismatch detected, triggering self-upgrade", .{});
+            const bin_name = protocol.deploymentFilename(info.target) orelse "utmm";
+            const upgrade_url = try std.fmt.allocPrint(allocator,
+                "http://{s}:{d}/bin/{s}", .{ host, protocol.DEFAULT_PORT, bin_name });
+            defer allocator.free(upgrade_url);
+            try triggerSelfUpgrade(io, allocator, upgrade_url);
+            // triggerSelfUpgrade calls std.process.exit(0) on success
         }
 
         // Wait for pty_spawn from Host
@@ -1348,6 +1346,17 @@ pub fn wsAnnounceLoop(
             },
         }
 
+        // Check for auto-upgrade signal from UDP listener
+        if (upgrade.needed.load(.acquire)) {
+            std.log.info("[upgrade] Version mismatch detected, triggering self-upgrade", .{});
+            const bin_name = protocol.deploymentFilename(info.target) orelse "utmm";
+            const upgrade_url = try std.fmt.allocPrint(allocator,
+                "http://{s}:{d}/bin/{s}", .{ host, protocol.DEFAULT_PORT, bin_name });
+            defer allocator.free(upgrade_url);
+            try triggerSelfUpgrade(io, allocator, upgrade_url);
+            // triggerSelfUpgrade calls std.process.exit(0) on success
+        }
+
         // pty shell exited: reconnect for fresh session
         if (pty_dead) {
             std.log.info("[guest-ws] Pty session ended, reconnecting...", .{});
@@ -1378,83 +1387,77 @@ fn readFileContent(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !
     return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, @enumFromInt(50 * 1024 * 1024));
 }
 
-fn downloadAndUpgrade(io: std.Io, allocator: std.mem.Allocator, client: *std.http.Client, url_path: []const u8) !void {
-    // Download the new binary — use heap buffer (binaries ~10-12MB, won't fit on stack)
-    const max_download = 20 * 1024 * 1024;
-    const download_buf = try allocator.alloc(u8, max_download);
-    defer allocator.free(download_buf);
-    var download_writer: std.Io.Writer = .fixed(download_buf);
-    const result = try client.fetch(.{
-        .location = .{ .url = url_path },
-        .method = .GET,
-        .response_writer = &download_writer,
-        .keep_alive = false,
-    });
-    if (result.status != .ok) return error.DownloadFailed;
+/// Copy current executable to utmm-old[.exe], launch it as a detached process
+/// with --update-url, then exit. The utmm-old process handles the actual upgrade.
+fn triggerSelfUpgrade(io: std.Io, allocator: std.mem.Allocator, upgrade_url: []const u8) !void {
 
-    const data = download_writer.buffered();
-    if (data.len < 100 * 1024) return error.BinaryTooSmall;
-    if (data.len >= max_download) return error.BufferFull;
+    // Get current executable path
+    var exe_buf: [4096]u8 = undefined;
+    const exe_len = try std.process.executablePath(io, &exe_buf);
+    const exe_path = exe_buf[0..exe_len];
+    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+    const old_name = if (builtin.os.tag == .windows) "utmm-old.exe" else "utmm-old";
+    const old_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ exe_dir, old_name });
+    defer allocator.free(old_path);
 
-    // Write utmm.next
-    const install_dir = if (builtin.os.tag == .windows) "C:\\opt\\utmm" else "/opt/utmm";
-    const next_name = if (builtin.os.tag == .windows) "utmm.next.exe" else "utmm.next";
-    const next_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ install_dir, next_name });
-    defer allocator.free(next_path);
+    std.log.info("[upgrade] Copying self to {s}", .{old_path});
 
-    const svc_exe = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ install_dir, if (builtin.os.tag == .windows) "utmm.exe" else "utmm" });
-    defer allocator.free(svc_exe);
+    // Copy current exe to utmm-old (overwrite any previous copy)
+    const max_copy = 20 * 1024 * 1024;
+    const copy_buf = try allocator.alloc(u8, max_copy);
+    defer allocator.free(copy_buf);
 
-    var dir = try std.Io.Dir.cwd().openDir(io, install_dir, .{});
-    defer dir.close(io);
-    var file = try dir.createFile(io, next_name, .{});
-    defer file.close(io);
-    var wb: [65536]u8 = undefined;
-    var file_writer = file.writer(io, &wb);
-    _ = try file_writer.interface.write(data);
-    try file_writer.interface.flush();
+    var src = try std.Io.Dir.cwd().openFile(io, exe_path, .{});
+    defer src.close(io);
 
-    // Trigger self-upgrade by restarting
-    std.log.info("[guest-http] Downloaded upgrade to {s} ({d} bytes) — restarting", .{ next_path, data.len });
+    const exe_size = try src.readPositionalAll(io, copy_buf, 0);
+    if (exe_size >= max_copy) return error.BinaryTooLarge;
+
+    // Delete old utmm-old if exists, then create new
+    std.Io.Dir.cwd().deleteFile(io, old_path) catch {};
+    var dst = try std.Io.Dir.cwd().createFile(io, old_path, .{});
+    defer dst.close(io);
+    try dst.writeStreamingAll(io, copy_buf[0..exe_size]);
+
+    // chmod +x on POSIX
+    if (builtin.os.tag != .windows) {
+        const chmod_cmd = try std.fmt.allocPrint(allocator, "chmod +x {s}", .{old_path});
+        defer allocator.free(chmod_cmd);
+        if (std.process.run(allocator, io, .{ .argv = &.{ "sh", "-c", chmod_cmd } })) |cr| {
+            allocator.free(cr.stdout);
+            allocator.free(cr.stderr);
+        } else |_| {}
+    }
+
+    // Launch utmm-old as detached process
+    std.log.info("[upgrade] Launching utmm-old with url={s}", .{upgrade_url});
 
     if (builtin.os.tag == .windows) {
-        // Windows: running .exe can be RENAMED but not overwritten.
-        // Write a batch file that waits for us to exit, then:
-        //   1. rename old utmm.exe → utmm.old.exe
-        //   2. rename new utmm.next.exe → utmm.exe
-        //   3. start the service
-        //   4. self-delete
-        // The batch runs in its own window (start /min), independent of this process.
-        const bat_path = "C:\\opt\\utmm\\upgrade.bat";
-        var bat_file = try std.Io.Dir.cwd().createFile(io, bat_path, .{});
-        defer bat_file.close(io);
-        var bwb: [1024]u8 = undefined;
-        var bw = bat_file.writer(io, &bwb);
-        try bw.interface.print(
-            \\@echo off
-            \\timeout /t 2 /nobreak > nul
-            \\move /Y "{s}" "{s}.old.exe" > nul 2>&1
-            \\move /Y "{s}" "{s}" > nul 2>&1
-            \\sc start UTM-Monitor-Guest > nul 2>&1
-            \\del "%~f0" > nul 2>&1
-        , .{ svc_exe, svc_exe, next_path, svc_exe });
-        try bw.interface.flush();
-        // Launch detached batch, then exit
-        _ = std.process.run(std.heap.page_allocator, io, .{
-            .argv = &.{ "cmd", "/c", "start", "/min", "", "C:\\opt\\utmm\\upgrade.bat" },
-        }) catch {};
+        // cmd /c start /min — independent process, survives parent exit
+        if (std.process.run(allocator, io, .{
+            .argv = &.{ "cmd", "/c", "start", "/min", "", old_path, "--update-url", upgrade_url },
+        })) |cr| {
+            allocator.free(cr.stdout);
+            allocator.free(cr.stderr);
+        } else |err| {
+            std.log.err("[upgrade] Failed to launch utmm-old: {}", .{err});
+            return err;
+        }
     } else {
-        // POSIX: mv can replace a running binary (old inode stays mapped).
-        // Shell runs new binary in background (&), then exits.
-        // chmod +x needed: createFile doesn't set exec bit by default.
-        const restart_cmd = try std.fmt.allocPrint(allocator,
-            "chmod +x {s} && mv {s} {s} && {s} --svc &",
-            .{ next_path, next_path, svc_exe, svc_exe });
-        defer allocator.free(restart_cmd);
-        _ = std.process.run(std.heap.page_allocator, io, .{
-            .argv = &.{ "sh", "-c", restart_cmd },
-        }) catch {};
+        // sh -c '... &' — background independent process
+        const launch_cmd = try std.fmt.allocPrint(allocator, "{s} --update-url {s} &", .{ old_path, upgrade_url });
+        defer allocator.free(launch_cmd);
+        if (std.process.run(allocator, io, .{
+            .argv = &.{ "sh", "-c", launch_cmd },
+        })) |cr| {
+            allocator.free(cr.stdout);
+            allocator.free(cr.stderr);
+        } else |err| {
+            std.log.err("[upgrade] Failed to launch utmm-old: {}", .{err});
+            return err;
+        }
     }
+
     std.process.exit(0);
 }
 

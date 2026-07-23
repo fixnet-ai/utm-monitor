@@ -120,6 +120,10 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
 
     std.debug.print("[status] Scanning LAN for UTM guests (UDP broadcast)...\n", .{});
 
+    // Build discovery query with version (new format: "ARE YOU OK?\r\n0.7.0\r\n")
+    const discovery_query = try protocol.buildDiscoveryQuery(gpa, protocol.VERSION);
+    defer gpa.free(discovery_query);
+
     // Send 5 rounds of broadcasts at 1-second intervals, collect responses continuously
     const start = std.Io.Timestamp.now(block_io, .real);
     const deadline = start.nanoseconds + 5_000_000_000;
@@ -138,7 +142,7 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
                 // Send to all collected broadcast addresses
                 var any_failed = false;
                 for (broadcast_addrs.items) |*bc_addr| {
-                    if (socket.send(block_io, bc_addr, protocol.DISCOVERY_QUERY)) |_| {
+                    if (socket.send(block_io, bc_addr, discovery_query)) |_| {
                     } else |_| { any_failed = true; }
                 }
                 if (any_failed) {
@@ -153,7 +157,7 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
                         };
                         // Retry all addresses after rebind
                         for (broadcast_addrs.items) |*bc_addr| {
-                            if (socket.send(block_io, bc_addr, protocol.DISCOVERY_QUERY)) |_| {
+                            if (socket.send(block_io, bc_addr, discovery_query)) |_| {
                                 send_errors = 0;
                             } else |err3| {
                                 std.debug.print("[status] Send failed after rebind: {}\n", .{err3});
@@ -433,6 +437,58 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
 // HTTP Host daemon (--host): unified HTTP server on :2121 (v0.3.0)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Periodic UDP broadcast loop — sends discovery query with Host version
+/// every 60 seconds so Guests can detect version mismatch and auto-upgrade.
+fn periodicBroadcastLoop(io: std.Io, gpa: std.mem.Allocator, shutdown: *std.atomic.Value(bool)) void {
+    // Use its own Io.Threaded instance (runs in background thread)
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    const thread_io = threaded.io();
+
+    const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", 0) catch |err| {
+        std.log.err("[host-bcast] Bind address parse error: {}", .{err});
+        return;
+    };
+    var socket = bind_addr.bind(thread_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
+        std.log.err("[host-bcast] UDP bind failed: {}", .{err});
+        return;
+    };
+    defer socket.close(thread_io);
+
+    // Build discovery query once (version doesn't change at runtime)
+    const query = protocol.buildDiscoveryQuery(gpa, protocol.VERSION) catch |err| {
+        std.log.err("[host-bcast] Failed to build query: {}", .{err});
+        return;
+    };
+    defer gpa.free(query);
+
+    std.log.info("[host-bcast] Periodic broadcast started (60s interval)", .{});
+
+    while (!shutdown.load(.acquire)) {
+        // Collect broadcast addresses each iteration (interfaces may change)
+        var addrs = broadcast.getSubnetBroadcasts(gpa) catch {
+            std.log.err("[host-bcast] Failed to collect broadcast addresses", .{});
+            std.Io.sleep(thread_io, std.Io.Duration.fromSeconds(60), .awake) catch {};
+            continue;
+        };
+        defer addrs.deinit(gpa);
+
+        for (addrs.items) |*bc_addr| {
+            socket.send(thread_io, bc_addr, query) catch |err| {
+                std.log.err("[host-bcast] Send to {any} failed: {}", .{ bc_addr, err });
+            };
+        }
+
+        // Sleep 60 seconds
+        var slept: u8 = 0;
+        while (slept < 60 and !shutdown.load(.acquire)) : (slept += 1) {
+            std.Io.sleep(thread_io, std.Io.Duration.fromSeconds(1), .awake) catch {};
+        }
+    }
+
+    _ = io;
+    std.log.info("[host-bcast] Shutting down", .{});
+}
+
 fn startHttpHost(
     block_io: std.Io,
     gpa: std.mem.Allocator,
@@ -468,6 +524,14 @@ fn startHttpHost(
     // Set callback for /etc/hosts sync
     state.on_guest_changed = null; // TODO: wire up hosts sync
     defer state.deinit();
+
+    // Spawn periodic UDP broadcast thread (every 60s, carries version for auto-upgrade)
+    var bcast_shutdown = std.atomic.Value(bool).init(false);
+    const bcast_thread = std.Thread.spawn(.{}, periodicBroadcastLoop, .{ block_io, gpa, &bcast_shutdown }) catch null;
+    defer {
+        bcast_shutdown.store(true, .release);
+        if (bcast_thread) |t| t.join();
+    }
 
     // Block forever in HTTP accept loop
     try httpd.serve(block_io, gpa, &router, &state, port);
