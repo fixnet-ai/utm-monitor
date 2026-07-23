@@ -55,5 +55,7 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
     } else "";
 
     // WebSocket announce loop — persistent connection, real-time push
-    try broadcast.wsAnnounceLoop(io, gpa, sysinfo, host_url);
+    // Pass is_svc: auto-upgrade checks only happen in daemon mode.
+    // Foreground (agent) mode is ephemeral — no point upgrading.
+    try broadcast.wsAnnounceLoop(io, gpa, sysinfo, host_url, cli.is_svc);
 }

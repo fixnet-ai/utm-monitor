@@ -445,6 +445,20 @@ pub fn handleBin(allocator: std.mem.Allocator, state: *httpd.HostState, request:
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// GET /version — Host version check (Guest auto-upgrade trigger)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn handleVersion(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+    _ = allocator;
+    _ = state;
+    _ = body;
+    try request.respond(protocol.VERSION, .{
+        .status = .ok,
+        .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // GET /api/guests — JSON status (for CLI --status)
 // ═══════════════════════════════════════════════════════════════════════════
 

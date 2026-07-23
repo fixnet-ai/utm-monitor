@@ -457,6 +457,7 @@ fn startHttpHost(
     try router.add(gpa, .POST, "/announce", host_http.handleAnnounce);
     try router.add(gpa, .GET, "/ws", host_http.handleWebSocket);
     try router.add(gpa, .GET, "/bin/", host_http.handleBin);
+    try router.add(gpa, .GET, "/version", host_http.handleVersion);
     try router.add(gpa, .POST, "/mcp", host_http.handleMcp);
     try router.add(gpa, .GET, "/", host_http.handleRoot);
 

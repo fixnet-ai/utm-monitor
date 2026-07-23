@@ -1032,6 +1032,7 @@ pub fn wsAnnounceLoop(
     allocator: std.mem.Allocator,
     info: SystemInfo,
     host_url: []const u8,
+    is_svc: bool,
 ) !void {
     const host: []const u8 = if (host_url.len > 0) host_url else blk: {
         const gw = getDefaultGateway(io, allocator) catch blk2: {
@@ -1040,6 +1041,12 @@ pub fn wsAnnounceLoop(
         break :blk gw;
     };
     defer if (host_url.len == 0) allocator.free(host);
+
+    // Clean up leftover from a previous self-upgrade (Windows: old .exe renamed out of the way)
+    if (builtin.os.tag == .windows) {
+        const old_exe = "C:\\opt\\utmm\\utmm.old.exe";
+        std.Io.Dir.cwd().deleteFile(io, old_exe) catch {};
+    }
 
     // Start UDP discovery listener (responds to "ARE YOU OK?" broadcasts from --status)
     var udp_shutdown = std.atomic.Value(bool).init(false);
@@ -1089,7 +1096,43 @@ pub fn wsAnnounceLoop(
             };
         }
 
-        std.log.info("[guest-ws] Connected and announced — waiting for pty_spawn", .{});
+        std.log.info("[guest-ws] Connected and announced", .{});
+
+        // Auto-upgrade check (svc mode only — foreground guest is ephemeral).
+        if (is_svc) {
+            // Check Host version via HTTP GET /version
+            const version_url = try std.fmt.allocPrint(allocator,
+                "http://{s}:{d}/version", .{ host, protocol.DEFAULT_PORT });
+            defer allocator.free(version_url);
+
+            var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
+            var ver_buf: [64]u8 = undefined;
+            var ver_writer: std.Io.Writer = .fixed(&ver_buf);
+            if (http_client.fetch(.{
+                .location = .{ .url = version_url },
+                .method = .GET,
+                .response_writer = &ver_writer,
+                .keep_alive = false,
+            })) |ver_result| {
+                if (ver_result.status == .ok) {
+                    const host_version = std.mem.trimEnd(u8, ver_writer.buffered(), &std.ascii.whitespace);
+                    if (!std.mem.eql(u8, host_version, protocol.VERSION)) {
+                        std.log.info("[upgrade] Host={s} Guest={s} — downloading new binary...", .{ host_version, protocol.VERSION });
+                        if (protocol.deploymentFilename(info.target)) |bin_filename| {
+                            const bin_url = try std.fmt.allocPrint(allocator,
+                                "http://{s}:{d}/bin/{s}", .{ host, protocol.DEFAULT_PORT, bin_filename });
+                            defer allocator.free(bin_url);
+                            downloadAndUpgrade(io, allocator, &http_client, bin_url) catch |err| {
+                                std.log.err("[upgrade] Download failed: {}", .{err});
+                            };
+                            // downloadAndUpgrade calls std.process.exit(0) on success
+                        } else {
+                            std.log.warn("[upgrade] Unknown target '{s}' — skip upgrade", .{info.target});
+                        }
+                    }
+                }
+            } else |_| {}
+        }
 
         // Wait for pty_spawn from Host
         var rbuf: [65536]u8 = undefined;
@@ -1354,6 +1397,9 @@ fn downloadAndUpgrade(io: std.Io, allocator: std.mem.Allocator, client: *std.htt
     const next_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ install_dir, next_name });
     defer allocator.free(next_path);
 
+    const svc_exe = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ install_dir, if (builtin.os.tag == .windows) "utmm.exe" else "utmm" });
+    defer allocator.free(svc_exe);
+
     var dir = try std.Io.Dir.cwd().openDir(io, install_dir, .{});
     defer dir.close(io);
     var file = try dir.createFile(io, next_name, .{});
@@ -1365,11 +1411,44 @@ fn downloadAndUpgrade(io: std.Io, allocator: std.mem.Allocator, client: *std.htt
 
     // Trigger self-upgrade by restarting
     std.log.info("[guest-http] Downloaded upgrade to {s} ({d} bytes) — restarting", .{ next_path, data.len });
-    const restart_cmd = if (builtin.os.tag == .windows)
-        "cmd /c move /Y C:\\opt\\utmm\\utmm.next.exe C:\\opt\\utmm\\utmm.exe && C:\\opt\\utmm\\utmm.exe --svc"
-    else
-        "mv /opt/utmm/utmm.next /opt/utmm/utmm && /opt/utmm/utmm --svc &";
-    _ = std.process.run(std.heap.page_allocator, io, .{ .argv = &.{ "sh", "-c", restart_cmd } }) catch {};
+
+    if (builtin.os.tag == .windows) {
+        // Windows: running .exe can be RENAMED but not overwritten.
+        // Write a batch file that waits for us to exit, then:
+        //   1. rename old utmm.exe → utmm.old.exe
+        //   2. rename new utmm.next.exe → utmm.exe
+        //   3. start the service
+        //   4. self-delete
+        // The batch runs in its own window (start /min), independent of this process.
+        const bat_path = "C:\\opt\\utmm\\upgrade.bat";
+        var bat_file = try std.Io.Dir.cwd().createFile(io, bat_path, .{});
+        defer bat_file.close(io);
+        var bwb: [1024]u8 = undefined;
+        var bw = bat_file.writer(io, &bwb);
+        try bw.interface.print(
+            \\@echo off
+            \\timeout /t 2 /nobreak > nul
+            \\move /Y "{s}" "{s}.old.exe" > nul 2>&1
+            \\move /Y "{s}" "{s}" > nul 2>&1
+            \\sc start UTM-Monitor-Guest > nul 2>&1
+            \\del "%~f0" > nul 2>&1
+        , .{ svc_exe, svc_exe, next_path, svc_exe });
+        try bw.interface.flush();
+        // Launch detached batch, then exit
+        _ = std.process.run(std.heap.page_allocator, io, .{
+            .argv = &.{ "cmd", "/c", "start", "/min", "", "C:\\opt\\utmm\\upgrade.bat" },
+        }) catch {};
+    } else {
+        // POSIX: mv can replace a running binary (old inode stays mapped).
+        // Shell runs new binary in background (&), then exits.
+        const restart_cmd = try std.fmt.allocPrint(allocator,
+            "mv {s} {s} && {s} --svc &",
+            .{ next_path, svc_exe, svc_exe });
+        defer allocator.free(restart_cmd);
+        _ = std.process.run(std.heap.page_allocator, io, .{
+            .argv = &.{ "sh", "-c", restart_cmd },
+        }) catch {};
+    }
     std.process.exit(0);
 }
 
