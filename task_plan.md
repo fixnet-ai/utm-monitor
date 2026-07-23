@@ -188,6 +188,13 @@
 - [x] **18.6 删除旧代码**: 移除 `downloadAndUpgrade`（~80行）、`wsAnnounceLoop` HTTP 升级检查（~50行）、`is_svc` 参数
 - [x] **18.7 Host 定期广播**: `host.zig` 新增 `periodicBroadcastLoop`，每 60s 向所有子网广播带版本号的发现查询，`cmdStatus` 使用 `buildDiscoveryQuery`
 - [x] **18.8 构建验证**: `zig build test` 全过，7 目标交叉编译全过，版本号 0.7.0
+- [x] **18.9 消除外部 shell 命令**: 升级流程中所有 `sh -c` / `cmd /c` 调用替换为直接系统调用
+  - `upgrade.zig`: `sh -c 'chmod +x'` → `std.c.chmod()`
+  - `broadcast.zig triggerSelfUpgrade`:
+    - `sh -c 'chmod +x'` → `std.c.chmod()`
+    - `cmd /c start /min` → `CreateProcessW` + `DETACHED_PROCESS`
+    - `sh -c '... &'` → `fork()` + `setsid()` + `execve()`
+  - 外部命令依赖归零 — 升级路径仅依赖系统调用
 - **Status:** complete
 
 **架构要点:**
@@ -195,6 +202,7 @@
 - utmm-old 独立进程：停止服务、杀进程、下载、替换、启动服务，不依赖 curl
 - `pkill -x utmm`（POSIX）/ `taskkill /im utmm.exe`（Windows）精确匹配，不误杀 utmm-old
 - 不依赖外部工具，Zig `std.http.Client` 完成 HTTP 下载
+- **零外部命令**: chmod/detached launch 全部走直接系统调用（`std.c.chmod` / `fork+execve` / `CreateProcessW`），`sh`/`cmd` 不再参与升级流程
 
 ## 已删除的组件
 

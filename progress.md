@@ -28,6 +28,14 @@
 
 **构建验证**: `zig build test` 全过，7 目标交叉编译（ReleaseSafe）全过
 
+**追加 — 消除外部 shell 命令**:
+- `upgrade.zig`: `sh -c 'chmod +x'` → `std.c.chmod(@ptrCast(path), 0o755)` — 直接 POSIX syscall
+- `broadcast.zig triggerSelfUpgrade`:
+  - `sh -c 'chmod +x'` → `std.c.chmod()` — 同 upgrade.zig
+  - `cmd /c start /min "" utmm-old.exe --update-url "..."` → `CreateProcessW` + `DETACHED_PROCESS` (0x00000008)
+  - `sh -c 'utmm-old --update-url ... &'` → `fork()` + `setsid()` + `execve()`
+- 升级路径零外部命令 — 全部走系统调用，`sh`/`cmd` 不再参与
+
 ## Session 2026-07-23 (v0.6.5 自动升级端到端修复)
 
 ### v0.6.5 发布

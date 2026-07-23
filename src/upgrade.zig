@@ -164,15 +164,11 @@ fn replaceBinary(io: std.Io, gpa: std.mem.Allocator, data: []const u8) !void {
     defer next_file.close(io);
     try next_file.writeStreamingAll(io, data);
 
-    // chmod +x on POSIX
+    // chmod +x on POSIX (no shell — direct syscall)
     if (builtin.os.tag != .windows) {
-        const chmod_cmd = try std.fmt.allocPrint(gpa, "chmod +x {s}", .{next_path});
-        defer gpa.free(chmod_cmd);
-        if (std.process.run(gpa, io, .{ .argv = &.{ "sh", "-c", chmod_cmd } })) |cr| {
-            gpa.free(cr.stdout);
-            gpa.free(cr.stderr);
-        } else |err| {
-            std.log.err("[upgrade] chmod failed: {}", .{err});
+        const chmod_rc = std.c.chmod(@ptrCast(next_path), 0o755);
+        if (chmod_rc != 0) {
+            std.log.err("[upgrade] chmod failed: errno={}", .{std.c._errno().*});
             return error.ChmodFailed;
         }
     }

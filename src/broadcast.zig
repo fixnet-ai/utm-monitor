@@ -591,6 +591,7 @@ extern "c" fn unlockpt(fd: std.posix.fd_t) c_int;
 extern "c" fn ptsname(fd: std.posix.fd_t) ?[*:0]u8;
 extern "c" fn fork() std.posix.pid_t;
 extern "c" fn setsid() std.posix.pid_t;
+extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
 extern "c" fn open(path: [*:0]const u8, flags: u32, mode: u32) std.posix.fd_t;
 extern "c" fn dup2(old: std.posix.fd_t, new: std.posix.fd_t) std.posix.fd_t;
 extern "c" fn close(fd: std.posix.fd_t) c_int;
@@ -1419,43 +1420,79 @@ fn triggerSelfUpgrade(io: std.Io, allocator: std.mem.Allocator, upgrade_url: []c
     defer dst.close(io);
     try dst.writeStreamingAll(io, copy_buf[0..exe_size]);
 
-    // chmod +x on POSIX
+    // chmod +x on POSIX (direct syscall, no shell)
     if (builtin.os.tag != .windows) {
-        const chmod_cmd = try std.fmt.allocPrint(allocator, "chmod +x {s}", .{old_path});
-        defer allocator.free(chmod_cmd);
-        if (std.process.run(allocator, io, .{ .argv = &.{ "sh", "-c", chmod_cmd } })) |cr| {
-            allocator.free(cr.stdout);
-            allocator.free(cr.stderr);
-        } else |_| {}
+        const chmod_rc = std.c.chmod(@ptrCast(old_path), 0o755);
+        if (chmod_rc != 0) {
+            std.log.err("[upgrade] chmod failed: errno={}", .{std.c._errno().*});
+            return error.ChmodFailed;
+        }
     }
 
     // Launch utmm-old as detached process
     std.log.info("[upgrade] Launching utmm-old with url={s}", .{upgrade_url});
 
     if (builtin.os.tag == .windows) {
-        // cmd /c start /min — independent process, survives parent exit
-        if (std.process.run(allocator, io, .{
-            .argv = &.{ "cmd", "/c", "start", "/min", "", old_path, "--update-url", upgrade_url },
-        })) |cr| {
-            allocator.free(cr.stdout);
-            allocator.free(cr.stderr);
-        } else |err| {
-            std.log.err("[upgrade] Failed to launch utmm-old: {}", .{err});
-            return err;
+        // CreateProcessW DETACHED_PROCESS — independent process, survives parent exit
+        const w = std.os.windows;
+        const PROCESS_INFORMATION = extern struct {
+            hProcess: w.HANDLE,
+            hThread: w.HANDLE,
+            dwProcessId: w.DWORD,
+            dwThreadId: w.DWORD,
+        };
+        const CloseHandle = @extern(
+            *const fn (hObject: w.HANDLE) callconv(.winapi) w.BOOL,
+            .{ .name = "CloseHandle", .library_name = "kernel32" },
+        );
+        const CreateProcessW = @extern(
+            *const fn (lpApplicationName: ?[*:0]const u16, lpCommandLine: [*:0]u16, lpProcessAttributes: ?*w.SECURITY_ATTRIBUTES, lpThreadAttributes: ?*w.SECURITY_ATTRIBUTES, bInheritHandles: w.BOOL, dwCreationFlags: w.DWORD, lpEnvironment: ?w.LPVOID, lpCurrentDirectory: ?[*:0]const u16, lpStartupInfo: *w.STARTUPINFOW, lpProcessInformation: *PROCESS_INFORMATION) callconv(.winapi) w.BOOL,
+            .{ .name = "CreateProcessW", .library_name = "kernel32" },
+        );
+
+        const DETACHED_PROCESS: w.DWORD = 0x00000008;
+
+        const cmd_line = try std.fmt.allocPrint(allocator, "\"{s}\" --update-url {s}", .{ old_path, upgrade_url });
+        defer allocator.free(cmd_line);
+
+        // Convert to null-terminated UTF-16LE
+        const cmd_utf16 = try allocator.alloc(u16, cmd_line.len + 1);
+        defer allocator.free(cmd_utf16);
+        const end_idx = try std.unicode.utf8ToUtf16Le(cmd_utf16, cmd_line);
+        cmd_utf16[end_idx] = 0;
+
+        var si: w.STARTUPINFOW = std.mem.zeroes(w.STARTUPINFOW);
+        si.cb = @sizeOf(w.STARTUPINFOW);
+
+        var pi: PROCESS_INFORMATION = undefined;
+
+        if (@intFromEnum(CreateProcessW(null, @as([*:0]u16, @ptrCast(cmd_utf16.ptr)), null, null, @enumFromInt(0), DETACHED_PROCESS, null, null, &si, &pi)) == 0) {
+            std.log.err("[upgrade] CreateProcessW failed", .{});
+            return error.LaunchFailed;
         }
+        _ = CloseHandle(pi.hProcess);
+        _ = CloseHandle(pi.hThread);
     } else {
-        // sh -c '... &' — background independent process
-        const launch_cmd = try std.fmt.allocPrint(allocator, "{s} --update-url {s} &", .{ old_path, upgrade_url });
-        defer allocator.free(launch_cmd);
-        if (std.process.run(allocator, io, .{
-            .argv = &.{ "sh", "-c", launch_cmd },
-        })) |cr| {
-            allocator.free(cr.stdout);
-            allocator.free(cr.stderr);
-        } else |err| {
-            std.log.err("[upgrade] Failed to launch utmm-old: {}", .{err});
-            return err;
+        // POSIX: fork + setsid + execve — detached background process
+        const old_path_z = try allocator.dupeZ(u8, old_path);
+        defer allocator.free(old_path_z);
+        const upgrade_url_z = try allocator.dupeZ(u8, upgrade_url);
+        defer allocator.free(upgrade_url_z);
+
+        const pid = fork();
+        if (pid == 0) {
+            // Child: detach from parent session
+            _ = setsid();
+
+            const argv = [_:null]?[*:0]const u8{ old_path_z.ptr, "--update-url", upgrade_url_z.ptr };
+            _ = execve(old_path_z.ptr, &argv, std.c.environ);
+            // execve failed
+            std.process.exit(1);
+        } else if (pid < 0) {
+            std.log.err("[upgrade] fork failed", .{});
+            return error.LaunchFailed;
         }
+        // Parent: child runs independently, continue
     }
 
     std.process.exit(0);
