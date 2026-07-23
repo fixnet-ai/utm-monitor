@@ -36,6 +36,14 @@
   - `sh -c 'utmm-old --update-url ... &'` → `fork()` + `setsid()` + `execve()`
 - 升级路径零外部命令 — 全部走系统调用，`sh`/`cmd` 不再参与
 
+**追加 — E2E 自动升级验证 + FileBusy 修复**:
+- **E2E 验证**（模拟 Host 版本升级 v0.7.0 → v0.7.1）：
+  - macvm (aarch64-macos): 自动检测版本不匹配 → triggerSelfUpgrade → utmm-old 下载/替换/重启 → v0.7.1 ✅
+  - WIN-Q0JNGDDBE28 (aarch64-windows): 同上 ✅
+- **Windows FileBusy bug**: `dst.close(io)` 在 `defer` 中延迟到函数返回才执行，但 `std.process.spawn` 在此之前调用，导致 `utmm-old.exe` 被自身文件句柄锁定。修复：用块作用域 `{ var dst = ...; defer dst.close(io); ... }` 确保 spawn 前关闭文件句柄。
+- **Windows 进程启动改进**: 使用 `std.process.spawn` 替代手动 `CreateProcessW`，由标准库处理 Windows 进程创建细节。
+- MODASIAIPC (x86_64 Windows, v0.6.5): 无 triggerSelfUpgrade 代码，需手动部署 v0.7.0
+
 ## Session 2026-07-23 (v0.6.5 自动升级端到端修复)
 
 ### v0.6.5 发布

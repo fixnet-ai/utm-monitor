@@ -1414,11 +1414,14 @@ fn triggerSelfUpgrade(io: std.Io, allocator: std.mem.Allocator, upgrade_url: []c
     const exe_size = try src.readPositionalAll(io, copy_buf, 0);
     if (exe_size >= max_copy) return error.BinaryTooLarge;
 
-    // Delete old utmm-old if exists, then create new
+    // Delete old utmm-old if exists, then create new and write copy
     std.Io.Dir.cwd().deleteFile(io, old_path) catch {};
-    var dst = try std.Io.Dir.cwd().createFile(io, old_path, .{});
-    defer dst.close(io);
-    try dst.writeStreamingAll(io, copy_buf[0..exe_size]);
+    {
+        var dst = try std.Io.Dir.cwd().createFile(io, old_path, .{});
+        defer dst.close(io);
+        try dst.writeStreamingAll(io, copy_buf[0..exe_size]);
+    }
+    // dst is now closed — file handle released before spawn
 
     // chmod +x on POSIX (direct syscall, no shell)
     if (builtin.os.tag != .windows) {
@@ -1433,45 +1436,13 @@ fn triggerSelfUpgrade(io: std.Io, allocator: std.mem.Allocator, upgrade_url: []c
     std.log.info("[upgrade] Launching utmm-old with url={s}", .{upgrade_url});
 
     if (builtin.os.tag == .windows) {
-        // CreateProcessW DETACHED_PROCESS — independent process, survives parent exit
-        const w = std.os.windows;
-        const PROCESS_INFORMATION = extern struct {
-            hProcess: w.HANDLE,
-            hThread: w.HANDLE,
-            dwProcessId: w.DWORD,
-            dwThreadId: w.DWORD,
-        };
-        const CloseHandle = @extern(
-            *const fn (hObject: w.HANDLE) callconv(.winapi) w.BOOL,
-            .{ .name = "CloseHandle", .library_name = "kernel32" },
-        );
-        const CreateProcessW = @extern(
-            *const fn (lpApplicationName: ?[*:0]const u16, lpCommandLine: [*:0]u16, lpProcessAttributes: ?*w.SECURITY_ATTRIBUTES, lpThreadAttributes: ?*w.SECURITY_ATTRIBUTES, bInheritHandles: w.BOOL, dwCreationFlags: w.DWORD, lpEnvironment: ?w.LPVOID, lpCurrentDirectory: ?[*:0]const u16, lpStartupInfo: *w.STARTUPINFOW, lpProcessInformation: *PROCESS_INFORMATION) callconv(.winapi) w.BOOL,
-            .{ .name = "CreateProcessW", .library_name = "kernel32" },
-        );
-
-        const DETACHED_PROCESS: w.DWORD = 0x00000008;
-
-        const cmd_line = try std.fmt.allocPrint(allocator, "\"{s}\" --update-url {s}", .{ old_path, upgrade_url });
-        defer allocator.free(cmd_line);
-
-        // Convert to null-terminated UTF-16LE
-        const cmd_utf16 = try allocator.alloc(u16, cmd_line.len + 1);
-        defer allocator.free(cmd_utf16);
-        const end_idx = try std.unicode.utf8ToUtf16Le(cmd_utf16, cmd_line);
-        cmd_utf16[end_idx] = 0;
-
-        var si: w.STARTUPINFOW = std.mem.zeroes(w.STARTUPINFOW);
-        si.cb = @sizeOf(w.STARTUPINFOW);
-
-        var pi: PROCESS_INFORMATION = undefined;
-
-        if (@intFromEnum(CreateProcessW(null, @as([*:0]u16, @ptrCast(cmd_utf16.ptr)), null, null, @enumFromInt(0), DETACHED_PROCESS, null, null, &si, &pi)) == 0) {
-            std.log.err("[upgrade] CreateProcessW failed", .{});
+        // Use std.process.spawn for proper detached process launch
+        _ = std.process.spawn(io, .{
+            .argv = &.{ old_path, "--update-url", upgrade_url },
+        }) catch |err| {
+            std.log.err("[upgrade] Failed to launch utmm-old: {}", .{err});
             return error.LaunchFailed;
-        }
-        _ = CloseHandle(pi.hProcess);
-        _ = CloseHandle(pi.hThread);
+        };
     } else {
         // POSIX: fork + setsid + execve — detached background process
         const old_path_z = try allocator.dupeZ(u8, old_path);
