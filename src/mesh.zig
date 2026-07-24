@@ -57,13 +57,35 @@ pub fn formatNodeId(id: NodeId, allocator: std.mem.Allocator) ![]const u8 {
 }
 
 /// Compute KCP conversation ID from two NodeIds (XOR of MACs → u32).
-pub fn computeConv(a: NodeId, b: NodeId) u32 {
-    var conv: u32 = 0;
+pub fn computeConv(a: NodeId, b: NodeId, nonce: u32) u32 {
+    var conv: u32 = nonce;
     for (0..6) |i| {
         const shift: u5 = @intCast((i % 4) * 8);
         conv ^= @as(u32, @intCast(a[i] ^ b[i])) << shift;
     }
     return conv;
+}
+
+/// Generate a process-unique nonce from ASLR-entropy (stack address) and PID.
+/// Changes on every process start, ensuring KCP conversation IDs are unique
+/// across Host restarts — stale sessions are naturally abandoned.
+fn generateNonce() u32 {
+    // Stack variable address provides ASLR entropy (randomized per-process).
+    var dummy: u8 = undefined;
+    const stack_addr: u32 = @truncate(@intFromPtr(&dummy));
+    // PID adds uniqueness across rapid restarts where stack layout might be similar.
+    const pid: u32 = if (builtin.os.tag == .windows)
+        std.os.windows.GetCurrentProcessId()
+    else
+        @intCast(std.c.getpid());
+    return pid ^ stack_addr;
+}
+
+/// Read the KCP conversation ID from a KCP packet embedded in mesh KCP data.
+/// The KCP header starts at offset 13 (after 1-byte TTL + 6-byte src + 6-byte dst).
+/// KCP conv is u32 big-endian at byte 0 of the KCP header.
+pub fn readKcpConv(data: []const u8) u32 {
+    return std.mem.readInt(u32, data[13..17], .big);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -245,6 +267,14 @@ pub const Mesh = struct {
     sessions: std.AutoHashMap(u32, *MeshSession),
     sessions_mutex: std.Io.Mutex,
 
+    /// Per-process nonce, XOR'd with connect_counter to produce unique
+    /// KCP conversation IDs across reconnections and Host restarts.
+    nonce: u32,
+
+    /// Counter incremented on each connect() call. Ensures each reconnection
+    /// gets a unique conv, preventing stale KCP seq number mismatch.
+    connect_counter: u32,
+
     // Shutdown
     shutdown: std.atomic.Value(bool),
 
@@ -288,6 +318,8 @@ pub const Mesh = struct {
             .shutdown = std.atomic.Value(bool).init(false),
             .upgrade_needed = upgrade_needed,
             .host_gateway_ip = host_gateway_ip,
+            .nonce = generateNonce(),
+            .connect_counter = 0,
             .clock_ms = 0,
         };
     }
@@ -642,34 +674,38 @@ pub const Mesh = struct {
         const src_mac: NodeId = data[1..7].*;
         const dst_mac: NodeId = data[7..13].*;
 
+        // Read KCP conversation ID directly from the KCP header.
+        // This is more robust than computing from MAC addresses because
+        // the conv embeds the Host's startup nonce — when Host restarts,
+        // the conv changes and a fresh session is created automatically.
+        const kcp_conv = readKcpConv(data);
+
         // Is this for us?
         if (std.mem.eql(u8, &dst_mac, &self.node_id)) {
-            // Deliver to our KCP session
-            const conv = computeConv(src_mac, self.node_id);
-
+            // Deliver to our KCP session (keyed by conv from packet header)
             // Lock to check/create session safely (protects against tunnelManager)
             self.sessions_mutex.lock(self.io) catch {};
-            const existing = self.sessions.get(conv);
+            const existing = self.sessions.get(kcp_conv);
             if (existing) |sess| {
                 self.sessions_mutex.unlock(self.io);
                 sess.kcp_inst.input(data[13..]) catch |err| {
                     std.log.err("[mesh] KCP input error: {}", .{err});
                 };
             } else {
-                std.log.debug("[mesh] New KCP session from incoming data conv={d}", .{conv});
+                std.log.debug("[mesh] New KCP session from incoming data conv={d}", .{kcp_conv});
                 // New incoming session — create KCP instance and store
                 const new_sess = try self.allocator.create(MeshSession);
                 errdefer self.allocator.destroy(new_sess);
                 new_sess.* = .{
-                    .kcp_inst = try kcp.Kcp.create(self.allocator, conv, new_sess),
+                    .kcp_inst = try kcp.Kcp.create(self.allocator, kcp_conv, new_sess),
                     .mesh = self,
                     .remote = src_mac,
-                    .conv = conv,
+                    .conv = kcp_conv,
                     .next_hop = src_mac, // direct for now
                     .allocator = self.allocator,
                 };
                 new_sess.kcp_inst.setOutput(meshKcpOutput);
-                try self.sessions.put(conv, new_sess);
+                try self.sessions.put(kcp_conv, new_sess);
                 self.sessions_mutex.unlock(self.io);
                 new_sess.kcp_inst.input(data[13..]) catch |err| {
                     std.log.err("[mesh] KCP input error (new session): {}", .{err});
@@ -866,7 +902,11 @@ pub const Mesh = struct {
         self.sessions_mutex.lock(self.io) catch {};
         defer self.sessions_mutex.unlock(self.io);
 
-        const conv = computeConv(self.node_id, dest);
+        // Increment counter to ensure each reconnection gets a unique conv.
+        // This prevents stale KCP seq number mismatch after kick/reconnect
+        // (when nonce hasn't changed because Host wasn't restarted).
+        self.connect_counter +%= 1;
+        const conv = computeConv(self.node_id, dest, self.nonce ^ self.connect_counter);
         if (self.sessions.get(conv)) |existing| return existing;
 
         const sess = try self.allocator.create(MeshSession);
@@ -898,14 +938,21 @@ pub const Mesh = struct {
 
     /// Close the KCP session for a specific destination node, if any.
     /// Used before reconnecting to avoid stale KCP seq number mismatch.
+    /// Finds the session by iterating (using `remote` field) rather than
+    /// computing conv, because the conv may have changed due to
+    /// connect_counter increments or nonce changes.
     pub fn closeSessionFor(self: *Mesh, dest: NodeId) void {
         self.sessions_mutex.lock(self.io) catch {};
         defer self.sessions_mutex.unlock(self.io);
-        const conv = computeConv(self.node_id, dest);
-        if (self.sessions.get(conv)) |sess| {
-            _ = self.sessions.remove(conv);
-            sess.deinit();
-            self.allocator.destroy(sess);
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, &entry.value_ptr.*.remote, &dest)) {
+                const sess = entry.value_ptr.*;
+                _ = self.sessions.remove(entry.key_ptr.*);
+                sess.deinit();
+                self.allocator.destroy(sess);
+                break;
+            }
         }
     }
 
@@ -1033,12 +1080,24 @@ test "formatNodeId" {
 test "computeConv" {
     const a: NodeId = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
     const b: NodeId = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
-    try std.testing.expectEqual(@as(u32, 0), computeConv(a, b));
+    // Same MACs with nonce=0 → conv = 0 (all XOR pairs cancel)
+    try std.testing.expectEqual(@as(u32, 0), computeConv(a, b, 0));
+    // Same MACs with nonce=42 → conv = 42
+    try std.testing.expectEqual(@as(u32, 42), computeConv(a, b, 42));
 
     const a2: NodeId = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
     const b2: NodeId = .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
-    _ = computeConv(a2, b2); // just verify non-zero and deterministic
-    try std.testing.expectEqual(computeConv(a2, b2), computeConv(a2, b2));
+    _ = computeConv(a2, b2, 0); // just verify non-zero and deterministic
+    try std.testing.expectEqual(computeConv(a2, b2, 0), computeConv(a2, b2, 0));
+    // Verify nonce changes conv
+    try std.testing.expect(computeConv(a2, b2, 0) != computeConv(a2, b2, 1));
+}
+
+test "readKcpConv" {
+    var buf: [64]u8 = [_]u8{0} ** 64;
+    // Write a KCP conv at offset 13 (big-endian, matching KCP wire format)
+    std.mem.writeInt(u32, buf[13..17], 0x12345678, .big);
+    try std.testing.expectEqual(@as(u32, 0x12345678), readKcpConv(&buf));
 }
 
 test "encodeLsa + decodeLsa round-trip" {
