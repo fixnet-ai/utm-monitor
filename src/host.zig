@@ -589,19 +589,6 @@ fn tunnelManager(
     state: *httpd.HostState,
     mesh_opt: *?mesh_mod.Mesh,
 ) void {
-    // Allocated tunnels that outlive a single scan iteration.
-    // Keyed by hostname so we don't re-connect for existing tunnels.
-    var active_tunnels: std.StringHashMap(*tunnel_mod.Tunnel) = std.StringHashMap(*tunnel_mod.Tunnel).init(allocator);
-    defer {
-        var it = active_tunnels.iterator();
-        while (it.next()) |entry| {
-            const tun_ptr = entry.value_ptr.*;
-            tun_ptr.deinit();
-            allocator.destroy(tun_ptr);
-        }
-        active_tunnels.deinit();
-    }
-
     while (true) {
         // Check shutdown
         if (mesh_opt.*) |*m| {
@@ -653,8 +640,11 @@ fn tunnelManager(
                     host_http.syncHostsFromState(state, allocator);
                 }
 
-                // Phase 2: Establish tunnel if not already active
-                if (active_tunnels.get(hostname) == null and state.getGuestTunnel(hostname) == null) {
+                // Phase 2: Establish tunnel if not already active.
+                // Uses state.getGuestTunnel() as the sole source of truth —
+                // when handleMeshGuest disconnects, its defer calls
+                // removeGuestTunnel, and the next scan reconnects.
+                if (state.getGuestTunnel(hostname) == null) {
                     // Close stale session first — KCP seq numbers are reset on
                     // reconnect, and the old session's rcv_nxt won't accept new data.
                     m.closeSessionFor(entry.key_ptr.*);
@@ -673,14 +663,6 @@ fn tunnelManager(
                         continue;
                     };
 
-                    active_tunnels.put(hostname, tun_ptr) catch |err| {
-                        std.log.err("[tun-mgr] active_tunnels put failed: {}", .{err});
-                        state.removeGuestTunnel(hostname);
-                        tun_ptr.deinit();
-                        allocator.destroy(tun_ptr);
-                        continue;
-                    };
-
                     // Spawn per-guest handler thread
                     const hostname_dup = allocator.dupe(u8, hostname) catch {
                         std.log.err("[tun-mgr] hostname dup failed for {s}", .{hostname});
@@ -692,7 +674,6 @@ fn tunnelManager(
                         std.log.err("[tun-mgr] handleMeshGuest spawn failed for {s}: {}", .{ hostname, err });
                         allocator.free(hostname_dup);
                         state.removeGuestTunnel(hostname);
-                        _ = active_tunnels.remove(hostname);
                         tun_ptr.deinit();
                         allocator.destroy(tun_ptr);
                         continue;
@@ -700,8 +681,7 @@ fn tunnelManager(
                     t.detach();
 
                     // Note: handleMeshGuest's defer frees hostname_dup on disconnect.
-                    // When it calls removeGuestTunnel, our state.getGuestTunnel returns null
-                    // and on next scan we re-connect.
+                    // When it calls removeGuestTunnel, our next scan will re-connect.
 
                     std.log.info("[tun-mgr] Tunnel + handler started for {s}", .{hostname});
                 }
