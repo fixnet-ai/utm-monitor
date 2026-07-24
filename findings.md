@@ -284,21 +284,57 @@ try response.flush();           // finalize chunked encoding chunk
 
 ## Known Issues
 
-1. **CLI upload/download path resolution**: Upload path on guest side is relative to
-   working directory (typically `/opt/utmm/`). Full path support would require the
-   guest to resolve absolute paths.
+### KCP / Mesh 传输层（v0.11.x）
 
-2. **pty_resize is a stub**: Terminal resize message is parsed but not applied
-   (TIOCSWINSZ ioctl not yet called).
+1. **Kick 后 reconnect 延迟 ~3s**: Guest 端 `stale_count > 600`（600 × 5ms = 3s）
+   才检测到旧 tunnel 失活。在此期间 exec 命令在 KCP send buffer 中排队，reconnect
+   完成后才会被处理。可优化为更快的失活检测（更低的阈值或显式通知机制）。
 
-3. **killForegroundProcess is a stub**: pty_signal supports per-signal values but
-   currently only sends SIGKILL/TerminateProcess to the shell child.
+2. **旧 KCP session 在 Guest 端累积**: 每次 kick 创建新 session（不同 conv），但旧
+   session 仅在 Mesh.deinit() 时清理。长时间运行多次 kick 后内存泄漏风险。Host 端
+   `closeSessionFor` 已正确清理旧 session，但 Guest 端缺乏对等清理逻辑。
 
-4. **VM suspend/resume may cause stale WebSocket**: If a VM is suspended and the
-   Host restarts, the guest may not detect the dead WebSocket connection until the
-   next write attempt (which may hang). A TCP keepalive or application-level
-   heartbeat could mitigate this.
+3. **Phantom session from handleKcpData race**: `handleKcpData` 在 mesh.run() 线程
+   运行，可能与 tunnelManager 线程的 `closeSessionFor`+`connect()` 竞态：Guest 旧
+   KCP 的 keepalive 包在 `closeSessionFor` 之后到达 → `handleKcpData` 创建新 phantom
+   session（旧 conv）→ `connect()` 再创建另一个 session（新 conv）。两者共存但
+   phantom session 仅浪费资源，不导致功能错误。
 
-5. **std.http.Server HEAD requests return 404**: Zig's `std.http.Server.respond()`
-   doesn't automatically handle HEAD by stripping body. GET requests work fine.
-   Upstream limitation.
+4. **Kick 后 shell 状态丢失**: Kick 强制 Guest 重 spawn pty，`cd`、`export` 等
+   shell 状态全部丢失。这是 pty-per-connection 模型的设计约束，需在文档中说明。
+
+5. **Pty 输出混入 shell 提示符**: Kick+reconnect 后，旧 pty 的残留输出（shell 提示符、
+   未完成命令的输出片段）可能混入新 session 的输出。`scanForMarker` 使用
+   `lastIndexOf` 缓解了 macOS 命令回显问题，但跨 session 的输出污染未解决。
+
+### 线程安全
+
+6. **Io.Event 竞态崩溃（已知，未修复）**: `wake_event.waitTimeout()` 在多 handler
+   并发时可能崩溃（`.unset => unreachable`）。upload 并发调用已触发此 bug。
+   HostState 的单一 `wake_event` 被所有 handler 共享，需改为 per-op 事件或
+   使用 `Io.Semaphore`。
+
+### 未验证用例
+
+7. **Windows VM 未验证**: windowsvm / winx64 在 Phase 30 验证期间离线。Kick+reconnect
+   修复在 Windows 上的行为未确认。
+
+8. **macOS Guest kick 未单独测试**: 仅 linuxvm 进行了 kick+reconnect 验证。macvm 的
+   基础 exec 正常，但 kick 场景未覆盖。
+
+9. **大文件 upload/download**: KCP 隧道无帧大小限制（相比旧 WebSocket 的 64KB），但
+   大文件（>10MB）传输未经测试。
+
+10. **自动升级端到端**: Phase 30 的 connect_counter 变更不影响自动升级逻辑，但
+    升级触发、下载、替换、重启全流程未重新验证。
+
+### 遗留（非 mesh 相关）
+
+11. **pty_resize is a stub**: Terminal resize message is parsed but not applied
+    (TIOCSWINSZ ioctl not yet called).
+
+12. **killForegroundProcess is a stub**: pty_signal supports per-signal values but
+    currently only sends SIGKILL/TerminateProcess to the shell child.
+
+13. **std.http.Server HEAD requests return 404**: Zig's `std.http.Server.respond()`
+    doesn't automatically handle HEAD by stripping body. Upstream limitation.

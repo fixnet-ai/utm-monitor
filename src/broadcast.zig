@@ -1144,16 +1144,13 @@ pub fn meshSessionLoop(
             if (n == 0) {
                 // No data — check for stale tunnel (Host restart detection).
                 // When Host restarts, the old KCP session persists but will never
-                // receive new data. After ~15s of silence, give up and wait for
-                // a new connection via waitForHostTunnel.
+                // receive new data. After ~3s of silence, check if a newer
+                // session (from restarted Host) has pending data.
                 stale_count += 1;
-                if (stale_count > 3000) { // 3000 × 5ms ≈ 15s
-                    if (!tunnel.isAlive()) {
-                        std.log.info("[guest-mesh] Tunnel dead after {d} idle polls, reconnecting", .{stale_count});
-                        break;
-                    }
+                if (stale_count > 600) { // 600 × 5ms ≈ 3s
                     // Check if a newer session exists in mesh.sessions with pending data.
-                    // This handles the case where Host restarted and created a fresh session.
+                    // This handles the case where Host restarted and created a fresh session
+                    // with a different KCP conv (due to the Host's nonce changing).
                     if (mesh_opt) |*m| {
                         m.sessions_mutex.lock(m.io) catch {
                             break;
@@ -1174,7 +1171,7 @@ pub fn meshSessionLoop(
                             break;
                         }
                     }
-                    stale_count = 2900; // Check again soon
+                    stale_count = 580; // Check again in ~100ms
                 }
                 std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
                 continue;

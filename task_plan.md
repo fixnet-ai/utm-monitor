@@ -349,3 +349,62 @@ v0.8.0: HTTP 层性能优化 — exec 输出流式传输（chunked + trailer）�
 - [x] MCP JSON-RPC `tools/list` / `vm_status` / `vm_exec` — 全部正常
 - [x] 8 目标交叉编译全过
 - **Status:** complete
+
+### Phase 29: v0.11.1 — Host 重启后 exec 挂起修复 ✅ (2026-07-24)
+
+**Bug**: Host 重启后，Guest 的 `handleKcpData` 使用 `computeConv(MAC, MAC)` 计算 KCP conv，
+由于 MAC 地址不变，新旧 session 的 conv 相同。Guest 找到旧 KCP session 并喂入新 Host 的数据，
+旧 KCP 因序号不匹配丢弃数据 → pty_spawn 永远无法到达 Guest → exec 永久挂起。
+
+**根因链路**:
+1. Host 重启 → 新 KCP 状态（seq=0）→ 向 Guest 发送 pty_spawn（sn=0）
+2. Guest `handleKcpData`: `computeConv(host_mac, guest_mac)` = 旧 conv → 找到旧 session
+3. 旧 KCP 的 `rcv_nxt` 远大于 0 → `kcp.input()` 丢弃 `sn=0` 的数据包（out of window）
+4. 新 Host 的数据从未被 Guest 应用层接收 → 双方都等待
+
+**修复方案**: KCP conv 嵌入 Host 启动时生成的 nonce，`handleKcpData` 从 KCP 包头直接读取 conv
+
+| 变更 | 文件 | 说明 |
+|------|------|------|
+| Mesh.nonce 字段 | `mesh.zig` | PID + ASLR 栈地址熵，每次进程启动唯一 |
+| `computeConv(a,b,nonce)` | `mesh.zig` | 第三个参数 nonce，XOR 进基础 conv |
+| `readKcpConv()` | `mesh.zig` | 从 KCP 包头偏移 13 读取 u32 big-endian conv |
+| `handleKcpData` 重写 | `mesh.zig` | 用 `readKcpConv(data)` 替代 `computeConv(src_mac, self.node_id)` |
+| `connect/closeSessionFor` | `mesh.zig` | 使用 `self.nonce` |
+| `generateNonce()` | `mesh.zig` | 跨平台 nonce 生成（POSIX `getpid` + Windows `GetCurrentProcessId` + 栈地址 XOR） |
+| stale_count 阈值 | `broadcast.zig` | 3000→600（15s→3s），移除不可靠的 `tunnel.isAlive()` 检查 |
+
+**验证结果**（2 次 Host 重启测试）:
+- linuxvm: `21:41:07 New KCP session conv=545727302` → `21:41:08 Newer session detected, reconnecting` → 1 秒切换完成
+- macvm: 同样正常恢复
+- 旧 session (conv=626532558) 与新 session (conv=545727302) 的 conv 不同 → nonce 方案正确
+
+**Status:** complete
+
+### Phase 30: v0.11.2 — Kick 后 reconnect exec 挂起修复 ✅ (2026-07-25)
+
+**Bug**: Kick 后 `m.connect()` 返回新 session，但 conv 与旧 session 相同（nonce 不变）。
+Guest 端旧 KCP session 仍然存在，`handleKcpData` 发现有相同 conv 的 session 就喂入旧 KCP，
+旧 KCP 因序号不匹配丢弃数据 → pty_spawn 无法到达 Guest → exec 永久挂起。
+
+**Phase 29 解决了 Host 重启但未解决 Kick**：Phase 29 的 nonce 方案仅在 Host 进程重启时改变
+conv。Kick 只是关闭 WebSocket 连接，Host 进程不重启，nonce 不变，新旧 session 的 conv
+完全一致。`connect()` 发现相同 conv 的 session 就直接返回旧的（已被 `closeSessionFor` 删除，
+但 Guest 端的旧 session 依然存在）。
+
+**修复方案**: 引入 `connect_counter`，每次 `connect()` 递增并 XOR 进 conv
+
+| 变更 | 位置 | 说明 |
+|------|------|------|
+| `connect_counter: u32` | `mesh.zig` Mesh struct | 每次 connect() 递增，XOR 进 conv |
+| `connect()` 重写 | `mesh.zig` | `self.connect_counter +%= 1` → `computeConv(host, guest, nonce ^ counter)` |
+| `closeSessionFor()` 重写 | `mesh.zig` | 改为迭代 sessions 按 `remote` 字段查找（不再计算 conv） |
+| `init()` 初始化 | `mesh.zig` | `.connect_counter = 0` |
+
+**验证结果**:
+- linuxvm: Kick 前 `conv=615622921` → Kick 后 `conv=615622920` → exec 正常恢复
+- 连续 3 次 Kick 后 exec 均正常执行
+- macvm: `sw_vers` 正常
+- 8 目标交叉编译全过
+
+**Status:** complete

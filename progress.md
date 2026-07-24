@@ -1,4 +1,43 @@
-# Progress: v0.8.2
+# Progress: v0.11.2
+
+## Session 2026-07-25 (Phase 30 — Kick 后 reconnect exec 挂起修复)
+
+### Phase 30: connect_counter 修复
+
+**Bug**: `--kick linuxvm` 后 `--exec` 永久挂起。Phase 29 的 nonce 方案仅在 Host 重启时改变 conv，
+Kick 不重启进程，nonce 不变 → 新旧 session conv 相同 → Guest 旧 KCP 拒绝新数据。
+
+**修复** (`src/mesh.zig`):
+- 新增 `connect_counter: u32` 字段，每次 `connect()` 递增
+- `connect()`: `conv = computeConv(host, guest, nonce ^ counter)` — 每次唯一
+- `closeSessionFor()`: 改为迭代 sessions 按 `remote` 字段查找（不再计算 conv）
+
+**验证结果**:
+| 测试 | 结果 |
+|------|------|
+| Kick 前 `conv=615622921` → Kick 后 `conv=615622920` | ✅ conv 变化 |
+| 连续 3 次 kick + exec | ✅ 全部恢复 |
+| Shell 持久化 (`cd /tmp && pwd`) | ✅ |
+| Upload/download round-trip | ✅ |
+| MCP JSON-RPC (`tools/list`, `vm_status`) | ✅ |
+| 静态文件服务 (`/bin/`) | ✅ |
+| 8 目标交叉编译 | ✅ 全部通过 |
+
+**Commit**: `963d40a` — fix: post-kick reconnect deadlock with connect_counter
+
+### Known Issues 整理
+
+更新 `findings.md` Known Issues 章节，从 5 项扩展到 13 项，分类为：
+- **KCP/Mesh 传输层**（5 项）：reconnect 3s 延迟、旧 session 累积、phantom session race、
+  shell 状态丢失、pty 输出混入
+- **线程安全**（1 项）：Io.Event 竞态崩溃（已知未修复）
+- **未验证用例**（4 项）：Windows VM、macOS kick、大文件传输、自动升级 E2E
+- **遗留非 mesh 相关**（3 项）：pty_resize stub、killForegroundProcess stub、HEAD 404
+
+### 文档更新
+- `task_plan.md`: 新增 Phase 30
+- `findings.md`: Known Issues 重写为 13 项分类清单
+- `progress.md`: 本会话记录
 
 ## Session 2026-07-24 (v0.8.2 发布 + 全文档同步)
 
