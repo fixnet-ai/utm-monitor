@@ -940,8 +940,16 @@ pub fn meshSessionLoop(
     // Mesh owns UDP :2121 for LSA + KCP relay + PING/PONG.
     var mesh_opt: ?mesh_mod.Mesh = null;
     var mesh_thread: ?std.Thread = null;
-    var mesh_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     var mesh_socket_opt: ?net.Socket = null;
+
+    // Create a dedicated Io.Threaded for mesh background thread.
+    // The main init.io does not support cross-thread concurrent I/O on
+    // Windows, causing error.ConcurrencyUnavailable when
+    // socket.receiveTimeout() is called from the mesh thread.
+    // Using a dedicated instance ensures the socket and its I/O operations
+    // live on the same Io, avoiding the cross-thread issue.
+    var mesh_threaded = std.Io.Threaded.init(allocator, .{});
+    const mesh_io = mesh_threaded.io();
 
     start_mesh: {
         // Collect broadcast addresses (subnet-directed + 255.255.255.255)
@@ -960,9 +968,6 @@ pub fn meshSessionLoop(
                 std.log.err("[guest-mesh] invalid --peer-mesh '{s}'", .{pm});
             }
         }
-
-        // Dedicated Io for mesh background thread (required on all platforms)
-        const mesh_io = mesh_threaded.io();
 
         // Bind UDP socket for mesh
         const bind_addr = net.IpAddress.parse("0.0.0.0", mesh_port) catch |err| {
@@ -1037,7 +1042,6 @@ pub fn meshSessionLoop(
             m.deinit();
             if (mesh_socket_opt) |s| s.close(m_io);
         }
-        mesh_threaded.deinit();
     }
 
     if (mesh_opt == null) {
@@ -1114,6 +1118,7 @@ pub fn meshSessionLoop(
 
         // Command dispatch loop
         var rbuf: [65536]u8 = undefined;
+        var stale_count: u32 = 0;
         while (!pty_dead.load(.acquire)) {
             // Check auto-upgrade signal before blocking recv.
             // Skip when peer_mesh is set (local testing mode — network LSAs
@@ -1137,10 +1142,44 @@ pub fn meshSessionLoop(
                 break;
             };
             if (n == 0) {
-                // No data — short sleep then retry
+                // No data — check for stale tunnel (Host restart detection).
+                // When Host restarts, the old KCP session persists but will never
+                // receive new data. After ~15s of silence, give up and wait for
+                // a new connection via waitForHostTunnel.
+                stale_count += 1;
+                if (stale_count > 3000) { // 3000 × 5ms ≈ 15s
+                    if (!tunnel.isAlive()) {
+                        std.log.info("[guest-mesh] Tunnel dead after {d} idle polls, reconnecting", .{stale_count});
+                        break;
+                    }
+                    // Check if a newer session exists in mesh.sessions with pending data.
+                    // This handles the case where Host restarted and created a fresh session.
+                    if (mesh_opt) |*m| {
+                        m.sessions_mutex.lock(m.io) catch {
+                            break;
+                        };
+                        const has_newer = blk: {
+                            var it = m.sessions.iterator();
+                            while (it.next()) |entry| {
+                                const sess = entry.value_ptr.*;
+                                if (sess != tunnel.session and sess.kcp_inst.peekSize() > 0) {
+                                    break :blk true;
+                                }
+                            }
+                            break :blk false;
+                        };
+                        m.sessions_mutex.unlock(m.io);
+                        if (has_newer) {
+                            std.log.info("[guest-mesh] Newer session detected, reconnecting", .{});
+                            break;
+                        }
+                    }
+                    stale_count = 2900; // Check again soon
+                }
                 std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
                 continue;
             }
+            stale_count = 0; // Reset on successful receive
 
             const msg_type: u8 = rbuf[0];
             const payload = rbuf[1..n];

@@ -171,6 +171,12 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
             .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
         },
     });
+    // Must flush immediately — BodyWriter docs: "The header is not guaranteed
+    // to be sent until BodyWriter.flush or BodyWriter.end is called."
+    body_writer.flush() catch |err| {
+        std.log.err("[exec] header flush failed for {s}: {}", .{ cmd_id, err });
+        return;
+    };
     // Track whether we called endChunked — defer fires end() only as fallback
     var chunked_ended = false;
     defer if (!chunked_ended) {
@@ -479,6 +485,10 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
             .extra_headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
         },
     });
+    body_writer.flush() catch |err| {
+        std.log.err("[download] header flush failed for {s}: {}", .{ cmd_id, err });
+        return;
+    };
     var chunked_ended = false;
     defer if (!chunked_ended) {
         body_writer.endChunked(.{}) catch {};

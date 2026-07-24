@@ -760,6 +760,21 @@ pub const Kcp = struct {
         // Move in-order segments from rcv_buf to rcv_queue
         while (self.rcv_buf.items.len > 0) {
             const seg = self.rcv_buf.items[0];
+            // Detect KCP reconnect: if the remote restarted, its seq numbers
+            // reset while our rcv_nxt is higher. seg.sn << rcv_nxt means the
+            // remote KCP is fresh — discard stale rcv_buf and reset rcv_nxt.
+            if (sn_lt(seg.sn, self.rcv_nxt) and self.rcv_nxt > 10) {
+                // Remote has restarted with fresh KCP state. Flush all
+                // previously buffered segments (from old connection) and
+                // reset rcv_nxt to accept the new data.
+                while (self.rcv_buf.items.len > 0) {
+                    const old = self.rcv_buf.orderedRemove(0);
+                    if (old.data) |d| self.allocator.free(d);
+                }
+                self.rcv_nxt = seg.sn;
+                // Fall through — the current seg will be processed on next iter
+                continue;
+            }
             if (seg.sn == self.rcv_nxt and self.rcv_queue.items.len < IKCP_WND_RCV) {
                 self.rcv_nxt += 1;
                 _ = self.rcv_buf.orderedRemove(0);
@@ -908,7 +923,7 @@ pub const Kcp = struct {
 
 /// Check if sn a is less than sn b (with u32 wraparound).
 /// Returns true if a < b in the sliding window sense.
-fn sn_lt(a: u32, b: u32) bool {
+pub fn sn_lt(a: u32, b: u32) bool {
     // Use signed comparison of the difference for correct wraparound.
     // @bitCast reinterprets the u32 difference as i32 without range checking.
     const diff: i32 = @bitCast(a -% b);

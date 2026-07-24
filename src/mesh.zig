@@ -5,6 +5,7 @@
 //! binary protocol on UDP :2121. First-byte dispatch identifies message type.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const kcp = @import("kcp.zig");
 const protocol = @import("protocol.zig");
 
@@ -323,22 +324,42 @@ pub const Mesh = struct {
     }
 
     /// Signal shutdown (thread-safe). The run() loop will exit.
+    /// On Windows, also closes the socket to unblock a pending
+    /// blocking receive() call (receiveTimeout is unsupported).
     pub fn signalShutdown(self: *Mesh) void {
         self.shutdown.store(true, .release);
+        if (builtin.os.tag == .windows) {
+            // Closing the socket unblocks any pending receive() call
+            // in the mesh thread, allowing it to check shutdown and exit.
+            self.socket.close(self.io);
+        }
     }
 
     /// Main UDP receive/dispatch loop. Blocks until shutdown is signaled.
     /// Should be run in its own thread.
     pub fn run(self: *Mesh) !void {
+        // Broadcast initial LSA before entering receive loop.
+        // On Windows, receive() blocks without timeout and periodicTasks
+        // only runs after received packets, so we need this initial
+        // broadcast to announce our presence immediately.
+        self.broadcastOwnLsaInit();
+        self.last_lsa_broadcast_ms = self.clock_ms;
+
+        if (builtin.os.tag == .windows) {
+            return self.runWindows();
+        }
+        return self.runPosix();
+    }
+
+    /// POSIX: use receiveTimeout with 1-second timeout for periodic tasks.
+    fn runPosix(self: *Mesh) !void {
         var buf: [4096]u8 = undefined;
 
         while (!self.shutdown.load(.acquire)) {
-            // Receive with 1-second timeout (so we can check shutdown periodically)
             const timeout: std.Io.Timeout = .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(1), .clock = .awake } };
             const msg = self.socket.receiveTimeout(self.io, &buf, timeout) catch |err| {
                 switch (err) {
                     error.Timeout => {
-                        // Advance clock and run periodic tasks
                         self.clock_ms +%= 1000;
                         try self.periodicTasks();
                         continue;
@@ -350,24 +371,95 @@ pub const Mesh = struct {
                 }
             };
 
-            // Advance clock by a small amount for each received packet
             self.clock_ms +%= 10;
 
             if (msg.data.len == 0) continue;
 
-            // Dispatch by first byte
             switch (msg.data[0]) {
                 protocol.MESH_TYPE_LSA => try self.handleLsa(msg.data[1..], msg.from),
                 protocol.MESH_TYPE_KCP => try self.handleKcpData(msg.data[1..], msg.from),
                 protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
                 protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
-                else => {}, // drop unknown types
+                else => {},
             }
 
             try self.periodicTasks();
         }
 
         std.log.info("[mesh] Shutting down", .{});
+    }
+
+    /// Windows: Zig 0.16.0 Io.Threaded on ARM64 Windows sometimes fails
+    /// with error.ConcurrencyUnavailable even for synchronous operate().
+    /// The underlying netReceiveOneWindows ignores the Io instance
+    /// entirely (calls NtDeviceIoControlFile directly), but the Io
+    /// initialization may trigger worker threads that interfere.
+    /// Workaround: use global_single_threaded Io which has no worker
+    /// threads and forces all operations synchronous.
+    /// Shutdown is handled by the main thread closing the socket to
+    /// unblock receive(). Periodic tasks run after each received
+    /// packet — Host LSA broadcasts every 5s provide regular wakeups.
+    fn runWindows(self: *Mesh) !void {
+        // Use the single-threaded Io to avoid ConcurrencyUnavailable on Windows.
+        const local_io = std.Io.Threaded.global_single_threaded.io();
+        var buf: [4096]u8 = undefined;
+
+        while (!self.shutdown.load(.acquire)) {
+            const msg = self.socket.receive(local_io, &buf) catch |err| {
+                if (self.shutdown.load(.acquire)) break;
+                std.log.err("[mesh] receive error: {}", .{err});
+                std.Io.sleep(local_io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+                continue;
+            };
+
+            self.clock_ms +%= 10;
+
+            if (msg.data.len == 0) continue;
+
+            switch (msg.data[0]) {
+                protocol.MESH_TYPE_LSA => try self.handleLsa(msg.data[1..], msg.from),
+                protocol.MESH_TYPE_KCP => try self.handleKcpData(msg.data[1..], msg.from),
+                protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
+                protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
+                else => {},
+            }
+
+            try self.periodicTasks();
+        }
+
+        std.log.info("[mesh] Shutting down", .{});
+    }
+
+    /// Broadcast own LSA once before entering receive loop.
+    /// Separate from broadcastOwnLsa to avoid the interval check.
+    fn broadcastOwnLsaInit(self: *Mesh) void {
+        self.lsa_seq +%= 1;
+
+        var neighbor_list: [32]NeighborEntry = undefined;
+        var neighbor_count: usize = 0;
+        var n_iter = self.neighbors.iterator();
+        while (n_iter.next()) |entry| {
+            if (neighbor_count >= neighbor_list.len) break;
+            neighbor_list[neighbor_count] = .{ .mac = entry.key_ptr.*, .cost = entry.value_ptr.cost };
+            neighbor_count += 1;
+        }
+
+        var lsa_buf: [1500]u8 = undefined;
+        const len = encodeLsa(
+            &lsa_buf,
+            self.node_id,
+            self.lsa_seq,
+            protocol.MESH_MAX_TTL,
+            0,
+            self.node_info,
+            neighbor_list[0..neighbor_count],
+        );
+
+        for (self.broadcast_addrs.items) |*addr| {
+            self.socket.send(self.io, addr, lsa_buf[0..len]) catch |err| {
+                std.log.err("[mesh] initial broadcast LSA to {any} failed: {}", .{ addr, err });
+            };
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -390,10 +482,6 @@ pub const Mesh = struct {
         self.sessions_mutex.lock(self.io) catch {};
         defer self.sessions_mutex.unlock(self.io);
 
-        const session_count = self.sessions.count();
-        if (session_count > 0) {
-            // Only log at debug level — periodicTasks runs every ~10ms
-        }
         var s_iter = self.sessions.iterator();
         while (s_iter.next()) |entry| {
             const sess = entry.value_ptr.*;
@@ -450,9 +538,20 @@ pub const Mesh = struct {
         if (self.lsas.getPtr(decoded.origin)) |existing| {
             // Use wrapping comparison: treat seq as wrapping, ignore if not newer
             const diff: i32 = @bitCast(decoded.seq -% existing.seq);
-            if (diff <= 0) return; // existing is same or newer
-            // Replace: free old entry
-            existing.deinit(self.allocator);
+            if (diff <= 0) {
+                // If node_info changed (e.g. Guest restart with different
+                // hostname), treat as a restart — accept the new LSA even
+                // though the seq number is lower/non-increasing.
+                if (!std.mem.eql(u8, decoded.node_info, existing.node_info)) {
+                    std.log.info("[mesh] LSA restart detected: node_info changed, accepting lower seq", .{});
+                    existing.deinit(self.allocator);
+                } else {
+                    return; // existing is same or newer
+                }
+            } else {
+                // Replace: free old entry
+                existing.deinit(self.allocator);
+            }
         }
 
         // Store LSA
@@ -795,6 +894,19 @@ pub const Mesh = struct {
         _ = self.sessions.remove(sess.conv);
         sess.deinit();
         self.allocator.destroy(sess);
+    }
+
+    /// Close the KCP session for a specific destination node, if any.
+    /// Used before reconnecting to avoid stale KCP seq number mismatch.
+    pub fn closeSessionFor(self: *Mesh, dest: NodeId) void {
+        self.sessions_mutex.lock(self.io) catch {};
+        defer self.sessions_mutex.unlock(self.io);
+        const conv = computeConv(self.node_id, dest);
+        if (self.sessions.get(conv)) |sess| {
+            _ = self.sessions.remove(conv);
+            sess.deinit();
+            self.allocator.destroy(sess);
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────

@@ -655,8 +655,11 @@ fn tunnelManager(
 
                 // Phase 2: Establish tunnel if not already active
                 if (active_tunnels.get(hostname) == null and state.getGuestTunnel(hostname) == null) {
-                    const sess = m.connect(entry.key_ptr.*) catch {
-                        std.log.debug("[tun-mgr] connect to {s} failed (will retry)", .{hostname});
+                    // Close stale session first — KCP seq numbers are reset on
+                    // reconnect, and the old session's rcv_nxt won't accept new data.
+                    m.closeSessionFor(entry.key_ptr.*);
+                    const sess = m.connect(entry.key_ptr.*) catch |err| {
+                        std.log.err("[tun-mgr] connect to {s} failed: {} (will retry)", .{ hostname, err });
                         continue;
                     };
                     const tun_ptr = allocator.create(tunnel_mod.Tunnel) catch continue;
