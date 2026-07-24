@@ -39,7 +39,7 @@ Current configuration — four VM targets tracked:
   `--install --user`: desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
   `--version`: print version. `--update-url`: upgrade mode (internal, launched by `utmm-old`).
 - **Host mode (`--host`)**: Unified HTTP server on port 2121 — guest registration
-  (WebSocket + HTTP announce), management commands (exec/upload/download/kick),
+  (WebSocket + HTTP announce), management commands (exec/upload/download),
   MCP JSON-RPC, static file serving (/bin/), /etc/hosts sync, auto-upgrade
   binary serving, and periodic UDP version broadcast. All on one port.
 
@@ -118,7 +118,6 @@ All handlers share one `HostState` instance, mutex-protected:
 - `guests`: ArrayList of `GuestEntry` (hostname, IP, target, MAC, version, shell)
 - `outgoing_frames`: StringHashMap of per-guest FIFO frame queues
 - `op_states`: StringHashMap of `OpState` by cmd_id (output buffer, exit_code, done flag)
-- `close_requests`: StringHashMap for kick tracking
 - `wake_event`: Io.Event signaled on op completion (wakes polling HTTP handlers)
 
 ### Key Design Decisions
@@ -130,7 +129,7 @@ All handlers share one `HostState` instance, mutex-protected:
 - **MDELIM markers**: `; echo MDELIM:$?\n` appended to each command. Host-side
   `scanForMarker` uses `lastIndexOf` — handles echoed command text on macOS/BSD
   (where pty master doesn't support tcsetattr ECHO disable)
-- Connection = Shell Session: kick closes WebSocket → pty killed → guest reconnects
+- Connection = Shell Session: tunnel disconnect → pty killed → guest reconnects
   with fresh shell
 - **Auto-upgrade via UDP broadcast**: Host broadcasts version every 60s via UDP.
   Guest `udpDiscoveryListener` detects mismatch, spawns `utmm-old` process which
@@ -194,7 +193,6 @@ utmm --host --save-config           # Save current parameters to config file
 # Management Commands (HTTP to 127.0.0.1:2121)
 utmm --status                       # All guest status (UDP broadcast discovery)
 utmm --exec linuxvm "uname -a"      # Remote exec (pty, env/cd persist)
-utmm --kick linuxvm                 # Kill guest shell, force reconnect
 utmm --upload file.txt linuxvm      # Upload file
 utmm --download linuxvm f.txt ./f.txt  # Download file
 utmm --gen-init linux               # Generate auto-start script (linux/macos/windows)

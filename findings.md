@@ -1,4 +1,4 @@
-# Findings: v0.8.1+
+# Findings: v0.11.4
 
 ## Auto-Upgrade 阻塞读取 Bug (2026-07-24)
 
@@ -286,26 +286,24 @@ try response.flush();           // finalize chunked encoding chunk
 
 ### KCP / Mesh 传输层（v0.11.x）
 
-1. **Kick 后 reconnect 延迟 ~3s**: Guest 端 `stale_count > 600`（600 × 5ms = 3s）
-   才检测到旧 tunnel 失活。在此期间 exec 命令在 KCP send buffer 中排队，reconnect
-   完成后才会被处理。可优化为更快的失活检测（更低的阈值或显式通知机制）。
+1. **Guest 端旧 KCP session 累积**: reconnect 创建新 session（不同 conv），旧
+   session 在 Host 端由 `handleMeshGuest` defer 的 `closeSession` 清理。
+   Guest 端旧 session 仅在 Mesh.deinit() 时清理，长时间运行多次 reconnect 后
+   内存泄漏风险。**Phase 32 已在 Host 端修复（defer 中调用 closeSession）。**
 
-2. **旧 KCP session 在 Guest 端累积**: 每次 kick 创建新 session（不同 conv），但旧
-   session 仅在 Mesh.deinit() 时清理。长时间运行多次 kick 后内存泄漏风险。Host 端
-   `closeSessionFor` 已正确清理旧 session，但 Guest 端缺乏对等清理逻辑。
+2. **KCP keepalive 死 session 跳过 (Phase 32 修复)**: 已修复 — `periodicTasks`
+   对 `dead` session 跳过 `kcp.update()`，消除 "neighbor not found" 噪声日志。
 
 3. **Phantom session from handleKcpData race**: `handleKcpData` 在 mesh.run() 线程
    运行，可能与 tunnelManager 线程的 `closeSessionFor`+`connect()` 竞态：Guest 旧
    KCP 的 keepalive 包在 `closeSessionFor` 之后到达 → `handleKcpData` 创建新 phantom
-   session（旧 conv）→ `connect()` 再创建另一个 session（新 conv）。两者共存但
-   phantom session 仅浪费资源，不导致功能错误。
+   session（旧 conv）→ `connect()` 再创建另一个 session（新 conv）。
 
-4. **Kick 后 shell 状态丢失**: Kick 强制 Guest 重 spawn pty，`cd`、`export` 等
-   shell 状态全部丢失。这是 pty-per-connection 模型的设计约束，需在文档中说明。
+4. **Reconnect 后 shell 状态丢失**: pty-per-connection 模型导致 reconnect 后
+   `cd`、`export` 等 shell 状态全部丢失。这是设计约束，非 bug。
 
-5. **Pty 输出混入 shell 提示符**: Kick+reconnect 后，旧 pty 的残留输出（shell 提示符、
-   未完成命令的输出片段）可能混入新 session 的输出。`scanForMarker` 使用
-   `lastIndexOf` 缓解了 macOS 命令回显问题，但跨 session 的输出污染未解决。
+5. **Pty 输出混入 shell 提示符**: Reconnect 后旧 pty 的残留输出（shell 提示符、
+   未完成命令的输出片段）可能混入新 session 的输出。
 
 ### 线程安全
 
@@ -316,25 +314,22 @@ try response.flush();           // finalize chunked encoding chunk
 
 ### 未验证用例
 
-7. **Windows VM 未验证**: windowsvm / winx64 在 Phase 30 验证期间离线。Kick+reconnect
-   修复在 Windows 上的行为未确认。
+7. **Windows VM 未验证**: windowsvm / winx64 在 Phase 30 验证期间离线。
 
-8. **macOS Guest kick 未单独测试**: 仅 linuxvm 进行了 kick+reconnect 验证。macvm 的
-   基础 exec 正常，但 kick 场景未覆盖。
+8. **macOS Guest reconnect 未单独测试**: macvm 的基础 exec 正常，但 reconnect 场景未覆盖。
 
 9. **大文件 upload/download**: KCP 隧道无帧大小限制（相比旧 WebSocket 的 64KB），但
    大文件（>10MB）传输未经测试。
 
-10. **自动升级端到端**: Phase 30 的 connect_counter 变更不影响自动升级逻辑，但
-    升级触发、下载、替换、重启全流程未重新验证。
+10. **自动升级端到端**: connect_counter 变更不影响自动升级逻辑，但
+   升级触发、下载、替换、重启全流程未重新验证。
 
 ### 遗留（非 mesh 相关）
 
 11. **pty_resize is a stub**: Terminal resize message is parsed but not applied
     (TIOCSWINSZ ioctl not yet called).
 
-12. **killForegroundProcess is a stub**: pty_signal supports per-signal values but
-    currently only sends SIGKILL/TerminateProcess to the shell child.
+12. **killForegroundProcess is a stub**: pty_signal 已移除，Ctrl+C 通过 stdin 透传。killForegroundProcess 函数已在 broadcast.zig 中删除。
 
 13. **std.http.Server HEAD requests return 404**: Zig's `std.http.Server.respond()`
     doesn't automatically handle HEAD by stripping body. Upstream limitation.

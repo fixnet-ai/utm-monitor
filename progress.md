@@ -1,4 +1,57 @@
-# Progress: v0.11.2
+# Progress: v0.11.4
+
+## Session 2026-07-25 (Phase 32 — Keepalive 死 session 跳过 + 内存泄漏修复)
+
+### Phase 32: keepalive dead session skip + memory leak fix
+
+**Bug 1**: `periodicTasks` 在 session 被 keepalive 标记 `dead = true` 后仍对其调用
+`kcp.update()`。KCP 重传触发 `meshKcpOutput` 回调，而 neighbor 已被移除，
+产生大量 `[mesh] kcp_output: neighbor not found for next_hop` 错误日志。
+
+**Bug 2**: `handleMeshGuest` defer 清理逻辑未释放 tunnel 指针、mesh session 和
+hostname 字符串 — 三者均由 `tunnelManager` 分配，导致每次 disconnect 泄漏。
+
+**修复 1** (`src/mesh.zig`):
+- `periodicTasks`: 在 kcp.update() 前加 `if (sess.dead) continue;`
+- 移除 dead 分支中冗余的 `if (!sess.dead)` 检查
+
+**修复 2** (`src/host_http.zig`):
+- `handleMeshGuest` defer: 加 `closeSession(tun.session)` + `tun.deinit()` +
+  `allocator.destroy(tun)` + `allocator.free(hostname)`
+
+**验证结果**:
+| 测试 | 结果 |
+|------|------|
+| exec/cd/export (local dual-port) | ✅ |
+| kill Guest → keepalive dead ~16s | ✅ 无 "neighbor not found" |
+| Guest 重启 → tunnelManager 重连 | ✅ exec 正常 |
+| `zig build test` | ✅ |
+| 8 目标交叉编译 | ✅ |
+
+---
+
+## Session 2026-07-25 (Phase 31 — 移除 --kick 命令)
+
+### Phase 31: 彻底清除 --kick
+
+**决策**: `--kick` 命令被 KCP keepalive（死连接检测）和 stdin Ctrl+C 透传（信号发送）完全替代。
+
+**代码变更**:
+| 文件 | 变更 | 行数 |
+|------|------|------|
+| `src/main.zig` | 删除 `cmd_kick`/`kick_target` 字段和解析 | -15 |
+| `src/host.zig` | 删除 `cmdKick` 函数和 `/kick` 路由 | -35 |
+| `src/host_http.zig` | 删除 `handleKick` 和 kick check | -40 |
+| `src/httpd.zig` | 删除 `close_requests`/`requestClose`/`checkCloseRequested` | -35 |
+| `src/mesh.zig` | 更新注释 | -2 |
+| `src/broadcast.zig` | 更新注释 | -1 |
+
+**文档变更**: README.md, CLAUDE.md, DESIGN.md, MANUAL.md, SKILL.md,
+task_plan.md, findings.md — 删除全部 kick 相关内容。
+
+**编译**: `zig build test` 全过。
+
+---
 
 ## Session 2026-07-25 (Phase 30 — Kick 后 reconnect exec 挂起修复)
 

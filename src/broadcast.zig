@@ -817,15 +817,6 @@ fn ptySpawnWindows(allocator: std.mem.Allocator) !PtySession {
     };
 }
 
-/// Kill foreground process group on pty (pty_signal handler).
-fn killForegroundProcess(master_fd: std.posix.fd_t, signal: u8) void {
-    _ = master_fd;
-    _ = signal;
-    // TODO: tcgetpgrp(master_fd) → kill(-pgrp, sig)
-    // For now, signal delivery via pty_signal frame is a stub.
-    // Closing the WS connection (--kick) implicitly kills the shell via SIGHUP.
-}
-
 /// Thread: continuously read pty master_fd, send pty_output frames to Host.
 /// Runs for entire WS connection lifetime. Sets pty_dead on EOF (shell exited).
 fn ptyReadLoop(
@@ -1066,6 +1057,10 @@ pub fn meshSessionLoop(
                     break :blk false;
                 };
                 if (n == 0) {
+                    if (!tunnel.isAlive()) {
+                        std.log.info("[guest-mesh] Tunnel dead before pty_spawn", .{});
+                        break :blk false;
+                    }
                     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
                     continue;
                 }
@@ -1118,7 +1113,6 @@ pub fn meshSessionLoop(
 
         // Command dispatch loop
         var rbuf: [65536]u8 = undefined;
-        var stale_count: u32 = 0;
         while (!pty_dead.load(.acquire)) {
             // Check auto-upgrade signal before blocking recv.
             // Skip when peer_mesh is set (local testing mode — network LSAs
@@ -1142,41 +1136,16 @@ pub fn meshSessionLoop(
                 break;
             };
             if (n == 0) {
-                // No data — check for stale tunnel (Host restart detection).
-                // When Host restarts, the old KCP session persists but will never
-                // receive new data. After ~3s of silence, check if a newer
-                // session (from restarted Host) has pending data.
-                stale_count += 1;
-                if (stale_count > 600) { // 600 × 5ms ≈ 3s
-                    // Check if a newer session exists in mesh.sessions with pending data.
-                    // This handles the case where Host restarted and created a fresh session
-                    // with a different KCP conv (due to the Host's nonce changing).
-                    if (mesh_opt) |*m| {
-                        m.sessions_mutex.lock(m.io) catch {
-                            break;
-                        };
-                        const has_newer = blk: {
-                            var it = m.sessions.iterator();
-                            while (it.next()) |entry| {
-                                const sess = entry.value_ptr.*;
-                                if (sess != tunnel.session and sess.kcp_inst.peekSize() > 0) {
-                                    break :blk true;
-                                }
-                            }
-                            break :blk false;
-                        };
-                        m.sessions_mutex.unlock(m.io);
-                        if (has_newer) {
-                            std.log.info("[guest-mesh] Newer session detected, reconnecting", .{});
-                            break;
-                        }
-                    }
-                    stale_count = 580; // Check again in ~100ms
+                // No data yet — normal KCP idle. Keepalive in mesh.zig
+                // handles dead connection detection (5s idle → probe every
+                // 5s → 3 unanswered → dead flag set).
+                if (!tunnel.isAlive()) {
+                    std.log.info("[guest-mesh] Tunnel dead (keepalive), reconnecting", .{});
+                    break;
                 }
-                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
                 continue;
             }
-            stale_count = 0; // Reset on successful receive
 
             const msg_type: u8 = rbuf[0];
             const payload = rbuf[1..n];
@@ -1194,13 +1163,10 @@ pub fn meshSessionLoop(
                         active_cmd_id = allocator.dupe(u8, input.cmd_id) catch &.{};
                         cmd_mutex.unlock(io);
 
-                        // Write command data to pty master (stdin of shell)
+                        // Write command data to pty master (stdin of shell).
+                        // Ctrl+C (0x03) and other control chars are forwarded
+                        // through pty stdin — termios generates signal automatically.
                         ptyWrite(&pty, input.command);
-                    }
-                },
-                @intFromEnum(tunproto.MsgType.signal_cmd) => {
-                    if (payload.len > 0) {
-                        killForegroundProcess(pty.master_fd, payload[0]);
                     }
                 },
                 @intFromEnum(tunproto.MsgType.upload_data) => {

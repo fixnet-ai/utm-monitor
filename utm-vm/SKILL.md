@@ -156,7 +156,7 @@ utmm --host               # Windows (Administrator)
 | "GuestNotFound" for a VM | VM is offline or name mismatch | Run `vm_status` to see which VMs are actually online |
 | WebSocket connection failed | Guest can't reach Host gateway | Guest auto-detects Host via default gateway; override with `--host-ip` |
 | MCP connection refused | Host daemon not running or old version | `sudo utmm --host` |
-| Command hangs or produces no output | Guest disconnected mid-command or shell dead | Check `vm_status`; use `--kick` then retry |
+| Command hangs or produces no output | Guest disconnected mid-command or shell dead | Check `vm_status`; wait for auto-reconnect or restart guest |
 
 **Fallback:** If MCP tools are unavailable, you can use the CLI directly:
 ```bash
@@ -199,7 +199,7 @@ chmod +x /opt/utmm/utmm
 - `vm_exec` is non-interactive — you cannot run commands that require TTY input (nano, top, etc.)
 - VM IPs can change on reboot — always check `vm_status` first, don't cache IPs
 - Windows cmd.exe has different escaping rules than bash — test simple commands first
-- Commands stream output in real time — no fixed timeout, but if a command hangs, use `--kick` to force shell restart
+- Commands stream output in real time — KCP keepalive detects dead connections and auto-reconnects
 
 ### Q: `--download` fails with "Guest not found" but the Guest is online
 **A**: This happens when you use a full path like `/opt/utmm/file.txt` instead of just the filename `file.txt`. Use just the basename:

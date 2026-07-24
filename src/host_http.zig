@@ -2,7 +2,6 @@
 //!
 //! Plugs into httpd.Router to provide:
 //!   POST /exec       — Send command to guest via KCP tunnel (pty, wait for MDELIM)
-//!   POST /kick       — Request guest tunnel close
 //!   POST /upload     — Upload file to guest via KCP tunnel
 //!   POST /download   — Download file from guest via KCP tunnel
 //!   GET  /bin/<file> — Serve static binaries
@@ -300,41 +299,6 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
         }
         state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(3600), .clock = .awake } }) catch {};
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// POST /kick — Close a guest's WebSocket connection
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub fn handleKick(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
-    _ = body;
-    const body_str = readBody(allocator, request) catch {
-        try respondError(request, .bad_request, "Missing body");
-        return;
-    };
-    defer allocator.free(body_str);
-
-    const parsed = httpd.parseJson(allocator, body_str) catch {
-        try respondError(request, .bad_request, "Invalid JSON");
-        return;
-    };
-    defer parsed.deinit();
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else => {
-            try respondError(request, .bad_request, "Expected JSON object");
-            return;
-        },
-    };
-
-    const vm = httpd.jsonGetString(obj, "vm") orelse {
-        try respondError(request, .bad_request, "Missing 'vm' field");
-        return;
-    };
-
-    std.log.info("[kick] Kicking guest {s}", .{vm});
-    try state.requestClose(vm);
-    try respondJson(request, "{\"ok\":true}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -738,7 +702,7 @@ pub fn handleMcp(allocator: std.mem.Allocator, state: *httpd.HostState, request:
 
 /// Background thread: reads tunproto frames from a Guest's KCP tunnel,
 /// dispatches to HostState (appendOpOutput, completeOpState, etc.).
-/// Runs until tunnel disconnects or kick is requested.
+/// Runs until tunnel disconnects.
 pub fn handleMeshGuest(
     allocator: std.mem.Allocator,
     state: *httpd.HostState,
@@ -752,7 +716,14 @@ pub fn handleMeshGuest(
         state.removeGuest(hostname);
         syncHostsFromState(state, allocator);
         if (state.on_guest_changed) |cb| cb(state);
+
         std.log.info("[mesh-guest] {s} disconnected, cleanup done", .{hostname});
+
+        // Free mesh session + tunnel + hostname (allocated by tunnelManager)
+        tun.session.mesh.closeSession(tun.session);
+        tun.deinit();
+        allocator.destroy(tun);
+        allocator.free(hostname);
     }
 
     // Send pty_spawn to guest — triggers ptySpawn + ptyReadLoop on guest side
@@ -772,12 +743,6 @@ pub fn handleMeshGuest(
     // Main loop: read guest responses from tunnel
     var rbuf: [65536]u8 = undefined;
     while (true) {
-        // Check kick request
-        if (state.checkCloseRequested(hostname)) {
-            std.log.info("[mesh-guest] {s} kicked, closing tunnel", .{hostname});
-            return;
-        }
-
         const n = tun.recv(&rbuf) catch |err| {
             std.log.err("[mesh-guest] tunnel recv failed for {s}: {}", .{ hostname, err });
             return;

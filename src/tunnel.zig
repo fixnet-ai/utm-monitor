@@ -44,8 +44,9 @@ pub const Tunnel = struct {
         return try self.session.kcp_inst.recv(buf);
     }
 
-    /// Check if the tunnel is still alive.
+    /// Check if the tunnel is still alive (KCP retransmit + keepalive).
     pub fn isAlive(self: *Tunnel) bool {
+        if (self.session.dead) return false;
         return !self.session.kcp_inst.isDead();
     }
 

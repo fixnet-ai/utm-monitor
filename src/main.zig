@@ -119,10 +119,6 @@ pub const CliArgs = struct {
     download_remote: ?[]const u8 = null,
     download_local: ?[]const u8 = null,
 
-    // kick: close guest's WebSocket connection (cancels exec)
-    cmd_kick: bool = false,
-    kick_target: ?[]const u8 = null,
-
     // Internal: upgrade URL passed by utmm-old process (--update-url)
     update_url: ?[]const u8 = null,
 };
@@ -199,12 +195,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
                 i += 1;
                 cli.exec_cmd = args[i];
             }
-        } else if (std.mem.eql(u8, arg, "--kick")) {
-            cli.cmd_kick = true;
-            if (i + 1 < args.len) {
-                i += 1;
-                cli.kick_target = args[i];
-            }
         } else if (std.mem.eql(u8, arg, "--save-config")) {
             cli.save_config = true;
         } else if (std.mem.eql(u8, arg, "--port")) {
@@ -268,7 +258,6 @@ pub fn printHelp() void {
         \\Management commands (connect to persistent Host via IPC, no --host needed):
         \\  --status            Query all online guest status (with target/arch/os)
         \\  --exec TARGET CMD   Execute command on target guest (TARGET=hostname or FQDN)
-        \\  --kick TARGET       Close guest's WebSocket connection (cancels running exec)
         \\  --upload FILE VM    Upload a file to Guest VM (via HTTP, no curl needed)
         \\  --download VM REMOTE LOCAL  Download REMOTE from Guest VM → LOCAL file
         \\  --gen-init PLATFORM  Generate auto-start script (linux/macos/windows)
@@ -438,7 +427,7 @@ pub fn main(init: std.process.Init) !void {
     // Mode dispatch
     // --mcp alone (no --host): MCP now integrated into Host HTTP server.
     // Redirect to --host which always serves /mcp on port 2121.
-    if (cli.is_mcp and !cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_upload and !cli.cmd_download and !cli.cmd_gen_init and !cli.save_config and !cli.cmd_install and !cli.cmd_uninstall and !cli.cmd_kick) {
+    if (cli.is_mcp and !cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_upload and !cli.cmd_download and !cli.cmd_gen_init and !cli.save_config and !cli.cmd_install and !cli.cmd_uninstall) {
         std.log.info("[main] --mcp deprecated; MCP available via --host on port 2121. Use 'utmm --host' instead.", .{});
         return;
     }
@@ -447,12 +436,12 @@ pub fn main(init: std.process.Init) !void {
     // used with management commands (--exec/--status/--upload/--download).
     // These commands always talk to the persistent Host via IPC first;
     // --host here would misleadingly suggest "run a new host instance".
-    if (cli.cmd_exec or cli.cmd_status or cli.cmd_upload or cli.cmd_download or cli.cmd_kick) {
+    if (cli.cmd_exec or cli.cmd_status or cli.cmd_upload or cli.cmd_download) {
         cli.is_host = false;
     }
 
     // --install/--uninstall work in both host and guest mode (install.zig uses cli.is_host)
-    if (cli.is_host or cli.cmd_status or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.is_mcp or cli.cmd_kick) {
+    if (cli.is_host or cli.cmd_status or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.is_mcp) {
         try host_mod.run(init, cli);
     } else if (cli.cmd_install or cli.cmd_uninstall) {
         try host_mod.run(init, cli);

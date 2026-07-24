@@ -231,8 +231,20 @@ pub const MeshSession = struct {
     mesh: *Mesh,
     remote: NodeId,
     conv: u32,
-    next_hop: NodeId, // if direct neighbor → same as remote; otherwise → relay target
+    next_hop: NodeId,
     allocator: std.mem.Allocator,
+
+    /// KCP keepalive — TCP-style idle probe.
+    /// After 5s idle, send a 1-byte probe through KCP. Each probe expects
+    /// the peer's KCP ACK response — if no ACK arrives, KCP retransmits.
+    /// After 3 unanswered probes (~15s total), the session is declared dead.
+    last_recv_ms: u32 = 0,
+    keepalive_probes: u8 = 0,
+    keepalive_next_ms: u32 = 0,
+
+    /// Set true by the mesh thread when keepalive declares dead.
+    /// Checked by Tunnel.isAlive() and the Guest command loop.
+    dead: bool = false,
 
     pub fn deinit(self: *MeshSession) void {
         self.kcp_inst.release();
@@ -510,14 +522,51 @@ pub const Mesh = struct {
             self.expireStale();
         }
 
-        // Update all KCP sessions (lock to prevent concurrent modification)
+        // Update all KCP sessions + keepalive (lock to prevent concurrent modification)
         self.sessions_mutex.lock(self.io) catch {};
         defer self.sessions_mutex.unlock(self.io);
 
         var s_iter = self.sessions.iterator();
         while (s_iter.next()) |entry| {
+            const conv = entry.key_ptr.*;
             const sess = entry.value_ptr.*;
+
+            // Once keepalive has declared a session dead, stop calling
+            // kcp.update() — retransmissions would trigger meshKcpOutput
+            // which tries to find a neighbor that's already been removed.
+            if (sess.dead) continue;
+
             sess.kcp_inst.update(self.clock_ms);
+
+            // ── KCP keepalive ──
+            // Check if data has arrived (proves peer is alive)
+            if (sess.kcp_inst.peekSize() >= 0) {
+                sess.last_recv_ms = self.clock_ms;
+                sess.keepalive_probes = 0;
+                sess.keepalive_next_ms = 0;
+            }
+
+            const idle = self.clock_ms -| sess.last_recv_ms;
+
+            if (idle < 5000) {
+                // Link is active — nothing to do
+            } else if (sess.keepalive_probes >= 3) {
+                // Dead: 3 probes sent, no response. Set flag only —
+                // the tunnel owner (handleMeshGuest / command loop)
+                // checks isAlive() and does the actual closeSession cleanup.
+                std.log.info("[mesh] keepalive dead conv={d} idle={d:.1}s", .{ conv, @as(f64, @floatFromInt(idle)) / 1000.0 });
+                sess.dead = true;
+            } else if (sess.keepalive_next_ms == 0) {
+                // First probe after idle period
+                sess.keepalive_probes = 1;
+                sess.keepalive_next_ms = self.clock_ms + 5000;
+                _ = sess.kcp_inst.send(&[_]u8{0xFF}) catch {};
+            } else if (self.clock_ms >= sess.keepalive_next_ms) {
+                // Next probe interval elapsed → send another
+                sess.keepalive_probes += 1;
+                sess.keepalive_next_ms = self.clock_ms + 5000;
+                _ = sess.kcp_inst.send(&[_]u8{0xFF}) catch {};
+            }
         }
     }
 
@@ -691,6 +740,8 @@ pub const Mesh = struct {
                 sess.kcp_inst.input(data[13..]) catch |err| {
                     std.log.err("[mesh] KCP input error: {}", .{err});
                 };
+                sess.last_recv_ms = self.clock_ms;
+                sess.keepalive_probes = 0;
             } else {
                 std.log.debug("[mesh] New KCP session from incoming data conv={d}", .{kcp_conv});
                 // New incoming session — create KCP instance and store
@@ -701,8 +752,9 @@ pub const Mesh = struct {
                     .mesh = self,
                     .remote = src_mac,
                     .conv = kcp_conv,
-                    .next_hop = src_mac, // direct for now
+                    .next_hop = src_mac,
                     .allocator = self.allocator,
+                    .last_recv_ms = self.clock_ms,
                 };
                 new_sess.kcp_inst.setOutput(meshKcpOutput);
                 try self.sessions.put(kcp_conv, new_sess);
@@ -903,7 +955,7 @@ pub const Mesh = struct {
         defer self.sessions_mutex.unlock(self.io);
 
         // Increment counter to ensure each reconnection gets a unique conv.
-        // This prevents stale KCP seq number mismatch after kick/reconnect
+        // This prevents stale KCP seq number mismatch after reconnect
         // (when nonce hasn't changed because Host wasn't restarted).
         self.connect_counter +%= 1;
         const conv = computeConv(self.node_id, dest, self.nonce ^ self.connect_counter);
@@ -920,6 +972,7 @@ pub const Mesh = struct {
             .conv = conv,
             .next_hop = next_hop,
             .allocator = self.allocator,
+            .last_recv_ms = self.clock_ms,
         };
         sess.kcp_inst.setOutput(meshKcpOutput);
 

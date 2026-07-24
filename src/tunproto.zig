@@ -12,8 +12,8 @@ const std = @import("std");
 pub const MsgType = enum(u8) {
     // Host → Guest commands
     pty_spawn = 0x10, // Trigger pty shell creation (no payload)
-    pty_exec_input = 0x11, // cmd_id(NT) + command_data
-    signal_cmd = 0x12, // 1-byte signal (0=SIGINT, 1=SIGTERM)
+    pty_exec_input = 0x11, // cmd_id(NT) + command_data (Ctrl+C = 0x03 via stdin)
+    _unused_0x12 = 0x12, // was signal_cmd — removed (stdin raw byte forwarding)
     upload_data = 0x13, // cmd_id(NT) + path(NT) + file_data(len-prefixed blob)
     download_cmd = 0x14, // cmd_id(NT) + path(NT)
 
@@ -89,14 +89,6 @@ pub fn buildPtyExecInput(allocator: std.mem.Allocator, cmd_id: []const u8, data:
     try buf.append(allocator, @intFromEnum(MsgType.pty_exec_input));
     try writeString(&buf, allocator, cmd_id);
     try buf.appendSlice(allocator, data);
-    return buf.toOwnedSlice(allocator);
-}
-
-pub fn buildSignalCmd(allocator: std.mem.Allocator, signal: u8) ![]const u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    try buf.append(allocator, @intFromEnum(MsgType.signal_cmd));
-    try buf.append(allocator, signal);
     return buf.toOwnedSlice(allocator);
 }
 
@@ -286,15 +278,6 @@ test "pty_exec_input with MDELIM" {
     const parsed = parsePtyExecInput(msg[1..]) orelse return error.ParseFailed;
     try std.testing.expectEqualStrings("x1", parsed.cmd_id);
     try std.testing.expectEqualStrings(cmd, parsed.command);
-}
-
-test "signal_cmd build" {
-    const allocator = std.testing.allocator;
-    const msg = try buildSignalCmd(allocator, 0); // SIGINT
-    defer allocator.free(msg);
-    try std.testing.expectEqual(@intFromEnum(MsgType.signal_cmd), msg[0]);
-    try std.testing.expectEqual(@as(usize, 2), msg.len);
-    try std.testing.expectEqual(@as(u8, 0), msg[1]);
 }
 
 test "upload_data round-trip with binary data" {

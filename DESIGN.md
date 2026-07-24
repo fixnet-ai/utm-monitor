@@ -29,7 +29,7 @@ HTTP :2121 保留为外部适配器（MCP JSON-RPC + 静态文件服务 + CLI �
 
 ```
                         ┌── MCP HTTP /mcp (JSON-RPC) ← AI Agent
-                        ├── CLI HTTP /exec, /upload, /download (/kick)
+                        ├── CLI HTTP /exec, /upload, /download
                         ├── CLI HTTP /api/guests
 Host ──KCP Tunnel────→ Guest (pty exec, upload, download, signal)
 Host ──UDP LSA ────→ Guest (discovery, 版本检测)
@@ -75,7 +75,6 @@ HTTP 端口 2121（仅 Host 侧）：
 - `POST /mcp` — MCP JSON-RPC（AI agent 接口）
 - `GET /api/guests` — Guest 列表
 - `GET /bin/*` — 静态文件 + 自动升级
-- `POST /kick` — 强制断开 guest
 
 ### 4. 新模块：tunproto.zig
 
@@ -220,7 +219,7 @@ on_lsa_received: ?OnLsaCallback         // LSA → guest table 同步回调
 guests: ArrayList(HostSideGuest)         // 不变
 op_states: StringHashMap(OpState)        // 不变
 wake_event: Io.Event                     // 不变
-close_requests: StringHashMap(void)      // 不变
+guest_tunnels: StringHashMap(*Tunnel)       // hostname → tunnel
 ```
 
 #### 6.2 HTTP handler 流程变化
@@ -301,7 +300,7 @@ fn handleMeshGuest(
             else => {},
         }
 
-        if (state.checkCloseRequested(hostname)) return;
+        // Host checks tunnel health via keepalive
     }
 }
 ```

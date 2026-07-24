@@ -73,7 +73,7 @@ utmm --host       # Host mode
 │  │ CLI Management Commands                   │  ← Host CLI            │
 │  │ --status / --exec via HTTP to Host :2121  │                        │
 │  │ --upload / --download via HTTP            │                        │
-│  │ --kick / --gen-init / --version           │                        │
+│  │ --gen-init / --version                    │                        │
 │  └──────────────────────────────────────────┘                        │
 │                                                                      │
 │  UDP Broadcast (periodic, :2121)                                     │
@@ -128,7 +128,6 @@ CLI management commands use standard HTTP:
 |----------|--------|---------|
 | `/api/guests` | GET | List all guests (JSON) |
 | `/exec` | POST | Send command via pty, wait for result |
-| `/kick` | POST | Close guest's WebSocket connection (kills pty shell) |
 | `/upload` | POST | Upload file to guest |
 | `/download` | POST | Download file from guest |
 | `/mcp` | POST | MCP JSON-RPC (AI agent entry) |
@@ -146,8 +145,6 @@ output arrives in real time as the command runs. Exit code is delivered via
 custom HTTP headers `x-vm` (target VM hostname) and `x-path` (file path on guest).
 Body is raw binary (`application/octet-stream`) — no JSON wrapping.
 Download response is chunked streaming with `x-exit-code` trailer.
-
-Use `--kick` to forcefully close a guest's shell session and force reconnect.
 
 #### UDP Broadcast Discovery (Port 2121)
 
@@ -581,7 +578,6 @@ Host Options:
 Management Commands (HTTP to Host on 127.0.0.1:2121):
   --status               Query online status of all Guests (UDP broadcast discovery)
   --exec TARGET CMD      Execute command on target Guest (pty shell, streaming output, no timeout)
-  --kick TARGET          Close guest's WebSocket connection (kills pty shell)
   --upload FILE VM       Upload a file to Guest
   --download VM R L      Download file from Guest
   --gen-init PLATFORM    Generate auto-start boot script (linux/macos/windows)
@@ -1184,7 +1180,7 @@ curl -s -X POST http://127.0.0.1:2121/mcp \
 | MCP connection refused | Host daemon not running | `sudo utmm --host` |
 | Port 2121 AddressInUse at Host start | Old `utmm` process still running | `sudo pkill -f utmm && sudo utmm --host` |
 | WebSocket connection failed | Guest can't reach Host gateway | Check guest gateway detection; use `--host-ip` to override |
-| Command hangs or produces no output | Guest disconnected mid-command or shell dead | Check `vm_status`; use `--kick` to force shell restart |
+| Command hangs or produces no output | Guest disconnected mid-command or shell dead | Check `vm_status`; wait for auto-reconnect or restart guest |
 
 ### 7.7 Complete Uninstall / Cleanup
 

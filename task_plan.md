@@ -1,14 +1,17 @@
-# Task Plan: v0.8.1+
+# Task Plan: v0.11.4+
 
 ## 目标
-v0.8.0: HTTP 层性能优化 — exec 输出流式传输（chunked + trailer），上传/下载二进制协议（自定义请求头 + 原始 body），消除 JSON 包装开销。
+v0.11.0: Mesh + KCP 统一传输 — 移除 WebSocket，KCP tunnel 成为唯一 Guest-Host 传输层。
+v0.11.1-4: Bug 修复周期 — Host 重启/reconnect exec 挂起、--kick 移除、KCP keepalive、
+内存泄漏修复。
 
-**核心变更：**
-- 每 WS 连接一个持久 shell session（非每命令一个进程）
-- 命令通过 pty stdin 输入，输出从 pty stdout 读取
-- `MDELIM:$?\n` 退出码标记嵌入输出流
-- HostState 从 pending queue 模型改为 outgoing_frames queue + OpState 模型
-- HTTP handler 通过 frame queue 与 WS handler 通信（非直接写 WS）
+**核心架构变更：**
+- 删除 wsclient.zig + wsproto.zig（WebSocket 层），tunproto.zig 替代
+- KCP Tunnel 为唯一 Guest-Host 传输（无帧大小限制）
+- LSA (Link State Advertisement) 替代 WebSocket announce 发现
+- HTTP :2121 保留为 MCP JSON-RPC + 静态文件适配器
+- KCP keepalive（TCP 风格：5s 空闲 → 探测 → 3 次失败 → dead）
+- pty_signal / --kick 移除，stdin 透传 Ctrl+C
 
 ## Phases
 
@@ -267,8 +270,6 @@ v0.8.0: HTTP 层性能优化 — exec 输出流式传输（chunked + trailer）�
 | deliverResult/deliverStdoutChunk/deliverExecExit | 50 | scanForMarker/completeOpState |
 | failGuestPending/markKicked/checkKicked | 40 | failAllPendingOps/requestClose/checkCloseRequested |
 | handleExecResult + POST /exec-result | 40 | 删除 |
-| --exec-cancel CLI | 30 | --kick CLI |
-
 ## 技术参考
 
 - [RFC 6455](https://datatracker.ietf.org/doc/html/rfc6455) — WebSocket Protocol
@@ -381,16 +382,11 @@ v0.8.0: HTTP 层性能优化 — exec 输出流式传输（chunked + trailer）�
 
 **Status:** complete
 
-### Phase 30: v0.11.2 — Kick 后 reconnect exec 挂起修复 ✅ (2026-07-25)
+### Phase 30: v0.11.2 — Reconnect 后 exec 挂起修复 ✅ (2026-07-25)
 
-**Bug**: Kick 后 `m.connect()` 返回新 session，但 conv 与旧 session 相同（nonce 不变）。
+**Bug**: Reconnect 后 `m.connect()` 返回新 session，但 conv 与旧 session 相同（nonce 不变）。
 Guest 端旧 KCP session 仍然存在，`handleKcpData` 发现有相同 conv 的 session 就喂入旧 KCP，
 旧 KCP 因序号不匹配丢弃数据 → pty_spawn 无法到达 Guest → exec 永久挂起。
-
-**Phase 29 解决了 Host 重启但未解决 Kick**：Phase 29 的 nonce 方案仅在 Host 进程重启时改变
-conv。Kick 只是关闭 WebSocket 连接，Host 进程不重启，nonce 不变，新旧 session 的 conv
-完全一致。`connect()` 发现相同 conv 的 session 就直接返回旧的（已被 `closeSessionFor` 删除，
-但 Guest 端的旧 session 依然存在）。
 
 **修复方案**: 引入 `connect_counter`，每次 `connect()` 递增并 XOR 进 conv
 
@@ -399,12 +395,69 @@ conv。Kick 只是关闭 WebSocket 连接，Host 进程不重启，nonce 不变�
 | `connect_counter: u32` | `mesh.zig` Mesh struct | 每次 connect() 递增，XOR 进 conv |
 | `connect()` 重写 | `mesh.zig` | `self.connect_counter +%= 1` → `computeConv(host, guest, nonce ^ counter)` |
 | `closeSessionFor()` 重写 | `mesh.zig` | 改为迭代 sessions 按 `remote` 字段查找（不再计算 conv） |
-| `init()` 初始化 | `mesh.zig` | `.connect_counter = 0` |
+
+**Status:** complete
+
+### Phase 31: v0.11.3 — 移除 --kick 命令 ✅ (2026-07-25)
+
+**决策**: 彻底删除 `--kick` CLI 命令及相关代码。KCP keepalive 替代 kick 的
+死连接检测功能，stdin 透传 Ctrl+C（pty termios 自然生成信号）替代信号发送功能。
+
+| 文件 | 变更 | 说明 |
+|------|------|------|
+| `src/main.zig` | 删除 `cmd_kick`/`kick_target` | 移除 CLI 字段和解析 |
+| `src/host.zig` | 删除 `cmdKick` + `/kick` 路由 | 移除 CLI 分发和 HTTP 路由 |
+| `src/host_http.zig` | 删除 `handleKick` | 移除 HTTP handler |
+| `src/httpd.zig` | 删除 `close_requests` + `requestClose` + `checkCloseRequested` | 移除 kick 机制 |
+| `src/mesh.zig` | 更新注释 | 移除 kick 引用 |
+| `src/broadcast.zig` | 更新注释 | 移除 kick 引用 |
+| 所有 *.md | 删除 kick 行 | README, CLAUDE.md, DESIGN.md, MANUAL.md, SKILL.md |
+
+**Status:** complete
+
+### Phase 32: v0.11.4 — KCP Keepalive 死 session 跳过 + 内存泄漏修复 ✅ (2026-07-25)
+
+**背景**: Phase 30 (KCP keepalive) 实现后，死 session 被标记 `dead = true` 但
+`periodicTasks` 仍对其调用 `kcp.update()`，导致 KCP 重传触发 `meshKcpOutput` 回调，
+而 neighbor 已被 `expireStale` 移除，产生大量 `[mesh] kcp_output: neighbor not found`
+错误日志。
+
+同时 `handleMeshGuest` 的 defer 清理逻辑缺少 tunnel/session/hostname 的内存释放。
+
+**修复 1: 跳过死 session 的 KCP update (mesh.zig)**
+
+```zig
+// periodicTasks — 对 dead session 直接 continue，跳过 kcp.update()
+if (sess.dead) continue;
+```
+
+**修复 2: handleMeshGuest 释放内存 (host_http.zig)**
+
+```zig
+defer {
+    // ... state cleanup ...
+    // 释放 mesh session + tunnel + hostname（由 tunnelManager 分配）
+    tun.session.mesh.closeSession(tun.session);
+    tun.deinit();
+    allocator.destroy(tun);
+    allocator.free(hostname);
+}
+```
+
+**修复 3: 移除 dead session 中的冗余 `if (!sess.dead)` 检查**
+
+由于 `if (sess.dead) continue;` 在前面提前退出，后面的 `sess.dead = true` 设置
+不再需要 `if (!sess.dead)` 检查。
+
+| 文件 | 变更 | 说明 |
+|------|------|------|
+| `src/mesh.zig` | `periodicTasks` 加 `if (sess.dead) continue` | 死 session 跳过 kcp.update() |
+| `src/host_http.zig` | `handleMeshGuest` defer 加 closeSession + destroy + free | 内存泄漏修复 |
 
 **验证结果**:
-- linuxvm: Kick 前 `conv=615622921` → Kick 后 `conv=615622920` → exec 正常恢复
-- 连续 3 次 Kick 后 exec 均正常执行
-- macvm: `sw_vers` 正常
-- 8 目标交叉编译全过
+- 本地双端口测试: exec/cd/export 正常
+- kill Guest: keepalive ~16s 后检测 dead，无 "neighbor not found" 错误
+- Guest 重启: tunnelManager 5s 内重连，exec 正常
+- `zig build test` 全过，8 目标交叉编译全过
 
 **Status:** complete

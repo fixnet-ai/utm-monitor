@@ -49,8 +49,6 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
     if (cli.cmd_exec) return cmdExec(block_io, gpa, cli.port, cli.exec_target.?, cli.exec_cmd.?);
     if (cli.cmd_upload) return cmdUpload(block_io, gpa, cli.port, cli.upload_target.?, cli.upload_file.?);
     if (cli.cmd_download) return cmdDownload(block_io, gpa, cli.port, cli.download_target.?, cli.download_remote.?, cli.download_local.?);
-    if (cli.cmd_kick) return cmdKick(block_io, gpa, cli.port, cli.kick_target.?);
-
     // --save-config
     if (cli.save_config) {
         const config_mod = @import("config.zig");
@@ -225,39 +223,6 @@ fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
 
     if (exit_code != 0) {
         std.process.exit(if (exit_code < 0) @as(u8, 1) else @intCast(exit_code));
-    }
-}
-
-fn cmdKick(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8) !void {
-    var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
-    defer client.deinit();
-
-    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/kick", .{port});
-    defer gpa.free(url);
-
-    const body = try std.fmt.allocPrint(gpa, "{{\"vm\":\"{s}\"}}", .{target});
-    defer gpa.free(body);
-
-    var resp_buf: [4096]u8 = undefined;
-    var resp_writer: std.Io.Writer = .fixed(&resp_buf);
-
-    const result = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .POST,
-        .payload = body,
-        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
-        .response_writer = &resp_writer,
-        .keep_alive = false,
-    }) catch |err| {
-        std.debug.print("[kick] HTTP request failed: {} — is Host running?\n", .{err});
-        return err;
-    };
-
-    if (result.status == .ok) {
-        std.debug.print("[kick] Kicked {s}\n", .{target});
-    } else {
-        std.debug.print("[kick] Error: {s}\n", .{resp_writer.buffered()});
-        return error.KickFailed;
     }
 }
 
@@ -436,7 +401,6 @@ fn startHttpHost(
     try router.add(gpa, .GET, "/api/guests", host_http.handleApiGuests);
     try router.add(gpa, .POST, "/download", host_http.handleDownload);
     try router.add(gpa, .POST, "/upload", host_http.handleUpload);
-    try router.add(gpa, .POST, "/kick", host_http.handleKick);
     try router.add(gpa, .POST, "/exec", host_http.handleExec);
     // Guest discovery now via mesh LSA — /announce and /ws removed
     try router.add(gpa, .GET, "/bin/", host_http.handleBin);

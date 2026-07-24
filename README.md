@@ -140,7 +140,6 @@ utmm --exec macvm "lldb ..."       # Same on macOS
 utmm --exec windowsvm "dir"        # Windows commands too
 utmm --upload build.zip linuxvm    # Push a build (raw binary)
 utmm --download linuxvm core ./    # Pull a core dump (streaming binary)
-utmm --kick linuxvm                # Force shell restart
 utmm --version                     # Print version
 ```
 

@@ -102,9 +102,6 @@ pub const HostState = struct {
     /// Operation state tracking: cmd_id → OpState.
     /// Used by exec/upload/download to track completion.
     op_states: std.StringHashMap(OpState),
-    /// Close requests: hostname → present (flag set).
-    /// HTTP --kick handler sets, WebSocket handler checks and consumes.
-    close_requests: std.StringHashMap(void),
     /// Wake event: set when any OpState completes (marker found or completeOpState called).
     /// HTTP/MCP handlers wait on this instead of busy-polling takeOpResult.
     wake_event: std.Io.Event = .unset,
@@ -124,7 +121,6 @@ pub const HostState = struct {
             .guests = .empty,
             .guest_tunnels = std.StringHashMap(*tunnel_mod.Tunnel).init(allocator),
             .op_states = std.StringHashMap(OpState).init(allocator),
-            .close_requests = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
         };
     }
@@ -160,14 +156,6 @@ pub const HostState = struct {
             self.op_states.deinit();
         }
 
-        // Free close requests
-        {
-            var it = self.close_requests.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-            }
-            self.close_requests.deinit();
-        }
     }
 
     /// Find a guest by hostname. Returns index into guests.items or null.
@@ -449,32 +437,6 @@ pub const HostState = struct {
         self.wake_event.set(self.io.?);
     }
 
-    // ══════════════════════════════════════════════════════════
-    // Close requests (--kick)
-    // ══════════════════════════════════════════════════════════
-
-    /// Mark a guest for WebSocket close (--kick).
-    pub fn requestClose(self: *HostState, hostname: []const u8) !void {
-        self.mutex.lock(self.io.?) catch return;
-        defer self.mutex.unlock(self.io.?);
-        const gop = try self.close_requests.getOrPut(hostname);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, hostname);
-        }
-        // Wake any HTTP handlers waiting on commands for this guest
-        self.wake_event.set(self.io.?);
-    }
-
-    /// Check if a guest is marked for kick, and consume the flag.
-    pub fn checkCloseRequested(self: *HostState, hostname: []const u8) bool {
-        self.mutex.lock(self.io.?) catch return false;
-        defer self.mutex.unlock(self.io.?);
-        if (self.close_requests.fetchRemove(hostname)) |kv| {
-            self.allocator.free(kv.key);
-            return true;
-        }
-        return false;
-    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
