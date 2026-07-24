@@ -79,15 +79,19 @@ fn runCmd(io: std.Io, gpa: std.mem.Allocator, argv: []const []const u8) void {
     } else |_| {}
 }
 
-/// Stop the utmm guest service via platform service manager.
+/// Stop all utmm services (both Host and Guest) via platform service manager.
+/// Best-effort: service not found is not an error.
 fn stopService(io: std.Io, gpa: std.mem.Allocator) !void {
     if (builtin.os.tag == .windows) {
         runCmd(io, gpa, &.{ "sc", "stop", "UTM-Monitor-Guest" });
+        runCmd(io, gpa, &.{ "sc", "stop", "UTM-Monitor-Host" });
     } else if (builtin.os.tag == .macos) {
         runCmd(io, gpa, &.{ "launchctl", "bootout", "system", "/Library/LaunchDaemons/com.utmm.guest.plist" });
+        runCmd(io, gpa, &.{ "launchctl", "bootout", "system", "/Library/LaunchDaemons/com.utmm.host.plist" });
     } else {
         // Linux (systemd)
         runCmd(io, gpa, &.{ "systemctl", "stop", "utmm-guest" });
+        runCmd(io, gpa, &.{ "systemctl", "stop", "utmm-host" });
     }
 }
 
@@ -185,14 +189,18 @@ fn replaceBinary(io: std.Io, gpa: std.mem.Allocator, data: []const u8) !void {
     }
 }
 
-/// Start the utmm guest service via platform service manager.
+/// Start all utmm services (both Host and Guest) via platform service manager.
+/// Best-effort: service not found is not an error.
 fn startService(io: std.Io, gpa: std.mem.Allocator) !void {
     if (builtin.os.tag == .windows) {
         runCmd(io, gpa, &.{ "sc", "start", "UTM-Monitor-Guest" });
+        runCmd(io, gpa, &.{ "sc", "start", "UTM-Monitor-Host" });
     } else if (builtin.os.tag == .macos) {
         runCmd(io, gpa, &.{ "launchctl", "bootstrap", "system", "/Library/LaunchDaemons/com.utmm.guest.plist" });
+        runCmd(io, gpa, &.{ "launchctl", "bootstrap", "system", "/Library/LaunchDaemons/com.utmm.host.plist" });
     } else {
         // Linux (systemd)
         runCmd(io, gpa, &.{ "systemctl", "start", "utmm-guest" });
+        runCmd(io, gpa, &.{ "systemctl", "start", "utmm-host" });
     }
 }

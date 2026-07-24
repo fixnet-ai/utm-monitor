@@ -139,7 +139,8 @@ No internet access needed on Guest VMs.
 
 **The Host must be running for everything:**
 ```bash
-sudo utmm --host
+sudo utmm --host          # macOS / Linux
+utmm --host               # Windows (Administrator)
 ```
 
 **MCP connects via HTTP** — The Host daemon serves MCP JSON-RPC over HTTP (streamableHttp) on `127.0.0.1:2121/mcp`. This is the same port as the HTTP server — everything on 2121. Configure your agent's `mcp.json`:
@@ -165,15 +166,17 @@ utmm --exec linuxvm "uname -a"
 
 ## Host Paths
 
-| Item | Path |
-|------|------|
-| Host binary (symlink) | `/usr/local/bin/utmm` → `/opt/utmm/utmm` |
-| Host binary (actual) | `/opt/utmm/utmm` → `/opt/utmm/utmm-aarch64-macos` |
-| All platform binaries | `/opt/utmm/utmm-*` (8 binaries from utmm.zip) |
-| Host service plist | `/Library/LaunchDaemons/com.utmm.host.plist` |
-| Guest service plist | `/Library/LaunchDaemons/com.utmm.guest.plist` |
-| Host log | `/var/log/utmm-host.log` |
-| Serve directory (HTTP) | `/opt/utmm/` by default (configurable via `--serve-dir`) |
+| Item | macOS | Linux | Windows |
+|------|-------|-------|---------|
+| Host binary (symlink) | `/usr/local/bin/utmm` → `/opt/utmm/utmm` | `/usr/local/bin/utmm` → `/opt/utmm/utmm` | `C:\opt\utmm\utmm.exe` |
+| Host binary (actual) | `/opt/utmm/utmm` → `/opt/utmm/utmm-aarch64-macos` | `/opt/utmm/utmm` → `/opt/utmm/utmm-x86_64-linux` | `C:\opt\utmm\utmm.exe` |
+| Guest binary | `/opt/utmm/utmm` | `/opt/utmm/utmm` | `C:\opt\utmm\utmm.exe` |
+| All platform binaries | `/opt/utmm/utmm-*` (8 binaries) | `/opt/utmm/utmm-*` (8 binaries) | `C:\opt\utmm\utmm-*.exe` |
+| Host service config | `/Library/LaunchDaemons/com.utmm.host.plist` | `/etc/systemd/system/utmm-host.service` | Windows Service: `UTM-Monitor-Host` |
+| Guest service config | `/Library/LaunchDaemons/com.utmm.guest.plist` | `/etc/systemd/system/utmm-guest.service` | Windows Service: `UTM-Monitor-Guest` |
+| Host log | `/var/log/utmm-host.log` | journald (`journalctl -u utmm-host`) | `C:\opt\utmm\utmm-host.log` |
+| Guest log | `/var/log/utmm-guest.log` | journald (`journalctl -u utmm-guest`) | `C:\opt\utmm\utmm-guest.log` |
+| Serve directory (HTTP) | `/opt/utmm/` | `/opt/utmm/` | `C:\opt\utmm\` | |
 
 ## Bootstrap Troubleshooting
 

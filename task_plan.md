@@ -310,3 +310,14 @@ v0.8.0: HTTP 层性能优化 — exec 输出流式传输（chunked + trailer）�
 - [x] 全 .md 文档版本引用同步至 v0.8.2
 - [x] GitHub Release + 全部 4 台机器部署
 - **Status:** complete
+
+### Phase 25: v0.9.0 — 跨平台 Host 支持 ✅
+- [x] `upgrade.zig`: stopService/startService 增加 Host 服务管理（三平台）
+- [x] `config.zig`: 移除硬编码 VM 配置（`[3]VmConfig` → `[]const VmConfig` 空切片）
+- [x] `main.zig`: hosts_file 按平台默认值（Windows: `C:\Windows\System32\drivers\etc\hosts`）
+- [x] `install.zig`: Windows Host 模式添加防火墙规则 + 提示
+- [x] `host.zig`: 端口 < 1024 权限提升提示
+- [x] README.md: 跨平台 Host 安装说明
+- [x] SKILL.md: Host Paths 表更新为三平台
+- [x] MANUAL.md: 2.3 节更新为跨平台 Host 安装指南
+- **Status:** complete

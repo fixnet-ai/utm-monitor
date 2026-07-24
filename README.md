@@ -83,10 +83,17 @@ This installs to `/opt/utmm/` and creates `/usr/local/bin/utmm`.
 ### 2. Start Host
 
 ```bash
+# macOS / Linux
 sudo utmm --host
-# Or auto-start on boot:
-sudo utmm --host --install
+sudo utmm --host --install   # Auto-start on boot
+
+# Windows (Administrator terminal)
+utmm --host
+utmm --host --install        # Auto-start on boot (Windows Service)
 ```
+
+> **Linux note:** Port 2121 < 1024 requires root or `sudo setcap cap_net_bind_service=+ep $(which utmm)`.
+> **Windows note:** The installer adds a firewall rule automatically. On first run, confirm the UAC prompt.
 
 ### 3. Register with AI Agent
 
@@ -160,7 +167,7 @@ Guest (raspigw, LAN) ──WebSocket──┘                      ── Static
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
 - **Single port**: HTTP + WebSocket + MCP + binary serving all on 2121
 - **Auto IP tracking**: Host syncs Guest IPs to `/etc/hosts` — hostnames always resolve
-- **Cross-platform**: macOS, Linux, Windows guests (aarch64, x86_64, x86 32-bit)
+- **Cross-platform**: macOS, Linux, Windows — both Host and Guest (aarch64, x86_64, x86 32-bit)
 - **Persistent shell session**: shell state survives across `--exec` calls (pty model)
 
 ## Docs

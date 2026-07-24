@@ -251,28 +251,42 @@ ipconfig            # Windows
 ping 192.168.64.2
 ```
 
-### 2.3 Host One-Click Installation (First-time Deployment on New Mac)
+### 2.3 Host One-Click Installation (macOS / Linux / Windows)
 
-Install on the Host side (the Mac running UTM) with a single command:
+Install on the Host machine with a single command:
 
+**macOS / Linux:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
 ```
 
-The script downloads `utmm.zip` from GitHub Releases, extracts all 6 platform binaries to `/opt/utmm/`, auto-detects the Host architecture, and creates symlinks:
+The script downloads `utmm.zip` from GitHub Releases, extracts all 8 platform binaries to `/opt/utmm/`, auto-detects the Host architecture, and creates symlinks:
 
 - `/opt/utmm/utmm` → `/opt/utmm/utmm-{arch}-{os}` (Host binary)
 - `/usr/local/bin/utmm` → `/opt/utmm/utmm` (convenience)
 
 All Guest binaries are already in `/opt/utmm/` after extraction — the Host's `serve_dir` defaults to this directory, so auto-upgrade works for all Guest architectures immediately.
 
+**Windows:**
+Download `utmm.zip` from [GitHub Releases](https://github.com/fixnet-ai/utm-monitor/releases), extract to `C:\opt\utmm\`, and run:
+```batch
+C:\opt\utmm\utmm.exe --host
+```
+
 Start the Host:
 
 ```bash
-sudo utmm --host --install   # Install as Host system service, auto-start on boot (also starts immediately)
+# macOS / Linux
+sudo utmm --host --install   # Install as system service, auto-start on boot (starts immediately)
+
+# Windows (Administrator terminal)
+C:\opt\utmm\utmm.exe --host --install   # Install as Windows Service, auto-start on boot
 ```
 
-> **Note**: Use `--host --install` to generate a Host-mode service config (with `--host` flag included, service name `com.utmm.host` / `utmm-host` / `UTM-Monitor-Host`). Use just `--install` (without `--host`) on Guest VMs to self-install as a Guest-mode service (`com.utmm.guest` / `utmm-guest` / `UTM-Monitor-Guest`). The same binary auto-detects the correct mode based on the presence of `--host`.
+> **Linux note:** Port 2121 < 1024 requires root or `sudo setcap cap_net_bind_service=+ep /opt/utmm/utmm`.
+> **Windows note:** The installer adds a firewall rule for the binary automatically. On first run, confirm any UAC prompt.
+
+> **Service mode note**: Use `--host --install` to generate a Host-mode service config (service name: `com.utmm.host` / `utmm-host` / `UTM-Monitor-Host`). Use just `--install` (without `--host`) on Guest VMs to self-install as a Guest-mode service (`com.utmm.guest` / `utmm-guest` / `UTM-Monitor-Guest`).
 
 ### 2.4 Bare-Metal Bootstrapping (First-time Guest VM Deployment)
 

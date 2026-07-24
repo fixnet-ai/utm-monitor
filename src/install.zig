@@ -489,9 +489,9 @@ pub fn installSelf(
                 std.debug.print("[install] Windows: start manually: sc start \"{s}\"\n", .{svc_name});
             }
 
-            // Allow utmm.exe through Windows Firewall (inbound).
-            // Without this, --status from other LAN machines cannot reach this guest.
-            // Program-based rule: simpler than per-port, covers UDP 2121 and future needs.
+            // Allow utmm through Windows Firewall (inbound).
+            // Without this, --status from other LAN machines cannot reach this guest/host.
+            // Program-based rule: simpler than per-port, covers UDP 2121 and HTTP :2121.
             // Clean up old port-based rule from v0.6.1 first.
             if (std.process.run(allocator, io, .{
                 .argv = &.{ "netsh", "advfirewall", "firewall", "delete", "rule", "name=UTM Monitor UDP" },
@@ -509,6 +509,10 @@ pub fn installSelf(
             } else |_| {
                 std.debug.print("[install] Windows: warning — failed to add firewall rule\n", .{});
                 std.debug.print("[install]   run manually: {s}\n", .{fw_rule});
+            }
+
+            if (is_host) {
+                std.debug.print("[install] Windows Host: ensure port {d} is reachable (HTTP/WS/MCP)\n", .{protocol.DEFAULT_PORT});
             }
         },
     }

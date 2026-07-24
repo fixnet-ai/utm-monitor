@@ -67,7 +67,10 @@ pub const CliArgs = struct {
     /// Host IP for Guest HTTP client (default: auto-detect via default gateway)
     host_ip: ?[]const u8 = null,
     /// hosts file path (host side)
-    hosts_file: []const u8 = "/etc/hosts",
+    hosts_file: []const u8 = if (builtin.os.tag == .windows)
+        "C:\\Windows\\System32\\drivers\\etc\\hosts"
+    else
+        "/etc/hosts",
     /// hosts marker comment text
     marker: []const u8 = protocol.HOSTS_MARKER_BEGIN,
     /// Config file path

@@ -542,6 +542,9 @@ fn startHttpHost(
     const sd = serve_dir orelse "/opt/utmm";
     std.debug.print("[host] HTTP server on 0.0.0.0:{d}\n", .{port});
     std.debug.print("[host] Serve dir: {s}\n", .{sd});
+    if (port < 1024 and builtin.os.tag != .windows) {
+        std.debug.print("[host] NOTE: port {d} < 1024 — run with sudo or 'setcap cap_net_bind_service=+ep' on Linux\n", .{port});
+    }
 
     // Build router with all endpoints
     var router = httpd.Router{};

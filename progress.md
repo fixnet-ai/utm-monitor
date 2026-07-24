@@ -18,6 +18,27 @@
 ### 文档全同步
 - README.md: 移除功能描述中的版本标记
 - utm-vm/SKILL.md: 移除 4 处版本标记
+
+## Session 2026-07-24 (v0.9.0 — 跨平台 Host 支持)
+
+### 背景
+- 核心逻辑（HTTP/WS/UDP/MCP/pty）已跨平台，多处代码已有 Linux/Windows 条件编译
+- 分析后发现 Linux Host 已基本可用，主要缺口在 upgrade.zig 和文档
+
+### 实现
+- `upgrade.zig`: stopService/startService 改为同时尝试 Host 和 Guest 服务（三平台）
+- `config.zig`: 硬编码 VM 配置数组改为空切片
+- `main.zig`: hosts_file 默认值按平台区分（Windows 使用 `C:\Windows\...`）
+- `install.zig`: Windows Host 防火墙规则添加
+- `host.zig`: 特权端口绑定提示
+- README.md: 跨平台 Host 安装说明 + 端口权限提示
+- SKILL.md: Host Paths 表更新为三平台列
+- MANUAL.md: 2.3 节重写为跨平台 Host 安装指南
+
+### 验证
+- `zig build test`: 43/43 全过
+- 8 目标交叉编译全过
+- Native binary (aarch64-macos) 验证为 Mach-O arm64
 - utm-vm/MANUAL.md: 功能描述去版本标记，示例版本更新至 v0.8.2
 
 ## Session 2026-07-24 (文档消噪 + Auto-Upgrade 修复)

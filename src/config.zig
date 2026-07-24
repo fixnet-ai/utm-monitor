@@ -11,12 +11,8 @@ pub const Config = struct {
     hosts_file: []const u8 = "/etc/hosts",
     marker: []const u8 = "UTM-MONITOR",
 
-    /// VM SSH configuration
-    vms: [3]VmConfig = .{
-        .{ .name = "macvm", .ssh = "root@macvm", .path = "/opt/utmm/" },
-        .{ .name = "linuxvm", .ssh = "root@linuxvm", .path = "/opt/utmm/" },
-        .{ .name = "windowsvm", .ssh = "Administrator@windowsvm", .path = "C:\\opt\\utmm\\" },
-    },
+    /// VM SSH configuration — deployment-specific, empty by default.
+    vms: []const VmConfig = &.{},
 };
 
 /// Single VM configuration
