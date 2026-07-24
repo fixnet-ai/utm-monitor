@@ -54,9 +54,9 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
         break :blk try std.fmt.allocPrint(gpa, "{s}", .{ip});
     } else "";
 
-    // WebSocket announce loop — persistent connection, real-time push.
-    // UpgradeSignal allows the UDP discovery listener to signal the main loop
+    // Mesh session loop — persistent KCP tunnel, real-time push.
+    // UpgradeSignal allows mesh LSA version check to signal the main loop
     // when a version mismatch is detected from Host broadcast.
     var upgrade_signal = broadcast.UpgradeSignal{};
-    try broadcast.wsAnnounceLoop(io, gpa, sysinfo, host_url, &upgrade_signal);
+    try broadcast.meshSessionLoop(io, gpa, sysinfo, host_url, &upgrade_signal, cli.mesh_port, cli.peer_mesh);
 }

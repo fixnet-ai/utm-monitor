@@ -54,14 +54,23 @@ comptime {
     _ = @import("config.zig");
     _ = @import("mcp.zig");
     _ = @import("agent.zig");
+    _ = @import("kcp.zig");
+    _ = @import("mesh.zig");
+    _ = @import("tunnel.zig");
+    _ = @import("tunproto.zig");
 }
 
 /// CLI parse result
 pub const CliArgs = struct {
     /// Whether in Host mode
     is_host: bool = false,
-    /// UDP port (also used for TCP — unified on 2121)
+    /// HTTP server port (Host mode)
     port: u16 = protocol.DEFAULT_PORT,
+    /// Mesh UDP port for LSA + KCP (default: same as port, configurable for local testing)
+    mesh_port: u16 = protocol.DEFAULT_PORT,
+    /// Direct peer mesh address for local testing (e.g. "127.0.0.1:2122").
+    /// Added to LSA broadcast list so peers on different mesh ports can discover each other.
+    peer_mesh: ?[]const u8 = null,
     /// Guest hostname (default: auto-detect hostname)
     hostname: ?[]const u8 = null,
     /// Host IP for Guest HTTP client (default: auto-detect via default gateway)
@@ -201,6 +210,12 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
         } else if (std.mem.eql(u8, arg, "--port")) {
             i += 1;
             if (i < args.len) cli.port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--mesh-port")) {
+            i += 1;
+            if (i < args.len) cli.mesh_port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--peer-mesh")) {
+            i += 1;
+            if (i < args.len) cli.peer_mesh = args[i];
         } else if (std.mem.eql(u8, arg, "--hostname")) {
             i += 1;
             if (i < args.len) cli.hostname = args[i];
@@ -447,7 +462,7 @@ pub fn main(init: std.process.Init) !void {
         // This gives the user GUI-aware exec access (runs in user session, not daemon).
         // System daemons use --svc to skip the stop/restart logic.
         const agent = @import("agent.zig");
-        try agent.run(init.io, init.gpa, cli.hostname, cli.port);
+        try agent.run(init.io, init.gpa, cli.hostname, cli.port, cli.mesh_port, cli.peer_mesh);
     }
 }
 

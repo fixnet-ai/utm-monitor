@@ -1,15 +1,16 @@
 //! Host HTTP endpoint handlers.
 //!
 //! Plugs into httpd.Router to provide:
-//!   POST /announce   — Guest heartbeat (backward compat, empty pending)
-//!   POST /exec       — Send command to guest via pty (enqueue pty_input, wait for MDELIM)
-//!   POST /kick       — Request guest WebSocket close
-//!   POST /upload     — Upload file to guest
-//!   POST /download   — Download file from guest
+//!   POST /exec       — Send command to guest via KCP tunnel (pty, wait for MDELIM)
+//!   POST /kick       — Request guest tunnel close
+//!   POST /upload     — Upload file to guest via KCP tunnel
+//!   POST /download   — Download file from guest via KCP tunnel
 //!   GET  /bin/<file> — Serve static binaries
 //!   GET  /           — Simple HTML status page
-//!   GET  /ws         — WebSocket upgrade (Guest persistent pty connection)
 //!   POST /mcp        — MCP JSON-RPC (delegates to mcp.zig)
+//!
+//! Guest discovery is now via mesh LSA — /announce and /ws are removed.
+//! All guest communication goes through KCP tunnel (tunproto.zig).
 //!
 //! All handlers receive (allocator, HostState, Request, body).
 
@@ -20,7 +21,8 @@ const httpd = @import("httpd.zig");
 const protocol = @import("protocol.zig");
 const hosts_file = @import("hosts_file.zig");
 const mcp = @import("mcp.zig");
-const wsproto = @import("wsproto.zig");
+const tunproto = @import("tunproto.zig");
+const tunnel_mod = @import("tunnel.zig");
 
 /// Read the request body as raw bytes. Caller owns the returned buffer.
 fn readBody(allocator: std.mem.Allocator, request: *http.Server.Request) ![]const u8 {
@@ -77,48 +79,6 @@ fn respondError(request: *http.Server.Request, status: http.Status, message: []c
         .status = status,
         .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
     });
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// POST /announce — Guest heartbeat (backward compat)
-// ═══════════════════════════════════════════════════════════════════════════
-
-pub fn handleAnnounce(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
-    _ = body;
-    const body_str = readBody(allocator, request) catch {
-        try respondError(request, .bad_request, "Missing or invalid body");
-        return;
-    };
-    defer allocator.free(body_str);
-
-    const parsed = httpd.parseJson(allocator, body_str) catch {
-        try respondError(request, .bad_request, "Invalid JSON");
-        return;
-    };
-    defer parsed.deinit();
-
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else => {
-            try respondError(request, .bad_request, "Expected JSON object");
-            return;
-        },
-    };
-
-    const hostname = httpd.jsonGetString(obj, "hostname") orelse "unknown";
-    const ip = httpd.jsonGetString(obj, "ip") orelse "0.0.0.0";
-    const target = httpd.jsonGetString(obj, "target") orelse "unknown";
-    const mac = httpd.jsonGetString(obj, "mac") orelse "00:00:00:00:00:00";
-    const version = httpd.jsonGetString(obj, "version") orelse protocol.VERSION;
-    const shell = httpd.jsonGetString(obj, "shell") orelse "";
-
-    const changed = state.upsertGuest(hostname, ip, target, mac, version, shell);
-    if (changed) {
-        syncHostsFromState(state, allocator);
-    }
-
-    // No pending commands in pty model — commands go via outgoing_frames through WebSocket
-    try respondJson(request, "{\"pending\":[]}");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -185,14 +145,23 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
     const cmd_with_marker = try httpd.buildCmdWithMarker(allocator, guest_shell, command);
     defer allocator.free(cmd_with_marker);
 
-    const frame = try wsproto.buildPtyInput(allocator, cmd_id, cmd_with_marker);
+    const frame = try tunproto.buildPtyExecInput(allocator, cmd_id, cmd_with_marker);
     defer allocator.free(frame);
 
-    // Create operation state and enqueue frame
+    // Create operation state and send via KCP tunnel
     try state.createOpState(cmd_id);
-    try state.enqueueOutgoingFrame(vm, frame);
 
-    std.log.info("[exec] Enqueued pty cmd {s} for {s}", .{ cmd_id, vm });
+    const tun = state.getGuestTunnel(vm) orelse {
+        try respondError(request, .service_unavailable, "GuestNotConnected");
+        return;
+    };
+    _ = tun.send(frame) catch |err| {
+        std.log.err("[exec] tunnel send failed for {s}: {}", .{ vm, err });
+        try respondError(request, .service_unavailable, "TunnelSendFailed");
+        return;
+    };
+
+    std.log.info("[exec] Sent pty cmd {s} for {s}", .{ cmd_id, vm });
 
     // Stream response using chunked transfer encoding
     var stream_buf: [4096]u8 = undefined;
@@ -204,6 +173,9 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
     });
     // Track whether we called endChunked — defer fires end() only as fallback
     var chunked_ended = false;
+    defer if (!chunked_ended) {
+        body_writer.endChunked(.{}) catch {};
+    };
 
     // Loop: write new output chunks as they arrive
     while (true) {
@@ -247,7 +219,7 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
             };
         }
 
-        const done_and_exit = blk: {
+        var done_and_exit: ?i32 = blk: {
             state.mutex.lock(state.io.?) catch {
                 break :blk @as(?i32, null);
             };
@@ -303,9 +275,24 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *httpd.HostState, request
             return;
         }
 
-        // Wait for next chunk (woken by WebSocket handler on each pty_output)
-        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(3600), .clock = .awake } }) catch {};
+        // Wait for next chunk (woken by WebSocket handler on each pty_output).
+        // Reset-then-double-check avoids a TOCTOU race: if wake_event.set()
+        // was called between our done-check above and reset(), the re-check
+        // catches it so we don't block for the full timeout waiting for a
+        // signal that already fired.
         state.wake_event.reset();
+        const done2 = blk: {
+            state.mutex.lock(state.io.?) catch break :blk @as(?i32, null);
+            defer state.mutex.unlock(state.io.?);
+            const op2 = state.op_states.getPtr(cmd_id) orelse break :blk @as(?i32, null);
+            if (op2.done) break :blk op2.exit_code;
+            break :blk @as(?i32, null);
+        };
+        if (done2) |ec| {
+            done_and_exit = ec;
+            continue; // will be handled at top of loop
+        }
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(3600), .clock = .awake } }) catch {};
     }
 }
 
@@ -387,13 +374,24 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, reque
     };
     defer allocator.free(cmd_id);
 
-    const frame = try wsproto.buildUploadReq(allocator, cmd_id, path, file_data);
+    const frame = try tunproto.buildUploadData(allocator, cmd_id, path, file_data);
     defer allocator.free(frame);
 
     try state.createOpState(cmd_id);
-    try state.enqueueOutgoingFrame(vm, frame);
 
-    // Wait for result — woken by WebSocket handler via wake_event
+    const tun = state.getGuestTunnel(vm) orelse {
+        try respondError(request, .service_unavailable, "GuestNotConnected");
+        return;
+    };
+    _ = tun.send(frame) catch |err| {
+        std.log.err("[upload] tunnel send failed for {s}: {}", .{ vm, err });
+        try respondError(request, .service_unavailable, "TunnelSendFailed");
+        return;
+    };
+
+    // Wait for result — woken by mesh handler thread via wake_event.
+    // Reset-then-double-check avoids TOCTOU race between concurrent waiters
+    // sharing the same wake_event.
     while (true) {
         if (state.takeOpResult(cmd_id)) |result| {
             defer allocator.free(result.stdout);
@@ -404,12 +402,21 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *httpd.HostState, reque
             }
             return;
         }
-        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(30), .clock = .awake } }) catch |err| {
+        state.wake_event.reset();
+        if (state.takeOpResult(cmd_id)) |result| {
+            defer allocator.free(result.stdout);
+            if (result.exit == 0) {
+                try respondJson(request, "{\"ok\":true}");
+            } else {
+                try respondError(request, .internal_server_error, "UploadFailed");
+            }
+            return;
+        }
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(120), .clock = .awake } }) catch |err| {
             std.log.err("[upload] wait timeout for {s}: {}", .{ cmd_id, err });
             try respondError(request, .gateway_timeout, "UploadTimeout");
             return;
         };
-        state.wake_event.reset();
     }
 }
 
@@ -449,11 +456,20 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
     };
     defer allocator.free(cmd_id);
 
-    const frame = try wsproto.buildDownloadReq(allocator, cmd_id, path);
+    const frame = try tunproto.buildDownloadCmd(allocator, cmd_id, path);
     defer allocator.free(frame);
 
     try state.createOpState(cmd_id);
-    try state.enqueueOutgoingFrame(vm, frame);
+
+    const tun = state.getGuestTunnel(vm) orelse {
+        try respondError(request, .service_unavailable, "GuestNotConnected");
+        return;
+    };
+    _ = tun.send(frame) catch |err| {
+        std.log.err("[download] tunnel send failed for {s}: {}", .{ vm, err });
+        try respondError(request, .service_unavailable, "TunnelSendFailed");
+        return;
+    };
 
     // Stream response via chunked encoding (same pattern as handleExec)
     var stream_buf: [4096]u8 = undefined;
@@ -464,6 +480,9 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
         },
     });
     var chunked_ended = false;
+    defer if (!chunked_ended) {
+        body_writer.endChunked(.{}) catch {};
+    };
 
     // Loop: write new output chunks as they arrive from guest
     while (true) {
@@ -498,7 +517,7 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
             };
         }
 
-        const done_and_exit = blk: {
+        var done_and_exit: ?i32 = blk: {
             state.mutex.lock(state.io.?) catch break :blk @as(?i32, null);
             defer state.mutex.unlock(state.io.?);
 
@@ -542,9 +561,20 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *httpd.HostState, req
             return;
         }
 
-        // Wait for next chunk
-        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(3600), .clock = .awake } }) catch {};
+        // Wait for next chunk — same reset-then-double-check pattern as exec.
         state.wake_event.reset();
+        const done2 = blk: {
+            state.mutex.lock(state.io.?) catch break :blk @as(?i32, null);
+            defer state.mutex.unlock(state.io.?);
+            const op2 = state.op_states.getPtr(cmd_id) orelse break :blk @as(?i32, null);
+            if (op2.done) break :blk op2.exit_code;
+            break :blk @as(?i32, null);
+        };
+        if (done2) |ec| {
+            done_and_exit = ec;
+            continue; // will be handled at top of loop
+        }
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(3600), .clock = .awake } }) catch {};
     }
 }
 
@@ -693,131 +723,96 @@ pub fn handleMcp(allocator: std.mem.Allocator, state: *httpd.HostState, request:
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GET /ws — WebSocket upgrade (Guest persistent pty connection)
+// Mesh guest handler — per-Guest KCP tunnel thread
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, request: *http.Server.Request, body: ?[]const u8) !void {
-    _ = body;
-
-    const upgrade = request.upgradeRequested();
-    const ws_key = upgrade.websocket orelse {
-        try respondError(request, .bad_request, "Not a WebSocket upgrade request");
-        return;
-    };
-
-    var ws = try request.respondWebSocket(.{ .key = ws_key });
-
-    // Flush 101 response so Guest can proceed with announce
-    try ws.output.flush();
-
-    // Read announce frame from guest (first message)
-    const announce = ws.readSmallMessage() catch |err| {
-        std.log.err("[ws] Announce read failed: {}", .{err});
-        return;
-    };
-    if (announce.opcode != .binary or announce.data.len == 0) {
-        std.log.err("[ws] Expected binary announce, got opcode={s}", .{@tagName(announce.opcode)});
-        return;
-    }
-    const msg_type: u8 = announce.data[0];
-    if (msg_type != @intFromEnum(wsproto.MsgType.announce)) {
-        std.log.err("[ws] Expected announce (1), got type={d}", .{msg_type});
-        return;
-    }
-    const info = wsproto.parseAnnounce(announce.data[1..]) orelse {
-        std.log.err("[ws] Failed to parse announce", .{});
-        return;
-    };
-
-    std.log.info("[ws] Guest {s} connected ({s} v{s})", .{ info.hostname, info.ip, info.version });
-
-    // Update guest table
-    const changed = state.upsertGuest(info.hostname, info.ip, info.target, info.mac, info.version, info.shell);
-    if (changed) syncHostsFromState(state, allocator);
-    const ws_hostname = try allocator.dupe(u8, info.hostname);
+/// Background thread: reads tunproto frames from a Guest's KCP tunnel,
+/// dispatches to HostState (appendOpOutput, completeOpState, etc.).
+/// Runs until tunnel disconnects or kick is requested.
+pub fn handleMeshGuest(
+    allocator: std.mem.Allocator,
+    state: *httpd.HostState,
+    hostname: []const u8,
+    tun: *tunnel_mod.Tunnel,
+) void {
     defer {
+        // Cleanup on disconnect
         state.failAllPendingOps();
-        state.removeGuest(ws_hostname);
+        state.removeGuestTunnel(hostname);
+        state.removeGuest(hostname);
         syncHostsFromState(state, allocator);
         if (state.on_guest_changed) |cb| cb(state);
-        allocator.free(ws_hostname);
+        std.log.info("[mesh-guest] {s} disconnected, cleanup done", .{hostname});
     }
-    if (state.on_guest_changed) |cb| cb(state);
 
     // Send pty_spawn to guest — triggers ptySpawn + ptyReadLoop on guest side
     {
-        const spawn_frame = try wsproto.buildPtySpawn(allocator);
-        defer allocator.free(spawn_frame);
-        ws.writeMessage(spawn_frame, .binary) catch |err| {
-            std.log.err("[ws] pty_spawn write failed for {s}: {}", .{ info.hostname, err });
+        const spawn_frame = tunproto.buildPtySpawn(allocator) catch |err| {
+            std.log.err("[mesh-guest] buildPtySpawn failed for {s}: {}", .{ hostname, err });
             return;
         };
-        std.log.info("[ws] Sent pty_spawn to {s}", .{info.hostname});
+        defer allocator.free(spawn_frame);
+        _ = tun.send(spawn_frame) catch |err| {
+            std.log.err("[mesh-guest] pty_spawn send failed for {s}: {}", .{ hostname, err });
+            return;
+        };
+        std.log.info("[mesh-guest] Sent pty_spawn to {s}", .{hostname});
     }
 
-    // Main loop: drain outgoing frames, read guest messages, check close
+    // Main loop: read guest responses from tunnel
+    var rbuf: [65536]u8 = undefined;
     while (true) {
-        // 1. Drain outgoing frames queue → send to guest
-        while (state.dequeueOutgoingFrame(ws_hostname)) |frame| {
-            defer allocator.free(frame);
-            ws.writeMessage(frame, .binary) catch |err| {
-                std.log.err("[ws] Frame write failed for {s}: {}", .{ info.hostname, err });
-                return;
-            };
+        // Check kick request
+        if (state.checkCloseRequested(hostname)) {
+            std.log.info("[mesh-guest] {s} kicked, closing tunnel", .{hostname});
+            return;
         }
 
-        // 2. Read message from guest (blocks)
-        const msg = ws.readSmallMessage() catch |err| {
-            std.log.err("[ws] Read failed for {s}: {}", .{ info.hostname, err });
+        const n = tun.recv(&rbuf) catch |err| {
+            std.log.err("[mesh-guest] tunnel recv failed for {s}: {}", .{ hostname, err });
             return;
         };
-
-        if (msg.opcode == .binary and msg.data.len > 0) {
-            const resp_type: u8 = msg.data[0];
-            const payload = msg.data[1..];
-            switch (resp_type) {
-                @intFromEnum(wsproto.MsgType.announce) => {
-                    if (wsproto.parseAnnounce(payload)) |a| {
-                        std.log.debug("[ws] Re-announce from {s}", .{a.hostname});
-                        _ = state.upsertGuest(a.hostname, a.ip, a.target, a.mac, a.version, a.shell);
-                        if (state.on_guest_changed) |cb| cb(state);
-                    }
-                },
-                @intFromEnum(wsproto.MsgType.pty_output) => {
-                    if (wsproto.parsePtyOutput(payload)) |out| {
-                        state.appendOpOutput(out.cmd_id, out.data);
-                        state.scanForMarker(out.cmd_id);
-                        // Wake streaming HTTP handlers even if marker not yet found
-                        state.wake_event.set(state.io.?);
-                    }
-                },
-                @intFromEnum(wsproto.MsgType.upload_resp) => {
-                    if (wsproto.parseUploadResp(payload)) |resp| {
-                        state.completeOpState(resp.cmd_id, resp.exit_code);
-                    }
-                },
-                @intFromEnum(wsproto.MsgType.download_resp) => {
-                    if (wsproto.parseDownloadResp(payload)) |resp| {
-                        state.appendOpOutput(resp.cmd_id, resp.file_data);
-                        state.completeOpState(resp.cmd_id, resp.exit_code);
-                    }
-                },
-                else => {
-                    std.log.debug("[ws] Unknown message type: {d}", .{resp_type});
-                },
+        if (n == 0) {
+            // Tunnel dead — reconnect handled by caller (tunnelManager)
+            if (tun.isAlive()) {
+                std.Io.sleep(state.io.?, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+                continue;
             }
-        } else if (msg.opcode == .ping) {
-            // RFC 6455: respond to ping with pong
-            ws.writeMessage(&.{}, .pong) catch {};
-        } else if (msg.opcode == .connection_close) {
-            std.log.info("[ws] Guest {s} disconnected", .{info.hostname});
+            std.log.info("[mesh-guest] {s} tunnel dead", .{hostname});
             return;
         }
 
-        // 3. Check kick request
-        if (state.checkCloseRequested(ws_hostname)) {
-            std.log.info("[ws] Guest {s} kicked, closing connection", .{info.hostname});
-            return;
+        if (n == 0 or rbuf[0] == 0) continue;
+        const msg_type: u8 = rbuf[0];
+        const payload = rbuf[1..n];
+
+        switch (msg_type) {
+            @intFromEnum(tunproto.MsgType.pty_exec_output) => {
+                if (tunproto.parsePtyExecOutput(payload)) |out| {
+                    state.appendOpOutput(out.cmd_id, out.data);
+                    state.scanForMarker(out.cmd_id);
+                    state.wake_event.set(state.io.?);
+                }
+            },
+            @intFromEnum(tunproto.MsgType.pty_exec_done) => {
+                if (tunproto.parsePtyExecDone(payload)) |done| {
+                    state.completeOpState(done.cmd_id, done.exit_code);
+                }
+            },
+            @intFromEnum(tunproto.MsgType.upload_result) => {
+                if (tunproto.parseUploadResult(payload)) |resp| {
+                    state.completeOpState(resp.cmd_id, resp.exit_code);
+                }
+            },
+            @intFromEnum(tunproto.MsgType.download_result) => {
+                if (tunproto.parseDownloadResult(payload)) |resp| {
+                    state.appendOpOutput(resp.cmd_id, resp.file_data);
+                    state.completeOpState(resp.cmd_id, resp.exit_code);
+                }
+            },
+            else => {
+                std.log.debug("[mesh-guest] Unknown msg type {d} from {s}", .{ msg_type, hostname });
+            },
         }
     }
 }
@@ -826,7 +821,7 @@ pub fn handleWebSocket(allocator: std.mem.Allocator, state: *httpd.HostState, re
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn syncHostsFromState(state: *httpd.HostState, allocator: std.mem.Allocator) void {
+pub fn syncHostsFromState(state: *httpd.HostState, allocator: std.mem.Allocator) void {
     state.mutex.lock(state.io.?) catch {};
     defer state.mutex.unlock(state.io.?);
 

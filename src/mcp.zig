@@ -10,7 +10,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const httpd = @import("httpd.zig");
-const wsproto = @import("wsproto.zig");
+const tunproto = @import("tunproto.zig");
 
 // ── MCP protocol constants ─────────────────────────────────────────────────
 
@@ -152,13 +152,19 @@ fn handleVmExec(allocator: std.mem.Allocator, state: *httpd.HostState, vm: []con
     const cmd_with_marker = try httpd.buildCmdWithMarker(allocator, guest_shell, command);
     defer allocator.free(cmd_with_marker);
 
-    const frame = try wsproto.buildPtyInput(allocator, cmd_id, cmd_with_marker);
+    const frame = try tunproto.buildPtyExecInput(allocator, cmd_id, cmd_with_marker);
     defer allocator.free(frame);
 
     try state.createOpState(cmd_id);
-    try state.enqueueOutgoingFrame(vm, frame);
 
-    // Wait for result — woken by WebSocket handler via wake_event
+    const tun = state.getGuestTunnel(vm) orelse {
+        return error.GuestNotConnected;
+    };
+    _ = tun.send(frame) catch {
+        return error.TunnelSendFailed;
+    };
+
+    // Wait for result — woken by mesh handler thread via wake_event
     while (true) {
         if (state.takeOpResult(cmd_id)) |result| {
             defer allocator.free(result.stdout);

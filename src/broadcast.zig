@@ -6,8 +6,9 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
 const protocol = @import("protocol.zig");
-const wsclient = @import("wsclient.zig");
-const wsproto_mod = @import("wsproto.zig");
+const tunnel_mod = @import("tunnel.zig");
+const tunproto = @import("tunproto.zig");
+const mesh_mod = @import("mesh.zig");
 
 /// Shared signal between udpDiscoveryListener (background thread) and
 /// wsAnnounceLoop (main thread). When the UDP listener detects a version
@@ -563,32 +564,7 @@ fn getGatewayWindows(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
 test "getDefaultGateway - signature" { _ = getDefaultGateway; }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// HTTP announce loop (v0.3.0: replaces UDP broadcast + TCP server)
-// Guest POSTs /announce every 1s, processes pending commands from response.
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Timer thread: sends periodic announce to keep Host unblocked.
-/// Used only on Windows (no poll). POSIX uses single-threaded poll loop.
-fn runTimerThread(ctx: *TimerCtx) void {
-    while (ctx.running) {
-        ctx.conn.io.sleep(std.Io.Duration.fromNanoseconds(std.time.ns_per_s), .awake) catch {};
-        if (!ctx.running) return;
-        // Check for auto-upgrade signal — close socket to wake main loop from readFrame
-        if (ctx.upgrade.needed.load(.acquire)) {
-            std.log.info("[upgrade] Version mismatch detected by timer thread, waking main loop", .{});
-            ctx.conn.stream.close(ctx.conn.io);
-            ctx.running = false;
-            return;
-        }
-        ctx.conn.writeFrame(ctx.msg, .binary) catch {
-            ctx.running = false;
-            return;
-        };
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// v0.5.0: pty session model — persistent pty per WebSocket connection
+// v0.11.0: pty session model — persistent pty per KCP tunnel connection
 // ═══════════════════════════════════════════════════════════════════════════
 
 // POSIX pty externs (available on macOS and Linux via libc)
@@ -854,12 +830,12 @@ fn killForegroundProcess(master_fd: std.posix.fd_t, signal: u8) void {
 /// Runs for entire WS connection lifetime. Sets pty_dead on EOF (shell exited).
 fn ptyReadLoop(
     master_fd: std.posix.fd_t,
-    conn: *wsclient.WsConn,
+    tun: *tunnel_mod.Tunnel,
     io: std.Io,
     allocator: std.mem.Allocator,
     active_cmd_id: *[]const u8,
     cmd_mutex: *std.Io.Mutex,
-    pty_dead: *bool,
+    pty_dead: *std.atomic.Value(bool),
 ) void {
     var buf: [4096]u8 = undefined;
 
@@ -879,10 +855,7 @@ fn ptyReadLoop(
             // it before the POLL.IN check — otherwise we spin at 100% CPU.
             if (fds[0].revents & std.posix.POLL.HUP != 0) {
                 std.log.info("[guest-pty] pty hangup (shell exited)", .{});
-                pty_dead.* = true;
-                if (builtin.os.tag == .windows) {
-                    conn.writeFrame(&.{}, .ping) catch {};
-                }
+                pty_dead.store(true, .release);
                 break;
             }
             if (fds[0].revents & std.posix.POLL.IN == 0) continue;
@@ -896,11 +869,7 @@ fn ptyReadLoop(
         if (n == 0) {
             // EOF: shell process exited
             std.log.info("[guest-pty] pty EOF (shell exited)", .{});
-            pty_dead.* = true;
-            // On Windows, send ping to wake main loop from readFrame
-            if (builtin.os.tag == .windows) {
-                conn.writeFrame(&.{}, .ping) catch {};
-            }
+            pty_dead.store(true, .release);
             break;
         }
 
@@ -914,11 +883,11 @@ fn ptyReadLoop(
         cmd_mutex.unlock(io);
         defer allocator.free(cmd_owned);
 
-        // Send pty_output frame
-        const frame = wsproto_mod.buildPtyOutput(allocator, cmd_owned, buf[0..n]) catch continue;
+        // Send pty_exec_output frame via tunnel
+        const frame = tunproto.buildPtyExecOutput(allocator, cmd_owned, buf[0..n]) catch continue;
         defer allocator.free(frame);
-        conn.writeFrame(frame, .binary) catch |err| {
-            std.log.err("[guest-pty] pty_output write error: {}", .{err});
+        _ = tun.send(frame) catch |err| {
+            std.log.err("[guest-pty] pty_exec_output send error: {}", .{err});
             break;
         };
     }
@@ -941,228 +910,170 @@ fn killChild(pid: std.posix.pid_t) void {
     }
 }
 
-const TimerCtx = struct {
-    conn: *wsclient.WsConn,
-    msg: []const u8,
-    running: bool,
-    upgrade: *UpgradeSignal,
-};
-
-/// WebSocket announce loop: persistent WS connection to Host.
-/// POSIX: single-threaded poll loop (no races).
-/// Windows: timer thread + mutex-protected writes.
-/// UDP discovery listener thread.
-/// Binds to UDP :2121, responds to "ARE YOU OK?\r\n" broadcasts with ANNOUNCE.
-/// Runs until `shutdown` is set true by the main thread.
-/// Uses its own Io.Threaded instance so I/O works from a background thread
-/// on all platforms (required on Windows where cross-thread Io ops fail).
-///
-/// On Windows, Zig 0.16.0 Io.Threaded does not support concurrent net_receive
-/// (Threaded.zig line 3198: "TODO integrate with overlapped I/O").
-/// `receiveTimeout` uses the concurrent path → returns ConcurrencyUnavailable.
-/// Workaround: use blocking `receive()` and have the main thread close the socket
-/// handle on shutdown to unblock this thread.
-fn udpDiscoveryListener(
-    caller_io: Io,
-    allocator: std.mem.Allocator,
-    info: *const SystemInfo,
-    shutdown: *std.atomic.Value(bool),
-    socket_handle_out: *?net.Socket.Handle,
-    upgrade: *UpgradeSignal,
-) void {
-    var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
-    const io = threaded.io();
-
-    const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", protocol.DEFAULT_PORT) catch |err| {
-        std.log.err("[udp-disc] Failed to parse bind addr: {}", .{err});
-        return;
-    };
-    const socket = bind_addr.bind(io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
-        std.log.err("[udp-disc] Failed to bind UDP :{d}: {}", .{ protocol.DEFAULT_PORT, err });
-        return;
-    };
-    defer socket.close(io);
-
-    std.log.info("[udp-disc] Listening on UDP :{d}", .{protocol.DEFAULT_PORT});
-
-    var buf: [4096]u8 = undefined;
-    while (!shutdown.load(.acquire)) {
-        if (builtin.os.tag == .windows) {
-            // Store handle so main thread can close it on shutdown to unblock us
-            @atomicStore(?net.Socket.Handle, socket_handle_out, socket.handle, .release);
-            const msg = socket.receive(io, &buf) catch |err| {
-                @atomicStore(?net.Socket.Handle, socket_handle_out, null, .release);
-                if (shutdown.load(.acquire)) break;
-                std.log.err("[udp-disc] receive error: {}", .{err});
-                continue;
-            };
-            @atomicStore(?net.Socket.Handle, socket_handle_out, null, .release);
-            // Process the message
-            if (std.mem.indexOf(u8, msg.data, "ARE YOU OK?") != null) {
-                // Check for version mismatch (auto-upgrade detection)
-                if (!upgrade.needed.load(.acquire)) {
-                    if (protocol.parseDiscoveryVersion(msg.data)) |host_version| {
-                        if (!std.mem.eql(u8, host_version, protocol.VERSION)) {
-                            std.log.info("[udp-disc] Version mismatch: host={s} guest={s} — signalling upgrade", .{ host_version, protocol.VERSION });
-                            upgrade.needed.store(true, .release);
-                            continue; // Skip response — stop accepting broadcasts
-                        }
-                    }
-                }
-                // Version matches or old format (no version line) — respond normally
-                const response = std.fmt.allocPrint(allocator,
-                    "{s}hostname: {s}\r\nip: {s}\r\ntarget: {s}\r\nmac: {s}\r\nversion: {s}\r\nshell: {s}\r\n\r\n",
-                    .{ protocol.DISCOVERY_RESPONSE_PREFIX, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell },
-                ) catch {
-                    std.log.err("[udp-disc] Failed to allocate response", .{});
-                    continue;
-                };
-                defer allocator.free(response);
-                socket.send(io, &msg.from, response) catch |err| {
-                    std.log.err("[udp-disc] send response to {any}: {}", .{ msg.from.getPort(), err });
-                };
-                std.log.debug("[udp-disc] Responded to discovery query", .{});
-            }
-        } else {
-            const timeout: Io.Timeout = .{ .duration = .{ .raw = Io.Duration.fromSeconds(1), .clock = .awake } };
-            const msg = socket.receiveTimeout(io, &buf, timeout) catch |err| {
-                switch (err) {
-                    error.Timeout => continue,
-                    else => {
-                        std.log.err("[udp-disc] receive error: {}", .{err});
-                        continue;
-                    },
-                }
-            };
-            if (std.mem.indexOf(u8, msg.data, "ARE YOU OK?") != null) {
-                // Check for version mismatch (auto-upgrade detection)
-                if (!upgrade.needed.load(.acquire)) {
-                    if (protocol.parseDiscoveryVersion(msg.data)) |host_version| {
-                        if (!std.mem.eql(u8, host_version, protocol.VERSION)) {
-                            std.log.info("[udp-disc] Version mismatch: host={s} guest={s} — signalling upgrade", .{ host_version, protocol.VERSION });
-                            upgrade.needed.store(true, .release);
-                            continue; // Skip response — stop accepting broadcasts
-                        }
-                    }
-                }
-                // Version matches or old format (no version line) — respond normally
-                const response = std.fmt.allocPrint(allocator,
-                    "{s}hostname: {s}\r\nip: {s}\r\ntarget: {s}\r\nmac: {s}\r\nversion: {s}\r\nshell: {s}\r\n\r\n",
-                    .{ protocol.DISCOVERY_RESPONSE_PREFIX, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell },
-                ) catch {
-                    std.log.err("[udp-disc] Failed to allocate response", .{});
-                    continue;
-                };
-                defer allocator.free(response);
-                socket.send(io, &msg.from, response) catch |err| {
-                    std.log.err("[udp-disc] send response to {any}: {}", .{ msg.from.getPort(), err });
-                };
-                std.log.debug("[udp-disc] Responded to discovery query", .{});
-            }
-        }
-    }
-
-    std.log.info("[udp-disc] Shutting down", .{});
-    _ = caller_io;
+/// Extract bare IP from host_url. Input format: "http://IP:PORT" → "IP".
+/// Returns empty string if parsing fails (safe default: no upgrade filtering on error).
+fn extractHostIp(host_url: []const u8) []const u8 {
+    // Strip "http://" prefix
+    const without_scheme = if (std.mem.startsWith(u8, host_url, "http://"))
+        host_url["http://".len..]
+    else
+        host_url;
+    // Find port separator
+    const colon = std.mem.indexOfScalar(u8, without_scheme, ':') orelse return without_scheme;
+    return without_scheme[0..colon];
 }
 
-pub fn wsAnnounceLoop(
+pub fn meshSessionLoop(
     io: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
     host_url: []const u8,
     upgrade: *UpgradeSignal,
+    mesh_port: u16,
+    peer_mesh: ?[]const u8,
 ) !void {
-    const host: []const u8 = if (host_url.len > 0) host_url else blk: {
-        const gw = getDefaultGateway(io, allocator) catch blk2: {
-            break :blk2 try allocator.dupe(u8, "192.168.64.1");
-        };
-        break :blk gw;
-    };
-    defer if (host_url.len == 0) allocator.free(host);
+    // Extract Host IP from host_url for LSA version check filtering.
+    // host_url format: "http://IP:PORT" — strip to just the IP.
+    const host_gateway_ip = extractHostIp(host_url);
 
-    // Start UDP discovery listener (responds to "ARE YOU OK?" broadcasts from --status,
-    // detects version mismatch for auto-upgrade)
-    var udp_shutdown = std.atomic.Value(bool).init(false);
-    var udp_socket_handle: ?net.Socket.Handle = null;
-    const udp_thread: ?std.Thread = std.Thread.spawn(.{}, udpDiscoveryListener, .{ io, allocator, &info, &udp_shutdown, &udp_socket_handle, upgrade }) catch blk: {
-        std.log.err("[guest-ws] UDP discovery listener spawn failed", .{});
-        break :blk null;
-    };
-    defer {
-        udp_shutdown.store(true, .release);
-        // On Windows, Io.Threaded receive() blocks forever — the concurrent path
-        // for net_receive is not implemented. Close the socket handle to unblock.
-        if (builtin.os.tag == .windows) {
-            if (@atomicLoad(?net.Socket.Handle, &udp_socket_handle, .acquire)) |handle| {
-                std.os.windows.CloseHandle(handle);
+    // Start mesh networking thread (LSA broadcast + KCP data dispatch).
+    // Mesh owns UDP :2121 for LSA + KCP relay + PING/PONG.
+    var mesh_opt: ?mesh_mod.Mesh = null;
+    var mesh_thread: ?std.Thread = null;
+    var mesh_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var mesh_socket_opt: ?net.Socket = null;
+
+    start_mesh: {
+        // Collect broadcast addresses (subnet-directed + 255.255.255.255)
+        var broadcast_addrs = getSubnetBroadcasts(allocator) catch |err| {
+            std.log.err("[guest-mesh] getSubnetBroadcasts failed: {}", .{err});
+            break :start_mesh;
+        };
+
+        // Add explicit peer mesh address for local testing (different mesh ports)
+        if (peer_mesh) |pm| {
+            if (protocol.parsePeerMeshAddr(pm)) |peer_addr| {
+                broadcast_addrs.append(allocator, peer_addr) catch |err| {
+                    std.log.err("[guest-mesh] append peer-mesh '{s}': {}", .{ pm, err });
+                };
+            } else {
+                std.log.err("[guest-mesh] invalid --peer-mesh '{s}'", .{pm});
             }
         }
-        if (udp_thread) |t| t.join();
+
+        // Dedicated Io for mesh background thread (required on all platforms)
+        const mesh_io = mesh_threaded.io();
+
+        // Bind UDP socket for mesh
+        const bind_addr = net.IpAddress.parse("0.0.0.0", mesh_port) catch |err| {
+            std.log.err("[guest-mesh] Mesh bind addr parse failed: {}", .{err});
+            broadcast_addrs.deinit(allocator);
+            break :start_mesh;
+        };
+        const mesh_socket = bind_addr.bind(mesh_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
+            std.log.err("[guest-mesh] Mesh UDP bind :{d} failed: {}", .{ mesh_port, err });
+            broadcast_addrs.deinit(allocator);
+            break :start_mesh;
+        };
+        mesh_socket_opt = mesh_socket;
+
+        // Parse MAC as mesh NodeId.
+        // When peer_mesh is set (local testing, same machine as Host),
+        // derive a unique NodeId from MAC+hostname to avoid collision.
+        const node_id = if (peer_mesh != null)
+            mesh_mod.deriveNodeId(info.mac, info.hostname) catch |err| {
+                std.log.err("[guest-mesh] deriveNodeId '{s}'+'{s}' failed: {}", .{ info.mac, info.hostname, err });
+                mesh_socket.close(mesh_io);
+                broadcast_addrs.deinit(allocator);
+                break :start_mesh;
+            }
+        else
+            mesh_mod.parseNodeId(info.mac) catch |err| {
+                std.log.err("[guest-mesh] Mesh MAC parse '{s}' failed: {}", .{ info.mac, err });
+                mesh_socket.close(mesh_io);
+                broadcast_addrs.deinit(allocator);
+                break :start_mesh;
+            };
+
+        // Build node_info string for LSA broadcast
+        const node_info = std.fmt.allocPrint(allocator,
+            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}",
+            .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
+        ) catch |err| {
+            std.log.err("[guest-mesh] Mesh node_info alloc failed: {}", .{err});
+            mesh_socket.close(mesh_io);
+            broadcast_addrs.deinit(allocator);
+            break :start_mesh;
+        };
+
+        // Create mesh instance (mesh takes ownership of node_info and broadcast_addrs)
+        mesh_opt = mesh_mod.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs, host_gateway_ip) catch |err| {
+            std.log.err("[guest-mesh] Mesh init failed: {}", .{err});
+            allocator.free(node_info);
+            mesh_socket.close(mesh_io);
+            broadcast_addrs.deinit(allocator);
+            break :start_mesh;
+        };
+
+        // Spawn mesh.run() in background thread
+        mesh_thread = std.Thread.spawn(.{}, mesh_mod.Mesh.run, .{&mesh_opt.?}) catch |err| {
+            std.log.err("[guest-mesh] Mesh thread spawn failed: {}", .{err});
+            mesh_opt.?.deinit();
+            mesh_socket.close(mesh_io);
+            mesh_opt = null;
+            break :start_mesh;
+        };
+
+        std.log.info("[guest-mesh] Mesh networking started (LSA on UDP :{d})", .{mesh_port});
     }
 
-    // Outer reconnect loop: connect, announce, spawn pty, process messages.
-    // Any connection failure or pty death causes reconnect from scratch.
-    var conn: wsclient.WsConn = undefined;
+    defer {
+        if (mesh_thread) |t| {
+            if (mesh_opt) |*m| m.signalShutdown();
+            t.join();
+        }
+        if (mesh_opt) |*m| {
+            const m_io = m.io;
+            m.deinit();
+            if (mesh_socket_opt) |s| s.close(m_io);
+        }
+        mesh_threaded.deinit();
+    }
+
+    if (mesh_opt == null) {
+        std.log.err("[guest-mesh] Mesh failed to start, exiting", .{});
+        return error.MeshInitFailed;
+    }
+
+    // Main loop: wait for Host tunnel, process commands, handle reconnect.
     while (true) {
-        // Connect with retry backoff
-        while (true) {
-            std.log.info("[guest-ws] Connecting to {s}:{d}", .{ host, protocol.DEFAULT_PORT });
-            conn = wsclient.WsConn.connect(io, allocator, host, protocol.DEFAULT_PORT) catch |err| {
-                std.log.err("[guest-ws] Connect failed: {} — retrying in 3s", .{err});
-                std.Io.sleep(io, std.Io.Duration.fromSeconds(3), .awake) catch {};
-                continue;
-            };
-            break;
-        }
+        // Wait for Host to establish a KCP tunnel and send pty_spawn
+        var tunnel = waitForHostTunnel(io, allocator, &mesh_opt) catch |err| {
+            std.log.err("[guest-mesh] waitForHostTunnel failed: {}", .{err});
+            continue;
+        };
 
-        // Send initial announce
-        {
-            const frame = try wsproto_mod.buildAnnounce(
-                allocator, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell,
-            );
-            defer allocator.free(frame);
-            conn.writeFrame(frame, .binary) catch |err| {
-                std.log.err("[guest-ws] Announce write failed: {}", .{err});
-                conn.close();
-                std.Io.sleep(io, std.Io.Duration.fromSeconds(3), .awake) catch {};
-                continue;
-            };
-        }
-
-        std.log.info("[guest-ws] Connected and announced", .{});
-
-        // Check if UDP listener detected a version mismatch
-        if (upgrade.needed.load(.acquire)) {
-            std.log.info("[upgrade] Version mismatch detected, triggering self-upgrade", .{});
-            const bin_name = protocol.deploymentFilename(info.target) orelse "utmm";
-            const upgrade_url = try std.fmt.allocPrint(allocator,
-                "http://{s}:{d}/bin/{s}", .{ host, protocol.DEFAULT_PORT, bin_name });
-            defer allocator.free(upgrade_url);
-            try triggerSelfUpgrade(io, allocator, upgrade_url);
-            // triggerSelfUpgrade calls std.process.exit(0) on success
-        }
-
-        // Wait for pty_spawn from Host
-        var rbuf: [65536]u8 = undefined;
-        const spawn_frame = blk: {
+        // Read pty_spawn from Host
+        const spawn_ok = blk: {
+            var rbuf: [4096]u8 = undefined;
             while (true) {
-                const f = conn.readFrame(&rbuf) catch |err| {
-                    std.log.err("[guest-ws] pty_spawn read error: {}", .{err});
-                    break :blk null;
+                const n = tunnel.recv(&rbuf) catch |err| {
+                    std.log.err("[guest-mesh] pty_spawn recv error: {}", .{err});
+                    break :blk false;
                 };
-                if (f.opcode == .close) break :blk null;
-                if (f.opcode == .binary and f.data.len > 0 and f.data[0] == @intFromEnum(wsproto_mod.MsgType.pty_spawn)) {
-                    break :blk f;
+                if (n == 0) {
+                    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+                    continue;
                 }
-                // Ignore any other frames before pty_spawn
-                std.log.debug("[guest-ws] Ignoring pre-spawn frame type={d}", .{f.data[0]});
+                if (n > 0 and rbuf[0] == @intFromEnum(tunproto.MsgType.pty_spawn)) {
+                    break :blk true;
+                }
+                std.log.debug("[guest-mesh] Ignoring pre-spawn frame type={d}", .{rbuf[0]});
             }
         };
-        if (spawn_frame == null) {
-            std.log.info("[guest-ws] No pty_spawn received, reconnecting...", .{});
-            conn.close();
-            std.Io.sleep(io, std.Io.Duration.fromSeconds(3), .awake) catch {};
+        if (!spawn_ok) {
+            std.log.info("[guest-mesh] No pty_spawn received, waiting for reconnect...", .{});
+            tunnel.deinit();
             continue;
         }
 
@@ -1170,12 +1081,10 @@ pub fn wsAnnounceLoop(
         const shell = detectShell(allocator) catch "/bin/sh";
         defer allocator.free(shell);
         const pty = ptySpawn(allocator, shell) catch |err| {
-            std.log.err("[guest-ws] ptySpawn failed: {}", .{err});
-            conn.close();
-            std.Io.sleep(io, std.Io.Duration.fromSeconds(3), .awake) catch {};
+            std.log.err("[guest-mesh] ptySpawn failed: {}", .{err});
+            tunnel.deinit();
             continue;
         };
-
         defer {
             allocator.free(pty.shell);
             killChild(pty.child_pid);
@@ -1183,211 +1092,152 @@ pub fn wsAnnounceLoop(
         }
 
         // Shared state between main loop and ptyReadLoop thread
-        var active_cmd_id: []const u8 = &.{}; // current cmd_id for pty_output tagging
+        var active_cmd_id: []const u8 = &.{};
         var cmd_mutex: std.Io.Mutex = std.Io.Mutex.init;
-        var pty_dead: bool = false;
+        var pty_dead: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
         // Start ptyReadLoop thread
         {
-            const thread_args = try allocator.create(struct {
-                master_fd: std.posix.fd_t,
-                conn: *wsclient.WsConn,
-                io: std.Io,
-                allocator: std.mem.Allocator,
-                active_cmd_id: *[]const u8,
-                cmd_mutex: *std.Io.Mutex,
-                pty_dead: *bool,
-            });
-            thread_args.* = .{
-                .master_fd = pty.master_fd,
-                .conn = &conn,
-                .io = io,
-                .allocator = allocator,
-                .active_cmd_id = &active_cmd_id,
-                .cmd_mutex = &cmd_mutex,
-                .pty_dead = &pty_dead,
-            };
             const t = try std.Thread.spawn(.{}, ptyReadLoop, .{
-                thread_args.master_fd,
-                thread_args.conn,
-                thread_args.io,
-                thread_args.allocator,
-                thread_args.active_cmd_id,
-                thread_args.cmd_mutex,
-                thread_args.pty_dead,
+                pty.master_fd,
+                &tunnel,
+                io,
+                allocator,
+                &active_cmd_id,
+                &cmd_mutex,
+                &pty_dead,
             });
             t.detach();
         }
 
-    // Pre-build announce message — static data, reused every second
-    const announce_msg = try wsproto_mod.buildAnnounce(
-        allocator, info.hostname, info.ip, info.target, info.mac, protocol.VERSION, info.shell,
-    );
-    defer allocator.free(announce_msg);
+        std.log.info("[guest-mesh] Pty session started, entering command loop", .{});
 
-    // Windows: start timer thread for periodic re-announce.
-    // POSIX: use single-threaded poll loop (no race).
-    var timer_ctx: if (builtin.os.tag == .windows) TimerCtx else struct {} = if (builtin.os.tag == .windows)
-        TimerCtx{ .conn = &conn, .msg = announce_msg, .running = true, .upgrade = upgrade }
-    else
-        .{};
-    if (builtin.os.tag == .windows) {
-        const timer_thread = std.Thread.spawn(.{}, runTimerThread, .{ &timer_ctx }) catch |err| {
-            std.log.err("[guest-ws] Timer thread spawn failed: {}", .{err});
-            return err;
-        };
-        timer_thread.detach();
-    }
-    defer if (builtin.os.tag == .windows) {
-        timer_ctx.running = false;
-    };
+        // Command dispatch loop
+        var rbuf: [65536]u8 = undefined;
+        while (!pty_dead.load(.acquire)) {
+            // Check auto-upgrade signal before blocking recv.
+            // Skip when peer_mesh is set (local testing mode — network LSAs
+            // from other machines may have version mismatches unrelated to us).
+            if (peer_mesh == null and upgrade.needed.load(.acquire)) {
+                std.log.info("[upgrade] Version mismatch, triggering self-upgrade", .{});
+                const gw = getDefaultGateway(io, allocator) catch "192.168.64.1";
+                defer if (!std.mem.eql(u8, gw, "192.168.64.1")) allocator.free(gw);
+                const bin_name = protocol.deploymentFilename(info.target) orelse "utmm";
+                const upgrade_url = std.fmt.allocPrint(allocator,
+                    "http://{s}:{d}/bin/{s}", .{ gw, protocol.DEFAULT_PORT, bin_name }) catch break;
+                defer allocator.free(upgrade_url);
+                triggerSelfUpgrade(io, allocator, upgrade_url) catch |err| {
+                    std.log.err("[upgrade] triggerSelfUpgrade failed: {}", .{err});
+                };
+                break;
+            }
 
-    while (true) {
-        // POSIX: poll socket with 1s timeout. Windows: timer thread handles announces.
-        if (builtin.os.tag != .windows and conn.leftover_len == 0) {
-            var fds: [1]std.posix.pollfd = .{
-                .{ .fd = conn.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
-            };
-            const poll_n = std.posix.poll(&fds, 1000) catch |err| {
-                std.log.err("[guest-ws] poll error: {}", .{err});
+            const n = tunnel.recv(&rbuf) catch |err| {
+                std.log.err("[guest-mesh] tunnel recv error: {}", .{err});
                 break;
             };
-            if (poll_n == 0) {
-                conn.writeFrame(announce_msg, .binary) catch |err| {
-                    std.log.err("[guest-ws] Announce write failed: {}", .{err});
-                    break;
-                };
-                // Check for auto-upgrade signal from UDP listener
-                if (upgrade.needed.load(.acquire)) {
-                    std.log.info("[upgrade] Version mismatch detected, triggering self-upgrade", .{});
-                    const bin_name = protocol.deploymentFilename(info.target) orelse "utmm";
-                    const upgrade_url = std.fmt.allocPrint(allocator,
-                        "http://{s}:{d}/bin/{s}", .{ host, protocol.DEFAULT_PORT, bin_name }) catch break;
-                    defer allocator.free(upgrade_url);
-                    triggerSelfUpgrade(io, allocator, upgrade_url) catch break;
-                }
-                // Check pty_dead before continuing — ptyReadLoop may have detected EOF
-                if (pty_dead) {
-                    std.log.info("[guest-ws] Pty session ended (detected on poll timeout), reconnecting...", .{});
-                    break;
-                }
+            if (n == 0) {
+                // No data — short sleep then retry
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
                 continue;
+            }
+
+            const msg_type: u8 = rbuf[0];
+            const payload = rbuf[1..n];
+
+            switch (msg_type) {
+                @intFromEnum(tunproto.MsgType.pty_spawn) => {
+                    std.log.info("[guest-mesh] pty re-spawn requested", .{});
+                    break;
+                },
+                @intFromEnum(tunproto.MsgType.pty_exec_input) => {
+                    if (tunproto.parsePtyExecInput(payload)) |input| {
+                        // Update active_cmd_id under mutex
+                        cmd_mutex.lock(io) catch {};
+                        if (active_cmd_id.len > 0) allocator.free(active_cmd_id);
+                        active_cmd_id = allocator.dupe(u8, input.cmd_id) catch &.{};
+                        cmd_mutex.unlock(io);
+
+                        // Write command data to pty master (stdin of shell)
+                        ptyWrite(&pty, input.command);
+                    }
+                },
+                @intFromEnum(tunproto.MsgType.signal_cmd) => {
+                    if (payload.len > 0) {
+                        killForegroundProcess(pty.master_fd, payload[0]);
+                    }
+                },
+                @intFromEnum(tunproto.MsgType.upload_data) => {
+                    if (tunproto.parseUploadData(payload)) |req| {
+                        std.log.debug("[guest-mesh] Upload: {s} ({d} bytes)", .{ req.path, req.file_data.len });
+                        const exit_code: i32 = writeFile(io, allocator, req.path, req.file_data) catch |err2| blk2: {
+                            std.log.err("[guest-mesh] Upload write failed: {}", .{err2});
+                            break :blk2 -1;
+                        };
+                        const resp = tunproto.buildUploadResult(allocator, req.cmd_id, exit_code) catch |err2| {
+                            std.log.err("[guest-mesh] buildUploadResult failed: {}", .{err2});
+                            continue;
+                        };
+                        defer allocator.free(resp);
+                        _ = tunnel.send(resp) catch |e| {
+                            std.log.err("[guest-mesh] upload_result send failed: {}", .{e});
+                        };
+                    }
+                },
+                @intFromEnum(tunproto.MsgType.download_cmd) => {
+                    if (tunproto.parseDownloadCmd(payload)) |req| {
+                        std.log.debug("[guest-mesh] Download: {s}", .{req.path});
+                        const file_content = readFileContent(io, allocator, req.path) catch |err2| {
+                            std.log.err("[guest-mesh] Download read failed: {}", .{err2});
+                            const err_resp = tunproto.buildDownloadResult(allocator, req.cmd_id, -1, "") catch continue;
+                            defer allocator.free(err_resp);
+                            _ = tunnel.send(err_resp) catch {};
+                            continue;
+                        };
+                        defer allocator.free(file_content);
+                        const resp = tunproto.buildDownloadResult(allocator, req.cmd_id, 0, file_content) catch |err2| {
+                            std.log.err("[guest-mesh] buildDownloadResult failed: {}", .{err2});
+                            continue;
+                        };
+                        defer allocator.free(resp);
+                        _ = tunnel.send(resp) catch |e| {
+                            std.log.err("[guest-mesh] download_result send failed: {}", .{e});
+                        };
+                    }
+                },
+                else => {
+                    std.log.debug("[guest-mesh] Unknown msg type: {d}", .{msg_type});
+                },
             }
         }
 
-        const frame = conn.readFrame(&rbuf) catch |err| {
-            std.log.err("[guest-ws] Read error: {}", .{err});
-            break;
-        };
-
-        switch (frame.opcode) {
-            .binary => {
-                if (frame.data.len == 0) continue;
-                const msg_type: u8 = frame.data[0];
-                const payload = frame.data[1..];
-
-                switch (msg_type) {
-                    @intFromEnum(wsproto_mod.MsgType.pty_input) => {
-                        if (wsproto_mod.parsePtyInput(payload)) |input| {
-                            // Update active_cmd_id under mutex
-                            cmd_mutex.lock(io) catch {};
-                            if (active_cmd_id.len > 0) allocator.free(active_cmd_id);
-                            active_cmd_id = allocator.dupe(u8, input.cmd_id) catch &.{};
-                            cmd_mutex.unlock(io);
-
-                            // Write command data to pty master (stdin of shell)
-                            ptyWrite(&pty, input.data);
-                        }
-                    },
-                    @intFromEnum(wsproto_mod.MsgType.pty_signal) => {
-                        if (payload.len > 0) {
-                            killForegroundProcess(pty.master_fd, payload[0]);
-                        }
-                    },
-                    @intFromEnum(wsproto_mod.MsgType.pty_resize) => {
-                        if (wsproto_mod.parsePtyResize(payload)) |_| {
-                            // TODO: apply terminal resize via TIOCSWINSZ
-                        }
-                    },
-                    @intFromEnum(wsproto_mod.MsgType.upload_req) => {
-                        if (wsproto_mod.parseUploadReq(payload)) |req| {
-                            std.log.debug("[guest-ws] Upload: {s} ({d} bytes)", .{ req.path, req.file_data.len });
-                            const exit_code: i32 = writeFile(io, allocator, req.path, req.file_data) catch |err| blk: {
-                                std.log.err("[guest-ws] Upload write failed: {}", .{err});
-                                break :blk -1;
-                            };
-                            const resp = wsproto_mod.buildUploadResp(allocator, req.cmd_id, exit_code) catch continue;
-                            defer allocator.free(resp);
-                            conn.writeFrame(resp, .binary) catch |err| {
-                                std.log.err("[guest-ws] Upload resp write failed: {}", .{err});
-                                break;
-                            };
-                        }
-                    },
-                    @intFromEnum(wsproto_mod.MsgType.download_req) => {
-                        if (wsproto_mod.parseDownloadReq(payload)) |req| {
-                            std.log.debug("[guest-ws] Download: {s}", .{req.path});
-                            const file_content = readFileContent(io, allocator, req.path) catch |err| {
-                                std.log.err("[guest-ws] Download read failed: {}", .{err});
-                                const err_resp = wsproto_mod.buildDownloadResp(allocator, req.cmd_id, -1, "") catch continue;
-                                defer allocator.free(err_resp);
-                                conn.writeFrame(err_resp, .binary) catch {};
-                                continue;
-                            };
-                            defer allocator.free(file_content);
-                            const resp = wsproto_mod.buildDownloadResp(allocator, req.cmd_id, 0, file_content) catch continue;
-                            defer allocator.free(resp);
-                            conn.writeFrame(resp, .binary) catch |err| {
-                                std.log.err("[guest-ws] Download resp write failed: {}", .{err});
-                                break;
-                            };
-                        }
-                    },
-                    else => {
-                        std.log.debug("[guest-ws] Unknown msg type: {d}", .{msg_type});
-                    },
-                }
-            },
-            .pong => {
-                // Keepalive pong from Host — continue
-            },
-            .ping => {
-                // Respond with pong
-                conn.writeFrame(frame.data, .pong) catch {};
-            },
-            .close => {
-                std.log.info("[guest-ws] Host requested close", .{});
-                break;
-            },
-            else => {
-                std.log.debug("[guest-ws] Unexpected opcode: {}", .{frame.opcode});
-            },
-        }
-
-        // Check for auto-upgrade signal from UDP listener
-        if (upgrade.needed.load(.acquire)) {
-            std.log.info("[upgrade] Version mismatch detected, triggering self-upgrade", .{});
-            const bin_name = protocol.deploymentFilename(info.target) orelse "utmm";
-            const upgrade_url = try std.fmt.allocPrint(allocator,
-                "http://{s}:{d}/bin/{s}", .{ host, protocol.DEFAULT_PORT, bin_name });
-            defer allocator.free(upgrade_url);
-            try triggerSelfUpgrade(io, allocator, upgrade_url);
-            // triggerSelfUpgrade calls std.process.exit(0) on success
-        }
-
-        // pty shell exited: reconnect for fresh session
-        if (pty_dead) {
-            std.log.info("[guest-ws] Pty session ended, reconnecting...", .{});
-            break;
-        }
-    }
-
-    std.log.info("[guest-ws] Disconnected, reconnecting in 3s...", .{});
-    conn.close();
-    std.Io.sleep(io, std.Io.Duration.fromSeconds(3), .awake) catch {};
+        std.log.info("[guest-mesh] Pty session ended, waiting for reconnect...", .{});
+        tunnel.deinit();
     }
 }
 
+/// Wait for Host to establish a KCP tunnel via mesh.
+fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_mod.Mesh) !tunnel_mod.Tunnel {
+    while (true) {
+        if (mesh_opt.*) |*m| {
+            m.sessions_mutex.lock(m.io) catch {};
+            const count = m.sessions.count();
+            if (count > 0) {
+                var it = m.sessions.iterator();
+                while (it.next()) |entry| {
+                    const sess = entry.value_ptr.*;
+                    const peek = sess.kcp_inst.peekSize();
+                    if (peek > 0) {
+                        m.sessions_mutex.unlock(m.io);
+                        return tunnel_mod.Tunnel.init(allocator, io, sess);
+                    }
+                }
+            }
+            m.sessions_mutex.unlock(m.io);
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+    }
+}
 /// Write data to file. Returns 0 on success, -1 on failure.
 fn writeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, data: []const u8) !i32 {
     _ = allocator;

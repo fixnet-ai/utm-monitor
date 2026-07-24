@@ -321,3 +321,31 @@ v0.8.0: HTTP 层性能优化 — exec 输出流式传输（chunked + trailer）�
 - [x] SKILL.md: Host Paths 表更新为三平台
 - [x] MANUAL.md: 2.3 节更新为跨平台 Host 安装指南
 - **Status:** complete
+
+### Phase 26: v0.11.0 — KCP Retransmission 修复 ✅
+- [x] **Bug #1**: `kcp.update()` 的 `updated` flag 导致 flush 只在首次调用 — 重传和 ACK 处理永久失效
+  - 修复: 移除 `updated` 检查，每次 `update()` 都调用 `flush()`
+- [x] **Bug #2**: `flush()` Step 2 更新 `resendts = current + rto` 后，Step 4 检查 `diff = current - resendts`（负值）→ `need_send` 永不成立 → 重传段永不发送
+  - 修复: 合并 Step 2+4 为单次遍历，保存 `old_resendts` 先判断是否需要发送，再更新计时器并调用 `outputSegment`
+- [x] **KCP 本地 loopback 测试**全部通过（含丢包重传、快速重传、乱序、大数据分段）
+- [x] `waitForHostTunnel` 添加 `sessions_mutex` 锁保护 — 消除与 `mesh.run()` 的数据竞争
+- [x] 调试日志降级: `periodicTasks` / `kcp_output` / `New KCP session` 从 `info` → `debug`
+- **Status:** complete
+
+### Phase 27: v0.11.0 — LSA 版本检查误升级修复 ✅
+- [x] **Bug**: Guest 收到其他 Guest 的 LSA（版本不同）→ `upgrade_needed` 被设置 → Guest 触发 self-upgrade 重启 → 死循环
+  - 根因: LSA 版本检查对所有远程节点生效，不区分 Host 和 peer Guest
+  - 修复: Mesh.init 新增 `host_gateway_ip` 参数，LSA 处理中提取 `ip:` 字段与网关 IP 比对，仅当 LSA 来自 Host 时才触发版本检查
+  - Host 端传空字符串跳过检查（Host 不自升级）
+- [x] `broadcast.zig`: 新增 `extractHostIp(host_url)` 辅助函数
+- [x] 验证: linuxvm + macvm 均 v0.11.0，无 `LSA version mismatch` 日志，无 self-upgrade 触发
+- **Status:** complete
+
+### Phase 28: v0.11.0 — VM 联网验证 ✅
+- [x] `--status` — linuxvm + macvm 均在线 (v0.11.0)
+- [x] `--exec linuxvm "echo HELLO"` — 即时响应（KCP tunnel 端到端正常）
+- [x] `--exec macvm "echo HELLO"` — 即时响应
+- [x] `--upload` / `--download` — 文件往返验证通过
+- [x] MCP JSON-RPC `tools/list` / `vm_status` / `vm_exec` — 全部正常
+- [x] 8 目标交叉编译全过
+- **Status:** complete

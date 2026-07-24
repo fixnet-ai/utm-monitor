@@ -28,6 +28,8 @@ pub fn run(
     gpa: std.mem.Allocator,
     hostname_override: ?[]const u8,
     port: u16,
+    mesh_port: u16,
+    peer_mesh: ?[]const u8,
 ) !void {
     // Detect whether we're in an interactive terminal (TTY).
     // If not, we were likely launched by a service manager without --svc
@@ -55,6 +57,8 @@ pub fn run(
         // (we skip the Windows SCM entry point, but still act as a daemon).
         const cli = main.CliArgs{
             .port = port,
+            .mesh_port = mesh_port,
+            .peer_mesh = peer_mesh,
             .hostname = hostname_override,
             .is_svc = true,
         };
@@ -86,6 +90,8 @@ pub fn run(
     // Same ports as the service — the agent takes over completely.
     const cli = main.CliArgs{
         .port = port,
+        .mesh_port = mesh_port,
+        .peer_mesh = peer_mesh,
         .hostname = hostname_override,
     };
     try guest.runWithIo(io, gpa, cli);

@@ -12,6 +12,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const http = std.http;
+const tunnel_mod = @import("tunnel.zig");
 
 pub const DEFAULT_PORT: u16 = 2121;
 
@@ -79,6 +80,7 @@ pub const GuestEntry = struct {
     version: []const u8,
     shell: []const u8,
     last_seen: i64, // monotonic milliseconds timestamp
+    mesh_mac: ?[6]u8 = null, // parsed MAC for mesh routing (v0.10.0+)
 };
 
 /// Tracks the state of an in-flight operation (exec/upload/download).
@@ -94,9 +96,9 @@ pub const HostState = struct {
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Guest table — ArrayList with linear search (only ~3 VMs, no HashMap needed).
     guests: std.ArrayList(GuestEntry),
-    /// Outgoing frame queue: hostname → FIFO of pre-built binary frames.
-    /// HTTP handlers push frames, WebSocket handler drains them.
-    outgoing_frames: std.StringHashMap(std.ArrayList([]const u8)),
+    /// Guest tunnel mapping: hostname → KCP Tunnel pointer.
+    /// HTTP handlers send frames via tunnel.send(), handler threads recv responses.
+    guest_tunnels: std.StringHashMap(*tunnel_mod.Tunnel),
     /// Operation state tracking: cmd_id → OpState.
     /// Used by exec/upload/download to track completion.
     op_states: std.StringHashMap(OpState),
@@ -113,11 +115,14 @@ pub const HostState = struct {
     serve_dir: []const u8 = "/opt/utmm",
     /// Called when guest table changes (for /etc/hosts sync)
     on_guest_changed: ?*const fn (*HostState) void = null,
+    /// Mesh networking instance (v0.10.0+, *mesh.Mesh). Set by host.zig when mesh is active.
+    /// Type-erased to avoid circular dependency. Cast with @ptrCast(@alignCast(...)).
+    mesh: ?*anyopaque = null,
 
     pub fn init(allocator: std.mem.Allocator) HostState {
         return .{
             .guests = .empty,
-            .outgoing_frames = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
+            .guest_tunnels = std.StringHashMap(*tunnel_mod.Tunnel).init(allocator),
             .op_states = std.StringHashMap(OpState).init(allocator),
             .close_requests = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
@@ -136,17 +141,13 @@ pub const HostState = struct {
         }
         self.guests.deinit(self.allocator);
 
-        // Free outgoing frames
+        // Free guest tunnels (just deinit the map — tunnels are owned by handler threads)
         {
-            var it = self.outgoing_frames.iterator();
+            var it = self.guest_tunnels.iterator();
             while (it.next()) |entry| {
-                for (entry.value_ptr.items) |frame| {
-                    self.allocator.free(frame);
-                }
-                entry.value_ptr.deinit(self.allocator);
                 self.allocator.free(entry.key_ptr.*);
             }
-            self.outgoing_frames.deinit();
+            self.guest_tunnels.deinit();
         }
 
         // Free op states
@@ -247,33 +248,48 @@ pub const HostState = struct {
         if (entry.shell.len > 0) self.allocator.free(entry.shell);
     }
 
+    /// Set the parsed mesh MAC for a guest (v0.10.0+ mesh support).
+    pub fn setGuestMeshMac(self: *HostState, hostname: []const u8, mac_bytes: [6]u8) void {
+        self.mutex.lock(self.io.?) catch return;
+        defer self.mutex.unlock(self.io.?);
+
+        const idx = self.guestIndex(hostname) orelse return;
+        self.guests.items[idx].mesh_mac = mac_bytes;
+    }
+
     // ══════════════════════════════════════════════════════════
-    // Outgoing frame queue (HTTP handlers push, WS handler drains)
+    // Guest tunnel registry (Host threads push, handler threads drain)
     // ══════════════════════════════════════════════════════════
 
-    /// Push a pre-built binary frame to a guest's outgoing queue.
-    pub fn enqueueOutgoingFrame(self: *HostState, hostname: []const u8, frame: []const u8) !void {
+    /// Register a KCP tunnel for a guest. Called by the LSA callback when
+    /// Host establishes a tunnel to a discovered guest.
+    pub fn registerGuestTunnel(self: *HostState, hostname: []const u8, tun: *tunnel_mod.Tunnel) !void {
         self.mutex.lock(self.io.?) catch {};
         defer self.mutex.unlock(self.io.?);
 
-        const gop = try self.outgoing_frames.getOrPut(hostname);
+        const gop = try self.guest_tunnels.getOrPut(hostname);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.allocator.dupe(u8, hostname);
-            gop.value_ptr.* = .empty;
         }
-        const frame_owned = try self.allocator.dupe(u8, frame);
-        try gop.value_ptr.append(self.allocator, frame_owned);
+        gop.value_ptr.* = tun;
     }
 
-    /// Pop the next frame from a guest's outgoing queue (FIFO).
-    /// Returns null if no frames queued. Caller owns the returned frame data.
-    pub fn dequeueOutgoingFrame(self: *HostState, hostname: []const u8) ?[]const u8 {
+    /// Look up a guest's KCP tunnel. Returns null if no tunnel registered.
+    pub fn getGuestTunnel(self: *HostState, hostname: []const u8) ?*tunnel_mod.Tunnel {
         self.mutex.lock(self.io.?) catch return null;
         defer self.mutex.unlock(self.io.?);
 
-        const list = self.outgoing_frames.getPtr(hostname) orelse return null;
-        if (list.items.len == 0) return null;
-        return list.orderedRemove(0);
+        return self.guest_tunnels.get(hostname);
+    }
+
+    /// Remove a guest's tunnel registration. Called when tunnel disconnects.
+    pub fn removeGuestTunnel(self: *HostState, hostname: []const u8) void {
+        self.mutex.lock(self.io.?) catch return;
+        defer self.mutex.unlock(self.io.?);
+
+        if (self.guest_tunnels.fetchRemove(hostname)) |kv| {
+            self.allocator.free(kv.key);
+        }
     }
 
     // ══════════════════════════════════════════════════════════
