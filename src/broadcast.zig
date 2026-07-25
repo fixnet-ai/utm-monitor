@@ -352,24 +352,9 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
         break :blk try allocator.dupe(u8, name);
     };
 
-    // Windows: detect IP + MAC via OS commands
-    if (builtin.os.tag == .windows) {
-        const ip = try getWindowsIp(io, allocator);
-        const mac = try getWindowsMac(io, allocator);
-        const shell = try detectShell(allocator);
-        return SystemInfo{
-            .hostname = hostname,
-            .ip = ip,
-            .mac = mac,
-            .target = target,
-            .iface_name = try allocator.dupe(u8, "unknown"),
-            .shell = shell,
-        };
-    }
-
-    // Unix: retry IP detection up to 5 times (1s apart).
+    // Retry IP detection up to 5 times (1s apart) on all platforms.
     // DHCP may not have completed when the Guest service first starts,
-    // especially on macOS VMs where network init and service launch race.
+    // causing getifaddrs() / route print to return no valid IPv4.
     // Without retry, the Guest embeds "0.0.0.0" in LSA broadcasts forever.
     const MAX_IP_RETRIES = 5;
     const IP_RETRY_DELAY_MS = 1000;
@@ -383,10 +368,19 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(IP_RETRY_DELAY_MS), .awake) catch {};
         }
 
-        if (try detectUnixIp(allocator)) |result| {
-            found_ip = result.ip;
-            found_iface = result.iface_name;
-            break;
+        if (builtin.os.tag == .windows) {
+            const ip = try getWindowsIp(io, allocator);
+            if (!std.mem.eql(u8, ip, "0.0.0.0")) {
+                found_ip = ip;
+                break;
+            }
+            allocator.free(ip);
+        } else {
+            if (try detectUnixIp(allocator)) |result| {
+                found_ip = result.ip;
+                found_iface = result.iface_name;
+                break;
+            }
         }
     }
 
@@ -394,7 +388,10 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
     const iface_name = found_iface orelse try allocator.dupe(u8, "unknown");
 
     // Get MAC
-    const mac = try getMacAddress(io, allocator, iface_name);
+    const mac = if (builtin.os.tag == .windows)
+        try getWindowsMac(io, allocator)
+    else
+        try getMacAddress(io, allocator, iface_name);
     const shell = try detectShell(allocator);
 
     return SystemInfo{

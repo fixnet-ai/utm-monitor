@@ -820,3 +820,39 @@ Windows 没有实现超时机制。
 **验证**: 10/10 连续 exec windowsvm 成功，`zig build test` 全绿
 
 **Status:** complete
+
+### Phase 43: v0.11.9 — KCP tunnel session 匹配 + 重连竞态修复 ✅ (2026-07-26)
+
+**背景**: v0.11.9 部署后，`--exec` 到物理 Windows Guest 挂起。
+
+**Root Cause 1 — LSA ephemeral source port** (`src/mesh.zig`):  
+物理 Windows `sendto()` 可能从临时端口发送 LSA 广播。Host 将 LSA 源端口存储为
+KCP 目标 → KCP 数据发往错误端口。  
+**修复**: `handleLsa` neighbor address 始终使用 `protocol.DEFAULT_PORT` (2121)。
+
+**Root Cause 2 — 重连竞态** (`src/broadcast.zig`):  
+Host 重启后 Guest 旧命令循环消耗 `pty_spawn` (0x10)，下一帧 `pty_exec_input`
+(0x11) 非预期 → 永远卡住。  
+**修复**: pty_spawn 读取循环同时接受 pty_exec_input 作为隐式 spawn 触发器，
+缓冲 exec 命令待 pty 就绪后投递。
+
+**Root Cause 3 — 双会话 conv 不匹配** (`src/host.zig`):  
+Host `m.connect()` 和 Guest 各自使用不同 nonce → 不同 conv ID →
+双会话独立运行 → 输出无法到达 Host。  
+**修复**: tunnelManager 统一搜索 Guest 发起的会话表条目，优先使用而非创建 Host 会话。
+
+**验证** (2026-07-26, 全部 4 Guest):
+- linuxvm: ✅ persistent shell (cd /tmp, export) 正常
+- macvm: ✅
+- windowsvm (UTM bridge): ✅
+- MODASIAIPC (物理 Windows x86_64): ✅
+
+**Commit**: `adffa15` (+98/-22: mesh.zig, broadcast.zig, host.zig)
+
+**遗留问题**:
+1. `host_http.zig:respondError` → `discardBody` panic — zig 0.16.0 `endChunked`
+   在 client 断开时触发 std/http/Server.zig:628 unreachable
+2. Host log `/var/log/utmm-host.log` 始终为空 — stdout 缓冲
+3. macOS Guest CLI exec 在 pty 会话终止时偶尔 Writer panic
+
+**Status:** complete
