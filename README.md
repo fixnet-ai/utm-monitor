@@ -6,10 +6,10 @@ Check processes, read logs, attach debuggers, profile performance on any machine
 running the Guest agent. Virtual or bare-metal — Linux, macOS, Windows. No SSH,
 no IP tracking, no context switching. Just `utmm --exec linuxvm "..."` and you're in.
 
-MCP integration lets AI coding agents do the same — debug across platforms through
+**MCP integration** - lets AI coding agents do the same — debug across platforms through
 natural language.
 
-Under the hood, a **mesh network** ties everything together. Guests auto-discover the
+**Mesh network & Zero config** - ties everything together Under the hood. Guests auto-discover the
 Host over the local network — no fixed IPs, no DNS, no manual wiring. A Linux VM on a
 bridge, a Windows laptop on Wi-Fi, a Raspberry Pi on Ethernet — they all show up in one
 flat `utmm --status`. From there, `utmm --exec <hostname> "..."` reaches any machine
