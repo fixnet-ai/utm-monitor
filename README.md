@@ -7,7 +7,6 @@ running the Guest agent. Virtual or bare-metal — Linux, macOS, Windows. No SSH
 no IP tracking, no context switching. Just `utmm --exec linuxvm "..."` and you're in.
 
 **MCP integration** 
-
 lets AI coding agents do the same — debug across platforms through
 natural language.
 
