@@ -1,5 +1,73 @@
 # Progress: v0.11.9
 
+## Session 2026-07-26 (Phase 43-45 — KCP tunnel 完善 + IP 检测重试)
+
+### Phase 43: KCP tunnel session 匹配 + 重连竞态修复 ✅
+
+**背景**: v0.11.9 部署后 `--exec` 到物理 Windows Guest 挂起。
+
+**3个根因**:
+1. **LSA 临时端口** — 物理 Windows `sendto()` 可能从临时端口发送 LSA → Host 存储错误端口 → KCP 数据发往错误端口。修复: `handleLsa` 始终使用 `DEFAULT_PORT` (2121)
+2. **重连竞态** — Host 重启后 Guest 读取 loop 消耗 `pty_spawn`，下一帧 `pty_exec_input` 非预期 → 永远卡住。修复: 接受 pty_exec_input 作为隐式 spawn 触发器
+3. **双会话 conv 不匹配** — Host `m.connect()` 和 Guest 使用不同 nonce → 不同 conv ID → 输出无法到达 Host。修复: tunnelManager 优先使用 Guest 发起的 session
+
+**文件变更**: `src/mesh.zig`, `src/broadcast.zig`, `src/host.zig` (+98/-22)
+
+**Commit**: `adffa15`
+
+**验证** (全部 4 Guest): linuxvm ✅, macvm ✅, windowsvm (UTM bridge) ✅, MODASIAIPC (物理 Windows x86_64) ✅
+
+**遗留问题**:
+1. `host_http.zig:respondError` → `discardBody` panic — zig 0.16.0 `endChunked` 在 client 断开时触发 unreachable
+2. Host log 始终为空 — stdout 缓冲
+3. macOS Guest CLI exec 在 pty 终止时偶尔 Writer panic
+
+### Phase 44: DHCP 启动竞态 — Guest IP 检测重试（全平台）✅
+
+**背景**: Guest `getSystemInfo()` 启动时调用一次，DHCP 尚未分配 IP → 永久 0.0.0.0
+
+**修复**:
+- 提取 `detectUnixIp()` 辅助函数（getifaddrs 枚举）
+- 统一重试循环：5 次 × 1s 延迟，适用于 Unix + Windows 全平台
+- Windows: 释放 `0.0.0.0` 字符串避免内存泄漏
+- API: `std.time.sleep` (已移除) → `std.Io.sleep(io, Duration.fromMilliseconds(n), .awake)`
+
+**文件变更**: `src/broadcast.zig` (+61/-42)
+
+**Commits**: `fba0a9f` (Unix) → `3fa0b5e` (全平台)
+
+### Phase 45: `--status`/`--version` 绕过管理员权限 ✅
+
+**修复**: `ensureAdmin` 移到 `--status`/`--version` 解析之后 — 这些命令只需 HTTP 客户端
+
+**Commit**: `67fc113`
+
+### 全平台 8 目标构建 + 全部署 ✅
+
+**构建** (所有 8 个目标 ReleaseSafe):
+```
+aarch64-linux-musl ✅  x86_64-linux-musl ✅  x86-linux-musl ✅
+aarch64-macos ✅       x86_64-macos ✅
+aarch64-windows ✅     x86_64-windows ✅    x86-windows-gnu ✅
+```
+
+**部署** (SCP + SSH):
+- Host (macOS): ✅ 二进制替换 + launchctl bootstrap
+- linuxvm: ✅ systemctl restart utmm-guest
+- macvm: ✅ (SSH 部署 — CLI exec 因 zsh pty panic 不可用)
+- windowsvm (aarch64): ✅ (SCP temp + PowerShell Move-Item + sc start)
+- winx64 (MODASIAIPC): ✅ (SSH key auth + taskkill + SCP temp + Move-Item)
+
+**部署 bug**: winx64 `sc stop` 显示 STOP_PENDING (NOT_STOPPABLE) → `taskkill /F` 绕过。
+Windows .exe 文件锁定 → SCP 到 `utmm.next.exe` → `Move-Item -Force`
+
+### 阶段性文档同步 ✅
+
+更新所有项目规划文件:
+- `task_plan.md` — Phase 43-45 新增
+- `findings.md` — Finding #39-41 新增 (DHCP race, Zig sleep API, Windows SCP 锁定)
+- `progress.md` — 本条目
+
 ## Session 2026-07-26 (Phase 41-42 — Windows KCP mesh 修复)
 
 ### Phase 41: v0.11.8 — Windows KCP stall 定时器线程修复 ✅

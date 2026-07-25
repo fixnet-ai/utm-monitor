@@ -600,3 +600,77 @@ tunnel），导致新 session 的 pty_output 被丢弃或路由到错误的 hand
 - 新 session 建立时强制关闭同 hostname 的旧 session
 
 **教训**: 测试 KCP 隧道问题时，必须先重启 Host 清除陈旧状态，否则测试结果不可靠。
+
+---
+
+### Finding 39: DHCP 启动竞态 — Guest 启动时 IP 可能尚未分配 (v0.11.9, 2026-07-26)
+
+**症状**: Guest 启动后 LSA 广播 IP 为 `0.0.0.0`，Host 无法路由 exec 到该 Guest。
+重启 Guest 后恢复正常。
+
+**诊断**: Guest `getSystemInfo()` 仅在启动时调用一次。在 UTM 桥接网络等虚拟化环境
+中，DHCP 需要 1-3 秒分配 IP，而 `utmm --svc` 可能在此之前启动。
+
+**C 代码测试**: 简单的 `getifaddrs()` C 程序在 SSH 中返回正确 IP 不等于 Guest
+服务启动时返回正确 IP。Guest 服务在引导序列中更早启动。
+
+**根因**: 三个平台的竞态条件相同：
+- **macOS/Linux**: `getifaddrs()` 遍历接口时不返回有效的非环回 IPv4
+- **Windows**: `route print 0.0.0.0` 的默认网关 0.0.0.0 或 PowerShell 返回空
+
+**修复**: `src/broadcast.zig` — `getSystemInfo()` 中添加重试循环（最多 5 次 × 1s），
+[commit `fba0a9f`] 仅 Unix，[commit `3fa0b5e`] 扩展至 Windows 全平台。
+
+**教训**:
+1. `getSystemInfo()` 是冷路径 — 允许在启动时等待是最简单的修复
+2. 虚拟化环境（UTM）的 DHCP 延迟可能高于预期 — 2s 延迟有时都不够，需 5 次重试
+3. 三种平台共享相同问题 — 统一修复优于平台特定修复
+
+**关联**: [[zig-016-api-notes]] (std.time.sleep → std.Io.sleep), [[pty-session-model]]
+
+---
+
+### Finding 40: Zig 0.16.0 sleep API 迁移 (v0.11.9, 2026-07-26)
+
+**变更**:
+- `std.time.sleep(ns)` → **已移除** → `std.Io.sleep(io, Duration.fromMilliseconds(n), .awake)`
+- `std.Thread.sleep(ns)` → **已移除** → 同上
+- `std.Io.Duration.fromMillis()` → **不存在** → `fromMilliseconds()`
+- `std.Io.Clock.monotonic` → **不存在** → `.awake`
+
+**示例**:
+```zig
+// 0.15.x
+std.time.sleep(1_000_000_000);
+
+// 0.16.0
+std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
+```
+
+**注意**: `std.Io.sleep` 需要 `io` 参数。在 Mesh 上下文中使用 `m.io` 或
+`global_single_threaded.io()`，具体取决于上下文。在重试循环中使用顶层 `io` 参数。
+
+**关联**: [[zig-016-api-notes]]
+
+---
+
+### Finding 41: Windows OpenSSH SCP 文件锁定问题 (v0.11.9, 2026-07-26)
+
+**症状**: `scp` 部署新二进制到 Windows Guest 时失败 — 文件被 `C:\opt\utmm\utmm.exe`
+锁定（Windows 保护运行中的 .exe 不被覆盖）。
+
+**修复**: 部署脚本使用临时文件名 + 进程终止 + 临时文件覆盖：
+```batch
+# 1. 终止运行中的进程
+taskkill /F /IM utmm.exe 2>nul
+# 2. scp 到临时文件名
+scp utmm-x86_64-windows.exe Administrator@192.168.3.x:C:\opt\utmm\utmm.next.exe
+# 3. 通过 PowerShell 替换
+powershell -Command "Move-Item -Force C:\opt\utmm\utmm.next.exe C:\opt\utmm\utmm.exe"
+```
+
+**关键**: `sc stop` 可能显示 `STOP_PENDING (NOT_STOPPABLE)` — Windows 服务终止
+超时 30s 且无法强制。`taskkill /F` 或 `Stop-Process -Force` 绕过此限制。
+
+**教训**: Windows .exe 替换与 POSIX `rename()` 语义不同。始终先终止进程再用
+临时文件 + Move-Item。

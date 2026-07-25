@@ -856,3 +856,58 @@ Host `m.connect()` 和 Guest 各自使用不同 nonce → 不同 conv ID →
 3. macOS Guest CLI exec 在 pty 会话终止时偶尔 Writer panic
 
 **Status:** complete
+
+### Phase 44: DHCP 启动竞态 — Guest IP 检测重试（全平台）✅ (2026-07-26)
+
+**背景**: `getSystemInfo()` 在 Guest 启动时仅调用一次。DHCP 尚未分配 IP →
+`getifaddrs()` 返回 0.0.0.0 → 该值永久写入 sysinfo → LSA 广播中 Guest 不可达。
+此问题影响全部三个平台。
+
+**修复方案**: 统一重试循环 — 最多 5 次 × 1s 延迟，适用于 Unix 和 Windows 路径。
+
+**迭代 1 — Unix 修复 (`fba0a9f`)**:
+- 从 `getSystemInfo()` 提取 `detectUnixIp()` 辅助函数 — 返回首个物理网卡 IPv4
+- 在 `getSystemInfo()` 中添加重试循环：5 次 × 1s，仅 macOS/Linux
+- 跳过 0.0.0.0 和 127.x.x.x；使用 `isPhysicalInterface()` 过滤虚拟网卡
+
+**迭代 2 — 全平台修复 (`3fa0b5e`)**:
+- 将重试循环提升至 `getSystemInfo()` 顶层 — 同时适用于 Unix (`getifaddrs`) 和
+  Windows (`route print` / PowerShell) 路径
+- Windows: 5 次重试 × 1s，释放每次返回的 `0.0.0.0` 字符串避免内存泄漏
+- Unix: `detectUnixIp` 每次返回分配的内存，重试时上层释放
+
+**关键代码**:
+```zig
+const MAX_IP_RETRIES = 5;
+const IP_RETRY_DELAY_MS = 1000;
+var attempt: usize = 0;
+while (attempt < MAX_IP_RETRIES) : (attempt += 1) {
+    if (attempt > 0) std.Io.sleep(io, Duration.fromMilliseconds(IP_RETRY_DELAY_MS), .awake) catch {};
+    // ... per-platform IP detection ...
+    if (found_valid_ip) break;
+}
+```
+
+**关联变更**: `std.time.sleep` / `std.Thread.sleep` 在 Zig 0.16.0 中已移除
+→ 使用 `std.Io.sleep(io, Duration.fromMilliseconds(n), .awake)`
+
+**文件变更**: `src/broadcast.zig` (+61/-42, 净+19: 提取 detectUnixIp + 统一重试循环)
+
+**Commit**: `fba0a9f` → `3fa0b5e`
+
+**Status:** complete
+
+### Phase 45: `--status`/`--version` 绕过管理员权限 ✅ (2026-07-26)
+
+**背景**: `utmm --status` 和 `utmm --version` 仅需 HTTP 客户端（不需要原始 socket），
+却要求 `sudo` 管理员权限。`ensureAdmin` 在解析 `--status` 之前即调用 → 用户被要求
+输入密码。
+
+**修复**: 将 `ensureAdmin` 调用移到解析 `--status`/`--version` 之后。这些命令仅向
+`127.0.0.1:2121` 发送 HTTP 请求，不需要管理员权限。
+
+**文件变更**: `src/main.zig` (+31/-21)
+
+**Commit**: `67fc113`
+
+**Status:** complete
