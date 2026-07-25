@@ -10,6 +10,21 @@ const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 
+/// Run a command, free the allocated stdout/stderr from RunResult, return true if success.
+fn runCmd(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
+    const result = std.process.run(allocator, io, .{ .argv = argv }) catch return false;
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
+    return true;
+}
+
+/// Run a command and return stdout (caller owns), or null on failure.
+fn runCmdStdout(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[]u8 {
+    const result = std.process.run(allocator, io, .{ .argv = argv }) catch return null;
+    allocator.free(result.stderr);
+    return result.stdout;
+}
+
 /// Supported operating system platforms
 pub const Platform = enum {
     linux,
@@ -176,7 +191,7 @@ pub fn installSelf(
                     const uid: u32 = if (builtin.os.tag != .windows) std.c.getuid() else 0;
                     const gui_target = try std.fmt.allocPrint(allocator, "gui/{d}", .{uid});
                     defer allocator.free(gui_target);
-                    if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", gui_target, plist_path } })) |_| {} else |_| {}
+                    _ = runCmd(allocator, io, &.{ "launchctl", "bootout", gui_target, plist_path });
                     std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
                 }
 
@@ -219,10 +234,10 @@ pub fn installSelf(
                 {
                     const service_path = try std.fmt.allocPrint(allocator, "{s}/.config/systemd/user/utmm-agent.service", .{home});
                     defer allocator.free(service_path);
-                    if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "stop", "utmm-agent.service" } })) |_| {} else |_| {}
-                    if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "disable", "utmm-agent.service" } })) |_| {} else |_| {}
+                    _ = runCmd(allocator, io, &.{ "systemctl", "--user", "stop", "utmm-agent.service" });
+                    _ = runCmd(allocator, io, &.{ "systemctl", "--user", "disable", "utmm-agent.service" });
                     std.Io.Dir.cwd().deleteFile(io, service_path) catch {};
-                    if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "daemon-reload" } })) |_| {} else |_| {}
+                    _ = runCmd(allocator, io, &.{ "systemctl", "--user", "daemon-reload" });
                 }
 
                 // Create desktop shortcut (double-click to launch guest in terminal)
@@ -304,7 +319,10 @@ pub fn installSelf(
             };
 
             // Unload existing service first (ignore errors)
-            if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", "system", plist_path } })) |_| {} else |_| {}
+            // Use sudo as safety net in case ensureAdmin didn't elevate (e.g. manual install)
+            _ = runCmd(allocator, io, &.{ "sudo", "launchctl", "bootout", "system", plist_path });
+            // Also try without sudo (for environments without sudo)
+            _ = runCmd(allocator, io, &.{ "launchctl", "bootout", "system", plist_path });
 
             // Write plist
             std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
@@ -384,12 +402,33 @@ pub fn installSelf(
             }
             try writer.interface.flush();
 
-            // Bootstrap the service (launchctl load is deprecated since macOS 10.10)
-            if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootstrap", "system", plist_path } })) |_| {
-                std.debug.print("[install] macOS: {s} plist bootstrapped: {s}\n", .{ label, plist_path });
-            } else |_| {
+            // Bootstrap the service — try sudo first (safety net), then without
+            // (e.g. NixOS/docker where sudo may not exist). Verify with launchctl list.
+            const boot_ok = if (runCmd(allocator, io, &.{ "sudo", "launchctl", "bootstrap", "system", plist_path }))
+                true
+            else if (runCmd(allocator, io, &.{ "launchctl", "bootstrap", "system", plist_path }))
+                true
+            else
+                false;
+
+            if (boot_ok) {
+                // Verify service is actually loaded
+                const list_result = runCmdStdout(allocator, io, &.{ "launchctl", "list" });
+                defer if (list_result) |o| allocator.free(o);
+                const is_loaded = if (list_result) |out|
+                    std.mem.indexOf(u8, out, label) != null
+                else
+                    false;
+
+                if (is_loaded) {
+                    std.debug.print("[install] macOS: {s} bootstrapped and verified running\n", .{label});
+                } else {
+                    std.debug.print("[install] macOS: {s} bootstrap returned OK but not in launchctl list — will load at next reboot\n", .{label});
+                }
+            } else {
                 std.debug.print("[install] macOS: plist written to {s}\n", .{plist_path});
-                std.debug.print("[install] run: sudo launchctl bootstrap system {s}\n", .{plist_path});
+                std.debug.print("[install] WARNING: bootstrap failed. Run manually:\n", .{});
+                std.debug.print("[install]   sudo launchctl bootstrap system {s}\n", .{plist_path});
             }
         },
         .linux => {
@@ -433,15 +472,15 @@ pub fn installSelf(
             std.debug.print("[install] Linux: systemd unit written to {s}\n", .{service_path});
 
             // Reload, enable, and start
-            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "daemon-reload" } })) |_| {} else |_| {}
+            _ = runCmd(allocator, io, &.{ "systemctl", "daemon-reload" });
             const full_name = try std.fmt.allocPrint(allocator, "{s}.service", .{svc_name});
             defer allocator.free(full_name);
-            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "enable", full_name } })) |_| {
+            if (runCmd(allocator, io, &.{ "systemctl", "enable", full_name })) {
                 std.debug.print("[install] Linux: {s} enabled\n", .{svc_name});
-            } else |_| {}
-            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "start", full_name } })) |_| {
+            }
+            if (runCmd(allocator, io, &.{ "systemctl", "start", full_name })) {
                 std.debug.print("[install] Linux: {s} started\n", .{svc_name});
-            } else |_| {
+            } else {
                 std.debug.print("[install] Linux: run manually: systemctl enable --now {s}\n", .{svc_name});
             }
         },
@@ -458,34 +497,25 @@ pub fn installSelf(
             defer allocator.free(bin_path);
 
             // Stop and delete existing service (ignore errors)
-            if (std.process.run(allocator, io, .{
-                .argv = &.{ "sc", "stop", svc_name },
-            })) |_| {} else |_| {}
-            if (std.process.run(allocator, io, .{
-                .argv = &.{ "sc", "delete", svc_name },
-            })) |_| {} else |_| {}
+            _ = runCmd(allocator, io, &.{ "sc", "stop", svc_name });
+            _ = runCmd(allocator, io, &.{ "sc", "delete", svc_name });
 
             // Create service: auto-start, runs in its own session (survives SSH disconnect)
             std.debug.print("[install] Windows: creating service '{s}'...\n", .{svc_name});
             std.debug.print("[install]   binPath= {s}\n", .{bin_path});
 
-            if (std.process.run(allocator, io, .{
-                .argv = &.{ "sc", "create", svc_name, "binPath=", bin_path, "start=", "auto" },
-            })) |r| {
+            if (runCmd(allocator, io, &.{ "sc", "create", svc_name, "binPath=", bin_path, "start=", "auto" })) {
                 std.debug.print("[install] Windows: service created\n", .{});
-                _ = r;
-            } else |_| {
+            } else {
                 std.debug.print("[install] Windows: failed to create service — create manually:\n", .{});
                 std.debug.print("[install]   sc create \"{s}\" binPath= \"{s}\" start= auto\n", .{ svc_name, bin_path });
                 return;
             }
 
             // Start the service immediately
-            if (std.process.run(allocator, io, .{
-                .argv = &.{ "sc", "start", svc_name },
-            })) |_| {
+            if (runCmd(allocator, io, &.{ "sc", "start", svc_name })) {
                 std.debug.print("[install] Windows: {s} started\n", .{svc_name});
-            } else |_| {
+            } else {
                 std.debug.print("[install] Windows: start manually: sc start \"{s}\"\n", .{svc_name});
             }
 
@@ -493,20 +523,14 @@ pub fn installSelf(
             // Without this, --status from other LAN machines cannot reach this guest/host.
             // Program-based rule: simpler than per-port, covers UDP 2121 and HTTP :2121.
             // Clean up old port-based rule from v0.6.1 first.
-            if (std.process.run(allocator, io, .{
-                .argv = &.{ "netsh", "advfirewall", "firewall", "delete", "rule", "name=UTM Monitor UDP" },
-            })) |_| {} else |_| {}
-            if (std.process.run(allocator, io, .{
-                .argv = &.{ "netsh", "advfirewall", "firewall", "delete", "rule", "name=UTM Monitor" },
-            })) |_| {} else |_| {}
+            _ = runCmd(allocator, io, &.{ "netsh", "advfirewall", "firewall", "delete", "rule", "name=UTM Monitor UDP" });
+            _ = runCmd(allocator, io, &.{ "netsh", "advfirewall", "firewall", "delete", "rule", "name=UTM Monitor" });
             // Use cmd /c to avoid netsh key=value quoting issues.
             const fw_rule = try std.fmt.allocPrint(allocator, "netsh advfirewall firewall add rule name=\"UTM Monitor\" dir=in action=allow program=\"{s}\" enable=yes", .{svc_exe});
             defer allocator.free(fw_rule);
-            if (std.process.run(allocator, io, .{
-                .argv = &.{ "cmd", "/c", fw_rule },
-            })) |_| {
+            if (runCmd(allocator, io, &.{ "cmd", "/c", fw_rule })) {
                 std.debug.print("[install] Windows: firewall rule added for {s}\n", .{svc_exe});
-            } else |_| {
+            } else {
                 std.debug.print("[install] Windows: warning — failed to add firewall rule\n", .{});
                 std.debug.print("[install]   run manually: {s}\n", .{fw_rule});
             }
@@ -538,7 +562,7 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                 const uid: u32 = if (builtin.os.tag != .windows) std.c.getuid() else 0;
                 const gui_target = try std.fmt.allocPrint(allocator, "gui/{d}", .{uid});
                 defer allocator.free(gui_target);
-                if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", gui_target, plist_path } })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "launchctl", "bootout", gui_target, plist_path });
                 std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
 
                 // Remove desktop shortcuts (all historical names)
@@ -549,7 +573,7 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                 }
 
                 // Kill any running guest
-                if (std.process.run(allocator, io, .{ .argv = &.{ "pkill", "-9", "-f", "utmm" } })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "pkill", "-9", "-f", "utmm" });
 
                 std.debug.print("[uninstall] macOS: guest cleaned up\n", .{});
             },
@@ -559,10 +583,10 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                 // Clean up leftover user systemd from previous versions
                 const service_path = try std.fmt.allocPrint(allocator, "{s}/.config/systemd/user/utmm-agent.service", .{home});
                 defer allocator.free(service_path);
-                if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "stop", "utmm-agent.service" } })) |_| {} else |_| {}
-                if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "disable", "utmm-agent.service" } })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "systemctl", "--user", "stop", "utmm-agent.service" });
+                _ = runCmd(allocator, io, &.{ "systemctl", "--user", "disable", "utmm-agent.service" });
                 std.Io.Dir.cwd().deleteFile(io, service_path) catch {};
-                if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "--user", "daemon-reload" } })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "systemctl", "--user", "daemon-reload" });
 
                 // Remove desktop shortcuts (all historical names)
                 for ([_][]const u8{ "utmm-agent.desktop", "utmm-guest.desktop", "utmm.desktop" }) |name| {
@@ -572,16 +596,14 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                 }
 
                 // Kill any running guest
-                if (std.process.run(allocator, io, .{ .argv = &.{ "pkill", "-9", "-f", "utmm" } })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "pkill", "-9", "-f", "utmm" });
 
                 std.debug.print("[uninstall] Linux: guest cleaned up\n", .{});
             },
             .windows => {
                 // Clean up any leftover Task Scheduler from previous versions
                 const task_name = "UTMM Agent";
-                if (std.process.run(allocator, io, .{
-                    .argv = &.{ "schtasks", "/delete", "/tn", task_name, "/f" },
-                })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "schtasks", "/delete", "/tn", task_name, "/f" });
 
                 // Remove desktop shortcuts (both old and new names)
                 const old_bat = "C:\\Users\\Public\\Desktop\\UTMM-Agent.bat";
@@ -590,7 +612,7 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                 std.Io.Dir.cwd().deleteFile(io, new_bat) catch {};
 
                 // Kill any running guest
-                if (std.process.run(allocator, io, .{ .argv = &.{ "taskkill", "/f", "/im", "utmm.exe" } })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "taskkill", "/f", "/im", "utmm.exe" });
 
                 std.debug.print("[uninstall] Windows: guest cleaned up\n", .{});
             },
@@ -606,7 +628,8 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
             for (labels) |label| {
                 const plist_path = try std.fmt.allocPrint(allocator, "/Library/LaunchDaemons/{s}.plist", .{label});
                 defer allocator.free(plist_path);
-                if (std.process.run(allocator, io, .{ .argv = &.{ "launchctl", "bootout", "system", plist_path } })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "sudo", "launchctl", "bootout", "system", plist_path });
+                _ = runCmd(allocator, io, &.{ "launchctl", "bootout", "system", plist_path });
                 std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
             }
             std.debug.print("[uninstall] macOS: services unloaded, plists removed\n", .{});
@@ -619,32 +642,26 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
                 defer allocator.free(full_name);
                 const unit_path = try std.fmt.allocPrint(allocator, "/etc/systemd/system/{s}", .{full_name});
                 defer allocator.free(unit_path);
-                if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "stop", full_name } })) |_| {} else |_| {}
-                if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "disable", full_name } })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "systemctl", "stop", full_name });
+                _ = runCmd(allocator, io, &.{ "systemctl", "disable", full_name });
                 std.Io.Dir.cwd().deleteFile(io, unit_path) catch {};
             }
-            if (std.process.run(allocator, io, .{ .argv = &.{ "systemctl", "daemon-reload" } })) |_| {} else |_| {}
+            _ = runCmd(allocator, io, &.{ "systemctl", "daemon-reload" });
             std.debug.print("[uninstall] Linux: services stopped, unit files removed\n", .{});
         },
         .windows => {
             // Stop and delete both old (UTM-Monitor) and new (UTM-Monitor-Host / UTM-Monitor-Guest) services
             const svc_names = [_][]const u8{ "UTM-Monitor", "UTM-Monitor-Host", "UTM-Monitor-Guest" };
             for (svc_names) |svc_name| {
-                if (std.process.run(allocator, io, .{
-                    .argv = &.{ "sc", "stop", svc_name },
-                })) |_| {} else |_| {}
-                if (std.process.run(allocator, io, .{
-                    .argv = &.{ "sc", "delete", svc_name },
-                })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "sc", "stop", svc_name });
+                _ = runCmd(allocator, io, &.{ "sc", "delete", svc_name });
             }
             std.debug.print("[uninstall] Windows: services stopped and removed\n", .{});
 
             // Remove firewall rules (ignore errors if they don't exist)
             const fw_names = [_][]const u8{ "name=UTM Monitor UDP", "name=UTM Monitor" };
             for (fw_names) |name| {
-                if (std.process.run(allocator, io, .{
-                    .argv = &.{ "netsh", "advfirewall", "firewall", "delete", "rule", name },
-                })) |_| {} else |_| {}
+                _ = runCmd(allocator, io, &.{ "netsh", "advfirewall", "firewall", "delete", "rule", name });
             }
         },
     }
@@ -659,10 +676,10 @@ pub fn uninstallSelf(io: std.Io, allocator: std.mem.Allocator, user_mode: bool) 
 fn killRunning(io: std.Io, allocator: std.mem.Allocator, platform: Platform) !void {
     switch (platform) {
         .macos, .linux => {
-            if (std.process.run(allocator, io, .{ .argv = &.{ "pkill", "-9", "utmm" } })) |_| {} else |_| {}
+            _ = runCmd(allocator, io, &.{ "pkill", "-9", "utmm" });
         },
         .windows => {
-            if (std.process.run(allocator, io, .{ .argv = &.{ "taskkill", "/f", "/im", "utmm.exe" } })) |_| {} else |_| {}
+            _ = runCmd(allocator, io, &.{ "taskkill", "/f", "/im", "utmm.exe" });
         },
     }
 }
