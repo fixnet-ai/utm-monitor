@@ -303,6 +303,38 @@ fn getMacAddress(io: std.Io, allocator: std.mem.Allocator, iface_name: []const u
 }
 
 /// One-stop system info collection: hostname + IP + MAC + target
+/// Enumerate physical NICs via getifaddrs(), return the first valid IPv4 address.
+/// Returns null if no suitable interface found (getifaddrs failure, no IPv4 on
+/// any physical NIC, or all addresses are 0.0.0.0 / loopback).
+fn detectUnixIp(allocator: std.mem.Allocator) !?struct { ip: []const u8, iface_name: []const u8 } {
+    var ifap: ?*ifaddrs = undefined;
+    if (getifaddrs(&ifap) != 0) return null;
+    defer freeifaddrs(ifap);
+
+    var current: ?*ifaddrs = ifap;
+    while (current) |ifa| : (current = ifa.ifa_next) {
+        if (ifa.ifa_addr == null) continue;
+
+        const addr = ifa.ifa_addr.?;
+        if (addr.sa_family != AF_INET) continue;
+
+        const name = std.mem.span(ifa.ifa_name);
+        if (!isPhysicalInterface(name)) continue;
+
+        const sin = @as(*align(1) const sockaddr_in, @ptrCast(addr));
+        const bytes = @as(*const [4]u8, @ptrCast(&sin.sin_addr)).*;
+
+        if (bytes[0] == 0 and bytes[1] == 0 and bytes[2] == 0 and bytes[3] == 0) continue;
+        if (bytes[0] == 127) continue;
+
+        const ip = try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
+        const iface_name = try allocator.dupe(u8, name);
+        std.debug.print("[broadcast] Physical NIC {s}: {s}\n", .{ name, ip });
+        return .{ .ip = ip, .iface_name = iface_name };
+    }
+    return null;
+}
+
 pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
 
     const target = zigTarget();
@@ -335,45 +367,27 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
         };
     }
 
-    // Unix: use getifaddrs() to enumerate interfaces, pick first physical NIC
-    var ifap: ?*ifaddrs = undefined;
-    if (getifaddrs(&ifap) != 0) {
-        const shell = try detectShell(allocator);
-        return SystemInfo{
-            .hostname = hostname,
-            .ip = try allocator.dupe(u8, "0.0.0.0"),
-            .mac = try allocator.dupe(u8, "00:00:00:00:00:00"),
-            .target = target,
-            .iface_name = try allocator.dupe(u8, "unknown"),
-            .shell = shell,
-        };
-    }
-    defer freeifaddrs(ifap);
-
+    // Unix: retry IP detection up to 5 times (1s apart).
+    // DHCP may not have completed when the Guest service first starts,
+    // especially on macOS VMs where network init and service launch race.
+    // Without retry, the Guest embeds "0.0.0.0" in LSA broadcasts forever.
+    const MAX_IP_RETRIES = 5;
+    const IP_RETRY_DELAY_MS = 1000;
     var found_ip: ?[]const u8 = null;
     var found_iface: ?[]const u8 = null;
+    var attempt: usize = 0;
 
-    var current: ?*ifaddrs = ifap;
-    while (current) |ifa| : (current = ifa.ifa_next) {
-        if (ifa.ifa_addr == null) continue;
+    while (attempt < MAX_IP_RETRIES) : (attempt += 1) {
+        if (attempt > 0) {
+            std.debug.print("[broadcast] IP not ready (attempt {}/{}), waiting {d}ms...\n", .{ attempt + 1, MAX_IP_RETRIES, IP_RETRY_DELAY_MS });
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(IP_RETRY_DELAY_MS), .awake) catch {};
+        }
 
-        const addr = ifa.ifa_addr.?;
-        if (addr.sa_family != AF_INET) continue;
-
-        const name = std.mem.span(ifa.ifa_name);
-        if (!isPhysicalInterface(name)) continue;
-
-        const sin = @as(*align(1) const sockaddr_in, @ptrCast(addr));
-        const bytes = @as(*const [4]u8, @ptrCast(&sin.sin_addr)).*;
-
-        if (bytes[0] == 0 and bytes[1] == 0 and bytes[2] == 0 and bytes[3] == 0) continue;
-        if (bytes[0] == 127) continue;
-
-        const ip = try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
-        found_ip = ip;
-        found_iface = try allocator.dupe(u8, name);
-        std.debug.print("[broadcast] Physical NIC {s}: {s}\n", .{ name, ip });
-        break;
+        if (try detectUnixIp(allocator)) |result| {
+            found_ip = result.ip;
+            found_iface = result.iface_name;
+            break;
+        }
     }
 
     const ip = found_ip orelse try allocator.dupe(u8, "0.0.0.0");
