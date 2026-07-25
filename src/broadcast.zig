@@ -1082,7 +1082,18 @@ pub fn meshSessionLoop(
             continue;
         };
 
-        // Read pty_spawn from Host
+        // Read initial frame from Host. Usually pty_spawn, but on Host
+        // restart the old command loop may have already consumed it and
+        // the next frame is pty_exec_input. Accept either as the spawn
+        // trigger, and buffer a pre-consumed exec command for delivery
+        // after the pty is ready.
+        var pending_cmd_id: []const u8 = &.{};
+        var pending_cmd_data: []const u8 = &.{};
+        defer {
+            if (pending_cmd_id.len > 0) allocator.free(pending_cmd_id);
+            if (pending_cmd_data.len > 0) allocator.free(pending_cmd_data);
+        }
+
         const spawn_ok = blk: {
             var rbuf: [4096]u8 = undefined;
             while (true) {
@@ -1100,6 +1111,17 @@ pub fn meshSessionLoop(
                     continue;
                 }
                 if (n > 0 and rbuf[0] == @intFromEnum(tunproto.MsgType.pty_spawn)) {
+                    break :blk true;
+                }
+                // Host restart race: old command loop consumed pty_spawn,
+                // next frame is pty_exec_input. Accept as implicit spawn
+                // and buffer the command for delivery after pty is ready.
+                if (n > 0 and rbuf[0] == @intFromEnum(tunproto.MsgType.pty_exec_input)) {
+                    std.log.info("[guest-mesh] pty exec before spawn (reconnect race), buffering", .{});
+                    if (tunproto.parsePtyExecInput(rbuf[1..n])) |input| {
+                        pending_cmd_id = allocator.dupe(u8, input.cmd_id) catch &.{};
+                        pending_cmd_data = allocator.dupe(u8, input.command) catch &.{};
+                    }
                     break :blk true;
                 }
                 std.log.debug("[guest-mesh] Ignoring pre-spawn frame type={d}", .{rbuf[0]});
@@ -1142,6 +1164,16 @@ pub fn meshSessionLoop(
                 &pty_dead,
             });
             t.detach();
+        }
+
+        // Deliver any exec command buffered from reconnect race
+        if (pending_cmd_data.len > 0) {
+            cmd_mutex.lock(io) catch {};
+            if (active_cmd_id.len > 0) allocator.free(active_cmd_id);
+            active_cmd_id = pending_cmd_id;
+            pending_cmd_id = &.{}; // ownership transferred
+            cmd_mutex.unlock(io);
+            ptyWrite(&pty, pending_cmd_data);
         }
 
         std.log.info("[guest-mesh] Pty session started, entering command loop", .{});

@@ -684,12 +684,19 @@ pub const Mesh = struct {
             .received_ms = self.clock_ms,
         });
 
-        // Update neighbor table (directly connected = LSA from that node)
+        // Update neighbor table (directly connected = LSA from that node).
+        // Force port to DEFAULT_PORT: LSA broadcasts may arrive from an
+        // ephemeral source port on some platforms (e.g. Windows), but all
+        // mesh KCP traffic uses the well-known port. Using the ephemeral
+        // port would cause KCP data to be sent to a port nothing listens on.
         {
             const result = try self.neighbors.getOrPut(decoded.origin);
             result.value_ptr.* = .{
                 .id = decoded.origin,
-                .addr = from,
+                .addr = switch (from) {
+                    .ip4 => |v4| net.IpAddress{ .ip4 = .{ .bytes = v4.bytes, .port = protocol.DEFAULT_PORT } },
+                    .ip6 => |v6| net.IpAddress{ .ip6 = .{ .bytes = v6.bytes, .port = protocol.DEFAULT_PORT, .flow = v6.flow, .interface = v6.interface } },
+                },
                 .last_seen_ms = self.clock_ms,
                 .cost = 1, // direct neighbor
             };

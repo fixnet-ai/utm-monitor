@@ -686,42 +686,79 @@ fn tunnelManager(
                 const existing_tun = state.getGuestTunnel(hostname);
                 const status_just_changed = changed and upgrading;
                 const tun_dead = existing_tun != null and !existing_tun.?.isAlive();
-                if (existing_tun == null or tun_dead or status_just_changed) {
+
+                // Check if a Guest-initiated session (different conv) is now
+                // available — happens when the Host restarts, creates a fallback
+                // session via m.connect(), then the Guest reconnects with its
+                // own session. We must switch to the Guest's session or data
+                // flows through mismatched conv IDs and exec hangs.
+                const guest_session_available = if (existing_tun != null and !tun_dead) blk: {
+                    const tun_conv = existing_tun.?.session.conv;
+                    var found: bool = false;
+                    m.sessions_mutex.lock(m.io) catch break :blk false;
+                    defer m.sessions_mutex.unlock(m.io);
+                    var s_it = m.sessions.iterator();
+                    while (s_it.next()) |s_entry| {
+                        if (std.mem.eql(u8, &s_entry.value_ptr.*.remote, &saved_node_id)) {
+                            if (s_entry.key_ptr.* != tun_conv) {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    break :blk found;
+                } else false;
+
+                if (existing_tun == null or tun_dead or status_just_changed or guest_session_available) {
                     if (existing_tun != null) {
-                        std.log.info("[tun-mgr] {s} tunnel replace (dead={}, upgrading={})", .{ hostname, tun_dead, status_just_changed });
+                        std.log.info("[tun-mgr] {s} tunnel replace (dead={}, upgrading={}, guestSession={})", .{ hostname, tun_dead, status_just_changed, guest_session_available });
                         state.removeGuestTunnel(hostname);
                     }
 
-                    // For upgrading guests: ONLY use Guest-initiated sessions
-                    // that have pending data from the Guest (upgrade_req).
-                    // Old sessions from the previous Guest instance may still
-                    // be in the table but have no data — skip those.
+                    // Always prefer a Guest-initiated session to avoid the
+                    // dual-session mismatch that causes exec hangs.
+                    //
+                    // Host and Guest each call m.connect() with their own
+                    // nonce+connect_counter, producing different conv IDs.
+                    // If handleMeshGuest uses the Host-created session but
+                    // the Guest sends data on its own session, output never
+                    // reaches the Host — the two sessions operate independently.
+                    //
+                    // Solution: search sessions table for one whose `remote`
+                    // matches this Guest. This is the session created by
+                    // handleKcpData when the Guest's first KCP packet arrived.
+                    //
+                    // For upgrading guests: only accept sessions with pending
+                    // data (upgrade_req). Stale sessions from the previous
+                    // Guest instance have no data and are skipped.
                     var sess: ?*mesh_mod.MeshSession = null;
-                    if (upgrading) {
+                    {
                         m.sessions_mutex.lock(m.io) catch continue;
                         defer m.sessions_mutex.unlock(m.io);
 
-                        // Search for session with pending data from the Guest
                         var s_it = m.sessions.iterator();
                         while (s_it.next()) |s_entry| {
                             if (std.mem.eql(u8, &s_entry.value_ptr.*.remote, &saved_node_id)) {
-                                if (s_entry.value_ptr.*.kcp_inst.peekSize() >= 0) {
-                                    sess = s_entry.value_ptr.*;
-                                    std.log.info("[tun-mgr] {s} using guest-initiated session conv={d} (data pending)", .{ hostname, s_entry.key_ptr.* });
-                                    break;
+                                if (upgrading and s_entry.value_ptr.*.kcp_inst.peekSize() < 0) {
+                                    std.log.info("[tun-mgr] {s} skipping stale session conv={d} (no data)", .{ hostname, s_entry.key_ptr.* });
+                                    continue;
                                 }
-                                // Session exists but no data — stale, skip it
-                                std.log.info("[tun-mgr] {s} skipping stale session conv={d} (no data)", .{ hostname, s_entry.key_ptr.* });
+                                sess = s_entry.value_ptr.*;
+                                std.log.info("[tun-mgr] {s} using guest-initiated session conv={d}", .{ hostname, s_entry.key_ptr.* });
+                                break;
                             }
                         }
+                    }
 
-                        // If no Guest-initiated session with data, skip tunnel
-                        // creation and wait for the next scan cycle.
-                        if (sess == null) {
+                    if (sess == null) {
+                        if (upgrading) {
+                            // Upgrading Guest hasn't sent upgrade_req yet — wait
                             continue;
                         }
-                    } else {
-                        // Non-upgrading guests: create Host-initiated session
+                        // No Guest-initiated session yet — create Host-initiated
+                        // session as fallback. The Guest may still connect later;
+                        // when it does, the next tunnelManager scan will replace
+                        // this session with the Guest-initiated one.
                         sess = m.connect(saved_node_id) catch |err| {
                             std.log.err("[tun-mgr] connect to {s} failed: {} (will retry)", .{ hostname, err });
                             continue;
