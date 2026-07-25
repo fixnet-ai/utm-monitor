@@ -441,58 +441,115 @@ pub const Mesh = struct {
         std.log.info("[mesh] Shutting down", .{});
     }
 
-    /// Windows: blocking receive() has no timeout support, so KCP flush,
-    /// ACKs, keepalive probes, and LSA broadcasts would only run when
-    /// external packets arrive. We spawn a periodic timer thread that
-    /// runs periodicTasks every second, matching POSIX runPosix() behavior.
-    /// The timer thread exits when shutdown is signaled.
-    ///
-    /// Uses global_single_threaded Io for the blocking receive to avoid
-    /// error.ConcurrencyUnavailable on ARM64 Windows.
+    /// Windows: Zig 0.16.0 Io.Threaded on ARM64 Windows may return
+    /// error.ConcurrencyUnavailable. When it does, fall back to blocking
+    /// receive on global_single_threaded with a separate timer thread.
+    /// Otherwise, use receiveTimeout (same as runPosix) for reliable
+    /// periodic KCP flush and keepalive.
     fn runWindows(self: *Mesh) !void {
-        const local_io = std.Io.Threaded.global_single_threaded.io();
         var buf: [4096]u8 = undefined;
 
-        // Periodic timer thread: wake every 1s to drive KCP flush + keepalive.
-        const timer_thread = std.Thread.spawn(.{}, runWindowsTimer, .{self}) catch |err| {
-            std.log.err("[mesh] Failed to spawn timer thread: {}", .{err});
-            return err;
-        };
-        timer_thread.detach();
-
+        // First try receiveTimeout with the mesh's own Io.
+        // On most Windows configurations this works fine.
+        // If ConcurrencyUnavailable occurs, fall back to blocking mode.
+        var use_blocking = false;
         while (!self.shutdown.load(.acquire)) {
-            const msg = self.socket.receive(local_io, &buf) catch |err| {
-                if (self.shutdown.load(.acquire)) break;
-                std.log.err("[mesh] receive error: {}", .{err});
-                std.Io.sleep(local_io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+            if (!use_blocking) {
+                const timeout: std.Io.Timeout = .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(1), .clock = .awake } };
+                const msg = self.socket.receiveTimeout(self.io, &buf, timeout) catch |err| {
+                    switch (err) {
+                        error.Timeout => {
+                            self.clock_ms +%= 1000;
+                            self.periodicTasks() catch {};
+                            continue;
+                        },
+                        error.ConcurrencyUnavailable => {
+                            std.log.info("[mesh] receiveTimeout not supported, falling back to blocking receive + timer", .{});
+                            use_blocking = true;
+                            // Fall through to blocking mode setup below —
+                            // continue the while loop; next iteration skips
+                            // (!use_blocking) guard and enters blocking path.
+                            continue;
+                        },
+                        else => {
+                            if (self.shutdown.load(.acquire)) break;
+                            std.log.err("[mesh] receive error: {}", .{err});
+                            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+                            continue;
+                        },
+                    }
+                };
+
+                self.clock_ms +%= 10;
+
+                if (msg.data.len == 0) continue;
+
+                switch (msg.data[0]) {
+                    protocol.MESH_TYPE_LSA => try self.handleLsa(msg.data[1..], msg.from),
+                    protocol.MESH_TYPE_KCP => try self.handleKcpData(msg.data[1..], msg.from),
+                    protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
+                    protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
+                    else => {},
+                }
+
+                try self.periodicTasks();
                 continue;
-            };
-
-            self.clock_ms +%= 10;
-
-            if (msg.data.len == 0) continue;
-
-            switch (msg.data[0]) {
-                protocol.MESH_TYPE_LSA => try self.handleLsa(msg.data[1..], msg.from),
-                protocol.MESH_TYPE_KCP => try self.handleKcpData(msg.data[1..], msg.from),
-                protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
-                protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
-                else => {},
             }
 
-            try self.periodicTasks();
+            // Blocking fallback: use global_single_threaded for receive.
+            // A timer thread drives periodicTasks every second so KCP
+            // flush, keepalive, and LSA broadcasts don't stall.
+            {
+                const local_io = std.Io.Threaded.global_single_threaded.io();
+
+                const timer_thread = std.Thread.spawn(.{}, runWindowsTimer, .{self}) catch |err| {
+                    std.log.err("[mesh] Failed to spawn timer thread: {}", .{err});
+                    return err;
+                };
+                timer_thread.detach();
+
+                while (!self.shutdown.load(.acquire)) {
+                    const msg = self.socket.receive(local_io, &buf) catch |err| {
+                        if (self.shutdown.load(.acquire)) break;
+                        std.log.err("[mesh] receive error: {}", .{err});
+                        std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+                        continue;
+                    };
+
+                    self.clock_ms +%= 10;
+
+                    if (msg.data.len == 0) continue;
+
+                    switch (msg.data[0]) {
+                        protocol.MESH_TYPE_LSA => try self.handleLsa(msg.data[1..], msg.from),
+                        protocol.MESH_TYPE_KCP => try self.handleKcpData(msg.data[1..], msg.from),
+                        protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
+                        protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
+                        else => {},
+                    }
+
+                    try self.periodicTasks();
+                }
+
+                std.log.info("[mesh] Shutting down", .{});
+                return;
+            }
         }
 
         std.log.info("[mesh] Shutting down", .{});
     }
 
-    /// Periodic timer for Windows — drives KCP flush, keepalive, and LSA
-    /// broadcasts every 1 second when no packets are being received.
-    /// Exits when shutdown is signaled.
+    /// Periodic timer for Windows blocking receive fallback.
+    /// Drives KCP flush, keepalive, and LSA broadcasts every 1 second.
+    /// Uses raw Windows Sleep() to avoid any Io dependency — timer must
+    /// run regardless of Io.Threaded configuration.
     fn runWindowsTimer(self: *Mesh) void {
-        const local_io = std.Io.Threaded.global_single_threaded.io();
+        const Sleep = @extern(
+            *const fn (std.os.windows.DWORD) callconv(.winapi) void,
+            .{ .name = "Sleep", .library_name = "kernel32" },
+        );
         while (!self.shutdown.load(.acquire)) {
-            std.Io.sleep(local_io, std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
+            Sleep(1000);
             if (self.shutdown.load(.acquire)) break;
             self.clock_ms +%= 1000;
             self.periodicTasks() catch {};
