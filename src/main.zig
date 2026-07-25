@@ -412,6 +412,25 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // ── Management commands: HTTP client only, no admin needed ──
+    // --exec/--status/--upload/--download talk to Host HTTP at 127.0.0.1:2121.
+    // --gen-init prints a script to stdout. --save-config writes a local file.
+    // Dispatch these BEFORE ensureAdmin() to avoid unnecessary sudo re-exec
+    // that hangs in non-interactive contexts.
+    if (cli.cmd_status or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config) {
+        // Fault tolerance: --host is meaningless with management commands
+        cli.is_host = false;
+        try host_mod.run(init, cli);
+        return;
+    }
+
+    // --mcp alone (no --host): MCP now integrated into Host HTTP server.
+    // Redirect to --host which always serves /mcp on port 2121.
+    if (cli.is_mcp and !cli.is_host and !cli.cmd_install and !cli.cmd_uninstall) {
+        std.log.info("[main] --mcp deprecated; MCP available via --host on port 2121. Use 'utmm --host' instead.", .{});
+        return;
+    }
+
     // ── Admin privilege check — required for everything below ──
     // Checks if running as root (POSIX) or Administrator/SYSTEM (Windows).
     // If not, attempts self-elevation (sudo / ShellExecuteW runas).
@@ -431,32 +450,23 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Mode dispatch
-    // --mcp alone (no --host): MCP now integrated into Host HTTP server.
-    // Redirect to --host which always serves /mcp on port 2121.
-    if (cli.is_mcp and !cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_upload and !cli.cmd_download and !cli.cmd_gen_init and !cli.save_config and !cli.cmd_install and !cli.cmd_uninstall) {
-        std.log.info("[main] --mcp deprecated; MCP available via --host on port 2121. Use 'utmm --host' instead.", .{});
+    // --install/--uninstall work in both host and guest mode (install.zig uses cli.is_host)
+    if (cli.cmd_install or cli.cmd_uninstall) {
+        try host_mod.run(init, cli);
         return;
     }
 
-    // Fault tolerance: --host is meaningless (and potentially confusing) when
-    // used with management commands (--exec/--status/--upload/--download).
-    // These commands always talk to the persistent Host via IPC first;
-    // --host here would misleadingly suggest "run a new host instance".
-    if (cli.cmd_exec or cli.cmd_status or cli.cmd_upload or cli.cmd_download) {
-        cli.is_host = false;
+    // --host: start HTTP server (requires admin for port binding)
+    if (cli.is_host) {
+        try host_mod.run(init, cli);
+        return;
     }
 
-    // --install/--uninstall work in both host and guest mode (install.zig uses cli.is_host)
-    if (cli.is_host or cli.cmd_status or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.is_mcp) {
-        try host_mod.run(init, cli);
-    } else if (cli.cmd_install or cli.cmd_uninstall) {
-        try host_mod.run(init, cli);
-    } else {
-        // Default Guest mode (foreground): stop background service, run Guest in
-        // foreground with visible terminal, restart service on exit (Ctrl+C / close).
-        // This gives the user GUI-aware exec access (runs in user session, not daemon).
-        // System daemons use --svc to skip the stop/restart logic.
+    // Default Guest mode (foreground): stop background service, run Guest in
+    // foreground with visible terminal, restart service on exit (Ctrl+C / close).
+    // This gives the user GUI-aware exec access (runs in user session, not daemon).
+    // System daemons use --svc to skip the stop/restart logic.
+    {
         const agent = @import("agent.zig");
         try agent.run(init.io, init.gpa, cli.hostname, cli.port, cli.mesh_port, cli.peer_mesh, cli.host_ip);
     }
