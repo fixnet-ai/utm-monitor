@@ -9,6 +9,13 @@ no IP tracking, no context switching. Just `utmm --exec linuxvm "..."` and you'r
 MCP integration lets AI coding agents do the same — debug across platforms through
 natural language.
 
+Under the hood, a **mesh network** ties everything together. Guests auto-discover the
+Host over the local network — no fixed IPs, no DNS, no manual wiring. A Linux VM on a
+bridge, a Windows laptop on Wi-Fi, a Raspberry Pi on Ethernet — they all show up in one
+flat `utmm --status`. From there, `utmm --exec <hostname> "..."` reaches any machine
+instantly. When a bug surfaces on a specific device, you don't SSH around hunting for IPs
+or reconnecting to different networks — you just type the hostname and attach a debugger.
+
 ## AI Agent Experience
 
 Same capabilities, natural language. Two MCP tools for Claude Code and other agents:
