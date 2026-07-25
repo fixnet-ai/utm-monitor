@@ -1,4 +1,47 @@
-# Progress: v0.11.5
+# Progress: v0.11.9
+
+## Session 2026-07-26 (Phase 41-42 — Windows KCP mesh 修复)
+
+### Phase 41: v0.11.8 — Windows KCP stall 定时器线程修复 ✅
+
+**问题**: Windows Guest `runWindows()` 使用阻塞 `receive()` 无超时。KCP flush/
+keepalive/ACK 仅在收到外部包时执行，空闲连接上 pty_output 卡在 snd_queue。
+
+**修复**:
+- `mesh.zig` — `runWindows()` spawn 独立定时器线程每秒执行 `periodicTasks()`
+- `tunnel.zig` — 新增 `sendAndFlush()`：pty output 立即 flush
+- `broadcast.zig` — 9 个 `send()` → `sendAndFlush()` 调用点
+
+**验证**: 10+ 连续 exec windowsvm 成功
+
+### Phase 42: v0.11.9 — Windows mesh runWindows 简化 ✅
+
+**问题**: v0.11.9 两阶段方案（receiveTimeout + 回退）在 ARM64 Windows 上 exec 挂起。
+
+**对比测试**: 强制 `use_blocking=true` 立即恢复正常 → 确认 receiveTimeout 路径故障
+
+**根因**: service Io 的 `receiveTimeout` 静默失败 — UDP 包到达但 KCP 应用层数据丢失
+
+**修复**: 简化为始终阻塞+定时器（同 v0.11.8），`runWindowsTimer` 改用 Win32 `Sleep()`
+
+**验证**: 10/10 连续 exec windowsvm 成功，`zig build test` 全绿
+
+**关键教训**:
+1. 测试前必须重启 Host 清除陈旧状态
+2. Windows ARM64 Io 行为不能假设与 POSIX 一致
+3. 阻塞 receive + 独立定时器线程最可靠
+
+**文件变更**: `src/mesh.zig` (28+/84-), `src/ver.zig` (0.11.8→0.11.9)
+
+### 阶段性文档同步 ✅ (2026-07-26)
+
+更新所有项目文档到 v0.11.9 实际状态：
+- `CLAUDE.md` — tunproto 消息类型表、HostState 字段、Windows mesh patterns、WebSocket 引用清理
+- `README.md` — 端口描述精确化
+- `DESIGN.md` — socket.zig 引用、HostState 字段、tunnelManager 实现描述
+- `task_plan.md` — Phase 41-42 新增
+- `findings.md` — Finding #37-38 新增
+- `progress.md` — 本条目
 
 ## Session 2026-07-25 (Phase 35 — Windows cmd.exe UTF-8)
 

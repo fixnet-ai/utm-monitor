@@ -12,13 +12,13 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
 - **Streaming exec**: HTTP chunked response with `x-exit-code` trailer — real-time
   output, no JSON wrapping, no timeout. Upload/download use raw binary body with
   custom headers (`x-vm`, `x-path`).
-- **Auto-upgrade**: Host broadcasts version via UDP every 60s. Guest detects
+- **Auto-upgrade**: Host broadcasts version via LSA every 2s. Guest detects
   mismatch, spawns `utmm-old` to stop→download→replace→restart. Zero shell commands.
 - **Persistent pty per connection**: `posix_openpt` (POSIX) / `CreatePipe` (Windows).
   Commands share one shell session — `cd`, `export`, shell history survive across calls.
   `MDELIM:$?\n` exit-code markers embedded in pty output.
 - **MCP JSON-RPC**: AI agents control machines through `vm_status` / `vm_exec` tools.
-- **Single port**: HTTP + WebSocket + MCP + static file serving all on 2121.
+- **Single port**: HTTP + MCP + static file serving all on 2121 (mesh on UDP same port).
 - **8 cross-compilation targets**: aarch64/x86_64/x86 × linux-musl/macos/windows.
 - **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
 
@@ -35,13 +35,13 @@ Current configuration — four VM targets tracked:
 ### Two Run Modes (Same Binary)
 
 - **Guest mode (default)**: Foreground mode — stops background service, runs in
-  terminal, restarts service on exit. `--svc`: daemon mode (WebSocket + pty shell).
+  terminal, restarts service on exit. `--svc`: daemon mode (mesh KCP tunnel + pty shell).
   `--install --user`: desktop shortcut (UTMM.command / UTMM.bat / utmm.desktop).
   `--version`: print version. `--update-url`: upgrade mode (internal, launched by `utmm-old`).
 - **Host mode (`--host`)**: Unified HTTP server on port 2121 — guest registration
-  (WebSocket + HTTP announce), management commands (exec/upload/download),
+  via mesh LSA, management commands (exec/upload/download),
   MCP JSON-RPC, static file serving (/bin/), /etc/hosts sync, auto-upgrade
-  binary serving, and periodic UDP version broadcast. All on one port.
+  binary serving, and periodic LSA version broadcast. All on one port.
 
 ### Complete Data Flow
 
@@ -100,17 +100,16 @@ File transfers use chunked protocol: command → file_chunk × N → file_eof.
 
 | Type | Value | Direction | Purpose |
 |------|-------|-----------|---------|
-| pty_spawn | 0x0c | host→guest | Trigger shell spawn |
-| pty_input | 0x0d | host→guest | Command for shell stdin (cmd_id + data) |
-| pty_output | 0x0e | guest→host | Shell stdout (cmd_id + data) |
-| pty_signal | 0x0f | host→guest | Signal to foreground process |
-| pty_resize | 0x10 | host→guest | Terminal resize (rows+cols) |
+| pty_spawn | 0x10 | host→guest | Trigger shell spawn |
+| pty_exec_input | 0x11 | host→guest | Command for shell stdin (cmd_id + data) |
+| pty_exec_output | 0x15 | guest→host | Shell stdout (cmd_id + data) |
+| pty_exec_done | 0x16 | guest→host | Command exit (cmd_id + exit_code) |
+| download_cmd | 0x14 | host→guest | Download request (cmd_id + path) |
 | upload_cmd | 0x1b | host→guest | Upload request (cmd_id + path + file_size + hash) |
+| upload_result | 0x17 | guest→host | Upload result (cmd_id + exit_code) |
 | file_chunk | 0x1c | bidirectional | 8KB file chunk (cmd_id + data) |
 | file_eof | 0x1d | bidirectional | End of file (cmd_id + exit_code + size + hash) |
-| download_cmd | 0x17 | host→guest | Download request (cmd_id + path) |
-| ping | 0x1e | host→guest | Keepalive probe |
-| upgrade_req | 0x19 | guest→host | Request upgrade binary |
+| upgrade_req | 0x19 | guest→host | Request upgrade binary (cmd_id + target) |
 
 ### KCP Reliable Transport (kcp.zig)
 
@@ -128,9 +127,12 @@ Key constants: `IKCP_MTU_DEFAULT=1300`, `IKCP_WND_SND=32`, `IKCP_WND_RCV=128`
 
 All handlers share one `HostState` instance, mutex-protected:
 - `guests`: ArrayList of `GuestEntry` (hostname, IP, target, MAC, version, shell)
-- `outgoing_frames`: StringHashMap of per-guest FIFO frame queues
+- `guest_tunnels`: StringHashMap of per-guest `*Tunnel` (KCP tunnel for exec/upload/download)
 - `op_states`: StringHashMap of `OpState` by cmd_id (output buffer, exit_code, done flag)
+- `transfers`: StringHashMap of `TransferState` (file transfer progress tracking)
 - `wake_event`: Io.Event signaled on op completion (wakes polling HTTP handlers)
+- `serve_dir`: static file serve directory (default: `/opt/utmm`)
+- `mesh`: opaque pointer to `*mesh.Mesh` instance
 
 ### Key Design Decisions
 
@@ -284,7 +286,7 @@ Before starting any work, read (if they exist): `./CLAUDE.md`, `./README.md`,
 - **sendBodyComplete("")** not `sendBodiless()` for empty POST body — the latter
   panics with chunked encoding (`unreachable` at Client.zig:914).
 
-### KCP Patterns (v0.11.8)
+### KCP Patterns (v0.11.9)
 
 KCP matches the C reference implementation (skywind3000/kcp). Key behaviors:
 
@@ -313,6 +315,18 @@ KCP matches the C reference implementation (skywind3000/kcp). Key behaviors:
   stale session reuse after Host restart.
 - **DeriveNodeId for local testing**: when `peer_mesh` is set, use
   `deriveNodeId(MAC, hostname)` instead of `parseNodeId(MAC)` to get unique node IDs.
+
+### Windows Mesh Patterns (v0.11.9)
+
+- **Blocking receive + timer thread**: Always uses `global_single_threaded.io()` with
+  blocking `socket.receive()` and a dedicated timer thread. Zig 0.16.0 `receiveTimeout`
+  with service Io silently fails on ARM64 Windows — UDP packets arrive but KCP
+  data never reaches the application layer. The timer thread uses raw Win32 `Sleep()`
+  to avoid Io dependency.
+- **No receiveTimeout**: The two-tier approach (try receiveTimeout, fall back to
+  blocking) was removed. The service Io may succeed at `receiveTimeout` but KCP
+  data is silently lost. Blocking receive on `global_single_threaded` is the only
+  reliable approach.
 
 ### Chunked File Transfer Patterns (v0.11.7+)
 

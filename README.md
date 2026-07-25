@@ -165,7 +165,7 @@ Guest (raspigw, LAN) ──KCP/Mesh──┘                      ── Static 
   mismatch, spawns `utmm-old` process to stop→download 8KB chunks via KCP→SHA256
   verify→replace→restart. Zero shell commands.
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
-- **Single HTTP port**: 2121 for MCP + CLI + static file serving; Mesh on separate UDP port
+- **Single port number**: 2121 for MCP + CLI + static file serving (TCP) and mesh networking (UDP)
 - **Auto IP tracking**: Host syncs Guest IPs to `/etc/hosts` — hostnames always resolve
 - **Cross-platform**: macOS, Linux, Windows — both Host and Guest (aarch64, x86_64, x86 32-bit)
 - **Persistent shell session**: shell state survives across `--exec` calls (pty model)

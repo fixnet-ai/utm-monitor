@@ -551,3 +551,52 @@ pty_output 永远无法被 Host 读取。
 **教训**: Zig 0.16.0 的 `Io.Mutex` 与 Go 的 `sync.Mutex` 不同 — Go 的 mutex
 可在任意 goroutine 中 lock/unlock；Zig 的 `Io.Mutex` 绑定到特定 `Io` 实例。
 跨线程共享 mutex 时必须确保所有访问者使用相同的 `Io` 实例。
+
+---
+
+### Finding 37: Windows ARM64 service Io 的 receiveTimeout 静默失败 — KCP 数据丢失 (v0.11.9, 2026-07-26)
+
+**症状**: `runWindows()` 使用 `receiveTimeout(self.io, ...)`（与 POSIX 同路径）时，
+Host 和 Guest 之间有 KCP keepalive 流量（UDP 收发包），但 `handleMeshGuest` 持续显示
+"recv empty" — KCP 应用层数据永远不会到达。
+
+**根因**: Zig 0.16.0 在 Windows ARM64 上，service Io（`init.io`）的 `receiveTimeout`
+不会返回 `error.ConcurrencyUnavailable`（如果返回则该 bug 会被回退路径捕获）。
+相反它 succeeds，但 KCP 层数据被静默丢弃。UDP 包在物理层到达 socket，但应用层
+无法通过 `kcp_inst.input()` 处理。
+
+**对比测试验证**:
+| runWindows 路径 | Guest Io | 结果 |
+|----------------|----------|------|
+| receiveTimeout | self.io (service Io) | ❌ exec 挂起 |
+| 阻塞 receive | global_single_threaded.io() | ✅ exec 正常 |
+
+**为什么 v0.11.8 不受影响**: v0.11.8 始终使用 `global_single_threaded.io()` + 阻塞
+receive + 定时器线程，从未尝试 receiveTimeout。
+
+**修复**: 简化 `runWindows()` — 移除 receiveTimeout 尝试，始终使用
+`global_single_threaded.io()` + 阻塞 receive + 定时器线程（原始 Win32 `Sleep()`）。
+
+**教训**:
+1. Windows ARM64 Zig 0.16.0 Io 行为可能与 POSIX 不同 — 不能假设一致性
+2. 静默失败（无错误返回值但数据丢失）比显式错误更难排查
+3. 在 Windows 上做对比测试非常重要 — 同一套代码的不同代码路径可能行为迥异
+
+**关联**: [[cross-io-mutex]], [[pty-session-model]], Windows Mesh Patterns (CLAUDE.md)
+
+---
+
+### Finding 38: Host 陈旧 KCP session 状态导致新 Guest 连接异常 (v0.11.9, 2026-07-26)
+
+**症状**: 部署新 Guest 二进制后（代码已验证在其他环境正常），exec 仍然挂起。
+重启 Host 后立即恢复正常。
+
+**根因**: Host 端陈旧 KCP session 状态未完全清理。Guest 重启后创建新 KCP session（新
+conv ID），但 Host 端旧 session 的 handleMeshGuest 线程尚未退出（仍在轮询已死的
+tunnel），导致新 session 的 pty_output 被丢弃或路由到错误的 handler。
+
+**修复**: 当前通过重启 Host 规避。未来应增强 session 生命周期管理：
+- `failAllPendingOps` 后立即 `closeSession`（不等 handleMeshGuest defer）
+- 新 session 建立时强制关闭同 hostname 的旧 session
+
+**教训**: 测试 KCP 隧道问题时，必须先重启 Host 清除陈旧状态，否则测试结果不可靠。

@@ -59,7 +59,7 @@ Host ──HTTP /bin/ ──→ Guest (静态文件 + 自动升级下载)
 │  mesh.zig: LSA routing, KCP relay            │
 ├──────────────────────────────────────────────┤
 │         Physical Layer                        │
-│  UDP :2121 (socket.zig)                      │
+│  UDP :2121 (mesh.zig socket)                 │
 └──────────────────────────────────────────────┘
 ```
 
@@ -222,13 +222,14 @@ enqueueOutgoingFrame(), dequeueOutgoingFrame()
 
 // 新增的字段：
 guest_tunnels: StringHashMap(*Tunnel)   // hostname → KCP tunnel
-on_lsa_received: ?OnLsaCallback         // LSA → guest table 同步回调
+on_guest_changed: ?*const fn (*HostState) void  // guest 变更回调（/etc/hosts 同步）
+transfers: StringHashMap(TransferState) // 文件传输进度跟踪
+mesh: ?*anyopaque                       // *mesh.Mesh 实例（不透明指针）
 
 // 保留的字段（略有修改）：
 guests: ArrayList(HostSideGuest)         // 不变
 op_states: StringHashMap(OpState)        // 不变
 wake_event: Io.Event                     // 不变
-guest_tunnels: StringHashMap(*Tunnel)       // hostname → tunnel
 ```
 
 #### 6.2 HTTP handler 流程变化
@@ -321,67 +322,40 @@ fn handleMeshGuest(
 
 #### 6.4 LSA → Guest Table 同步
 
-Host 的 mesh.run() 线程收到 LSA 后，通过回调将 node_info 同步到 HostState.guests：
+Host 的 `tunnelManager` 线程（`host.zig:607`）周期性扫描 `mesh.lsas`，解析 `node_info`
+字段（hostname/ip/target/version/shell/status/role）并同步到 `HostState.guests`：
+
+- 直接遍历 `mesh.lsas`（非回调模式），解析 key:value 行格式
+- skip Host 自身和 role="host" 的节点（仅处理 Guest）
+- 调用 `state.upsertGuest()` 更新 guest table
+- 变更时调用 `syncHostsFromState()` 同步 `/etc/hosts`
 
 ```zig
-fn onLsaReceived(state: *HostState, node_id: NodeId, node_info: []const u8) void {
-    const info = protocol.GuestInfo.parse(state.allocator, node_info) catch return;
-    defer info.deinit(state.allocator);
-
-    // 更新 guest table
-    _ = state.upsertGuest(info.hostname, info.ip, info.target,
-        mesh.formatNodeId(node_id, state.allocator) catch return,
-        info.version, info.shell);
-
-    // 如果尚无 tunnel，建立连接
-    if (state.getGuestTunnel(info.hostname) == null) {
-        if (state.mesh) |mesh_ptr| {
-            const m: *Mesh = @ptrCast(@alignCast(mesh_ptr));
-            if (m.routeTo(node_id)) |_| {
-                const tun = state.allocator.create(Tunnel) catch return;
-                tun.* = Tunnel.connect(state.allocator, state.io.?, m, node_id) catch {
-                    state.allocator.destroy(tun);
-                    return;
-                };
-                state.registerGuestTunnel(info.hostname, tun) catch return;
-
-                // 发送 pty_spawn
-                const spawn_frame = tunproto.buildPtySpawn(state.allocator) catch return;
-                defer state.allocator.free(spawn_frame);
-                _ = tun.send(spawn_frame) catch {};
-
-                // spawn handler 线程
-                const hostname_dup = state.allocator.dupe(u8, info.hostname) catch return;
-                const t = std.Thread.spawn(.{}, handleMeshGuest, .{
-                    state.allocator, state, hostname_dup, tun,
-                }) catch return;
-                t.detach();
-            }
-        }
-    }
-}
+// 实际代码位于 host.zig:607 tunnelManager()
+// 核心流程：
+//   遍历 mesh.lsas → 解析 node_info → upsertGuest() → syncHostsFromState()
+//   检查 guest_tunnels → 按需 Mesh.connect() → pty_spawn → handleMeshGuest
 ```
 
 #### 6.5 Tunnel Manager 线程
 
-周期性检查 guest_tunnels 健康状态：
+`tunnelManager`（`host.zig:607`）周期性（~2s）执行 Guest 生命周期管理：
+
+1. **Phase 1 — LSA 同步**：遍历 `mesh.lsas`，解析 Guest info，填充 guest table
+2. **Phase 2 — Tunnel 建立**：对尚无 tunnel 的 Guest，调用 `mesh.connect()` 建立 KCP 隧道，发送 `pty_spawn`，spawn `handleMeshGuest` 线程
+3. **Phase 3 — 清理**：清理无 tunnel 的已注册 Guest，检查断开的 tunnel
+
+实际实现比设计草图更复杂，包括：Guest-initiated vs Host-initiated session 判断、upgrade
+检测（version 变更 → tunnel 替换）、stale session 清理。
 
 ```zig
-fn tunnelManager(state: *HostState) void {
-    while (!state.shutdown.load(.acquire)) {
-        state.mutex.lock(state.io.?) catch continue;
-        defer state.mutex.unlock(state.io.?);
-
-        for (state.guests.items) |*guest| {
-            if (state.guest_tunnels.get(guest.hostname) == null) {
-                // 尝试重连
-                if (state.mesh) |mesh_ptr| {
-                    const m: *Mesh = @ptrCast(@alignCast(mesh_ptr));
-                    // ... 尝试 Mesh.connect + pty_spawn + spawn handler ...
-                }
-            }
-        }
-        state.io.?.sleep(std.Io.Duration.fromSeconds(5), .awake) catch {};
+// 简化示意（完整实现见 host.zig:607-740+）
+fn tunnelManager(allocator, state, mesh_opt) void {
+    while (!shutdown) {
+        // Phase 1: sync m.lsas → state.guests (upsertGuest)
+        // Phase 2: establish tunnels for guests without one
+        // Phase 3: cleanup stale entries
+        sleep(2s);
     }
 }
 ```

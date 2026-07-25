@@ -767,3 +767,56 @@ pty_spawn 但 pty 输出无法到达 Host。
 **7/7 目标编译**: ✅ aarch64/x86_64/x86 × linux-musl/macos/windows
 
 **Status:** complete
+
+### Phase 41: v0.11.8 — Windows KCP stall 定时器线程修复 ✅ (2026-07-26)
+
+**Bug**: Windows Guest `runWindows()` 使用阻塞 `receive()` 无超时。KCP flush、
+keepalive、ACK、LSA 广播仅在收到外部包时执行。空闲连接上 pty_output 永远卡在 KCP
+snd_queue 中无人 flush，所有 exec 命令 hang。
+
+**根因**: POSIX `runPosix()` 用 `receiveTimeout(1s)`，超时时驱动 `periodicTasks()`。
+Windows 没有实现超时机制。
+
+**修复**:
+1. `runWindows()` — spawn 独立定时器线程 `runWindowsTimer()`，每秒执行 `periodicTasks()`
+2. `tunnel.zig` — 新增 `sendAndFlush()`：pty output 帧立即 flush（不等 1s 定时器）
+3. `mesh.zig` — 定时器线程与主 receive 线程通过 `sessions_mutex` 同步
+4. 9 个 `send()` 调用点 → 改为 `sendAndFlush()`（ptyReadLoop 关键路径）
+
+**文件变更**: `src/mesh.zig` (+64/-6), `src/tunnel.zig` (+24/-0), `src/broadcast.zig` (9 处 send→sendAndFlush)
+
+**验证**: 10+ 连续 exec 在 windowsvm 上全部成功
+
+**版本**: 0.11.7 → 0.11.8
+
+**Status:** complete
+
+### Phase 42: v0.11.9 — Windows mesh runWindows 简化 ✅ (2026-07-26)
+
+**背景**: Phase 41 后，v0.11.8 Debug Guest (阻塞+定时器) + Host 在 windowsvm 上 exec
+正常工作 4+ 次。但代码重构为两阶段方案（先 receiveTimeout 后回退）后 exec 挂起。
+
+**迭代 1 — 两阶段方案 (8eaafa5)**:
+- 先尝试 `receiveTimeout`（同 POSIX），失败则回退到阻塞+定时器
+- `break` → `continue` 修复：`error.ConcurrencyUnavailable` handler 中的 `break`
+  退出外层 while 循环而非进入回退路径
+
+**迭代 2 — 对比测试发现 (d9bed65)**:
+- 强制 `use_blocking = true`（旧方案）→ exec 立即正常工作
+- 默认 `use_blocking = false`（receiveTimeout 路径）→ exec 挂起
+- **根因**: service Io 的 `receiveTimeout` 在 ARM64 Windows 上静默失败 —
+  UDP 包到达 socket 但 KCP 应用层数据无法被读取
+
+**最终修复**: 简化为始终使用阻塞+定时器（与 v0.11.8 一致），移除 receiveTimeout 尝试路径。
+`runWindowsTimer` 改用原始 Win32 `Sleep()` 消除 Io 依赖。
+
+**关键教训**:
+1. Host 陈旧状态会干扰新 Guest 连接 — 测试前需重启 Host
+2. Windows ARM64 service Io 行为与 POSIX Io 不同 — 不能假设 receiveTimeout 可用
+3. 阻塞 receive + 独立定时器线程是最可靠的 Windows 方案
+
+**文件变更**: `src/mesh.zig` (28+/84-, 净减少 56 行), `src/ver.zig` (0.11.8→0.11.9)
+
+**验证**: 10/10 连续 exec windowsvm 成功，`zig build test` 全绿
+
+**Status:** complete
