@@ -86,15 +86,24 @@ HTTP 端口 2121（仅 Host 侧）：
 Host → Guest:
   0x10 pty_spawn       触发 pty shell 创建（无 payload）
   0x11 pty_exec_input  cmd_id(NT) + command(NT)
-  0x12 signal_cmd      1-byte signal (0=SIGINT, 1=SIGTERM)
-  0x13 upload_data     cmd_id(NT) + path(NT) + file_data(4-byte BE len + data)
   0x14 download_cmd    cmd_id(NT) + path(NT)
+  0x1b upload_cmd      cmd_id(NT) + path(NT) + file_size(BE u32) + file_hash(NT)
 
 Guest → Host:
   0x15 pty_exec_output  cmd_id(NT) + chunk_data
   0x16 pty_exec_done    cmd_id(NT) + exit_code(4-byte BE i32)
   0x17 upload_result    cmd_id(NT) + exit_code(4-byte BE i32)
-  0x18 download_result  cmd_id(NT) + exit_code(4-byte BE i32) + file_data(4-byte BE len + data)
+  0x19 upgrade_req      cmd_id(NT) + target(NT)
+
+双向（Host ↔ Guest）:
+  0x1c file_chunk       cmd_id(NT) + data(4-byte BE len + data) — 8KB 文件片段
+  0x1d file_eof         cmd_id(NT) + exit_code(BE i32) + file_size(BE u32) + file_hash(NT)
+
+已废弃:
+  0x12 _unused          was signal_cmd (stdin raw byte forwarding)
+  0x13 _unused          was upload_data (被 upload_cmd + file_chunk × N + file_eof 替代)
+  0x18 _unused          was download_result (被 file_chunk × N + file_eof 替代)
+  0x1a _unused          was upgrade_bin (被 file_chunk × N + file_eof 替代)
 
 NT = null-terminated string
 BE = big-endian
@@ -112,12 +121,13 @@ BE = big-endian
 | pty_spawn (12) | pty_spawn (0x10) | type 值变，payload 不变 |
 | pty_input (13) | pty_exec_input (0x11) | type 值变，payload 不变 |
 | pty_output (14) | pty_exec_output (0x15) | type 值变，payload 不变 |
-| pty_signal (15) | signal_cmd (0x12) | type 值变，payload 不变 |
-| upload_req (4) | upload_data (0x13) | type 值变，payload 不变 |
+| pty_signal (15) | _unused (0x12) | **删除**：stdin raw byte forwarding 替代 |
+| upload_req (4) | upload_cmd (0x1b) | type 值变 + **分块协议**：file_chunk × N + file_eof |
 | upload_resp (5) | upload_result (0x17) | type 值变，payload 不变 |
 | download_req (6) | download_cmd (0x14) | type 值变，payload 不变 |
-| download_resp (7) | download_result (0x18) | type 值变，payload 不变 |
+| download_resp (7) | file_chunk + file_eof (0x1c/0x1d) | **分块协议**：逐块传输替代单消息 |
 | (无) | pty_exec_done (0x16) | **新增**：显式退出码消息 |
+| (无) | upgrade_req (0x19) | **新增**：KCP 隧道自动升级请求 |
 
 #### 4.4 pty_exec_done — 新增消息类型
 
@@ -170,9 +180,8 @@ meshSessionLoop():
     while (true):
       tunnel.recv(&rbuf) → switch tunproto.MsgType:
         0x11 pty_exec_input → ptyWrite; 执行完毕后 tunnel.send(pty_exec_done)
-        0x12 signal_cmd → killForegroundProcess
-        0x13 upload_data → 写文件 + tunnel.send(upload_result)
-        0x14 download_cmd → 读文件 + tunnel.send(download_result)
+        0x14 download_cmd → sendChunkedFile()（读文件 8KB → file_chunk × N → file_eof）
+        0x1b upload_cmd → receiveChunkedFile()（接收 file_chunk × N 写盘 + SHA256 → file_eof 校验）
         0x10 pty_spawn → 重建 pty
       if pty_dead or tunnel_disconnected → break
     // tunnel 断开 → 回到外层循环，等待 Host 重连
@@ -291,10 +300,15 @@ fn handleMeshGuest(
                 state.completeOpState(resp.cmd_id, resp.exit_code);
                 state.wake_event.set(state.io.?);
             },
-            0x18 => { // download_result
-                const resp = tunproto.parseDownloadResult(payload) orelse continue;
-                state.appendOpOutput(resp.cmd_id, resp.file_data);
-                state.completeOpState(resp.cmd_id, resp.exit_code);
+            0x1c => { // file_chunk
+                const chunk = tunproto.parseFileChunk(payload) orelse continue;
+                state.appendOpOutput(chunk.cmd_id, chunk.data);
+                state.updateTransferProgress(chunk.cmd_id);
+            },
+            0x1d => { // file_eof
+                const eof = tunproto.parseFileEof(payload) orelse continue;
+                state.setOpFileMeta(eof.cmd_id, eof.file_size, eof.file_hash);
+                state.completeOpState(eof.cmd_id, eof.exit_code);
                 state.wake_event.set(state.io.?);
             },
             else => {},

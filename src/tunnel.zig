@@ -31,8 +31,53 @@ pub const Tunnel = struct {
     /// Send data through the tunnel. Data is queued in KCP for reliable delivery.
     /// The actual UDP transmission happens via mesh.run()'s periodicTasks (kcp.update).
     /// NOTE: Does NOT call kcp.update() — only mesh.run() thread updates KCP state.
-    /// This avoids data races when send() is called from HTTP/MCP handler threads.
+    /// Locks sessions_mutex to synchronize with mesh thread's kcp.flush().
+    /// For batch sends, prefer lock() + sendLocked() + unlock() to avoid
+    /// mutex starvation of the mesh thread's ACK processing loop.
     pub fn send(self: *Tunnel, data: []const u8) !usize {
+        try self.session.mesh.sessions_mutex.lock(self.io);
+        defer self.session.mesh.sessions_mutex.unlock(self.io);
+        try self.session.kcp_inst.send(data);
+        return data.len;
+    }
+
+    /// Send data and immediately flush KCP to trigger UDP transmission.
+    /// Combines send + kcp.update in a single lock cycle.
+    /// Use this when the mesh thread's periodicTasks might not run promptly
+    /// (e.g., on Windows where the mesh loop uses blocking receive without
+    /// timeout). Prefer send() for batch operations where multiple chunks
+    /// should be flushed once; use sendAndFlush() for latency-sensitive
+    /// single messages like pty output frames.
+    ///
+    /// Sets kcp_inst.current and calls flush() directly rather than going
+    /// through update(), bypassing the interval rate limiter (ts_flush check).
+    /// update() won't flush if called within the same interval since the last
+    /// mesh thread periodicTasks, which would defeat this optimization.
+    pub fn sendAndFlush(self: *Tunnel, data: []const u8, current_ms: u32) !usize {
+        try self.session.mesh.sessions_mutex.lock(self.io);
+        defer self.session.mesh.sessions_mutex.unlock(self.io);
+        try self.session.kcp_inst.send(data);
+        self.session.kcp_inst.current = current_ms;
+        self.session.kcp_inst.flush();
+        return data.len;
+    }
+
+    /// Acquire sessions_mutex. Use with sendLocked()/flushLocked() for batch
+    /// operations to prevent mesh thread starvation between per-chunk sends.
+    /// Always pair with unlock() — prefer defer.
+    /// Returns LockFailed if the Io context is canceled.
+    pub fn lock(self: *Tunnel) !void {
+        try self.session.mesh.sessions_mutex.lock(self.io);
+    }
+
+    /// Release sessions_mutex acquired by lock().
+    pub fn unlock(self: *Tunnel) void {
+        self.session.mesh.sessions_mutex.unlock(self.io);
+    }
+
+    /// Send data assuming sessions_mutex is already held (via lock()).
+    /// Does NOT lock/unlock — caller is responsible for synchronization.
+    pub fn sendLocked(self: *Tunnel, data: []const u8) !usize {
         try self.session.kcp_inst.send(data);
         return data.len;
     }
@@ -40,14 +85,70 @@ pub const Tunnel = struct {
     /// Receive data from the tunnel. Returns immediately — does NOT poll or block.
     /// Returns 0 if no data is available (not an error — caller should sleep and retry).
     /// NOTE: Does NOT call kcp.update() — only mesh.run() thread updates KCP state.
+    /// Locks sessions_mutex to synchronize with mesh thread's kcp.input().
     pub fn recv(self: *Tunnel, buf: []u8) !usize {
+        try self.session.mesh.sessions_mutex.lock(self.io);
+        defer self.session.mesh.sessions_mutex.unlock(self.io);
         return try self.session.kcp_inst.recv(buf);
     }
 
     /// Check if the tunnel is still alive (KCP retransmit + keepalive).
+    /// Locks sessions_mutex to synchronize with mesh thread.
+    /// On mutex lock failure, assumes alive — a transient lock failure
+    /// does not mean the tunnel is dead, and returning false here
+    /// causes the handleMeshGuest thread to exit prematurely.
     pub fn isAlive(self: *Tunnel) bool {
+        self.session.mesh.sessions_mutex.lock(self.io) catch return true;
+        defer self.session.mesh.sessions_mutex.unlock(self.io);
         if (self.session.dead) return false;
         return !self.session.kcp_inst.isDead();
+    }
+
+    /// Returns the size of the next complete message in the receive queue,
+    /// or -1 if no complete message is available. In message mode (non-stream),
+    /// this is the exact size needed for the next recv() call. Callers can
+    /// use this to allocate the correct buffer size before calling recv().
+    /// Locks sessions_mutex to synchronize with mesh thread.
+    pub fn peekSize(self: *Tunnel) i32 {
+        self.session.mesh.sessions_mutex.lock(self.io) catch return -1;
+        defer self.session.mesh.sessions_mutex.unlock(self.io);
+        return self.session.kcp_inst.peekSize();
+    }
+
+    /// Force immediate KCP flush. Normally the mesh thread's periodic update
+    /// drives KCP flushing, but during large file transfers we want to push
+    /// data through without waiting for the next cycle (which can be 1 second).
+    /// current_ms should come from the mesh's clock for consistency.
+    /// Locks sessions_mutex to synchronize with mesh thread.
+    pub fn flush(self: *Tunnel, current_ms: u32) void {
+        self.session.mesh.sessions_mutex.lock(self.io) catch return;
+        defer self.session.mesh.sessions_mutex.unlock(self.io);
+        self.session.kcp_inst.update(current_ms);
+    }
+
+    /// Flush assuming sessions_mutex is already held (via lock()).
+    pub fn flushLocked(self: *Tunnel, current_ms: u32) void {
+        self.session.kcp_inst.update(current_ms);
+    }
+
+    /// Enable fast transfer mode for the upgrade tunnel.
+    /// - setNoDelay(nc=true): nocwnd disables congestion window limit.
+    ///   Does NOT enable stream mode — message mode with single-segment
+    ///   chunks (≤MSS) avoids fragmentation; peekSize returns immediately
+    ///   and recv returns exactly one message per call.
+    /// Locks sessions_mutex to synchronize with mesh thread.
+    pub fn enableFastMode(self: *Tunnel) void {
+        self.session.mesh.sessions_mutex.lock(self.io) catch return;
+        defer self.session.mesh.sessions_mutex.unlock(self.io);
+        self.session.kcp_inst.setNoDelay(false, 10, 0, true);
+    }
+
+    /// Number of KCP segments waiting to be sent (snd_queue) + in flight (snd_buf).
+    /// Returns 0 when all data has been acknowledged by the peer.
+    pub fn waiting(self: *Tunnel) usize {
+        self.session.mesh.sessions_mutex.lock(self.io) catch return 0;
+        defer self.session.mesh.sessions_mutex.unlock(self.io);
+        return self.session.kcp_inst.waiting();
     }
 
     /// Close the tunnel and release the mesh session.

@@ -10,7 +10,7 @@ const guest = @import("guest.zig");
 const host_mod = @import("host.zig");
 const httpd = @import("httpd.zig");
 const host_http = @import("host_http.zig");
-const upgrade = @import("upgrade.zig");
+const priv = @import("priv.zig");
 
 // ── Windows Service integration types and externs (only compiled on Windows) ──
 const windows = if (builtin.os.tag == .windows) std.os.windows else struct {
@@ -21,6 +21,7 @@ const windows = if (builtin.os.tag == .windows) std.os.windows else struct {
 const SERVICE_WIN32_OWN_PROCESS = 0x00000010;
 const SERVICE_RUNNING = 0x00000004;
 const SERVICE_STOPPED = 0x00000001;
+const SERVICE_STOP_PENDING = 0x00000003;
 const SERVICE_ACCEPT_STOP = 0x00000001;
 const SERVICE_CONTROL_STOP = 0x00000001;
 
@@ -58,6 +59,8 @@ comptime {
     _ = @import("mesh.zig");
     _ = @import("tunnel.zig");
     _ = @import("tunproto.zig");
+    _ = @import("priv.zig");
+    _ = @import("upgrade.zig");
 }
 
 /// CLI parse result
@@ -119,8 +122,9 @@ pub const CliArgs = struct {
     download_remote: ?[]const u8 = null,
     download_local: ?[]const u8 = null,
 
-    // Internal: upgrade URL passed by utmm-old process (--update-url)
-    update_url: ?[]const u8 = null,
+    // Internal: auto-upgrade bootstrap (spawned by Guest when version mismatch detected)
+    cmd_upgrade: bool = false,
+    upgrade_target: ?[]const u8 = null,
 };
 
 /// Parse command-line arguments
@@ -135,6 +139,11 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             cli.is_host = true;
         } else if (std.mem.eql(u8, arg, "--status")) {
             cli.cmd_status = true;
+        } else if (std.mem.eql(u8, arg, "--upgrade")) {
+            cli.cmd_upgrade = true;
+        } else if (std.mem.eql(u8, arg, "--target")) {
+            i += 1;
+            if (i < args.len) cli.upgrade_target = args[i];
         } else if (std.mem.eql(u8, arg, "--version")) {
             cli.cmd_version = true;
         } else if (std.mem.eql(u8, arg, "--gen-init")) {
@@ -149,9 +158,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             cli.is_user = true;
         } else if (std.mem.eql(u8, arg, "--svc")) {
             cli.is_svc = true;
-        } else if (std.mem.eql(u8, arg, "--update-url")) {
-            i += 1;
-            if (i < args.len) cli.update_url = args[i];
         } else if (std.mem.eql(u8, arg, "--uninstall")) {
             cli.cmd_uninstall = true;
         } else if (std.mem.eql(u8, arg, "--upload")) {
@@ -288,23 +294,26 @@ const SvcGlobals = struct {
     var io_ptr: ?std.Io = null;
     var gpa_ptr: ?std.mem.Allocator = null;
     var cli_ptr: ?CliArgs = null;
+    var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 };
 
 fn svcCtrlHandler(dwControl: u32, _: u32, _: ?*anyopaque, _: ?*anyopaque) callconv(.winapi) u32 {
     if (dwControl == SERVICE_CONTROL_STOP) {
+        // Report STOP_PENDING — the main service loop will stop cleanly
+        // and report STOPPED after runWithIo returns.
         if (SvcGlobals.status_handle) |h| {
             var status = SERVICE_STATUS{
                 .dwServiceType = SERVICE_WIN32_OWN_PROCESS,
-                .dwCurrentState = SERVICE_STOPPED,
+                .dwCurrentState = SERVICE_STOP_PENDING,
                 .dwControlsAccepted = 0,
                 .dwWin32ExitCode = 0,
                 .dwServiceSpecificExitCode = 0,
-                .dwCheckPoint = 0,
-                .dwWaitHint = 0,
+                .dwCheckPoint = 1,
+                .dwWaitHint = 30000, // 30s for graceful shutdown
             };
             _ = SetServiceStatus(h, &status);
         }
-        std.process.exit(0);
+        SvcGlobals.shutdown_flag.store(true, .release);
     }
     return 1;
 }
@@ -332,11 +341,11 @@ fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
     const svc_cli = SvcGlobals.cli_ptr orelse @panic("cli_ptr not set");
 
     if (svc_cli.is_host) {
-        host_mod.runWithIo(svc_io, svc_gpa, svc_cli) catch |err| {
+        host_mod.runWithIo(svc_io, svc_gpa, svc_cli, &SvcGlobals.shutdown_flag) catch |err| {
             std.debug.print("[svc] host run failed: {}\n", .{err});
         };
     } else {
-        guest.runWithIo(svc_io, svc_gpa, svc_cli) catch |err| {
+        guest.runWithIo(svc_io, svc_gpa, svc_cli, &SvcGlobals.shutdown_flag) catch |err| {
             std.debug.print("[svc] guest run failed: {}\n", .{err});
         };
     }
@@ -375,52 +384,50 @@ fn winServiceRun(io: std.Io, gpa: std.mem.Allocator, cli: CliArgs) !void {
     }
 }
 
-/// Check if the current executable name contains "-old" (utmm-old / utmm-old.exe).
-fn isOldMode(io: std.Io) bool {
-    var exe_buf: [4096]u8 = undefined;
-    const exe_len = std.process.executablePath(io, &exe_buf) catch return false;
-    const exe_path = exe_buf[0..exe_len];
-    const exe_name = std.fs.path.basename(exe_path);
-    return std.mem.indexOf(u8, exe_name, "-old") != null;
-}
-
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var cli = try parseArgs(args);
 
-    // Check if running as utmm-old (upgrade mode).
-    // Triggered by --update-url flag OR executable name containing "-old".
-    if (cli.update_url != null or isOldMode(init.io)) {
-        const url = cli.update_url orelse {
-            std.log.err("[upgrade] --update-url required in upgrade mode", .{});
-            return error.MissingUpdateUrl;
-        };
-        try upgrade.run(init, url);
+    // --version: no admin needed, just print version and exit.
+    if (cli.cmd_version) {
+        std.debug.print("utmm v{s}\n", .{protocol.VERSION});
         return;
     }
 
+    // --help: no admin needed, just print help and exit.
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--help")) {
+        printHelp();
+        return;
+    }
+
+    // --upgrade: auto-upgrade bootstrap (utmm-old). Spawned by Guest when
+    // version mismatch detected via mesh LSA. Must run before ensureAdmin
+    // because it inherits admin privileges from the parent service process.
+    if (cli.cmd_upgrade) {
+        const upgrade = @import("upgrade.zig");
+        try upgrade.runUpgrade(init.io, init.gpa, cli.upgrade_target orelse {
+            std.debug.print("--upgrade requires --target <arch>\n", .{});
+            return;
+        }, cli.mesh_port, cli.peer_mesh);
+        return;
+    }
+
+    // ── Admin privilege check — required for everything below ──
+    // Checks if running as root (POSIX) or Administrator/SYSTEM (Windows).
+    // If not, attempts self-elevation (sudo / ShellExecuteW runas).
+    // On success the new elevated process takes over; on failure prints
+    // a clear error and exits.
+    try priv.ensureAdmin(init.io, args, init.arena.allocator());
+
     // --svc (internal): run as system daemon — no service stop/restart.
     // On Windows this registers with SCM; on POSIX it just runs guest directly.
-    // Must be checked before anything else so the service manager gets a clean
-    // guest process without foreground mode's service management logic.
+    // Admin check above ensures we're running with proper privileges.
     if (cli.is_svc) {
         if (builtin.os.tag == .windows) {
             return winServiceRun(init.io, init.gpa, cli);
         }
         // POSIX: service manager launched us — just run guest directly
         try guest.run(init, cli);
-        return;
-    }
-
-    // --version (single-line machine-readable format, for version sync script parsing)
-    if (cli.cmd_version) {
-        std.debug.print("utmm v{s}\n", .{protocol.VERSION});
-        return;
-    }
-
-    // --help
-    if (args.len > 1 and std.mem.eql(u8, args[1], "--help")) {
-        printHelp();
         return;
     }
 
@@ -451,7 +458,7 @@ pub fn main(init: std.process.Init) !void {
         // This gives the user GUI-aware exec access (runs in user session, not daemon).
         // System daemons use --svc to skip the stop/restart logic.
         const agent = @import("agent.zig");
-        try agent.run(init.io, init.gpa, cli.hostname, cli.port, cli.mesh_port, cli.peer_mesh);
+        try agent.run(init.io, init.gpa, cli.hostname, cli.port, cli.mesh_port, cli.peer_mesh, cli.host_ip);
     }
 }
 

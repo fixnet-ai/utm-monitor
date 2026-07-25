@@ -15,10 +15,10 @@ const mesh_mod = @import("mesh.zig");
 const tunnel_mod = @import("tunnel.zig");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
-    return runWithIo(init.io, init.gpa, cli);
+    return runWithIo(init.io, init.gpa, cli, null);
 }
 
-pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs) !void {
+pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
     // --install / --uninstall: delegate to install module
     if (cli.cmd_install) {
         const install_mod = @import("install.zig");
@@ -72,7 +72,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 
     // --host: start HTTP server (v0.3.0 unified architecture)
     if (cli.is_host) {
-        try startHttpHost(block_io, gpa, cli.port, cli.mesh_port, cli.hosts_file, serve_dir, cli.peer_mesh);
+        try startHttpHost(block_io, gpa, cli.port, cli.mesh_port, cli.hosts_file, serve_dir, cli.peer_mesh, shutdown);
         return;
     }
 
@@ -222,7 +222,9 @@ fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
     }
 
     if (exit_code != 0) {
-        std.process.exit(if (exit_code < 0) @as(u8, 1) else @intCast(exit_code));
+        // Clamp to u8: negative or >255 → exit 1, otherwise @intCast
+        const code: u8 = if (exit_code <= 0 or exit_code > 255) 1 else @intCast(exit_code);
+        std.process.exit(code);
     }
 }
 
@@ -234,13 +236,26 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
     };
     defer gpa.free(file_data);
 
+    // Compute SHA256 hash
+    var sha256_hex: [64]u8 = undefined;
+    var file_hash: []const u8 = "";
+    {
+        var sha256: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(file_data, &sha256, .{});
+        for (sha256, 0..) |b, j| {
+            sha256_hex[j * 2] = "0123456789abcdef"[b >> 4];
+            sha256_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+        }
+        file_hash = &sha256_hex;
+    }
+
     const basename = std.fs.path.basename(local_file);
     const dest = try std.fmt.allocPrint(gpa, "/opt/utmm/{s}", .{basename});
     defer gpa.free(dest);
 
-    std.debug.print("[upload] Uploading {s} -> {s} ({s}) ({d} bytes)...\n", .{ local_file, target, dest, file_data.len });
+    std.debug.print("[upload] Uploading {s} -> {s} ({s}) ({d} bytes, sha256={s})...\n", .{ local_file, target, dest, file_data.len, file_hash });
 
-    // HTTP POST raw binary body with x-vm and x-path headers
+    // HTTP POST raw binary body with x-vm, x-path, x-file-hash headers
     var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
     defer client.deinit();
 
@@ -258,6 +273,7 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
         .extra_headers = &.{
             .{ .name = "x-vm", .value = target },
             .{ .name = "x-path", .value = dest },
+            .{ .name = "x-file-hash", .value = file_hash },
             .{ .name = "Content-Type", .value = "application/octet-stream" },
         },
         .keep_alive = false,
@@ -318,7 +334,10 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
     };
     defer req.deinit();
 
-    req.sendBodyComplete("") catch |err| {
+    // Send "{}" instead of empty body to avoid Zig 0.16.0 respondStreaming
+    // panic on empty POST body + keep_alive=false (Server.discardBody unreachable).
+    var empty_body = [2]u8{ '{', '}' };
+    req.sendBodyComplete(&empty_body) catch |err| {
         std.debug.print("[download] sendBody failed: {}\n", .{err});
         return err;
     };
@@ -336,11 +355,15 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
         return error.DownloadFailed;
     }
 
-    // Stream response body to local file
-    const local_file = try std.Io.Dir.cwd().createFile(block_io, local_path, .{});
-    defer local_file.close(block_io);
+    // Stream response body to temp file first (atomic rename after hash verify)
+    const temp_path = try std.fmt.allocPrint(gpa, "{s}.utmm-tmp", .{local_path});
+    defer gpa.free(temp_path);
+    std.Io.Dir.cwd().deleteFile(block_io, temp_path) catch {};
+
+    const tmp_file = try std.Io.Dir.cwd().createFile(block_io, temp_path, .{});
+    defer tmp_file.close(block_io);
     var file_wb: [65536]u8 = undefined;
-    var fw = local_file.writer(block_io, &file_wb);
+    var fw = tmp_file.writer(block_io, &file_wb);
     const file_iface = &fw.interface;
 
     var body_reader = response.reader(&transfer_buf);
@@ -356,19 +379,51 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
     }
     file_iface.flush() catch {};
 
-    // Parse x-exit-code from trailers
+    // Parse x-exit-code, x-file-hash, x-file-size from trailers
     var exit_code: i32 = 1;
+    var file_hash: []const u8 = "";
+    var file_size: u32 = 0;
     var trailers = response.iterateTrailers();
     while (trailers.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "x-exit-code")) {
             exit_code = std.fmt.parseInt(i32, h.value, 10) catch 1;
         }
+        if (std.ascii.eqlIgnoreCase(h.name, "x-file-hash")) {
+            file_hash = h.value;
+        }
+        if (std.ascii.eqlIgnoreCase(h.name, "x-file-size")) {
+            file_size = @intCast(std.fmt.parseInt(u64, h.value, 10) catch 0);
+        }
     }
 
     if (exit_code != 0) {
         std.debug.print("[download] Guest returned error, exit code {d}\n", .{exit_code});
+        std.Io.Dir.cwd().deleteFile(block_io, temp_path) catch {};
         return error.DownloadFailed;
     }
+
+    // Verify hash if provided
+    if (file_hash.len > 0 and total_bytes > 0) {
+        const tmp_content = try std.Io.Dir.cwd().readFileAlloc(block_io, temp_path, gpa, @enumFromInt(50 * 1024 * 1024));
+        defer gpa.free(tmp_content);
+        var sha256: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(tmp_content, &sha256, .{});
+        var actual_hex: [64]u8 = undefined;
+        for (sha256, 0..) |b, j| {
+            actual_hex[j * 2] = "0123456789abcdef"[b >> 4];
+            actual_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+        }
+        if (!std.mem.eql(u8, &actual_hex, file_hash)) {
+            std.debug.print("[download] Hash mismatch! expected={s} actual={s}\n", .{ file_hash, &actual_hex });
+            std.Io.Dir.cwd().deleteFile(block_io, temp_path) catch {};
+            return error.HashMismatch;
+        }
+        std.debug.print("[download] Hash verified: {s}\n", .{file_hash});
+    }
+
+    // Atomic rename from temp to final path
+    std.Io.Dir.cwd().deleteFile(block_io, local_path) catch {};
+    try std.Io.Dir.cwd().rename(temp_path, std.Io.Dir.cwd(), local_path, block_io);
 
     std.debug.print("[download] Received {d} bytes -> {s}\n", .{ total_bytes, local_path });
 }
@@ -385,6 +440,7 @@ fn startHttpHost(
     hosts_path: []const u8,
     serve_dir: ?[]const u8,
     peer_mesh: ?[]const u8,
+    shutdown: ?*std.atomic.Value(bool),
 ) !void {
     _ = hosts_path;
 
@@ -483,7 +539,7 @@ fn startHttpHost(
 
         // Build node_info for LSA
         const node_info = std.fmt.allocPrint(gpa,
-            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}",
+            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:host\nstatus:serving",
             .{ host_info.hostname, host_info.ip, host_info.target, protocol.VERSION, host_info.shell },
         ) catch |err| {
             std.log.err("[host] Mesh node_info alloc: {}", .{err});
@@ -534,7 +590,7 @@ fn startHttpHost(
     tun_mgr_thread.detach();
 
     // Block forever in HTTP accept loop
-    try httpd.serve(block_io, gpa, &router, &state, port);
+    try httpd.serve(block_io, gpa, &router, &state, port, shutdown);
 }
 
 /// Parse a simple key:value line from LSA node_info.
@@ -561,15 +617,18 @@ fn tunnelManager(
 
         // Phase 1: Sync LSA nodes → guest table
         if (mesh_opt.*) |*m| {
-            // NOTE: iterating m.lsas from a non-mesh thread has a benign race
-            // with mesh.run() adding LSA entries. In practice, entries are
-            // added during initial LSA exchange and rarely modified thereafter.
+            // NOTE: iterating m.lsas from a non-mesh thread has a race
+            // with mesh.run() replacing LSA entries (e.g. upgrade restart).
+            // Duplicate node_info + node_id to avoid use-after-free.
             var lsa_it = m.lsas.iterator();
             while (lsa_it.next()) |entry| {
                 const lsa = entry.value_ptr.*;
+                const saved_node_info = allocator.dupe(u8, lsa.node_info) catch continue;
+                defer allocator.free(saved_node_info);
+                const saved_node_id: mesh_mod.NodeId = entry.key_ptr.*;
 
                 // Skip self (Host node)
-                if (std.mem.eql(u8, &entry.key_ptr.*, &m.node_id)) continue;
+                if (std.mem.eql(u8, &saved_node_id, &m.node_id)) continue;
 
                 // Parse guest info from LSA node_info string
                 var hostname: []const u8 = "";
@@ -578,28 +637,34 @@ fn tunnelManager(
                 var version: []const u8 = "";
                 var shell: []const u8 = "";
                 var mac_str: []const u8 = "";
+                var status: []const u8 = "";
+                var role: []const u8 = "";
 
-                var line_it = std.mem.splitScalar(u8, lsa.node_info, '\n');
+                var line_it = std.mem.splitScalar(u8, saved_node_info, '\n');
                 while (line_it.next()) |line| {
                     if (parseNodeInfoLine(line, "hostname")) |v| hostname = v;
                     if (parseNodeInfoLine(line, "ip")) |v| ip = v;
                     if (parseNodeInfoLine(line, "target")) |v| target = v;
                     if (parseNodeInfoLine(line, "version")) |v| version = v;
                     if (parseNodeInfoLine(line, "shell")) |v| shell = v;
+                    if (parseNodeInfoLine(line, "status")) |v| status = v;
+                    if (parseNodeInfoLine(line, "role")) |v| role = v;
                 }
+
+                // Only process Guest nodes (skip other Host instances)
+                if (std.mem.eql(u8, role, "host")) continue;
 
                 if (hostname.len == 0 or ip.len == 0) continue;
 
                 // Convert mesh NodeId to MAC string
-                const node_bytes = entry.key_ptr.*;
                 mac_str = std.fmt.allocPrint(allocator, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
-                    node_bytes[0], node_bytes[1], node_bytes[2],
-                    node_bytes[3], node_bytes[4], node_bytes[5],
+                    saved_node_id[0], saved_node_id[1], saved_node_id[2],
+                    saved_node_id[3], saved_node_id[4], saved_node_id[5],
                 }) catch continue;
                 defer allocator.free(mac_str);
 
                 // Upsert to guest table
-                const changed = state.upsertGuest(hostname, ip, target, mac_str, version, shell);
+                const changed = state.upsertGuest(hostname, ip, target, mac_str, version, shell, status);
                 if (changed and hostname.len > 0) {
                     host_http.syncHostsFromState(state, allocator);
                 }
@@ -608,16 +673,62 @@ fn tunnelManager(
                 // Uses state.getGuestTunnel() as the sole source of truth —
                 // when handleMeshGuest disconnects, its defer calls
                 // removeGuestTunnel, and the next scan reconnects.
-                if (state.getGuestTunnel(hostname) == null) {
-                    // Close stale session first — KCP seq numbers are reset on
-                    // reconnect, and the old session's rcv_nxt won't accept new data.
-                    m.closeSessionFor(entry.key_ptr.*);
-                    const sess = m.connect(entry.key_ptr.*) catch |err| {
-                        std.log.err("[tun-mgr] connect to {s} failed: {} (will retry)", .{ hostname, err });
-                        continue;
-                    };
+                //
+                // When status changes to "upgrading" (utmm-old takes over),
+                // force-replace the old tunnel immediately instead of waiting
+                // for KCP keepalive timeout on the dead Guest connection.
+                //
+                // For upgrading guests: prefer a Guest-initiated session (created
+                // via the Guest's m.connect()) over creating a new Host-initiated
+                // session. This avoids the dual-session mismatch that causes
+                // tunnel death during file transfer.
+                const upgrading = std.mem.eql(u8, status, "upgrading");
+                const existing_tun = state.getGuestTunnel(hostname);
+                const status_just_changed = changed and upgrading;
+                const tun_dead = existing_tun != null and !existing_tun.?.isAlive();
+                if (existing_tun == null or tun_dead or status_just_changed) {
+                    if (existing_tun != null) {
+                        std.log.info("[tun-mgr] {s} tunnel replace (dead={}, upgrading={})", .{ hostname, tun_dead, status_just_changed });
+                        state.removeGuestTunnel(hostname);
+                    }
+
+                    // For upgrading guests: ONLY use Guest-initiated sessions
+                    // that have pending data from the Guest (upgrade_req).
+                    // Old sessions from the previous Guest instance may still
+                    // be in the table but have no data — skip those.
+                    var sess: ?*mesh_mod.MeshSession = null;
+                    if (upgrading) {
+                        m.sessions_mutex.lock(m.io) catch continue;
+                        defer m.sessions_mutex.unlock(m.io);
+
+                        // Search for session with pending data from the Guest
+                        var s_it = m.sessions.iterator();
+                        while (s_it.next()) |s_entry| {
+                            if (std.mem.eql(u8, &s_entry.value_ptr.*.remote, &saved_node_id)) {
+                                if (s_entry.value_ptr.*.kcp_inst.peekSize() >= 0) {
+                                    sess = s_entry.value_ptr.*;
+                                    std.log.info("[tun-mgr] {s} using guest-initiated session conv={d} (data pending)", .{ hostname, s_entry.key_ptr.* });
+                                    break;
+                                }
+                                // Session exists but no data — stale, skip it
+                                std.log.info("[tun-mgr] {s} skipping stale session conv={d} (no data)", .{ hostname, s_entry.key_ptr.* });
+                            }
+                        }
+
+                        // If no Guest-initiated session with data, skip tunnel
+                        // creation and wait for the next scan cycle.
+                        if (sess == null) {
+                            continue;
+                        }
+                    } else {
+                        // Non-upgrading guests: create Host-initiated session
+                        sess = m.connect(saved_node_id) catch |err| {
+                            std.log.err("[tun-mgr] connect to {s} failed: {} (will retry)", .{ hostname, err });
+                            continue;
+                        };
+                    }
                     const tun_ptr = allocator.create(tunnel_mod.Tunnel) catch continue;
-                    tun_ptr.* = tunnel_mod.Tunnel.init(allocator, m.io, sess);
+                    tun_ptr.* = tunnel_mod.Tunnel.init(allocator, m.io, sess.?);
 
                     // Register with HostState
                     state.registerGuestTunnel(hostname, tun_ptr) catch |err| {
@@ -643,9 +754,6 @@ fn tunnelManager(
                         continue;
                     };
                     t.detach();
-
-                    // Note: handleMeshGuest's defer frees hostname_dup on disconnect.
-                    // When it calls removeGuestTunnel, our next scan will re-connect.
 
                     std.log.info("[tun-mgr] Tunnel + handler started for {s}", .{hostname});
                 }

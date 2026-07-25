@@ -30,6 +30,7 @@ pub fn run(
     port: u16,
     mesh_port: u16,
     peer_mesh: ?[]const u8,
+    host_ip: ?[]const u8,
 ) !void {
     // Detect whether we're in an interactive terminal (TTY).
     // If not, we were likely launched by a service manager without --svc
@@ -60,9 +61,10 @@ pub fn run(
             .mesh_port = mesh_port,
             .peer_mesh = peer_mesh,
             .hostname = hostname_override,
+            .host_ip = host_ip,
             .is_svc = true,
         };
-        return guest.runWithIo(io, gpa, cli);
+        return guest.runWithIo(io, gpa, cli, null);
     }
 
     // ── Foreground mode (TTY) ────────────────────────────────────────────
@@ -93,8 +95,9 @@ pub fn run(
         .mesh_port = mesh_port,
         .peer_mesh = peer_mesh,
         .hostname = hostname_override,
+        .host_ip = host_ip,
     };
-    try guest.runWithIo(io, gpa, cli);
+    try guest.runWithIo(io, gpa, cli, null);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

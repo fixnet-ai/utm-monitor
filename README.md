@@ -146,28 +146,31 @@ utmm --version                     # Print version
 ## How It Works
 
 The Host runs an HTTP server on port 2121. Each Guest maintains a persistent
-WebSocket connection to the Host. The Host distributes commands to Guests and
-streams results back — HTTP handlers queue frames, WebSocket delivers them,
-pty sessions execute them.
+Mesh + KCP tunnel to the Host via UDP. LSA (Link State Advertisement) broadcasts
+handle topology discovery. The Host distributes commands to Guests and streams
+results back — HTTP handlers send frames through KCP tunnels, pty sessions execute.
 
 ```
-Guest (linuxvm)      ──WebSocket──┐
-Guest (macvm)        ──WebSocket──┤──→ Host HTTP :2121 ── MCP /mcp (AI agents)
-Guest (windowsvm)    ──WebSocket──┤                      ── CLI (--status, --exec)
-Guest (raspigw, LAN) ──WebSocket──┘                      ── Static files (/bin/)
-                         ┌── UDP broadcast discovery ────┘   (--status, any LAN machine)
-                         │   + periodic version broadcast (auto-upgrade trigger)
+Guest (linuxvm)      ──KCP/Mesh──┐
+Guest (macvm)        ──KCP/Mesh──┤──→ Host HTTP :2121 ── MCP /mcp (AI agents)
+Guest (windowsvm)    ──KCP/Mesh──┤                      ── CLI (--status, --exec)
+Guest (raspigw, LAN) ──KCP/Mesh──┘                      ── Static files (/bin/)
+                         ┌── LSA broadcast discovery ───┘   (topology + auto-upgrade trigger)
 ```
 
 - **Streaming exec**: output flows in real time via HTTP chunked encoding with
-  `x-exit-code` trailer. No JSON wrapping, no timeout. Upload/download use raw binary body.
-- **Auto-upgrade**: Host broadcasts version via UDP every 60s. Guest detects
-  mismatch, spawns `utmm-old` process to stop→download→replace→restart. Zero shell commands.
+  `x-exit-code` trailer. No JSON wrapping, no timeout. Upload/download use chunked
+  stream (8KB blocks) over KCP tunnel.
+- **Auto-upgrade**: Host broadcasts version in LSA every 2s. Guest detects
+  mismatch, spawns `utmm-old` process to stop→download 8KB chunks via KCP→SHA256
+  verify→replace→restart. Zero shell commands.
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
-- **Single port**: HTTP + WebSocket + MCP + binary serving all on 2121
+- **Single HTTP port**: 2121 for MCP + CLI + static file serving; Mesh on separate UDP port
 - **Auto IP tracking**: Host syncs Guest IPs to `/etc/hosts` — hostnames always resolve
 - **Cross-platform**: macOS, Linux, Windows — both Host and Guest (aarch64, x86_64, x86 32-bit)
 - **Persistent shell session**: shell state survives across `--exec` calls (pty model)
+- **Reliable transport**: KCP ARQ protocol matching C reference — sliding window,
+  congestion control, fast retransmit, window probing
 
 ## Docs
 

@@ -754,6 +754,14 @@ fn ptySpawnWindows(allocator: std.mem.Allocator) !PtySession {
         *const fn (lpApplicationName: ?[*:0]const u16, lpCommandLine: [*:0]u16, lpProcessAttributes: ?*w.SECURITY_ATTRIBUTES, lpThreadAttributes: ?*w.SECURITY_ATTRIBUTES, bInheritHandles: BOOL, dwCreationFlags: DWORD, lpEnvironment: ?LPVOID, lpCurrentDirectory: ?[*:0]const u16, lpStartupInfo: *w.STARTUPINFOW, lpProcessInformation: *PROCESS_INFORMATION) callconv(.winapi) BOOL,
         .{ .name = "CreateProcessW", .library_name = "kernel32" },
     );
+    const SetConsoleOutputCP = @extern(
+        *const fn (wCodePageID: w.UINT) callconv(.winapi) w.BOOL,
+        .{ .name = "SetConsoleOutputCP", .library_name = "kernel32" },
+    );
+    const SetConsoleCP_ext = @extern(
+        *const fn (wCodePageID: w.UINT) callconv(.winapi) w.BOOL,
+        .{ .name = "SetConsoleCP", .library_name = "kernel32" },
+    );
 
     const HANDLE_FLAG_INHERIT: DWORD = 1;
 
@@ -791,9 +799,15 @@ fn ptySpawnWindows(allocator: std.mem.Allocator) !PtySession {
 
     var pi: PROCESS_INFORMATION = undefined;
 
+    // Best-effort: set UTF-8 code page on our console BEFORE spawning cmd.exe.
+    // If utmm runs as a service (no console), these calls fail silently and
+    // we rely on the "chcp 65001" in the cmd command line below instead.
+    _ = SetConsoleOutputCP(65001);
+    _ = SetConsoleCP_ext(65001);
+
     // Convert UTF-8 command line to null-terminated UTF-16LE for CreateProcessW.
     // std.unicode.utf8ToUtf16LeWithNull was removed in Zig 0.16.0.
-    const cmd_u8 = "cmd.exe /k";
+    const cmd_u8 = "cmd.exe /k chcp 65001 >nul & set LANG=en_US.UTF-8";
     const cmd_utf16 = try allocator.alloc(u16, cmd_u8.len + 1); // +1 for null
     defer allocator.free(cmd_utf16);
     const end_idx = try std.unicode.utf8ToUtf16Le(cmd_utf16, cmd_u8);
@@ -807,12 +821,12 @@ fn ptySpawnWindows(allocator: std.mem.Allocator) !PtySession {
     _ = CloseHandle(stdin_read);
     _ = CloseHandle(stdout_write);
 
-    std.log.info("[guest-pty] Windows pipe pty: cmd.exe /k pid={d}", .{pi.dwProcessId});
+    std.log.info("[guest-pty] Windows pipe pty: cmd.exe /k (UTF-8) pid={d}", .{pi.dwProcessId});
 
     return PtySession{
         .master_fd = stdout_read,
         .child_pid = pi.hProcess,
-        .shell = try allocator.dupe(u8, "cmd.exe /k"),
+        .shell = try allocator.dupe(u8, "cmd.exe /k chcp 65001 >nul & set LANG=en_US.UTF-8"),
         .stdin_fd = stdin_write,
     };
 }
@@ -874,10 +888,16 @@ fn ptyReadLoop(
         cmd_mutex.unlock(io);
         defer allocator.free(cmd_owned);
 
-        // Send pty_exec_output frame via tunnel
+        // Send pty_exec_output frame via tunnel with immediate flush.
+        // On Windows, the mesh loop uses blocking receive() without timeout,
+        // so periodicTasks (which normally flushes KCP) only runs when a
+        // packet arrives. Without immediate flush, output data would sit in
+        // KCP snd_queue until the next incoming packet (up to 5s delay).
+        // sendAndFlush() triggers kcp.update() which calls the output callback
+        // to transmit queued segments via UDP immediately.
         const frame = tunproto.buildPtyExecOutput(allocator, cmd_owned, buf[0..n]) catch continue;
         defer allocator.free(frame);
-        _ = tun.send(frame) catch |err| {
+        _ = tun.sendAndFlush(frame, tun.session.mesh.clock_ms) catch |err| {
             std.log.err("[guest-pty] pty_exec_output send error: {}", .{err});
             break;
         };
@@ -922,6 +942,7 @@ pub fn meshSessionLoop(
     upgrade: *UpgradeSignal,
     mesh_port: u16,
     peer_mesh: ?[]const u8,
+    shutdown: ?*std.atomic.Value(bool),
 ) !void {
     // Extract Host IP from host_url for LSA version check filtering.
     // host_url format: "http://IP:PORT" — strip to just the IP.
@@ -993,7 +1014,7 @@ pub fn meshSessionLoop(
 
         // Build node_info string for LSA broadcast
         const node_info = std.fmt.allocPrint(allocator,
-            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}",
+            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:serving",
             .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
         ) catch |err| {
             std.log.err("[guest-mesh] Mesh node_info alloc failed: {}", .{err});
@@ -1040,8 +1061,21 @@ pub fn meshSessionLoop(
         return error.MeshInitFailed;
     }
 
+    // Helper: check shutdown flag without namespace-qualifying the type
+    const checkShutdown = struct {
+        fn check(s: ?*std.atomic.Value(bool)) bool {
+            if (s) |ptr| return ptr.load(.acquire);
+            return false;
+        }
+    }.check;
+
     // Main loop: wait for Host tunnel, process commands, handle reconnect.
     while (true) {
+        if (checkShutdown(shutdown)) {
+            std.log.info("[guest-mesh] Shutdown requested, exiting", .{});
+            break;
+        }
+
         // Wait for Host to establish a KCP tunnel and send pty_spawn
         var tunnel = waitForHostTunnel(io, allocator, &mesh_opt) catch |err| {
             std.log.err("[guest-mesh] waitForHostTunnel failed: {}", .{err});
@@ -1052,6 +1086,7 @@ pub fn meshSessionLoop(
         const spawn_ok = blk: {
             var rbuf: [4096]u8 = undefined;
             while (true) {
+                if (checkShutdown(shutdown)) break :blk false;
                 const n = tunnel.recv(&rbuf) catch |err| {
                     std.log.err("[guest-mesh] pty_spawn recv error: {}", .{err});
                     break :blk false;
@@ -1111,23 +1146,30 @@ pub fn meshSessionLoop(
 
         std.log.info("[guest-mesh] Pty session started, entering command loop", .{});
 
-        // Command dispatch loop
-        var rbuf: [65536]u8 = undefined;
+        // Command dispatch loop — uses 256KB fixed buffer.
+        // File transfers (upload/download/upgrade) use chunked protocol:
+        // upload_cmd + file_chunk × N + file_eof, avoiding full-file buffering.
+        var rbuf: [262144]u8 = undefined;
         while (!pty_dead.load(.acquire)) {
+            // Check Windows service shutdown signal before blocking recv.
+            if (checkShutdown(shutdown)) {
+                std.log.info("[guest-mesh] Shutdown requested, exiting command loop", .{});
+                break;
+            }
+
             // Check auto-upgrade signal before blocking recv.
-            // Skip when peer_mesh is set (local testing mode — network LSAs
-            // from other machines may have version mismatches unrelated to us).
-            if (peer_mesh == null and upgrade.needed.load(.acquire)) {
-                std.log.info("[upgrade] Version mismatch, triggering self-upgrade", .{});
-                const gw = getDefaultGateway(io, allocator) catch "192.168.64.1";
-                defer if (!std.mem.eql(u8, gw, "192.168.64.1")) allocator.free(gw);
-                const bin_name = protocol.deploymentFilename(info.target) orelse "utmm";
-                const upgrade_url = std.fmt.allocPrint(allocator,
-                    "http://{s}:{d}/bin/{s}", .{ gw, protocol.DEFAULT_PORT, bin_name }) catch break;
-                defer allocator.free(upgrade_url);
-                triggerSelfUpgrade(io, allocator, upgrade_url) catch |err| {
-                    std.log.err("[upgrade] triggerSelfUpgrade failed: {}", .{err});
+            // When peer_mesh is set, also check version mismatch (local dual-port testing).
+            if (upgrade.needed.load(.acquire)) {
+                std.log.info("[upgrade] Version mismatch, initiating utmm-old upgrade", .{});
+                performUpgrade(io, allocator, &tunnel, info.target, mesh_port, peer_mesh) catch |err| {
+                    std.log.err("[upgrade] performUpgrade failed: {}", .{err});
+                    upgrade.needed.store(false, .release);
                 };
+                break;
+            }
+
+            if (!tunnel.isAlive()) {
+                std.log.info("[guest-mesh] Tunnel dead (keepalive), reconnecting", .{});
                 break;
             }
 
@@ -1135,14 +1177,7 @@ pub fn meshSessionLoop(
                 std.log.err("[guest-mesh] tunnel recv error: {}", .{err});
                 break;
             };
-            if (n == 0) {
-                // No data yet — normal KCP idle. Keepalive in mesh.zig
-                // handles dead connection detection (5s idle → probe every
-                // 5s → 3 unanswered → dead flag set).
-                if (!tunnel.isAlive()) {
-                    std.log.info("[guest-mesh] Tunnel dead (keepalive), reconnecting", .{});
-                    break;
-                }
+            if (n == 0 or rbuf[0] == 0) {
                 std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
                 continue;
             }
@@ -1169,43 +1204,33 @@ pub fn meshSessionLoop(
                         ptyWrite(&pty, input.command);
                     }
                 },
-                @intFromEnum(tunproto.MsgType.upload_data) => {
-                    if (tunproto.parseUploadData(payload)) |req| {
-                        std.log.debug("[guest-mesh] Upload: {s} ({d} bytes)", .{ req.path, req.file_data.len });
-                        const exit_code: i32 = writeFile(io, allocator, req.path, req.file_data) catch |err2| blk2: {
-                            std.log.err("[guest-mesh] Upload write failed: {}", .{err2});
-                            break :blk2 -1;
-                        };
-                        const resp = tunproto.buildUploadResult(allocator, req.cmd_id, exit_code) catch |err2| {
-                            std.log.err("[guest-mesh] buildUploadResult failed: {}", .{err2});
-                            continue;
-                        };
-                        defer allocator.free(resp);
-                        _ = tunnel.send(resp) catch |e| {
-                            std.log.err("[guest-mesh] upload_result send failed: {}", .{e});
+                @intFromEnum(tunproto.MsgType.upload_cmd) => {
+                    if (tunproto.parseUploadCmd(payload)) |cmd| {
+                        std.log.debug("[guest-mesh] Upload cmd: {s} ({d} bytes, hash={s})", .{ cmd.path, cmd.file_size, cmd.file_hash });
+                        receiveChunkedFile(io, allocator, &tunnel, cmd.cmd_id, cmd.path, cmd.file_hash) catch |e| {
+                            std.log.err("[guest-mesh] Upload receive failed: {}", .{e});
+                            const resp = tunproto.buildUploadResult(allocator, cmd.cmd_id, -1) catch continue;
+                            defer allocator.free(resp);
+                            _ = tunnel.sendAndFlush(resp, tunnel.session.mesh.clock_ms) catch {};
                         };
                     }
                 },
                 @intFromEnum(tunproto.MsgType.download_cmd) => {
-                    if (tunproto.parseDownloadCmd(payload)) |req| {
-                        std.log.debug("[guest-mesh] Download: {s}", .{req.path});
-                        const file_content = readFileContent(io, allocator, req.path) catch |err2| {
-                            std.log.err("[guest-mesh] Download read failed: {}", .{err2});
-                            const err_resp = tunproto.buildDownloadResult(allocator, req.cmd_id, -1, "") catch continue;
-                            defer allocator.free(err_resp);
-                            _ = tunnel.send(err_resp) catch {};
-                            continue;
-                        };
-                        defer allocator.free(file_content);
-                        const resp = tunproto.buildDownloadResult(allocator, req.cmd_id, 0, file_content) catch |err2| {
-                            std.log.err("[guest-mesh] buildDownloadResult failed: {}", .{err2});
-                            continue;
-                        };
-                        defer allocator.free(resp);
-                        _ = tunnel.send(resp) catch |e| {
-                            std.log.err("[guest-mesh] download_result send failed: {}", .{e});
+                    if (tunproto.parseDownloadCmd(payload)) |cmd| {
+                        std.log.debug("[guest-mesh] Download cmd: {s}", .{cmd.path});
+                        sendChunkedFile(io, allocator, &tunnel, cmd.cmd_id, cmd.path) catch |e| {
+                            std.log.err("[guest-mesh] Download send failed: {}", .{e});
+                            const eof = tunproto.buildFileEof(allocator, cmd.cmd_id, -1, 0, "") catch continue;
+                            defer allocator.free(eof);
+                            _ = tunnel.sendAndFlush(eof, tunnel.session.mesh.clock_ms) catch {};
                         };
                     }
+                },
+                @intFromEnum(tunproto.MsgType.file_chunk) => {
+                    std.log.debug("[guest-mesh] Unexpected file_chunk in command loop (ignored)", .{});
+                },
+                @intFromEnum(tunproto.MsgType.file_eof) => {
+                    std.log.debug("[guest-mesh] Unexpected file_eof in command loop (ignored)", .{});
                 },
                 else => {
                     std.log.debug("[guest-mesh] Unknown msg type: {d}", .{msg_type});
@@ -1231,7 +1256,7 @@ fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_
                     const peek = sess.kcp_inst.peekSize();
                     if (peek > 0) {
                         m.sessions_mutex.unlock(m.io);
-                        return tunnel_mod.Tunnel.init(allocator, io, sess);
+                        return tunnel_mod.Tunnel.init(allocator, m.io, sess);
                     }
                 }
             }
@@ -1240,102 +1265,207 @@ fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
     }
 }
-/// Write data to file. Returns 0 on success, -1 on failure.
-fn writeFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, data: []const u8) !i32 {
-    _ = allocator;
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
+/// Convert 32-byte SHA256 hash to hex string. Caller owns returned string.
+pub fn hexHash(allocator: std.mem.Allocator, hash: *const [32]u8) ![]const u8 {
+    var hex: [64]u8 = undefined;
+    for (hash, 0..) |b, j| {
+        hex[j * 2] = "0123456789abcdef"[b >> 4];
+        hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    return try allocator.dupe(u8, &hex);
+}
+
+/// Receive a chunked file transfer (upload): create temp file, receive
+/// file_chunk messages and write incrementally, verify SHA256 on file_eof,
+/// rename temp → final, send upload_result.
+fn receiveChunkedFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    tun: *tunnel_mod.Tunnel,
+    cmd_id: []const u8,
+    dest_path: []const u8,
+    expected_hash: []const u8,
+) !void {
+    // Create temp file in the same directory as destination
+    const dirname = std.fs.path.dirname(dest_path) orelse ".";
+    const basename = std.fs.path.basename(dest_path);
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}/.utmm-tmp-{s}", .{ dirname, basename });
+    defer allocator.free(temp_path);
+
+    std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+    const temp_file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+    defer temp_file.close(io);
     var wb: [65536]u8 = undefined;
-    var writer = file.writer(io, &wb);
-    _ = try writer.interface.write(data);
-    try writer.interface.flush();
-    return 0;
-}
+    var writer = temp_file.writer(io, &wb);
 
-/// Read file content. Caller owns returned string.
-fn readFileContent(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, @enumFromInt(50 * 1024 * 1024));
-}
+    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
+    var received: u32 = 0;
 
-/// Copy current executable to utmm-old[.exe], launch it as a detached process
-/// with --update-url, then exit. The utmm-old process handles the actual upgrade.
-fn triggerSelfUpgrade(io: std.Io, allocator: std.mem.Allocator, upgrade_url: []const u8) !void {
-
-    // Get current executable path
-    var exe_buf: [4096]u8 = undefined;
-    const exe_len = try std.process.executablePath(io, &exe_buf);
-    const exe_path = exe_buf[0..exe_len];
-    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
-    const old_name = if (builtin.os.tag == .windows) "utmm-old.exe" else "utmm-old";
-    const old_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ exe_dir, old_name });
-    defer allocator.free(old_path);
-
-    std.log.info("[upgrade] Copying self to {s}", .{old_path});
-
-    // Copy current exe to utmm-old (overwrite any previous copy)
-    const max_copy = 20 * 1024 * 1024;
-    const copy_buf = try allocator.alloc(u8, max_copy);
-    defer allocator.free(copy_buf);
-
-    var src = try std.Io.Dir.cwd().openFile(io, exe_path, .{});
-    defer src.close(io);
-
-    const exe_size = try src.readPositionalAll(io, copy_buf, 0);
-    if (exe_size >= max_copy) return error.BinaryTooLarge;
-
-    // Delete old utmm-old if exists, then create new and write copy
-    std.Io.Dir.cwd().deleteFile(io, old_path) catch {};
-    {
-        var dst = try std.Io.Dir.cwd().createFile(io, old_path, .{});
-        defer dst.close(io);
-        try dst.writeStreamingAll(io, copy_buf[0..exe_size]);
-    }
-    // dst is now closed — file handle released before spawn
-
-    // chmod +x on POSIX (direct syscall, no shell)
-    if (builtin.os.tag != .windows) {
-        const chmod_rc = std.c.chmod(@ptrCast(old_path), 0o755);
-        if (chmod_rc != 0) {
-            std.log.err("[upgrade] chmod failed: errno={}", .{std.c._errno().*});
-            return error.ChmodFailed;
+    // Inner loop: receive file_chunk + file_eof
+    var rbuf: [262144]u8 = undefined;
+    while (true) {
+        if (!tun.isAlive()) {
+            return error.TunnelDeadDuringUpload;
         }
-    }
 
-    // Launch utmm-old as detached process
-    std.log.info("[upgrade] Launching utmm-old with url={s}", .{upgrade_url});
-
-    if (builtin.os.tag == .windows) {
-        // Use std.process.spawn for proper detached process launch
-        _ = std.process.spawn(io, .{
-            .argv = &.{ old_path, "--update-url", upgrade_url },
-        }) catch |err| {
-            std.log.err("[upgrade] Failed to launch utmm-old: {}", .{err});
-            return error.LaunchFailed;
+        const n = tun.recv(&rbuf) catch |err| {
+            std.log.err("[guest-mesh] Chunk recv error: {}", .{err});
+            return err;
         };
-    } else {
-        // POSIX: fork + setsid + execve — detached background process
-        const old_path_z = try allocator.dupeZ(u8, old_path);
-        defer allocator.free(old_path_z);
-        const upgrade_url_z = try allocator.dupeZ(u8, upgrade_url);
-        defer allocator.free(upgrade_url_z);
+        if (n == 0) continue;
 
-        const pid = fork();
-        if (pid == 0) {
-            // Child: detach from parent session
-            _ = setsid();
+        const msg_type: u8 = rbuf[0];
+        const payload = rbuf[1..n];
 
-            const argv = [_:null]?[*:0]const u8{ old_path_z.ptr, "--update-url", upgrade_url_z.ptr };
-            _ = execve(old_path_z.ptr, &argv, std.c.environ);
-            // execve failed
-            std.process.exit(1);
-        } else if (pid < 0) {
-            std.log.err("[upgrade] fork failed", .{});
-            return error.LaunchFailed;
+        switch (msg_type) {
+            @intFromEnum(tunproto.MsgType.file_chunk) => {
+                const chunk = tunproto.parseFileChunk(payload) orelse {
+                    std.log.err("[guest-mesh] Failed to parse file_chunk", .{});
+                    return error.ParseFailed;
+                };
+                if (!std.mem.eql(u8, chunk.cmd_id, cmd_id)) {
+                    std.log.debug("[guest-mesh] Ignoring file_chunk for other cmd_id: {s}", .{chunk.cmd_id});
+                    continue;
+                }
+
+                _ = writer.interface.write(chunk.data) catch |e| {
+                    std.log.err("[guest-mesh] Write chunk failed: {}", .{e});
+                    return error.WriteFailed;
+                };
+                sha256.update(chunk.data);
+                received += @intCast(chunk.data.len);
+            },
+            @intFromEnum(tunproto.MsgType.file_eof) => {
+                const eof = tunproto.parseFileEof(payload) orelse {
+                    std.log.err("[guest-mesh] Failed to parse file_eof", .{});
+                    return error.ParseFailed;
+                };
+                if (!std.mem.eql(u8, eof.cmd_id, cmd_id)) {
+                    std.log.debug("[guest-mesh] Ignoring file_eof for other cmd_id: {s}", .{eof.cmd_id});
+                    continue;
+                }
+
+                writer.interface.flush() catch {};
+
+                // Verify SHA256 (incremental: sha256.update per chunk, final here)
+                var hash: [32]u8 = undefined;
+                sha256.final(&hash);
+                const actual_hex = try hexHash(allocator, &hash);
+                defer allocator.free(actual_hex);
+
+                if (expected_hash.len > 0 and !std.mem.eql(u8, actual_hex, expected_hash)) {
+                    std.log.err("[guest-mesh] Upload hash mismatch: got {s}, expected {s}", .{ actual_hex, expected_hash });
+                    const resp = try tunproto.buildUploadResult(allocator, cmd_id, -1);
+                    defer allocator.free(resp);
+                    _ = tun.sendAndFlush(resp, tun.session.mesh.clock_ms) catch {};
+                    return error.HashMismatch;
+                }
+
+                std.log.debug("[guest-mesh] Upload hash verified: {s}", .{actual_hex});
+
+                // Atomic rename from temp to final path
+                try std.Io.Dir.cwd().rename(temp_path, std.Io.Dir.cwd(), dest_path, io);
+                std.log.info("[guest-mesh] Upload complete: {s} ({d} bytes)", .{ dest_path, received });
+
+                const resp = try tunproto.buildUploadResult(allocator, cmd_id, 0);
+                defer allocator.free(resp);
+                _ = tun.sendAndFlush(resp, tun.session.mesh.clock_ms) catch |e| {
+                    std.log.err("[guest-mesh] upload_result send failed: {}", .{e});
+                };
+                return;
+            },
+            @intFromEnum(tunproto.MsgType.pty_exec_input) => {
+                // pty commands may arrive during file transfer — ignore them;
+                // the Host should serialize file transfers and exec commands.
+                std.log.debug("[guest-mesh] Ignoring pty_exec_input during chunked receive", .{});
+                continue;
+            },
+            else => {
+                std.log.debug("[guest-mesh] Ignoring msg type {d} during chunked receive", .{msg_type});
+                continue;
+            },
         }
-        // Parent: child runs independently, continue
+    }
+}
+
+/// Send a file as chunked transfer (download): open file, read 8KB chunks,
+/// send as file_chunk messages with incremental SHA256, finish with file_eof.
+fn sendChunkedFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    tun: *tunnel_mod.Tunnel,
+    cmd_id: []const u8,
+    path: []const u8,
+) !void {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+        std.log.err("[guest-mesh] Download open failed: {}", .{err});
+        const eof = try tunproto.buildFileEof(allocator, cmd_id, -1, 0, "");
+        defer allocator.free(eof);
+        _ = tun.sendAndFlush(eof, tun.session.mesh.clock_ms) catch {};
+        return;
+    };
+    defer file.close(io);
+
+    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
+    var total: u32 = 0;
+    var chunk_buf: [8192]u8 = undefined;
+    var file_read_buf: [8192]u8 = undefined;
+    var file_reader = file.reader(io, &file_read_buf);
+
+    while (true) {
+        const n = file_reader.interface.readSliceShort(&chunk_buf) catch |err2| {
+            std.log.err("[guest-mesh] Download read error: {}", .{err2});
+            const eof = try tunproto.buildFileEof(allocator, cmd_id, -1, 0, "");
+            defer allocator.free(eof);
+            _ = tun.sendAndFlush(eof, tun.session.mesh.clock_ms) catch {};
+            return err2;
+        };
+        if (n == 0) break; // EOF
+
+        sha256.update(chunk_buf[0..n]);
+
+        const chunk = try tunproto.buildFileChunk(allocator, cmd_id, chunk_buf[0..n]);
+        defer allocator.free(chunk);
+        _ = tun.send(chunk) catch |e| {
+            std.log.err("[guest-mesh] file_chunk send failed: {}", .{e});
+            return e;
+        };
+        total += @intCast(n);
     }
 
+    // Build hash and send file_eof
+    var hash: [32]u8 = undefined;
+    sha256.final(&hash);
+    const hex = try hexHash(allocator, &hash);
+    defer allocator.free(hex);
+
+    std.log.info("[guest-mesh] Download complete: {s} ({d} bytes, sha256={s})", .{ path, total, hex });
+
+    const eof = try tunproto.buildFileEof(allocator, cmd_id, 0, total, hex);
+    defer allocator.free(eof);
+    _ = tun.sendAndFlush(eof, tun.session.mesh.clock_ms) catch |e| {
+        std.log.err("[guest-mesh] file_eof send failed: {}", .{e});
+    };
+}
+
+/// Auto-upgrade via utmm-old detached bootstrap.
+/// Spawns a detached child process (utmm-old) that stops the service,
+/// downloads the new binary via mesh KCP tunnel, replaces it, and restarts.
+/// After spawning, this process exits — the child outlives it.
+fn performUpgrade(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    tun: *tunnel_mod.Tunnel,
+    target: []const u8,
+    mesh_port: u16,
+    peer_mesh: ?[]const u8,
+) !void {
+    _ = tun;
+    const upgrade = @import("upgrade.zig");
+    try upgrade.spawnDetachedUpgrader(io, allocator, target, mesh_port, peer_mesh);
+    std.log.info("[upgrade] utmm-old spawned — exiting for upgrade", .{});
     std.process.exit(0);
 }
+
 
 test "getSubnetBroadcasts - signature" { _ = getSubnetBroadcasts; }

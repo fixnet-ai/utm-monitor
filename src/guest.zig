@@ -10,11 +10,14 @@ const broadcast = @import("broadcast.zig");
 
 /// Guest mode entry point (from std.process.Init)
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
-    return runWithIo(init.io, init.gpa, cli);
+    return runWithIo(init.io, init.gpa, cli, null);
 }
 
 /// Guest mode entry point (called from Windows service or direct process start).
-pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs) !void {
+/// shutdown is an optional atomic flag — when set (Windows service stop), the
+/// mesh session loop exits cleanly so the SCM receives STOPPED instead of a
+/// broken pipe error.
+pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
     // Collect system information (sync, uses blocking Io for process.run etc.)
     var sysinfo = try broadcast.getSystemInfo(io, gpa);
     defer {
@@ -58,5 +61,5 @@ pub fn runWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").Cl
     // UpgradeSignal allows mesh LSA version check to signal the main loop
     // when a version mismatch is detected from Host broadcast.
     var upgrade_signal = broadcast.UpgradeSignal{};
-    try broadcast.meshSessionLoop(io, gpa, sysinfo, host_url, &upgrade_signal, cli.mesh_port, cli.peer_mesh);
+    try broadcast.meshSessionLoop(io, gpa, sysinfo, host_url, &upgrade_signal, cli.mesh_port, cli.peer_mesh, shutdown);
 }

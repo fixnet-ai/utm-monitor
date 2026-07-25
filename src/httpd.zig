@@ -79,6 +79,7 @@ pub const GuestEntry = struct {
     mac: []const u8,
     version: []const u8,
     shell: []const u8,
+    status: []const u8, // "serving" | "upgrading" | "" (from LSA, for upgrade tracking)
     last_seen: i64, // monotonic milliseconds timestamp
     mesh_mac: ?[6]u8 = null, // parsed MAC for mesh routing (v0.10.0+)
 };
@@ -90,6 +91,19 @@ pub const OpState = struct {
     done: bool = false,
     /// Bytes already sent to streaming HTTP response.
     sent_pos: usize = 0,
+    /// File metadata from file_eof (for x-file-hash/x-file-size trailers).
+    file_hash: []const u8 = "",
+    file_size_meta: u32 = 0,
+};
+
+/// Tracks an in-flight file transfer for singleton deduplication.
+/// Key format: "<vm>:<path>" — destination path determines uniqueness,
+/// not who initiated the transfer. Upload and download to the same
+/// (vm, path) also share a key (they can't sensibly run concurrently).
+pub const TransferState = struct {
+    cmd_id: []const u8,
+    file_size: u32,
+    bytes_transferred: u32 = 0,
 };
 
 pub const HostState = struct {
@@ -102,6 +116,9 @@ pub const HostState = struct {
     /// Operation state tracking: cmd_id → OpState.
     /// Used by exec/upload/download to track completion.
     op_states: std.StringHashMap(OpState),
+    /// Transfer state tracking: transfer_key → TransferState.
+    /// Used for upload/download singleton deduplication.
+    transfers: std.StringHashMap(TransferState),
     /// Wake event: set when any OpState completes (marker found or completeOpState called).
     /// HTTP/MCP handlers wait on this instead of busy-polling takeOpResult.
     wake_event: std.Io.Event = .unset,
@@ -121,6 +138,7 @@ pub const HostState = struct {
             .guests = .empty,
             .guest_tunnels = std.StringHashMap(*tunnel_mod.Tunnel).init(allocator),
             .op_states = std.StringHashMap(OpState).init(allocator),
+            .transfers = std.StringHashMap(TransferState).init(allocator),
             .allocator = allocator,
         };
     }
@@ -156,6 +174,16 @@ pub const HostState = struct {
             self.op_states.deinit();
         }
 
+        // Free transfers
+        {
+            var it = self.transfers.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.value_ptr.cmd_id);
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.transfers.deinit();
+        }
+
     }
 
     /// Find a guest by hostname. Returns index into guests.items or null.
@@ -173,7 +201,7 @@ pub const HostState = struct {
 
     /// Upsert a guest from announce data (caller must own the strings — they are duplicated).
     /// Returns true if this is a new guest or IP/target/version/shell changed.
-    pub fn upsertGuest(self: *HostState, hostname: []const u8, ip: []const u8, target: []const u8, mac: []const u8, version: []const u8, shell: []const u8) bool {
+    pub fn upsertGuest(self: *HostState, hostname: []const u8, ip: []const u8, target: []const u8, mac: []const u8, version: []const u8, shell: []const u8, status: []const u8) bool {
         self.mutex.lock(self.io.?) catch {};
         defer self.mutex.unlock(self.io.?);
 
@@ -186,6 +214,7 @@ pub const HostState = struct {
             if (!std.mem.eql(u8, existing.target, target)) changed = true;
             if (!std.mem.eql(u8, existing.version, version)) changed = true;
             if (!std.mem.eql(u8, existing.shell, shell)) changed = true;
+            if (!std.mem.eql(u8, existing.status, status)) changed = true;
 
             // Update fields (free old strings)
             if (!std.mem.eql(u8, existing.ip, ip)) {
@@ -204,6 +233,10 @@ pub const HostState = struct {
                 if (existing.shell.len > 0) self.allocator.free(existing.shell);
                 existing.shell = self.allocator.dupe(u8, shell) catch existing.shell;
             }
+            if (!std.mem.eql(u8, existing.status, status)) {
+                if (existing.status.len > 0) self.allocator.free(existing.status);
+                existing.status = self.allocator.dupe(u8, status) catch existing.status;
+            }
             existing.last_seen = now_ms;
             return changed;
         }
@@ -216,6 +249,7 @@ pub const HostState = struct {
             .mac = self.allocator.dupe(u8, mac) catch mac,
             .version = self.allocator.dupe(u8, version) catch version,
             .shell = if (shell.len > 0) self.allocator.dupe(u8, shell) catch shell else "",
+            .status = if (status.len > 0) self.allocator.dupe(u8, status) catch status else "",
             .last_seen = now_ms,
         }) catch return false;
         return true;
@@ -234,6 +268,7 @@ pub const HostState = struct {
         self.allocator.free(entry.mac);
         self.allocator.free(entry.version);
         if (entry.shell.len > 0) self.allocator.free(entry.shell);
+        if (entry.status.len > 0) self.allocator.free(entry.status);
     }
 
     /// Set the parsed mesh MAC for a guest (v0.10.0+ mesh support).
@@ -383,6 +418,17 @@ pub const HostState = struct {
         self.wake_event.set(self.io.?);
     }
 
+    /// Set file metadata on an op state (for download x-file-hash/x-file-size trailers).
+    pub fn setOpFileMeta(self: *HostState, cmd_id: []const u8, file_hash: []const u8, file_size_meta: u32) void {
+        self.mutex.lock(self.io.?) catch return;
+        defer self.mutex.unlock(self.io.?);
+
+        const op = self.op_states.getPtr(cmd_id) orelse return;
+        if (op.file_hash.len > 0) self.allocator.free(op.file_hash);
+        op.file_hash = if (file_hash.len > 0) self.allocator.dupe(u8, file_hash) catch "" else "";
+        op.file_size_meta = file_size_meta;
+    }
+
     /// Take the result of a completed operation. Returns null if not yet done.
     /// On success, removes the operation state. Caller owns stdout string.
     pub fn takeOpResult(self: *HostState, cmd_id: []const u8) ?struct { stdout: []const u8, exit: i32 } {
@@ -414,6 +460,57 @@ pub const HostState = struct {
         if (self.op_states.fetchRemove(cmd_id)) |kv| {
             var output = kv.value.output;
             output.deinit(self.allocator);
+            self.allocator.free(kv.key);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // Transfer state tracking (upload/download singleton dedup)
+    // ══════════════════════════════════════════════════════════
+
+    /// Look up an in-progress transfer by key. Returns null if not found.
+    /// Caller MUST hold mutex.
+    pub fn findTransfer(self: *HostState, key: []const u8) ?TransferState {
+        return self.transfers.get(key);
+    }
+
+    /// Register a new transfer. Caller MUST hold mutex.
+    pub fn registerTransfer(self: *HostState, key: []const u8, cmd_id: []const u8, file_size: u32) !void {
+        const gop = try self.transfers.getOrPut(key);
+        if (gop.found_existing) {
+            // Replace existing — free old cmd_id
+            self.allocator.free(gop.value_ptr.cmd_id);
+        } else {
+            gop.key_ptr.* = try self.allocator.dupe(u8, key);
+        }
+        gop.value_ptr.* = .{
+            .cmd_id = try self.allocator.dupe(u8, cmd_id),
+            .file_size = file_size,
+            .bytes_transferred = 0,
+        };
+    }
+
+    /// Update bytes_transferred for a transfer by cmd_id.
+    pub fn updateTransferProgress(self: *HostState, cmd_id: []const u8, bytes: u32) void {
+        var it = self.transfers.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.cmd_id, cmd_id)) {
+                entry.value_ptr.bytes_transferred = bytes;
+                if (entry.value_ptr.file_size == 0 and bytes > 0) {
+                    entry.value_ptr.file_size = bytes;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Remove a transfer by key. Safe to call on non-existent key.
+    pub fn removeTransfer(self: *HostState, key: []const u8) void {
+        self.mutex.lock(self.io.?) catch return;
+        defer self.mutex.unlock(self.io.?);
+
+        if (self.transfers.fetchRemove(key)) |kv| {
+            self.allocator.free(kv.value.cmd_id);
             self.allocator.free(kv.key);
         }
     }
@@ -532,6 +629,7 @@ pub fn serve(
     router: *Router,
     state: *HostState,
     port: u16,
+    shutdown: ?*std.atomic.Value(bool),
 ) !void {
     const addr = try std.Io.net.IpAddress.parse("0.0.0.0", port);
     var server = try addr.listen(io, .{ .reuse_address = true });
@@ -540,6 +638,14 @@ pub fn serve(
     std.log.info("[httpd] HTTP server on 0.0.0.0:{d}", .{port});
 
     while (true) {
+        // Check for Windows service shutdown before blocking on accept
+        if (shutdown) |s| {
+            if (s.load(.acquire)) {
+                std.log.info("[httpd] Shutdown requested, stopping accept loop", .{});
+                break;
+            }
+        }
+
         const stream = server.accept(io) catch |err| {
             std.log.err("[httpd] Accept error: {}", .{err});
             continue;

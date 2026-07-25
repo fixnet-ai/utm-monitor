@@ -33,7 +33,7 @@ pub const IKCP_DEAD_LINK: u32 = 20; // max retransmissions before dead link
 pub const IKCP_RTO_MIN: i32 = 100; // minimum RTO (ms)
 pub const IKCP_RTO_MAX: i32 = 60000; // maximum RTO (ms)
 pub const IKCP_RTO_DEFAULT: i32 = 200; // default RTO (ms)
-pub const IKCP_THRESH_INIT: u32 = 2; // slow start threshold
+pub const IKCP_THRESH_INIT: u32 = 64; // slow start threshold (set high for bulk transfer)
 pub const IKCP_THRESH_MIN: u32 = 2; // minimum slow start threshold
 pub const IKCP_PROBE_INIT: u32 = 7000; // window probe interval (ms)
 pub const IKCP_PROBE_LIMIT: u32 = 120000; // max probe interval before dead link
@@ -115,12 +115,15 @@ pub const Kcp = struct {
     snd_una: u32, // oldest unacknowledged sequence number
     snd_nxt: u32, // next sequence number to assign
     rcv_nxt: u32, // next expected receive sequence number
+    rmt_wnd: u32, // remote receive window size (from segment headers)
 
     // Timers and RTO
     ts_recent: u32, // most recent received timestamp
     ts_lastack: u32, // timestamp of last ack sent
     ts_probe: u32, // timestamp of last window probe
     probe_wait: u32, // window probe wait interval
+    ts_flush: u32, // timestamp of last flush (rate limiting)
+    probe: u32, // window probe flags: bit 0 = IKCP_ASK_SEND, bit 1 = IKCP_ASK_TELL
     ssthresh: u32, // slow start threshold
     rx_rttval: i32, // RTT variance
     rx_srtt: i32, // smoothed RTT
@@ -136,20 +139,20 @@ pub const Kcp = struct {
     // Receive buffer: received segments (in-order buffer)
     rcv_buf: std.ArrayList(Segment),
 
-    // Ack list: sequence numbers to acknowledge
-    acklist: std.ArrayList(u32),
+    // Ack list: (sn, ts) pairs for pending acknowledgments
+    acklist: std.ArrayList([2]u32),
 
     // Current time (monotonic milliseconds)
     current: u32,
 
-    // Buffer for recv reassembly
+    // Buffer for flush output (MTU * 3 for worst-case batching)
     buffer: ?[]u8,
 
     // Interval
     interval: u32,
-    next_update: u32, // ts_flush + interval
 
-    // Congestion control flags
+    // Congestion control
+    cwnd: u32, // congestion window (segments)
     nocwnd: bool, // no congestion window
     stream: bool, // stream mode (1 = stream, 0 = message/datagram)
 
@@ -162,6 +165,11 @@ pub const Kcp = struct {
     fastlimit: u32, // fast retransmit limit
     nodelay: bool, // nodelay mode (disable Nagle-like behavior)
     updated: bool, // has kcp_update been called
+
+    // Global retransmission counter (incremented on each timeout)
+    xmit: u32,
+    // Bytes acknowledged in this input call (for congestion control)
+    ackedlen: u32,
 
     // Output callback + user pointer
     output: ?OutputCallback,
@@ -183,10 +191,13 @@ pub const Kcp = struct {
             .snd_una = 0,
             .snd_nxt = 0,
             .rcv_nxt = 0,
+            .rmt_wnd = IKCP_WND_RCV,
             .ts_recent = 0,
             .ts_lastack = 0,
             .ts_probe = 0,
             .probe_wait = 0,
+            .ts_flush = 0,
+            .probe = 0,
             .ssthresh = IKCP_THRESH_INIT,
             .rx_rttval = 0,
             .rx_srtt = 0,
@@ -200,7 +211,7 @@ pub const Kcp = struct {
             .current = 0,
             .buffer = null,
             .interval = IKCP_INTERVAL,
-            .next_update = 0,
+            .cwnd = 0,
             .nocwnd = false,
             .stream = false,
             .dead_link = IKCP_DEAD_LINK,
@@ -209,6 +220,8 @@ pub const Kcp = struct {
             .fastlimit = IKCP_FAST_LIMIT,
             .nodelay = false,
             .updated = false,
+            .xmit = 0,
+            .ackedlen = 0,
             .output = null,
             .user = user,
             .allocator = allocator,
@@ -219,7 +232,6 @@ pub const Kcp = struct {
 
     /// Release all resources. Does NOT free the user pointer.
     pub fn release(self: *Kcp) void {
-        // Free owned data buffers in all queues
         for (self.snd_queue.items) |seg| {
             if (seg.data) |d| self.allocator.free(d);
         }
@@ -252,34 +264,41 @@ pub const Kcp = struct {
     // Configuration setters
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// Enable nodelay mode.
-    /// nodelay: 0=disable, 1=enable
-    /// interval: internal update interval in ms (default 100)
+    /// Enable nodelay mode. Matches ikcp_nodelay semantics exactly.
+    /// nodelay: 0=disable, 1=enable (reduces rx_minrto to IKCP_RTO_NDL)
+    /// interval: internal update interval in ms (default 100, clamped 10-5000)
     /// resend: fast retransmit threshold (0=disable, 2=typical)
     /// nc: 0=normal congestion, 1=no congestion control
     pub fn setNoDelay(self: *Kcp, nodelay: bool, interval: u32, resend: i32, nc: bool) void {
         if (nodelay) {
             self.nodelay = true;
-            if (interval > 0) self.interval = interval;
-            if (resend >= 0) self.fastresend = resend;
-            if (nc) self.nocwnd = true;
+            self.rx_minrto = 30; // IKCP_RTO_NDL
         } else {
             self.nodelay = false;
-            if (interval > 0) self.interval = interval;
-            self.fastresend = 0;
-            self.nocwnd = false;
+            self.rx_minrto = IKCP_RTO_MIN;
         }
+        if (interval > 0) {
+            self.interval = if (interval > 5000) 5000 else if (interval < 10) 10 else interval;
+        }
+        if (resend >= 0) {
+            self.fastresend = resend;
+        }
+        self.nocwnd = nc;
     }
 
-    /// Set MTU. mss is adjusted automatically.
+    /// Set MTU. mss is adjusted automatically. Allocates flush buffer.
     pub fn setMtu(self: *Kcp, mtu: u32) void {
-        if (mtu < 50) return; // minimum sensible MTU
+        if (mtu < 50 or mtu < IKCP_OVERHEAD) return;
         self.mtu = mtu;
         self.mss = mtu - IKCP_OVERHEAD;
+        // Re-allocate flush buffer (MTU * 3 for worst-case batching)
+        if (self.buffer) |buf| {
+            self.allocator.free(buf);
+        }
+        self.buffer = self.allocator.alloc(u8, (mtu + IKCP_OVERHEAD) * 3) catch null;
     }
 
-    /// Set window sizes. Note: window sizes are compile-time constants
-    /// (IKCP_WND_SND / IKCP_WND_RCV) for simplicity.
+    /// Set window sizes.
     pub fn setWndSize(_: *Kcp, _: u32, _: u32) void {}
 
     /// Set dead link limit (max retransmissions before declaring dead).
@@ -297,12 +316,17 @@ pub const Kcp = struct {
     // ──────────────────────────────────────────────────────────────────────────
 
     /// Receive a lower-level UDP packet (KCP datagram).
-    /// Process incoming segments: update ACK state, enqueue received data,
-    /// trigger fast retransmit checks.
+    /// Process incoming segments: parse UNA first, process ACK/PUSH/WASK/WINS,
+    /// aggregate fastack, update congestion control.
     pub fn input(self: *Kcp, data: []const u8) !void {
-        self.updated = false;
+        const prev_una = self.snd_una;
+        self.ackedlen = 0;
 
         if (data.len < IKCP_OVERHEAD) return;
+
+        var maxack: u32 = 0;
+        var latest_ts: u32 = 0;
+        var flag: bool = false;
 
         var pos: usize = 0;
         while (pos + IKCP_OVERHEAD <= data.len) {
@@ -312,8 +336,7 @@ pub const Kcp = struct {
             // Verify conversation ID
             if (seg.conv != self.conv) continue;
 
-            // Verify data length. Only copy payload for PUSH segments —
-            // ACK/WASK/WINS segments never carry data and would leak if allocated.
+            // Verify data length. Only copy PUSH payloads.
             const data_len: usize = @intCast(seg.len);
             if (pos + data_len > data.len) return;
             if (data_len > 0 and seg.cmd == IKCP_CMD_PUSH) {
@@ -323,109 +346,194 @@ pub const Kcp = struct {
             }
             pos += data_len;
 
-            // Process each segment type
-            switch (seg.cmd) {
-                IKCP_CMD_PUSH => try self.parseData(seg),
-                IKCP_CMD_ACK => self.parseAck(seg.sn),
-                IKCP_CMD_WASK => self.parseWask(seg),
-                IKCP_CMD_WINS => self.parseWins(seg),
-                else => {}, // ignore unknown commands
-            }
+            // Update remote window from EVERY segment header
+            self.rmt_wnd = seg.wnd;
 
-            // Update remote window
-            self.parseFastack(seg.sn, seg.ts);
-            self.parseUack(seg.una);
+            // Process UNA BEFORE command — removes acknowledged segments
             self.parseUna(seg.una);
+            self.shrinkBuf();
+
+            // Dispatch by command
+            switch (seg.cmd) {
+                IKCP_CMD_ACK => {
+                    // Update RTT estimate if timestamp is recent
+                    const rtt: i32 = @bitCast(self.current -% seg.ts);
+                    if (rtt >= 0) {
+                        self.updateRtt(rtt);
+                    }
+                    self.parseAck(seg.sn);
+                    self.shrinkBuf();
+                    // Track maxack for fast retransmit aggregation
+                    if (!flag) {
+                        flag = true;
+                        maxack = seg.sn;
+                        latest_ts = seg.ts;
+                    } else if (sn_lt(maxack, seg.sn)) {
+                        maxack = seg.sn;
+                        latest_ts = seg.ts;
+                    } else if (!sn_lt(seg.sn, maxack) and sn_lt(latest_ts, seg.ts)) {
+                        // Same maxack, keep the one with later timestamp
+                        maxack = seg.sn;
+                        latest_ts = seg.ts;
+                    }
+                },
+                IKCP_CMD_PUSH => {
+                    // Only accept data within the receive window
+                    if (!sn_lt(seg.sn, self.rcv_nxt + IKCP_WND_RCV)) {
+                        // segment beyond window — drop
+                        if (seg.data) |d| self.allocator.free(d);
+                        continue;
+                    }
+                    try self.ackPush(seg.sn, seg.ts);
+                    if (!sn_lt(seg.sn, self.rcv_nxt)) {
+                        try self.parseData(seg);
+                    } else {
+                        // segment already received — drop
+                        if (seg.data) |d| self.allocator.free(d);
+                    }
+                },
+                IKCP_CMD_WASK => {
+                    // Remote probing our window — respond with WINS
+                    self.probe |= 0x2; // IKCP_ASK_TELL
+                },
+                IKCP_CMD_WINS => {
+                    // Remote told us its window size — wnd already updated above
+                },
+                else => {},
+            }
+        }
+
+        // Aggregate fastack at end — only once per input call
+        if (flag) {
+            self.parseFastack(maxack, latest_ts);
+        }
+
+        // Congestion control: update cwnd when snd_una advances
+        if (sn_lt(prev_una, self.snd_una)) {
+            if (!self.nocwnd) {
+                if (self.cwnd < self.rmt_wnd) {
+                    const mss = self.mss;
+                    if (self.cwnd < self.ssthresh) {
+                        self.cwnd += 1;
+                        self.incr += mss;
+                    } else {
+                        if (self.incr < mss) self.incr = mss;
+                        self.incr += (mss * mss) / self.incr + (mss / 16);
+                        if ((self.cwnd + 1) * mss <= self.incr) {
+                            self.cwnd = @divTrunc(self.incr + mss - 1, mss);
+                        }
+                    }
+                    if (self.cwnd > self.rmt_wnd) {
+                        self.cwnd = self.rmt_wnd;
+                        self.incr = self.rmt_wnd * mss;
+                    }
+                }
+            }
         }
     }
 
     /// Receive application data. Returns number of bytes written to buf.
     /// Returns 0 if no data available. NEVER allocates.
     pub fn recv(self: *Kcp, buf: []u8) !usize {
-        // Fast path: no data
         if (self.rcv_queue.items.len == 0) return 0;
 
         const peek_size = self.peekSize();
         if (peek_size < 0) return 0;
         const total: usize = @intCast(peek_size);
 
+        // Track if we need to signal receive window recovery
+        const recover = self.rcv_queue.items.len >= IKCP_WND_RCV;
+
         if (self.stream) {
-            // Stream mode: merge all consecutive segments
             if (total > buf.len) return error.BufferTooSmall;
             var offset: usize = 0;
-
             while (self.rcv_queue.items.len > 0) {
                 const seg = &self.rcv_queue.items[0];
-                const dlen = seg.len;
-
                 if (seg.data) |d| {
-                    @memcpy(buf[offset..][0..@intCast(dlen)], d);
-                    offset += @intCast(dlen);
+                    @memcpy(buf[offset..][0..@intCast(seg.len)], d);
+                    offset += @intCast(seg.len);
                 }
-
                 if (self.rcv_queue.items[0].data) |d| self.allocator.free(d);
                 _ = self.rcv_queue.orderedRemove(0);
-                // Stream mode: read all available segments (no message boundaries)
             }
-
+            _ = recover;
             return offset;
         } else {
-            // Message mode: return one complete message
-            if (self.rcv_queue.items.len == 0) return 0;
-
             const seg = &self.rcv_queue.items[0];
             if (seg.frg != 0) {
-                // Need all fragments — rcv_queue must contain frg+1 segments
                 if (self.rcv_queue.items.len < seg.frg + 1) return 0;
             }
-
             if (total > buf.len) return error.BufferTooSmall;
 
             var offset: usize = 0;
             while (self.rcv_queue.items.len > 0) {
                 const rseg = &self.rcv_queue.items[0];
-                const dlen = rseg.len;
-
                 if (rseg.data) |d| {
-                    @memcpy(buf[offset..][0..@intCast(dlen)], d);
-                    offset += @intCast(dlen);
+                    @memcpy(buf[offset..][0..@intCast(rseg.len)], d);
+                    offset += @intCast(rseg.len);
                 }
-
                 const last = (rseg.frg == 0);
                 if (self.rcv_queue.items[0].data) |d| self.allocator.free(d);
                 _ = self.rcv_queue.orderedRemove(0);
                 if (last) break;
             }
-
+            _ = recover;
             return offset;
         }
     }
 
     /// Queue application data for sending.
     /// Data is split into MTU-sized segments and queued.
+    /// In stream mode, appends to last snd_queue segment if it has room.
     pub fn send(self: *Kcp, data: []const u8) !void {
         self.updated = false;
         if (data.len == 0) return;
 
-        // Calculate how many segments we need
-        const count: u32 = if (data.len <= self.mss)
+        var remaining = data;
+        var sent: usize = 0;
+
+        // Stream mode: try to append to previous segment in snd_queue
+        if (self.stream) {
+            if (self.snd_queue.items.len > 0) {
+                const last = &self.snd_queue.items[self.snd_queue.items.len - 1];
+                if (last.len < self.mss) {
+                    const capacity = self.mss - last.len;
+                    const extend = @min(remaining.len, capacity);
+                    if (extend > 0) {
+                        const new_data = try self.allocator.alloc(u8, last.len + extend);
+                        if (last.data) |ld| {
+                            @memcpy(new_data[0..last.len], ld);
+                            self.allocator.free(ld);
+                        }
+                        @memcpy(new_data[last.len..], remaining[0..extend]);
+                        last.data = new_data;
+                        last.len += @intCast(extend);
+                        remaining = remaining[extend..];
+                        sent = extend;
+                    }
+                }
+            }
+            if (remaining.len == 0) return;
+        }
+
+        const count: u32 = if (remaining.len <= self.mss)
             1
         else
-            @intCast((data.len + self.mss - 1) / self.mss);
+            @intCast((remaining.len + self.mss - 1) / self.mss);
 
-        if (count > IKCP_WND_RCV) return error.MessageTooLarge;
+        if (count >= IKCP_WND_RCV) {
+            if (self.stream and sent > 0) return;
+            return error.MessageTooLarge;
+        }
 
-        // Stream mode: all fragments have frg=0 (stream doesn't use fragmentation markers)
-        // Message mode: frg counts down from count-1 to 0
         var offset: usize = 0;
         var i: u32 = count;
         while (i > 0) : (i -= 1) {
-            const chunk_size = @min(@as(usize, self.mss), data.len - offset);
+            const chunk_size = @min(@as(usize, self.mss), remaining.len - offset);
             const frg: u8 = if (self.stream) 0 else @intCast(i - 1);
 
-            // Copy data to heap — KCP owns segment data for retransmission
             const owned = try self.allocator.alloc(u8, chunk_size);
-            @memcpy(owned, data[offset..][0..chunk_size]);
+            @memcpy(owned, remaining[offset..][0..chunk_size]);
 
             const seg = Segment{
                 .conv = self.conv,
@@ -437,7 +545,7 @@ pub const Kcp = struct {
                 .una = 0,
                 .len = @intCast(chunk_size),
                 .data = owned,
-                .xmit = 0,
+                .xmit = 0, // xmit starts at 0, incremented on first send in flush
                 .resendts = 0,
                 .rto = 0,
                 .fastack = 0,
@@ -448,281 +556,394 @@ pub const Kcp = struct {
         }
     }
 
-    /// Update KCP state. Call periodically (e.g., every 10-100ms).
+    /// Update KCP state. Matches ikcp_update: rate-limited by interval.
+    /// Call periodically (e.g., every 10-100ms).
     /// current_ms: monotonically increasing millisecond counter.
     pub fn update(self: *Kcp, current_ms: u32) void {
         self.current = current_ms;
 
-        // Always call flush — KCP needs flush on every update for:
-        // - Initial data sending (first update after send)
-        // - Retransmission (segments with expired resendts)
-        // - ACK processing (acknowledgments from remote)
-        self.flush();
-
-        // Calculate next update time
-        var slap: i32 = @intCast(self.interval);
-
-        // Check send buffer for retransmission
-        for (self.snd_buf.items) |*seg| {
-            if (seg.xmit == 0) continue;
-            const diff: i32 = @bitCast(current_ms -% seg.resendts);
-            if (diff >= 0) {
-                slap = @min(slap, diff);
-            } else {
-                slap = @min(slap, -diff);
-            }
+        if (!self.updated) {
+            self.updated = true;
+            self.ts_flush = self.current;
         }
 
-        self.next_update = current_ms + @as(u32, @intCast(@max(slap, @as(i32, @intCast(self.interval / 2)))));
+        var slap: i32 = @bitCast(self.current -% self.ts_flush);
+
+        // Handle wraparound / large jumps
+        if (slap >= 10000 or slap < -10000) {
+            self.ts_flush = self.current;
+            slap = 0;
+        }
+
+        if (slap >= 0) {
+            // Advance ts_flush by interval, ensuring we don't fall behind
+            self.ts_flush += self.interval;
+            if (@as(i32, @bitCast(self.current -% self.ts_flush)) >= 0) {
+                self.ts_flush = self.current + self.interval;
+            }
+            self.flush();
+        }
     }
 
     /// Check when the next kcp_update call is needed (ms).
-    /// Returns the timestamp when update should next be called, or 0 if immediately.
+    /// Returns the timestamp when update should next be called, or current if immediately.
     pub fn check(self: *Kcp, current_ms: u32) u32 {
-        // Check if any segment in send buffer needs retransmission soon
-        var min_ts: u32 = current_ms + self.interval;
+        var ts_flush = self.ts_flush;
 
-        for (self.snd_buf.items) |*seg| {
-            if (seg.xmit > 0) {
-                const diff: i32 = @intCast(seg.resendts -| current_ms);
-                if (@as(u32, @intCast(@max(diff, 0))) < min_ts - current_ms) {
-                    min_ts = seg.resendts;
-                }
-            }
-        }
-
-        // Check if immediate update is needed
-        if (self.acklist.items.len > 0 or self.snd_queue.items.len > 0) {
+        if (!self.updated) {
             return current_ms;
         }
 
-        return min_ts;
+        // Handle wraparound / large jumps
+        {
+            const diff: i32 = @bitCast(current_ms -% ts_flush);
+            if (diff >= 10000 or diff < -10000) {
+                ts_flush = current_ms;
+            }
+        }
+
+        // If flush is due now, return current
+        if (@as(i32, @bitCast(current_ms -% ts_flush)) >= 0) {
+            return current_ms;
+        }
+
+        // Calculate time until next flush
+        const tm_flush: u32 = @intCast(@as(i32, @bitCast(ts_flush -% current_ms)));
+
+        // Check segments in snd_buf for the earliest resendts
+        var tm_packet: u32 = 0x7FFFFFFF;
+        for (self.snd_buf.items) |*seg| {
+            if (seg.xmit == 0) continue;
+            const diff: i32 = @bitCast(seg.resendts -% current_ms);
+            if (diff <= 0) {
+                return current_ms;
+            }
+            if (@as(u32, @intCast(diff)) < tm_packet) {
+                tm_packet = @intCast(diff);
+            }
+        }
+
+        var minimal = @min(tm_packet, tm_flush);
+        if (minimal >= self.interval) minimal = self.interval;
+
+        return current_ms + minimal;
     }
 
     /// Flush pending segments through the output callback.
     /// Called internally by update(), but can also be called directly.
-    /// Internal bookkeeping (queue→buf move, retransmission timers) always runs.
-    /// Actual sending only occurs if an output callback is set.
+    /// Matches ikcp_flush exactly:
+    /// 1. Send pending ACKs (batched into MTU-sized packets)
+    /// 2. Window probe if rmt_wnd == 0
+    /// 3. Move snd_queue → snd_buf (SN-based sliding window)
+    /// 4. Send/retransmit data segments from snd_buf
+    /// 5. Update ssthresh/cwnd on fast retransmit / timeout
     pub fn flush(self: *Kcp) void {
         const current = self.current;
 
-        // Calculate receive window (needed for segment header)
-        const rcv_wnd = self.rcvWnd();
-
-        // 1. Move segments from snd_queue to snd_buf (always, even without output)
-        while (self.snd_queue.items.len > 0) {
-            const seg = self.snd_queue.items[0];
-
-            var new_seg = seg;
-            new_seg.sn = self.snd_nxt;
-            self.snd_nxt += 1;
-            new_seg.una = self.rcv_nxt;
-            new_seg.ts = current;
-            new_seg.wnd = rcv_wnd;
-            new_seg.xmit = 1;
-            new_seg.resendts = current + @as(u32, @intCast(self.rx_rto));
-            new_seg.rto = @intCast(self.rx_rto);
-            new_seg.fastack = 0;
-
-            self.snd_buf.append(self.allocator, new_seg) catch return;
-            _ = self.snd_queue.orderedRemove(0);
+        // Allocate flush buffer if needed (MTU * 3)
+        if (self.buffer == null) {
+            self.buffer = self.allocator.alloc(u8, (self.mtu + IKCP_OVERHEAD) * 3) catch null;
         }
+        const buffer = self.buffer orelse return;
+        var ptr: usize = 0;
 
-        // If no output callback, internal state is updated but nothing is sent.
-        // This is valid — segments accumulate in snd_buf and will be sent
-        // once an output callback is set.
-        if (self.output == null) {
-            self.acklist.clearRetainingCapacity();
-            return;
-        }
+        var seg = Segment{
+            .conv = self.conv,
+            .cmd = IKCP_CMD_ACK,
+            .frg = 0,
+            .wnd = self.rcvWnd(),
+            .una = self.rcv_nxt,
+            .len = 0,
+            .sn = 0,
+            .ts = 0,
+        };
+        var change: u32 = 0;
+        var lost: bool = false;
+        const prior_cwnd = self.cwnd;
 
-        // 2. Send acknowledgments
-        var ack_count = self.acklist.items.len;
-        if (ack_count > 0) {
-            var i: usize = 0;
-            while (i < self.acklist.items.len) : (i += 1) {
-                if (self.snd_buf.items.len >= IKCP_WND_SND) break;
-
-                const sn = self.acklist.items[i];
-                const ack_seg = Segment{
-                    .conv = self.conv,
-                    .cmd = IKCP_CMD_ACK,
-                    .frg = 0,
-                    .wnd = self.rcvWnd(),
-                    .ts = current,
-                    .sn = sn,
-                    .una = self.rcv_nxt,
-                    .len = 0,
-                    .data = null,
-                };
-
-                self.outputSegment(&ack_seg);
-                ack_count -= 1;
+        // ── 1. Send all pending ACKs (batched to MTU) ──
+        {
+            const count = self.acklist.items.len;
+            if (count > 0) {
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    const size: usize = ptr;
+                    if (size + IKCP_OVERHEAD > self.mtu) {
+                        self.outputData(buffer[0..size]);
+                        ptr = 0;
+                    }
+                    seg.sn = self.acklist.items[i][0];
+                    seg.ts = self.acklist.items[i][1];
+                    ptr = self.encodeSeg(ptr, buffer, &seg);
+                }
+                self.acklist.clearRetainingCapacity();
             }
         }
 
-        // 3. Check retransmission timers AND send segments (combined pass).
-        // We update xmit/resendts first, then check if sending is needed
-        // using the OLD resendts value stored before the update.
-        for (self.snd_buf.items) |*seg| {
-            if (seg.xmit == 0) continue;
-
-            var need_send = false;
-
-            // Always send segments that haven't been sent yet (xmit == 1, first time)
-            if (seg.xmit == 1) {
-                need_send = true;
-            }
-
-            // Check retransmission (before updating resendts)
-            const old_resendts = seg.resendts;
-            const diff: i32 = @bitCast(current -% old_resendts);
-
-            // Fast retransmit
-            if (!need_send and self.fastresend > 0 and seg.fastack >= self.fastlimit and seg.xmit <= self.fastresend) {
-                need_send = true;
-                seg.rto = @as(u32, @intCast(self.rx_rto));
-            }
-
-            // Normal timeout retransmission
-            if (!need_send and diff >= 0) {
-                need_send = true;
-                seg.rto = seg.rto + @max(seg.rto, @as(u32, @intCast(self.rx_rto)));
-            }
-
-            if (need_send) {
-                seg.xmit += 1;
-                seg.resendts = current + seg.rto;
-                seg.ts = current;
-                seg.wnd = self.rcvWnd();
-                seg.una = self.rcv_nxt;
-                self.outputSegment(seg);
-            }
-        }
-
-        // 5. Window probe (reuse rcv_wnd from step 1)
-        if (rcv_wnd == 0) {
+        // ── 2. Window probe (when remote window is zero) ──
+        if (self.rmt_wnd == 0) {
             if (self.probe_wait == 0) {
                 self.probe_wait = IKCP_PROBE_INIT;
                 self.ts_probe = current + self.probe_wait;
             } else {
-                if (current -% self.ts_probe >= self.probe_wait) {
-                    if (self.probe_wait < IKCP_PROBE_LIMIT) {
-                        self.probe_wait *= 2;
+                if (@as(i32, @bitCast(current -% self.ts_probe)) >= 0) {
+                    if (self.probe_wait < IKCP_PROBE_INIT) {
+                        self.probe_wait = IKCP_PROBE_INIT;
+                    }
+                    self.probe_wait += self.probe_wait / 2;
+                    if (self.probe_wait > IKCP_PROBE_LIMIT) {
+                        self.probe_wait = IKCP_PROBE_LIMIT;
                     }
                     self.ts_probe = current + self.probe_wait;
-
-                    // Send window probe (WASK)
-                    const probe = Segment{
-                        .conv = self.conv,
-                        .cmd = IKCP_CMD_WASK,
-                        .frg = 0,
-                        .wnd = rcv_wnd,
-                        .ts = current,
-                        .sn = 0,
-                        .una = self.rcv_nxt,
-                        .len = 0,
-                        .data = null,
-                    };
-                    self.outputSegment(&probe);
+                    self.probe |= 0x1; // IKCP_ASK_SEND
                 }
             }
         } else {
+            self.ts_probe = 0;
             self.probe_wait = 0;
-            self.ts_probe = current;
         }
 
-        // 6. Flush ACK list — keep unsent ACKs for next flush
-        if (ack_count > 0 and ack_count < self.acklist.items.len) {
-            // Partial send: unsent ACKs are at indices [sent_count..].
-            // Shift them to the front to preserve them for next flush.
-            const sent = self.acklist.items.len - ack_count;
-            const unsent = self.acklist.items[sent..];
-            std.mem.copyForwards(u32, self.acklist.items[0..unsent.len], unsent);
-            self.acklist.shrinkRetainingCapacity(unsent.len);
-        } else if (ack_count == 0) {
-            // All ACKs were sent — clear the list
-            self.acklist.clearRetainingCapacity();
+        // Flush window probe commands
+        if (self.probe & 0x1 != 0) {
+            seg.cmd = IKCP_CMD_WASK;
+            const size: usize = ptr;
+            if (size + IKCP_OVERHEAD > self.mtu) {
+                self.outputData(buffer[0..size]);
+                ptr = 0;
+            }
+            ptr = self.encodeSeg(ptr, buffer, &seg);
         }
-        // If no ACKs were sent (ack_count == items.len), keep all for next flush
+        if (self.probe & 0x2 != 0) {
+            seg.cmd = IKCP_CMD_WINS;
+            const size: usize = ptr;
+            if (size + IKCP_OVERHEAD > self.mtu) {
+                self.outputData(buffer[0..size]);
+                ptr = 0;
+            }
+            ptr = self.encodeSeg(ptr, buffer, &seg);
+        }
+        self.probe = 0;
+
+        // ── 3. Calculate send window ──
+        // cwnd = min(snd_wnd, rmt_wnd), then min(cwnd_kcp, cwnd) if congestion
+        // Ensure at least 1 segment so first send doesn't deadlock (cwnd starts at 0).
+        var cwnd: u32 = @min(IKCP_WND_SND, self.rmt_wnd);
+        if (!self.nocwnd) {
+            cwnd = @min(if (self.cwnd < 1) @as(u32, 1) else self.cwnd, cwnd);
+        }
+
+        // Move segments from snd_queue to snd_buf (SN-based sliding window)
+        // Condition: snd_nxt < snd_una + cwnd (sequence number within window)
+        while (sn_lt(self.snd_nxt, self.snd_una + cwnd)) {
+            if (self.snd_queue.items.len == 0) break;
+
+            var newseg = self.snd_queue.orderedRemove(0);
+            newseg.conv = self.conv;
+            newseg.cmd = IKCP_CMD_PUSH;
+            newseg.wnd = seg.wnd;
+            newseg.ts = current;
+            newseg.sn = self.snd_nxt;
+            self.snd_nxt += 1;
+            newseg.una = self.rcv_nxt;
+            newseg.resendts = current;
+            newseg.rto = @intCast(self.rx_rto);
+            newseg.fastack = 0;
+            newseg.xmit = 0;
+
+            self.snd_buf.append(self.allocator, newseg) catch break;
+        }
+
+        // ── 4. Send/retransmit data segments ──
+        const resent: u32 = if (self.fastresend > 0) @intCast(self.fastresend) else 0xFFFFFFFF;
+        const rtomin: u32 = if (!self.nodelay) @intCast(@divTrunc(self.rx_rto, 8)) else 0;
+
+        for (self.snd_buf.items) |*segment| {
+            var needsend = false;
+
+            if (segment.xmit == 0) {
+                // First send — always send
+                needsend = true;
+                segment.xmit += 1;
+                segment.rto = @intCast(self.rx_rto);
+                segment.resendts = current + segment.rto + rtomin;
+            } else {
+                const diff: i32 = @bitCast(current -% segment.resendts);
+
+                // Retransmission timeout
+                if (diff >= 0) {
+                    needsend = true;
+                    segment.xmit += 1;
+                    self.xmit += 1;
+                    if (!self.nodelay) {
+                        segment.rto += @max(segment.rto, @as(u32, @intCast(self.rx_rto)));
+                    } else {
+                        const step: u32 = if (self.nodelay) segment.rto else @intCast(self.rx_rto);
+                        segment.rto += step / 2;
+                    }
+                    segment.resendts = current + segment.rto;
+                    lost = true;
+                }
+                // Fast retransmit
+                else if (segment.fastack >= resent) {
+                    if (segment.xmit <= self.fastlimit or self.fastlimit <= 0) {
+                        needsend = true;
+                        segment.xmit += 1;
+                        segment.fastack = 0;
+                        segment.resendts = current + segment.rto;
+                        change += 1;
+                    }
+                }
+            }
+
+            if (needsend) {
+                segment.ts = current;
+                segment.wnd = seg.wnd;
+                segment.una = self.rcv_nxt;
+
+                const need = IKCP_OVERHEAD + segment.len;
+
+                // Flush buffer if this segment doesn't fit
+                {
+                    const size: usize = ptr;
+                    if (size + need > self.mtu) {
+                        self.outputData(buffer[0..size]);
+                        ptr = 0;
+                    }
+                }
+
+                ptr = self.encodeSeg(ptr, buffer, segment);
+                if (segment.len > 0) {
+                    if (segment.data) |d| {
+                        @memcpy(buffer[ptr..][0..segment.len], d);
+                        ptr += segment.len;
+                    }
+                }
+
+                if (segment.xmit >= self.dead_link) {
+                    self.state = 0xFFFFFFFF;
+                }
+            }
+        }
+
+        // ── 5. Flush remaining data ──
+        if (ptr > 0) {
+            self.outputData(buffer[0..ptr]);
+        }
+
+        // ── 6. Update ssthresh/cwnd on fast retransmit ──
+        if (change > 0) {
+            const inflight = self.snd_nxt - self.snd_una;
+            self.ssthresh = inflight / 2;
+            if (self.ssthresh < IKCP_THRESH_MIN) {
+                self.ssthresh = IKCP_THRESH_MIN;
+            }
+            self.cwnd = self.ssthresh + resent;
+            self.incr = self.cwnd * self.mss;
+        }
+
+        // ── 7. Update ssthresh/cwnd on timeout ──
+        if (lost) {
+            self.ssthresh = prior_cwnd / 2;
+            if (self.ssthresh < IKCP_THRESH_MIN) {
+                self.ssthresh = IKCP_THRESH_MIN;
+            }
+            self.cwnd = 1;
+            self.incr = self.mss;
+        }
+
+        if (self.cwnd < 1) {
+            self.cwnd = 1;
+            self.incr = self.mss;
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
     // Internal: segment processing
     // ──────────────────────────────────────────────────────────────────────────
 
+    /// Remove acknowledged segments from snd_buf (using UNA from segment).
     fn parseUna(self: *Kcp, una: u32) void {
-        // Remove acknowledged segments from send buffer
         var i: usize = 0;
         while (i < self.snd_buf.items.len) {
             const sn = self.snd_buf.items[i].sn;
-            // Use sequence number comparison with wraparound
             if (sn_lt(sn, una)) {
+                self.ackedlen += self.snd_buf.items[i].len;
                 if (self.snd_buf.items[i].data) |d| self.allocator.free(d);
                 _ = self.snd_buf.orderedRemove(i);
-                // don't increment i — next element slides into this position
             } else {
                 i += 1;
             }
         }
     }
 
+    /// Update snd_una to first segment in snd_buf (or snd_nxt if empty).
+    fn shrinkBuf(self: *Kcp) void {
+        if (self.snd_buf.items.len > 0) {
+            self.snd_una = self.snd_buf.items[0].sn;
+        } else {
+            self.snd_una = self.snd_nxt;
+        }
+    }
+
+    /// Parse a data segment: insert into rcv_buf, then move in-order to rcv_queue.
     fn parseData(self: *Kcp, seg: Segment) !void {
         // Update remote timestamp
         self.ts_recent = seg.ts;
 
-        // Insert into receive buffer in order by sequence number
-        try self.insertRcvBuf(seg);
+        // Check window bounds (rcv_nxt + rcv_wnd)
+        if (!sn_lt(seg.sn, self.rcv_nxt + IKCP_WND_RCV)) {
+            // Segment is outside the receive window — drop
+            if (seg.data) |d| self.allocator.free(d);
+            return;
+        }
+        if (sn_lt(seg.sn, self.rcv_nxt)) {
+            // Segment is already acknowledged — drop
+            if (seg.data) |d| self.allocator.free(d);
+            return;
+        }
 
-        // Move in-order segments from rcv_buf to rcv_queue
+        try self.insertRcvBuf(seg);
         self.moveRcvBuf();
     }
 
+    /// Parse an ACK: find and remove the acknowledged segment from snd_buf.
     fn parseAck(self: *Kcp, sn: u32) void {
-        // Mark segment as acknowledged (fast retransmit counter)
-        for (self.snd_buf.items) |*seg| {
-            if (seg.sn == sn) {
-                seg.fastack += 1;
+        // Only process ACKs within valid range
+        if (sn_lt(sn, self.snd_una) or !sn_lt(sn, self.snd_nxt)) return;
+
+        for (self.snd_buf.items, 0..) |*seg, idx| {
+            if (sn == seg.sn) {
+                self.ackedlen += seg.len;
+                if (seg.data) |d| self.allocator.free(d);
+                _ = self.snd_buf.orderedRemove(idx);
                 break;
             }
+            if (sn_lt(sn, seg.sn)) break;
         }
     }
 
+    /// Parse WASK (window probe from remote): trigger WINS response in flush.
     fn parseWask(self: *Kcp, seg: Segment) void {
-        // Remote is asking for our window size — send WINS
-        const wins = Segment{
-            .conv = self.conv,
-            .cmd = IKCP_CMD_WINS,
-            .frg = 0,
-            .wnd = self.rcvWnd(),
-            .ts = self.current,
-            .sn = 0,
-            .una = self.rcv_nxt,
-            .len = 0,
-        };
-        self.outputSegment(&wins);
         _ = seg;
+        self.probe |= 0x2; // IKCP_ASK_TELL
     }
 
-    fn parseWins(_: *Kcp, _: Segment) void {
-        // Remote told us its window size — already handled in parseFastack
-    }
+    /// Parse WINS (window size notification from remote).
+    fn parseWins(_: *Kcp, _: Segment) void {}
 
+    /// Parse fastack: increment fastack counter for segments with sn < the ack sn.
+    /// Called once per input with the aggregated maxack/latest_ts.
     fn parseFastack(self: *Kcp, sn: u32, ts: u32) void {
-        // Fast retransmit tracking
-        if (!sn_lt(sn, self.snd_una)) {
-            // Calculate RTT
-            if (ts > 0) {
-                const rtt: i32 = @bitCast(self.current -% ts);
-                self.updateRtt(rtt);
-            }
-        }
-    }
+        if (sn_lt(sn, self.snd_una) or !sn_lt(sn, self.snd_nxt)) return;
 
-    fn parseUack(self: *Kcp, una: u32) void {
-        // Update snd_una and clean acknowledged segments
-        if (sn_lt(self.snd_una, una)) {
-            self.snd_una = una;
+        for (self.snd_buf.items) |*seg| {
+            if (sn_lt(sn, seg.sn)) break;
+            if (sn != seg.sn) {
+                // IKCP_FASTACK_CONSERVE: only increment if our TS is not newer
+                if (@as(i32, @bitCast(ts -% seg.ts)) >= 0) {
+                    seg.fastack += 1;
+                }
+            }
         }
     }
 
@@ -731,12 +952,11 @@ pub const Kcp = struct {
     // ──────────────────────────────────────────────────────────────────────────
 
     fn insertRcvBuf(self: *Kcp, seg: Segment) !void {
-        // Insert segment into rcv_buf, maintaining sequence number order
-        // Find insertion point
+        // Find insertion point (maintaining SN order) and detect duplicates
         var insert_idx: usize = self.rcv_buf.items.len;
         for (self.rcv_buf.items, 0..) |existing, idx| {
             if (existing.sn == seg.sn) {
-                // Duplicate — ignore, free owned data
+                // Duplicate — drop
                 if (seg.data) |d| self.allocator.free(d);
                 return;
             }
@@ -751,28 +971,19 @@ pub const Kcp = struct {
         } else {
             try self.rcv_buf.insert(self.allocator, insert_idx, seg);
         }
-
-        // Ack this segment
-        try self.ackPush(seg.sn, seg.ts);
     }
 
     fn moveRcvBuf(self: *Kcp) void {
         // Move in-order segments from rcv_buf to rcv_queue
         while (self.rcv_buf.items.len > 0) {
             const seg = self.rcv_buf.items[0];
-            // Detect KCP reconnect: if the remote restarted, its seq numbers
-            // reset while our rcv_nxt is higher. seg.sn << rcv_nxt means the
-            // remote KCP is fresh — discard stale rcv_buf and reset rcv_nxt.
+            // KCP reconnect detection: remote restarted, SN wrap-back
             if (sn_lt(seg.sn, self.rcv_nxt) and self.rcv_nxt > 10) {
-                // Remote has restarted with fresh KCP state. Flush all
-                // previously buffered segments (from old connection) and
-                // reset rcv_nxt to accept the new data.
                 while (self.rcv_buf.items.len > 0) {
                     const old = self.rcv_buf.orderedRemove(0);
                     if (old.data) |d| self.allocator.free(d);
                 }
                 self.rcv_nxt = seg.sn;
-                // Fall through — the current seg will be processed on next iter
                 continue;
             }
             if (seg.sn == self.rcv_nxt and self.rcv_queue.items.len < IKCP_WND_RCV) {
@@ -783,6 +994,27 @@ pub const Kcp = struct {
                 break;
             }
         }
+    }
+
+    /// Returns the number of segments in rcv_queue (for diagnostics).
+    pub fn rcvQueueLen(self: *Kcp) usize {
+        return self.rcv_queue.items.len;
+    }
+
+    /// Returns the number of segments in rcv_buf (for diagnostics).
+    pub fn rcvBufLen(self: *Kcp) usize {
+        return self.rcv_buf.items.len;
+    }
+
+    /// Returns the next expected receive sequence number (for diagnostics).
+    pub fn rcvNxt(self: *Kcp) u32 {
+        return self.rcv_nxt;
+    }
+
+    /// Returns the SN of the first segment in rcv_buf, or null if empty.
+    pub fn firstRcvBufSn(self: *Kcp) ?u32 {
+        if (self.rcv_buf.items.len == 0) return null;
+        return self.rcv_buf.items[0].sn;
     }
 
     pub fn peekSize(self: *Kcp) i32 {
@@ -815,29 +1047,50 @@ pub const Kcp = struct {
     // Internal: output
     // ──────────────────────────────────────────────────────────────────────────
 
+    /// Encode a segment header into buffer at position `pos`. Returns new position
+    /// (pos + IKCP_OVERHEAD). Caller is responsible for copying segment data.
+    fn encodeSeg(self: *Kcp, pos: usize, buffer: []u8, seg: *const Segment) usize {
+        _ = self;
+        std.mem.writeInt(u32, buffer[pos..][0..4], seg.conv, .big);
+        buffer[pos + 4] = seg.cmd;
+        buffer[pos + 5] = seg.frg;
+        std.mem.writeInt(u16, buffer[pos + 6 ..][0..2], seg.wnd, .big);
+        std.mem.writeInt(u32, buffer[pos + 8 ..][0..4], seg.ts, .big);
+        std.mem.writeInt(u32, buffer[pos + 12 ..][0..4], seg.sn, .big);
+        std.mem.writeInt(u32, buffer[pos + 16 ..][0..4], seg.una, .big);
+        std.mem.writeInt(u32, buffer[pos + 20 ..][0..4], seg.len, .big);
+        return pos + IKCP_OVERHEAD;
+    }
+
+    /// Send raw buffer data through the output callback.
+    fn outputData(self: *Kcp, data: []const u8) void {
+        if (self.output) |cb| {
+            cb(self.conv, data, self.user);
+        }
+    }
+
+    /// Encode and send a single segment through the output callback.
+    /// Used for single-segment sends (old API compatibility).
     fn outputSegment(self: *Kcp, seg: *const Segment) void {
         if (self.output == null) return;
 
         const total_len = IKCP_OVERHEAD + seg.len;
 
-        // Use stack buffer for default MTU; heap-allocate for larger custom MTU.
-        // The output callback is synchronous (immediate sendto), so the buffer
-        // only needs to live for the duration of the callback call.
         if (total_len <= IKCP_MTU_DEFAULT) {
             var buf: [IKCP_MTU_DEFAULT]u8 = undefined;
-            _ = seg.encode(&buf);
+            _ = self.encodeSeg(0, &buf, seg);
             if (seg.len > 0 and seg.data != null) {
                 @memcpy(buf[IKCP_OVERHEAD..][0..@intCast(seg.len)], seg.data.?);
             }
-            self.output.?(seg.conv, buf[0..@intCast(total_len)], self.user);
+            self.outputData(buf[0..@intCast(total_len)]);
         } else {
             const buf = self.allocator.alloc(u8, total_len) catch return;
             defer self.allocator.free(buf);
-            _ = seg.encode(buf);
+            _ = self.encodeSeg(0, buf, seg);
             if (seg.len > 0 and seg.data != null) {
                 @memcpy(buf[IKCP_OVERHEAD..][0..@intCast(seg.len)], seg.data.?);
             }
-            self.output.?(seg.conv, buf, self.user);
+            self.outputData(buf);
         }
     }
 
@@ -876,10 +1129,9 @@ pub const Kcp = struct {
     fn ackPush(self: *Kcp, sn: u32, ts: u32) !void {
         // Deduplicate — don't add if already in list
         for (self.acklist.items) |existing| {
-            if (existing == sn) return;
+            if (existing[0] == sn) return;
         }
-        try self.acklist.append(self.allocator, sn);
-        _ = ts;
+        try self.acklist.append(self.allocator, .{ sn, ts });
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -909,6 +1161,11 @@ pub const Kcp = struct {
     /// Get pending send queue size.
     pub fn sendQueueSize(self: *Kcp) usize {
         return self.snd_queue.items.len;
+    }
+
+    /// Get send buffer size (segments in flight, unacknowledged).
+    pub fn sndBufLen(self: *Kcp) usize {
+        return self.snd_buf.items.len;
     }
 
     /// Get pending receive queue size.
@@ -1449,15 +1706,15 @@ test "kcp update/check timing" {
     var kcp = try Kcp.create(allocator, 11, null);
     defer kcp.release();
 
-    // Initial check should return current time (nothing to do)
+    // Initial check: updated=false → returns current time (nothing to do yet)
     const t0 = kcp.check(0);
-    // With no data, check returns interval from now
-    try std.testing.expect(t0 >= kcp.interval);
+    try std.testing.expectEqual(@as(u32, 0), t0);
 
-    // After sending data, check should return current (need immediate flush)
+    // After sending data and updating once, check should return current (needs flush)
     try kcp.send("data");
+    kcp.update(0); // sets updated=true, flushes, advances ts_flush
     const t1 = kcp.check(100);
-    try std.testing.expectEqual(@as(u32, 100), t1);
+    try std.testing.expect(t1 >= kcp.interval);
 }
 
 test "kcp empty send" {
@@ -1486,7 +1743,7 @@ test "kcp nodelay configuration" {
     kcp.setNoDelay(false, 100, 5, false);
     try std.testing.expect(!kcp.nodelay);
     try std.testing.expectEqual(@as(u32, 100), kcp.interval);
-    try std.testing.expectEqual(@as(i32, 0), kcp.fastresend);
+    try std.testing.expectEqual(@as(i32, 5), kcp.fastresend); // C ref: sets if resend >= 0
     try std.testing.expect(!kcp.nocwnd);
 }
 

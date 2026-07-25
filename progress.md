@@ -1,4 +1,78 @@
-# Progress: v0.11.4
+# Progress: v0.11.5
+
+## Session 2026-07-25 (Phase 35 — Windows cmd.exe UTF-8)
+
+### Phase 35: Windows cmd.exe 强制 UTF-8
+
+**问题**: `ptySpawnWindows` 启动 `cmd.exe /k`，默认 code page = 系统 ANSI，
+中文命令/文件名乱码。
+
+**修复** (`src/broadcast.zig`):
+- `CreateProcessW` 前调 `SetConsoleOutputCP(65001)` + `SetConsoleCP(65001)`
+- cmd 命令行 `cmd.exe /k chcp 65001 >nul & set LANG=en_US.UTF-8`
+- 三层保障：SetConsoleCP → chcp → LANG 环境变量
+
+## Session 2026-07-25 (Phase 34 — Mesh 同机双端口路由修复)
+
+### Phase 34: Mesh 同机双端口 KCP 双向通信修复
+
+**问题**: Host:2121 + Guest:2122 同机不同端口时，KCP 双向通信失效。
+
+**根因**: `handleKcpData(_: net.IpAddress)` 忽略 `from` 参数。Guest 收到 Host
+KCP 数据后创建 session (`next_hop = Host_node_id`)，但 Guest 邻居表里没有 Host
+（LSA 端口不匹配），`meshKcpOutput` → `neighbor not found` → ACK 发不回去 →
+KCP session 单向失效。
+
+**修复**: `handleKcpData` 使用 `from` 参数，新 session 创建时自动添加 `src_mac`
+为邻居 (`addr = from`)，不依赖 LSA 邻居发现。
+
+### download 空 body panic 修复
+
+`cmdDownload` 的 `sendBodyComplete("")` 触发 Zig 0.16.0 HTTP server
+`respondStreaming` → `discardBody` → `unreachable` panic。
+改为 `sendBodyComplete("{}")` 发送非空 body。
+
+### 本机双端口全部功能验证 ✅
+
+| 功能 | 方法 | 结果 |
+|------|------|------|
+| exec | `utmm --exec testvm "echo hello"` | ✅ |
+| upload | `curl POST /upload x-vm:testvm x-path:/tmp/test.txt` | ✅ SHA256 匹配 |
+| 单例去重 | 并发 upload 同一文件 | ✅ `transfer_in_progress` |
+| download | `curl POST /download -d '{}'` | ✅ 内容+SHA256 匹配 |
+| 目录列表 | `curl http://127.0.0.1:2121/` | ✅ Guests+Files HTML |
+| `zig build test` | | ✅ 全过 |
+
+## Session 2026-07-25 (Phase 33 — Upload/Download 优化 + 单例 key 简化)
+
+### Phase 33: Upload/Download 三项优化
+
+**任务**:
+1. tunproto 协议扩展: upload_data + download_result 增加 file_size + file_hash
+2. HTTP 单例去重: 重复的 upload/download 请求拒绝并返回进度
+3. 临时文件 + 原子 rename: SHA256 校验后 mv 到最终路径
+4. HTTP 目录列表: GET / 列出 serve_dir 文件为可点击 HTML
+
+**用户反馈修正**: 单例 key 从 `"up:<vm>:<path>"` / `"dl:<vm>:<path>"` 简化为
+`"<vm>:<path>"` — "只需要判断最终目标路径相同的单例即可，因为其他电脑也可能
+上传同一个文件，太严格的单例拒绝条件反而无效。"
+
+**修改文件**:
+| 文件 | 变更 |
+|------|------|
+| `src/tunproto.zig` | +writeU32/readU32, upload_data/download_result 扩展, 测试更新 |
+| `src/httpd.zig` | +TransferState, +transfers map, +OpState meta 字段, +5 个 transfer 方法 |
+| `src/host_http.zig` | handleUpload/handleDownload 单例检查 + hash/size, handleRoot 目录列表 |
+| `src/broadcast.zig` | +computeSHA256, writeFile temp+rename, readFileContent 返回 hash |
+| `src/host.zig` | cmdUpload SHA256 计算, cmdDownload temp+hash 验证+rename |
+
+**验证结果**:
+| 测试 | 结果 |
+|------|------|
+| `zig build test` | ✅ 全过（含 tunproto round-trip 更新） |
+| 8 目标交叉编译 | ✅ |
+| 单例 key 格式化 `"<vm>:<path>"` | ✅ 代码审查通过 |
+| 本机双端口功能测试 | ⚠️ mesh 同机路由已知问题（非本次变更） |
 
 ## Session 2026-07-25 (Phase 32 — Keepalive 死 session 跳过 + 内存泄漏修复)
 
@@ -756,3 +830,231 @@ socket.close），第二次 CloseHandle 返回 INVALID_HANDLE 但无害。竞态
 - findings.md: Windows ConcurrencyUnavailable 根因 + 修复
 - zig-codegen.md: Io.Threaded Windows net_receive 限制
 - progress.md: Phase 15 + v0.6.0 发布记录
+
+### Phase 35 — 管理员权限检查 + 自我提权 (2026-07-25)
+
+- **新建 `src/priv.zig`**（~195 行）: 跨平台权限检查 + 提权模块
+  - POSIX: `geteuid() == 0` 检查 → `sudo` + `execve` 自我提权
+  - Windows: `CheckTokenMembership(Administrators)` 检查 → `ShellExecuteW "runas"` 提权
+  - 失败输出明确错误信息并 exit(1)
+- **集成到 `main.zig`**: `--version` / `--help` / `--update-url` 之后、`--svc` 之前执行检查
+  - 无例外尽早检查，确保后续所有操作均有管理员权限
+- **构建验证**: `zig build test` 全过，8/8 目标交叉编译全过
+- **Zig 0.16 适配**: 修复 4 个 Windows 编译问题 (BOOL enum、ArrayList unmanaged、
+  @alignCast、extern null param)
+- **文档更新**: findings.md + zig-016-api-notes memory
+
+### Phase 36 — KCP 隧道自动升级 (2026-07-25)
+
+- **背景**: WebSocket 完全移除 (v0.11.0)，自动升级路径需要迁移到 KCP 隧道
+- **`src/tunproto.zig`**: 新增 `upgrade_req` (0x17) + `upgrade_bin` (0x1a)
+  - `UpgradeReqData` struct: version + hostname (NT 字符串)
+  - `UpgradeBinData` struct: version + data (blob) + sha256_hash
+  - `buildUpgradeReq` / `parseUpgradeReq` + `buildUpgradeBin` / `parseUpgradeBin`
+  - 2 个 round-trip 测试 (upgrade_req + upgrade_bin)
+- **`src/broadcast.zig`**: `performUpgrade()` 重写
+  - KCP tunnel 替代原 WebSocket 连接
+  - 发送 `upgrade_req` → recv `upgrade_bin` → SHA256 校验 → `selfReplace(data)`
+- **`src/host_http.zig`**: `handleUpgradeReq()` 新增
+  - 收到 upgrade_req → 读 serve_dir 二进制 → SHA256 → 发送 upgrade_bin
+- **`src/host.zig`**: KCP tunnel 在 `startHost()` 初始化，传入 meshCallback
+- **构建验证**: `zig build test` 全过，8/8 目标交叉编译全过
+- **文档更新**: task_plan.md + findings.md (Phase 36 记录)
+
+### Phase 37 — 分块文件传输协议 (2026-07-25)
+
+- **问题**: KCP 消息模式要求 buf ≥ 完整消息大小，大文件传输内存不可控
+- **方案**: 8KB 分块协议 — upload_cmd → file_chunk × N → file_eof
+  - 三条传输路径全部改造：upload / download / upgrade
+  - 增量 SHA256：`init()` → per-chunk `update()` → `final()`，只需 32 字节状态
+  - 固定 256KB buffer，撤销 peekSize 动态分配
+- **`src/tunproto.zig`**: 558 行（清理后）
+  - 新增枚举值: `upload_cmd` (0x1b) / `file_chunk` (0x1c) / `file_eof` (0x1d)
+  - 旧枚举标记 `_unused_0x13/0x18/0x1a` 防止重用
+  - 新增 struct: `UploadCmdData` / `FileChunkData` / `FileEofData`
+  - 新增 build 函数: `buildUploadCmd` / `buildFileChunk` / `buildFileEof`
+  - 新增 parse 函数: `parseUploadCmd` / `parseFileChunk` / `parseFileEof`
+  - 6 个 round-trip 测试 + 1 个上传流程测试
+  - 删除旧函数: `buildUploadData` / `buildDownloadResult` / `buildUpgradeBin` /
+    `parseUploadData` / `parseDownloadResult` / `parseUpgradeBin`
+  - 删除旧 struct: `UploadDataData` / `DownloadResultData` / `UpgradeBinData`
+  - **净删除 162 行**（删 262 行旧 blob-in-message 代码 + 增 100 行新分块代码）
+- **`src/broadcast.zig`** (~1500+ 行):
+  - 命令循环恢复 256KB 固定 buffer：`var rbuf: [262144]u8 = undefined`
+  - 新增 `hexHash()`: 32 字节 SHA256 → 64 字符 hex 字符串
+  - 新增 `receiveChunkedFile()`: 流式接收 upload
+    - 创建 temp 文件 → 循环 recv file_chunk（写盘 + sha256.update）→
+      file_eof（sha256.final + hash 比对 + rename temp → final）
+  - 新增 `sendChunkedFile()`: 流式发送 download
+    - 打开文件 → 循环读 8KB → send file_chunk → sha256.update → send file_eof
+  - `performUpgrade()` 重写: 分块接收 + 增量 SHA256 + 60s 超时
+    - 调用 `selfReplace(temp_path)` 改签名
+  - `selfReplace()` 签名变更: `data: []const u8` → `temp_path: []const u8`
+  - 移除 `computeSHA256` / `writeFile` / `readFileContent`
+- **`src/host_http.zig`** (~1035 行):
+  - `handleUpload()`: 流式读 request body 8KB 一块
+    - 使用 `readerExpectNone(&http_buf)` + 循环读 body_reader
+    - 每块: sha256.update + buildFileChunk + tunnel.send
+    - 最后: sha256.final + buildFileEof + completeOpState
+  - `handleDownload()`: 发送 download_cmd（不变），通过 mesh handler 收 file_chunk
+  - `handleMeshGuest()`: 恢复 256KB 固定 buffer
+    - 新增 `file_chunk` dispatch: appendOpOutput + updateTransferProgress
+    - 新增 `file_eof` dispatch: setOpFileMeta + completeOpState
+    - 移除 `download_result` dispatch
+  - `handleUpgradeReq()`: 流式读 serve_dir 二进制
+    - 打开二进制 → 循环读 8KB → sha256.update + buildFileChunk + tunnel.send →
+      sha256.final + buildFileEof
+    - 移除 buildUpgradeBin 调用
+- **`src/httpd.zig`**: 注释修正：评论区 download_result → file_eof
+- **构建验证**: `zig build test` 全过（含 7 个新 tunproto 测试），8/8 交叉编译全过
+- **能力提升**:
+  - 支持 >1GB 文件上传/下载（之前受限于单条消息内存）
+  - 升级二进制不再全量加载到内存
+  - 内存占用恒定 ~256KB，与文件大小无关
+- **文档更新**: task_plan.md + findings.md + progress.md (Phase 37 记录)
+
+---
+
+## 2026-07-25 — Phase 38: KCP 协议完整重写
+
+**目标**: 匹配 C 参考实现 (skywind3000/kcp)，修复自升级文件传输 ~38KB 停滞。
+
+**前置分析**（上一会话）:
+- 下载 C 参考 ikcp.c (1423 行)，逐行对比 Zig kcp.zig (1548 行)
+- 识别 10+ 处关键差异：rmt_wnd 缺失、发送窗口误用段计数、无接收窗口检查、
+  无条件 flush、ACK 守卫死锁、xmit 初始值、无 shrinkBuf、fastack 未聚合、
+  无输入后拥塞控制、RTO jitter 缺失
+- 用户明确指示："全部都实现，你没必要简化"
+
+**重写范围** (`src/kcp.zig`):
+
+**1. Kcp struct 重写** (行 108-230):
+- 新增字段: `rmt_wnd: u32`, `ts_flush: u32`, `probe: u32`, `xmit: u32`, `ackedlen: u32`
+- acklist 类型变更: `std.ArrayList(u32)` → `std.ArrayList([2]u32)` (存 sn,ts 对)
+- `cwnd` 初始化为 0（匹配 C），`incr` 初始化为 0
+- 删除 `next_update`（被 ts_flush 替代）
+
+**2. 配置 setters 重写** (行 263-320):
+- `setNoDelay()`: nodelay=true 时 `rx_minrto = 30` (IKCP_RTO_NDL)；
+  interval 夹紧 10-5000；`nocwnd = nc`（始终赋值，匹配 C 的 `if (nc >= 0)` 语义）
+- `setMtu()`: 分配 flush buffer `(mtu + IKCP_OVERHEAD) * 3`
+
+**3. input() 重写** (行 345-425):
+- UNA 优先处理 → parseUna + shrinkBuf
+- 每段读取 `self.rmt_wnd = seg.wnd`
+- ACK 聚合: 跨所有段跟踪 maxack/latest_ts，末尾单次 parseFastack
+- PUSH 窗口检查: `sn < rcv_nxt + WND_RCV` 且在 `sn >= rcv_nxt` 范围内
+- 拥塞控制 after input: `snd_una` 推进后 cwnd 增长（慢启动 + 拥塞避免）
+
+**4. send() 重写** (行 487-559):
+- Stream 模式: 追加到 snd_queue 最后一个段（减少碎片化）
+- xmit 初始值 = 0（匹配 C）
+
+**5. update() 重写** (行 561-588):
+- ts_flush rate limiting: `if (slap >= 0)` 才 flush
+- ts_flush 推进逻辑匹配 C 的 `kcp->ts_flush += kcp->interval`
+
+**6. check() 重写** (行 590-631):
+- 基于 ts_flush + resendts 计算下次唤醒时间
+- `updated == false` → 返回 current（未初始化）
+
+**7. flush() 完整重写** (行 634-859):
+- 批量 ACK 编码到 MTU 包: `encodeSeg()` + `outputData()`
+- 窗口探测: 检查 `rmt_wnd == 0`（非 rcvWnd）
+- SN 滑动窗口: `while (sn_lt(snd_nxt, snd_una + cwnd))` 移动 snd_queue → snd_buf
+- cwnd >= 1 确保首次发送不死锁
+- rtomin jitter: nodelay=0 时 `resendts = current + rto + rtomin`
+- 快速重传: change 计数 → ssthresh = inflight/2, cwnd = ssthresh + resent
+- 超时: lost = true → ssthresh = cwnd/2, cwnd = 1
+- 批量数据段编码: 多段打包到一个 UDP 数据报
+- dead_link 检测: `xmit >= dead_link` → state = 0xFFFFFFFF
+
+**8. 内部 parse 函数重写** (行 861-949):
+- `parseUna()`: 遍历 snd_buf，移除 acked 段，累计 ackedlen
+- `shrinkBuf()`: 新增 — 从 snd_buf[0].sn 更新 snd_una
+- `parseData()`: 双重窗口检查 + insertRcvBuf + moveRcvBuf
+- `parseAck()`: 直接匹配 sn 移除段（非 fastack 递增）
+- `parseFastack()`: 聚合调用 — 遍历 snd_buf，IKCP_FASTACK_CONSERVE 语义
+
+**9. 新增方法** (行 1047-1090):
+- `encodeSeg(pos, buffer, seg) → usize`: 编码段头到 buffer，返回新位置
+- `outputData(data)`: 通过 output callback 发送原始数据
+
+**10. ackPush 更新** (行 1109-1115):
+- 存储 `.{ sn, ts }` 对 → `ArrayList([2]u32)`
+- 去重检查 based on sn[0]
+
+**测试修复**:
+- `nodelay configuration`: fastresend 期望值 0 → 5（C 参考 `if (resend >= 0)` 始终赋值）
+- `update/check timing`: `check(0)` 期望 >= interval → 0（updated=false 返回 current）
+- `tunnel init and isAlive`: cwnd=0 → cwnd=1 修复后通过
+
+**验证**:
+- `zig build test` — 91/91 通过 ✅
+- 7/8 交叉编译通过 ✅（x86-windows-gnu 已知 _system@4 链接器警告）
+- 1MB KCP exec 传输: 即时完成 ✅
+- 7MB KCP exec 传输: 成功（之前 ~38KB 停滞）✅
+- 15MB KCP exec 传输: 成功 ✅
+
+**文件变更汇总**:
+| 文件 | 变更 | 估计行数 |
+|------|------|---------|
+| `src/kcp.zig` | 完整重写 | ~1100 行重写 |
+| `task_plan.md` | Phase 38 记录 | +50 行 |
+| `findings.md` | 发现 #26-#31 | +45 行 |
+| `progress.md` | 本会话记录 | +80 行 |
+| `CLAUDE.md` | 架构文档更新 | 重构 5 节，+45 行 |
+
+**关键教训**:
+1. 协议实现必须逐行对照参考代码，简化会引入隐蔽差异
+2. 滑动窗口协议的最关键字段是 rmt_wnd — 没有它窗口完全失效
+3. ACK 发送不应有条件守卫 — 无条件发送是避免死锁的关键
+4. cwnd=0 的初始化值需要在实际发送时做 >=1 的保护
+5. nodelay nocwnd 参数应始终赋值（不应用 `if (nc)` 守卫）
+
+---
+
+## 2026-07-25 (Session 2): Phase 39 — cross-Io mutex exec 超时修复
+
+### 背景
+Phase 38 (KCP 完整重写) 部署后，`utmm --exec` 在所有 VM 上超时。
+Host 日志显示 `[mesh-guest] linuxvm recv empty x17000` — handleMeshGuest 的
+recv loop 持续收到 0 字节，pty_spawn 被写入但不能读取 pty_output。
+
+### 诊断过程
+1. 检查 Host 日志 → `recv empty` 循环（tun.recv() 返回 0 字节，非错误）
+2. 检查 `tunnel.zig:recv()` → `try sessions_mutex.lock(self.io)` 如失败则立即返回错误
+3. 检查 `sessions_mutex` 创建位置 → `Mesh.init()` 使用 `m.io`（mesh 线程 Io）
+4. 检查 Guest `waitForHostTunnel` → `Tunnel.init(allocator, io, sess)` 使用主线程 Io
+5. 确认：Zig 0.16.0 `Io.Mutex.lock()` 要求相同 Io 实例 → cross-Io → `error.Canceled`
+
+### 修复
+单行修改 `src/broadcast.zig:1232`:
+- `io` → `m.io`
+
+### 部署
+1. 构建: `zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe` ✅
+2. 构建: `zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe` ✅
+3. 部署 Host: `cp utmm-aarch64-macos /opt/utmm/utmm-aarch64-macos` ✅
+4. 部署 linuxvm: `scp utmm-aarch64-linux root@192.168.64.2:/opt/utmm/utmm-aarch64-linux` ✅
+5. 部署 macvm: `scp utmm-aarch64-macos root@192.168.64.4:/opt/utmm/utmm-aarch64-macos` ✅
+6. 重启服务: systemctl restart utmm-guest + launchctl bootstrap ✅
+7. 启动 Host: launchctl bootstrap ✅
+
+### 验证结果
+| VM | 命令 | 结果 |
+|-----|------|------|
+| linuxvm | `uname -a` | ✅ Linux ubuntu 7.0.0-27-generic aarch64 |
+| linuxvm | `cd /tmp && pwd && cat testfile` | ✅ 持久 shell 验证通过 |
+| linuxvm | `ps aux \| head -5` | ✅ 多行输出正常 |
+| macvm | `sw_vers` | ✅ macOS 26.5.2 |
+| macvm | `export FOO=hello_world && echo $FOO` | ✅ 环境变量持久化 |
+| macvm | `ls -la /opt/utmm/` | ✅ 目录列表正常 |
+
+### 文件变更
+| 文件 | 变更 |
+|------|------|
+| `src/broadcast.zig:1232` | `io` → `m.io`（单行修复）|
+| `task_plan.md` | Phase 39 新增 |
+| `findings.md` | Finding #35 更新 + #36 新增 |
+| `progress.md` | 本条目 |

@@ -745,3 +745,114 @@ if (builtin.os.tag == .windows) {
 ```
 Shutdown 时主线程通过 atomic pointer 获取 socket handle，调用 `CloseHandle` 取消
 阻塞的 `receive()`，使后台线程正常退出。
+
+## SHA256 增量计算 (v0.11.6)
+
+大文件的 SHA256 校验不需要将整个文件加载到内存。使用 `Sha256.init()` /
+`.update()` / `.final()` 流式 API：
+
+```zig
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+// 初始化
+var sha256 = Sha256.init(.{});
+
+// 逐块更新（每块 8KB，不需要 buffer 整个文件）
+sha256.update(chunk1);
+sha256.update(chunk2);
+// ...
+
+// 获取最终 hash
+var hash: [32]u8 = undefined;
+sha256.final(&hash);
+
+// 转换为 hex 字符串（64 字符）
+fn hexHash(hash: [32]u8, hex_buf: *[64]u8) []const u8 {
+    _ = std.fmt.bufPrint(hex_buf, "{s}", .{std.fmt.fmtSliceHexLower(&hash)}) catch unreachable;
+    return hex_buf;
+}
+```
+
+**关键点**：
+- `Sha256.init({})` — 注意传入空 options `{}`（非 `.{}` 初始化，是 struct default）
+- `update()` 每次传一块即可，内部状态仅 32 字节
+- `final(&hash)` 消费状态并写入 32 字节 hash
+- 适用于 GB 级文件 — 内存占用与文件大小无关
+- 此 API 来自 `std.crypto.hash.sha2.Sha256`（Zig 0.16）
+
+### KCP 协议实现：序列号回绕比较
+
+C 参考实现使用 `ITimediff(sn, una)` 宏进行 u32 序列号带绕回比较。
+Zig 中用 `@bitCast` 将 u32 差值转为 i32 实现相同效果：
+
+```zig
+/// Check if sn a is less than sn b (with u32 wraparound).
+pub fn sn_lt(a: u32, b: u32) bool {
+    const diff: i32 = @bitCast(a -% b);
+    return diff < 0;
+}
+```
+
+**关键点**：
+- `-%` 确保差值计算也是 wraparound（对 u32 来说就是普通 subtract，因为 u32 已经 wrap）
+- `@bitCast` 将差值按 i32 解释 — 正值表示 a 较大，负值表示 b 较大
+- 此方法等同于 C 的 `((i32)((a)-(b)) < 0)`
+- **不得使用 `a < b`**：裸比较无法处理 u32 回绕（如 `0xFFFFFFFE < 0x00000001` 为 false，但 SN 语义下应收下）
+
+### KCP flush buffer 设计
+
+flush() 需要将多个 segment 打包到 MTU 大小的 UDP 数据报中。C 参考使用
+栈上的 scratch buffer。Zig 的 buffer 分配策略：
+
+```zig
+// create/setMtu 时分配
+self.buffer = self.allocator.alloc(u8, (mtu + IKCP_OVERHEAD) * 3) catch null;
+
+// flush() 中使用
+const buffer = self.buffer orelse return;
+var ptr: usize = 0;
+// ... 循环编码 segments ...
+if (ptr > 0) {
+    self.outputData(buffer[0..ptr]);
+}
+```
+
+**关键点**：
+- `* 3` — 最坏情况：ACK + WASK + WINS 各占一个 MTU
+- `buffer: ?[]u8` — nullable slice，需要时才分配
+- `outputData()` 直接发送 buffer slice，不涉及额外分配
+- 批量编码减少了 output callback 调用次数和 UDP syscall 开销
+
+### Zig 0.16: @divTrunc 用于正数除法（floor semantic）
+
+```zig
+// 正确：正数除法用 @divTrunc（truncate toward zero = floor for positive）
+const rtomin: u32 = @intCast(@divTrunc(self.rx_rto, 8));
+
+// 错误：@divFloor 已移除（Zig 0.14+），@divTrunc 对正数结果相同
+```
+
+### Zig 0.16: ArrayList([2]u32) vs ArrayList(u32)
+
+当 acklist 需要存储 (sn, ts) 对时：
+
+```zig
+// 旧格式
+acklist: std.ArrayList(u32),
+
+// 新格式 — [2]u32 元组
+acklist: std.ArrayList([2]u32),
+
+// 追加
+try self.acklist.append(self.allocator, .{ sn, ts });
+
+// 访问
+const sn = self.acklist.items[i][0];
+const ts = self.acklist.items[i][1];
+```
+
+**关键点**：
+- `.{ sn, ts }` 是 `[2]u32` 字面量
+- 二维索引 `items[i][0]` 直接访问，无需中间结构体
+- ArrayList 仍可做 append/clearRetainingCapacity 等操作
+- 此模式比创建 struct 更轻量（无需定义新类型）

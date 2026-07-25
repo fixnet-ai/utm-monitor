@@ -379,6 +379,14 @@ pub const Mesh = struct {
         }
     }
 
+    /// Replace the LSA node_info string dynamically (e.g. to signal
+    /// status change from "serving" to "upgrading"). Next LSA broadcast
+    /// will carry the new info. Takes ownership of new_info.
+    pub fn updateNodeInfo(self: *Mesh, new_info: []const u8) void {
+        self.allocator.free(self.node_info);
+        self.node_info = new_info;
+    }
+
     /// Main UDP receive/dispatch loop. Blocks until shutdown is signaled.
     /// Should be run in its own thread.
     pub fn run(self: *Mesh) !void {
@@ -433,20 +441,24 @@ pub const Mesh = struct {
         std.log.info("[mesh] Shutting down", .{});
     }
 
-    /// Windows: Zig 0.16.0 Io.Threaded on ARM64 Windows sometimes fails
-    /// with error.ConcurrencyUnavailable even for synchronous operate().
-    /// The underlying netReceiveOneWindows ignores the Io instance
-    /// entirely (calls NtDeviceIoControlFile directly), but the Io
-    /// initialization may trigger worker threads that interfere.
-    /// Workaround: use global_single_threaded Io which has no worker
-    /// threads and forces all operations synchronous.
-    /// Shutdown is handled by the main thread closing the socket to
-    /// unblock receive(). Periodic tasks run after each received
-    /// packet — Host LSA broadcasts every 5s provide regular wakeups.
+    /// Windows: blocking receive() has no timeout support, so KCP flush,
+    /// ACKs, keepalive probes, and LSA broadcasts would only run when
+    /// external packets arrive. We spawn a periodic timer thread that
+    /// runs periodicTasks every second, matching POSIX runPosix() behavior.
+    /// The timer thread exits when shutdown is signaled.
+    ///
+    /// Uses global_single_threaded Io for the blocking receive to avoid
+    /// error.ConcurrencyUnavailable on ARM64 Windows.
     fn runWindows(self: *Mesh) !void {
-        // Use the single-threaded Io to avoid ConcurrencyUnavailable on Windows.
         const local_io = std.Io.Threaded.global_single_threaded.io();
         var buf: [4096]u8 = undefined;
+
+        // Periodic timer thread: wake every 1s to drive KCP flush + keepalive.
+        const timer_thread = std.Thread.spawn(.{}, runWindowsTimer, .{self}) catch |err| {
+            std.log.err("[mesh] Failed to spawn timer thread: {}", .{err});
+            return err;
+        };
+        timer_thread.detach();
 
         while (!self.shutdown.load(.acquire)) {
             const msg = self.socket.receive(local_io, &buf) catch |err| {
@@ -472,6 +484,19 @@ pub const Mesh = struct {
         }
 
         std.log.info("[mesh] Shutting down", .{});
+    }
+
+    /// Periodic timer for Windows — drives KCP flush, keepalive, and LSA
+    /// broadcasts every 1 second when no packets are being received.
+    /// Exits when shutdown is signaled.
+    fn runWindowsTimer(self: *Mesh) void {
+        const local_io = std.Io.Threaded.global_single_threaded.io();
+        while (!self.shutdown.load(.acquire)) {
+            std.Io.sleep(local_io, std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
+            if (self.shutdown.load(.acquire)) break;
+            self.clock_ms +%= 1000;
+            self.periodicTasks() catch {};
+        }
     }
 
     /// Broadcast own LSA once before entering receive loop.
@@ -523,7 +548,13 @@ pub const Mesh = struct {
         }
 
         // Update all KCP sessions + keepalive (lock to prevent concurrent modification)
-        self.sessions_mutex.lock(self.io) catch {};
+        self.sessions_mutex.lock(self.io) catch {
+            // If the Io context is canceled, skip this periodicTasks cycle.
+            // Do NOT proceed without the lock — shared data would be
+            // accessed unsynchronized and the deferred unlock would corrupt
+            // the mutex state.
+            return;
+        };
         defer self.sessions_mutex.unlock(self.io);
 
         var s_iter = self.sessions.iterator();
@@ -714,7 +745,7 @@ pub const Mesh = struct {
 
     /// Process an incoming KCP_DATA packet (data does NOT include the type byte).
     /// Format: ttl(1) src_mac(6) dst_mac(6) kcp_segment(variable)
-    fn handleKcpData(self: *Mesh, data: []const u8, _: net.IpAddress) !void {
+    fn handleKcpData(self: *Mesh, data: []const u8, from: net.IpAddress) !void {
         if (data.len < 13 + kcp.IKCP_OVERHEAD) return;
 
         const ttl = data[0];
@@ -724,27 +755,59 @@ pub const Mesh = struct {
         const dst_mac: NodeId = data[7..13].*;
 
         // Read KCP conversation ID directly from the KCP header.
-        // This is more robust than computing from MAC addresses because
-        // the conv embeds the Host's startup nonce — when Host restarts,
-        // the conv changes and a fresh session is created automatically.
         const kcp_conv = readKcpConv(data);
 
-        // Is this for us?
+        // Are we the destination?
         if (std.mem.eql(u8, &dst_mac, &self.node_id)) {
+            std.log.info("[mesh-kcp] recv UDP {d}B from {any} conv={d}", .{ data.len, from, kcp_conv });
             // Deliver to our KCP session (keyed by conv from packet header)
-            // Lock to check/create session safely (protects against tunnelManager)
-            self.sessions_mutex.lock(self.io) catch {};
+            self.sessions_mutex.lock(self.io) catch {
+            // If the Io context is canceled, skip this periodicTasks cycle.
+            // Do NOT proceed without the lock — shared data would be
+            // accessed unsynchronized and the deferred unlock would corrupt
+            // the mutex state.
+            return;
+        };
             const existing = self.sessions.get(kcp_conv);
             if (existing) |sess| {
-                self.sessions_mutex.unlock(self.io);
+                const prev_peek = sess.kcp_inst.peekSize();
                 sess.kcp_inst.input(data[13..]) catch |err| {
                     std.log.err("[mesh] KCP input error: {}", .{err});
                 };
+                const new_peek = sess.kcp_inst.peekSize();
+                if (prev_peek != new_peek) {
+                    const first_sn = sess.kcp_inst.firstRcvBufSn();
+                    std.log.info("[mesh-kcp] conv={d} peek {}→{} rcvQ={d} rcvB={d} rcvNxt={d} firstBufSn={any}", .{
+                        kcp_conv, prev_peek, new_peek,
+                        sess.kcp_inst.rcvQueueLen(),
+                        sess.kcp_inst.rcvBufLen(),
+                        sess.kcp_inst.rcvNxt(),
+                        first_sn,
+                    });
+                } else if (sess.kcp_inst.rcvBufLen() > 0) {
+                    // Data arrives in rcv_buf but peekSize unchanged (gap exists)
+                    const first_sn = sess.kcp_inst.firstRcvBufSn();
+                    std.log.debug("[mesh-kcp-stall] conv={d} rcvQ={d} rcvB={d} rcvNxt={d} firstBufSn={any} peek={}", .{
+                        kcp_conv,
+                        sess.kcp_inst.rcvQueueLen(),
+                        sess.kcp_inst.rcvBufLen(),
+                        sess.kcp_inst.rcvNxt(),
+                        first_sn,
+                        new_peek,
+                    });
+                }
                 sess.last_recv_ms = self.clock_ms;
                 sess.keepalive_probes = 0;
+                // Keep neighbor alive: update last_seen_ms so expireStale
+                // doesn't remove it while this KCP session is still active.
+                if (self.neighbors.getPtr(src_mac)) |neighbor| {
+                    neighbor.last_seen_ms = self.clock_ms;
+                    neighbor.addr = from;
+                }
+                self.sessions_mutex.unlock(self.io);
             } else {
-                std.log.debug("[mesh] New KCP session from incoming data conv={d}", .{kcp_conv});
-                // New incoming session — create KCP instance and store
+                std.log.info("[mesh] New KCP session from {any} conv={d}", .{ from, kcp_conv });
+                // New incoming session — create KCP instance and store.
                 const new_sess = try self.allocator.create(MeshSession);
                 errdefer self.allocator.destroy(new_sess);
                 new_sess.* = .{
@@ -757,11 +820,25 @@ pub const Mesh = struct {
                     .last_recv_ms = self.clock_ms,
                 };
                 new_sess.kcp_inst.setOutput(meshKcpOutput);
-                try self.sessions.put(kcp_conv, new_sess);
-                self.sessions_mutex.unlock(self.io);
+                // CRITICAL: feed the first packet's data to kcp.input() —
+                // it contains the KCP SYN/data that initializes the connection.
                 new_sess.kcp_inst.input(data[13..]) catch |err| {
                     std.log.err("[mesh] KCP input error (new session): {}", .{err});
                 };
+                try self.sessions.put(kcp_conv, new_sess);
+                self.sessions_mutex.unlock(self.io);
+
+                // Auto-add the source as a neighbor so we can send KCP
+                // ACKs/output back.
+                {
+                    const n_result = try self.neighbors.getOrPut(src_mac);
+                    n_result.value_ptr.* = .{
+                        .id = src_mac,
+                        .addr = from,
+                        .last_seen_ms = self.clock_ms,
+                        .cost = 1,
+                    };
+                }
             }
         } else {
             // Relay: forward to next hop toward dst
@@ -787,7 +864,7 @@ pub const Mesh = struct {
         const mesh = sess.mesh;
         // Look up next-hop neighbor for sending
         if (mesh.neighbors.get(sess.next_hop)) |neighbor| {
-            std.log.debug("[mesh] kcp_output: conv={d} len={d} to={}", .{ conv, data.len, neighbor.addr });
+            std.log.info("[mesh] kcp_output: conv={d} len={d} to={} next_hop={any}", .{ conv, data.len, neighbor.addr, sess.next_hop });
             var buf: [4096]u8 = undefined;
             buf[0] = protocol.MESH_TYPE_KCP;
             buf[1] = protocol.MESH_MAX_TTL;
@@ -951,7 +1028,13 @@ pub const Mesh = struct {
     /// Create (or return existing) KCP session to a remote node.
     /// Thread-safe: locks sessions_mutex to protect against concurrent mesh.run() access.
     pub fn connect(self: *Mesh, dest: NodeId) !*MeshSession {
-        self.sessions_mutex.lock(self.io) catch {};
+        self.sessions_mutex.lock(self.io) catch {
+            // If the Io context is canceled, fail the connect.
+            // Do NOT proceed without the lock — shared data would be
+            // accessed unsynchronized and the deferred unlock would corrupt
+            // the mutex state.
+            return error.Canceled;
+        };
         defer self.sessions_mutex.unlock(self.io);
 
         // Increment counter to ensure each reconnection gets a unique conv.
@@ -982,7 +1065,13 @@ pub const Mesh = struct {
 
     /// Close and free a session.
     pub fn closeSession(self: *Mesh, sess: *MeshSession) void {
-        self.sessions_mutex.lock(self.io) catch {};
+        self.sessions_mutex.lock(self.io) catch {
+            // If the Io context is canceled, skip this periodicTasks cycle.
+            // Do NOT proceed without the lock — shared data would be
+            // accessed unsynchronized and the deferred unlock would corrupt
+            // the mutex state.
+            return;
+        };
         defer self.sessions_mutex.unlock(self.io);
         _ = self.sessions.remove(sess.conv);
         sess.deinit();
@@ -995,7 +1084,13 @@ pub const Mesh = struct {
     /// computing conv, because the conv may have changed due to
     /// connect_counter increments or nonce changes.
     pub fn closeSessionFor(self: *Mesh, dest: NodeId) void {
-        self.sessions_mutex.lock(self.io) catch {};
+        self.sessions_mutex.lock(self.io) catch {
+            // If the Io context is canceled, skip this periodicTasks cycle.
+            // Do NOT proceed without the lock — shared data would be
+            // accessed unsynchronized and the deferred unlock would corrupt
+            // the mutex state.
+            return;
+        };
         defer self.sessions_mutex.unlock(self.io);
         var it = self.sessions.iterator();
         while (it.next()) |entry| {

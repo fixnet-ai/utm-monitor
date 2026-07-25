@@ -1,4 +1,50 @@
-# Findings: v0.11.4
+# Findings: v0.11.5
+
+## Upload/Download 优化 Discoveries (2026-07-25)
+
+### `std.fmt.fmtSliceHexLower` 在 Zig 0.16.0 中已移除
+
+SHA256 hex 编码需手动实现。3 个调用位置（broadcast.zig、host.zig × 2），统一使用
+手动循环 `"0123456789abcdef"[b >> 4]` / `"0123456789abcdef"[b & 0x0F]`。
+
+### `Dir.rename()` 参数顺序
+
+Zig 0.16.0 签名: `Dir.rename(old_dir, old_path, new_dir, new_path, io)` — io 是最后一个参数。
+
+### `Dir.Iterator.next(io)` 需要 io 参数
+
+Zig 0.16.0 `Dir.Iterator.next()` 需要传入 `io` 参数: `iter.next(io)`。
+
+### 单例 key 设计 — 简化为仅目标路径
+
+原始设计 `"up:<vm>:<path>"` / `"dl:<vm>:<path>"` 区分了方向和来源。
+用户反馈: 只需按目标路径去重，其他机器也可能上传/下载同一文件。
+最终 key: `"<vm>:<path>"` — upload 和 download 去同一目标也共享 key
+（不能同时运行）。
+
+### Mesh 同机路由问题（已修复）
+
+原问题: 本机双端口测试时，Host 和 Guest 使用不同 mesh 端口（2121/2122），
+Guest 的 KCP output 找不到 Host 邻居（LSA 通过端口 2121 广播，Guest 监听 2122 收不到）。
+
+修复: `handleKcpData` 创建新 session 时，自动将 `src_mac` 添加为邻居（`addr = from`）。
+这样 KCP 反向通信不依赖 LSA 邻居发现。
+
+### Windows cmd.exe UTF-8 三层保障 (2026-07-25)
+
+`CreatePipe` + `CreateProcessW("cmd.exe /k")` 模式下，cmd.exe 没有真正 console，
+默认 code page = 系统 ANSI（中文 Windows 为 936），UTF-8 命令和文件名可能乱码。
+
+**三层修复**:
+1. `SetConsoleOutputCP(65001)` + `SetConsoleCP(65001)` — utmm 有 console 时子进程继承
+2. `chcp 65001 >nul` — cmd.exe 内部设置（无 console 时兜底）
+3. `set LANG=en_US.UTF-8` — 跨平台工具（git、python 等）尊重此变量
+
+### Zig 0.16.0 `respondStreaming` + 空 body panic
+
+`cmdDownload` 使用 `sendBodyComplete("")` 发送空 body 到 POST /download，
+触发 `respondStreaming` → `discardBody` → `unreachable` panic。
+修复: 发送非空 body `"{}"`。
 
 ## Auto-Upgrade 阻塞读取 Bug (2026-07-24)
 
@@ -333,3 +379,175 @@ try response.flush();           // finalize chunked encoding chunk
 
 13. **std.http.Server HEAD requests return 404**: Zig's `std.http.Server.respond()`
     doesn't automatically handle HEAD by stripping body. Upstream limitation.
+
+### Phase 35 — 管理员权限检查 + 自我提权 (2026-07-25)
+
+14. **Zig 0.16 `std.os.windows.BOOL` 已是 enum**: `Bool(c_int)` 类型，值 `.FALSE` / `.TRUE`，
+    不再是原始整数。对比用 `!= .FALSE` 而非 `!= 0`。
+
+15. **Zig 0.16 `std.ArrayList` 跨平台差异**: macOS native 上 `ArrayList(T).init(gpa)` 仍可
+    编译（向后兼容别名），但 Windows 交叉编译时 `ArrayList(T)` 解析为无状态 `Aligned(T, null)`，
+    无 `.init(gpa)` 方法。必须用 `.empty` 初始化并传 gpa 到每个方法调用。
+
+16. **Zig 0.16 `@ptrCast` 对齐检测**: `[*:0]const u8` (align 1) → `[*:0]const u16` (align 2)
+    需要 `@alignCast` 中间步骤。macOS native 常忽略此检测，Windows 交叉编译严格检查。
+
+17. **extern 声明中 `null` 不可强制转换为非可选指针**: Windows API 的可空参数（如
+    `ShellExecuteW` 的 `lpDirectory`）必须在 `@extern` 签名中声明为 `?LPCWSTR`。
+
+### Phase 36 — KCP 隧道自动升级 (2026-07-25)
+
+18. **KCP 隧道单线程架构**: Tunnel 对象的 `send()` / `recv()` 不能跨线程共享。
+    Host 端 `handleMeshGuest` 在 HTTP worker 线程中运行，所有 tunnel 操作必须在
+    同一函数调用链中完成。回调模式（传入 `handleMeshGuest` 到 `tunnel.run()`）
+    解决了这个问题。
+
+19. **blob-in-message 的局限性 (Phase 36 临时方案)**: 升级二进制直接嵌入消息，
+    因为文件 ~5-20MB 仍在可接受范围。但此设计不适用于 GB 级文件，Phase 37 用
+    分块协议替代。
+
+### Phase 37 — 分块文件传输协议 (2026-07-25)
+
+20. **KCP `recv` 消息完整性约束**: KCP `recv(buf)` 要求 buf ≥ 完整消息大小，
+    否则返回 `BufferTooSmall`。不能分段接收一条消息。这意味着单条消息不能超过
+    buf 大小，大文件传输必须分块。
+
+21. **256KB 固定 buffer 足够**: 所有消息类型中，`file_chunk` 最大（~8KB + 少量
+    协议头），`pty_output` 也远小于 256KB。撤销了 peekSize 动态分配，简化了
+    接收循环——只需循环 `tunnel.recv(&rbuf)` 不需要每次分配新 buffer。
+
+22. **增量 SHA256 消除全量 hash 的内存开销**: `Sha256.init({})` → `.update(chunk)`
+    per chunk → `.final(&hash)` — 只需 32 字节 hash 状态，无需 buffer 整个文件。
+    适用于所有三条路径 (upload/download/upgrade)。
+
+23. **`std.Io.Dir.rename` 签名变更**: Zig 0.16 的 `dir.rename(old_path, new_dir,
+    new_path, io)` 需要目标目录 + 文件名分开传入，非 `old_path → new_path` 的
+    单一路径模式。
+
+24. **分块协议设计选择**: 选择 `upload_cmd → file_chunk × N → file_eof` 而非
+    在 `upload_cmd` 中约定 chunk 数量，因为后者需要发送方先遍历文件确认大小，
+    增加一次文件系统操作。逐块发送直到 EOF 对发送方更自然。
+
+25. **PtySession 重启导致下载结果丢失**: 下载路径 Host→Guest→Host 中，
+    Guest shell 的 PtySession 可能因超时重启，导致 file_eof 到达 Host 时
+    cmd_id 对应的 op_states 已清空。从 ping/pty 输出中区分 file_chunk/file_eof，
+    两者使用不同的 Guest 端 dispatch 路径确保不依赖 PtySession。
+
+### Phase 38 — KCP 协议完整重写 (2026-07-25)
+
+26. **Zig 版 KCP 与 C 参考存在 10+ 处关键差异**: 下载 C 参考实现 (skywind3000/kcp)
+    逐行对比后发现 Zig 版缺少滑动窗口核心机制：
+    - `rmt_wnd` 缺失 → 无法限制发送速度以匹配接收方能力
+    - 发送窗口用段计数而非 SN 比较 → 无法正确处理序列号回绕
+    - 接收窗口无检查 → 重复/过期段可注入
+    - 无条件 flush → 无 rate limiting，CPU 空转
+    - 窗口探测检查 `rcvWnd()` 而非 `rmt_wnd` → 探测完全失效
+    - ACK 在 `snd_buf >= WND_SND` 时停发 → 发送满窗口时死锁
+    - xmit 初始值 1 而非 0 → RTO 计算偏离 C 行为
+    - 无 shrinkBuf → snd_una 更新不正确
+    - fastack 未聚合 → 快速重传计数不准
+    - 无输入后拥塞控制 → cwnd 永久不增长
+
+27. **cwnd=0 初始化导致首次发送死锁**: C 参考中 cwnd 初始值为 0，理论上是
+    通过首个 ACK 的 snd_una 推进来触发拥塞控制初始化 cwnd。但首个 flush 时
+    若 cwnd=0，`snd_nxt < snd_una + 0` 永远为 false → 无数据发送 → 无 ACK
+    返回 → 死锁。修复：在 flush() 发送窗口计算中 `if (cwnd < 1) cwnd = 1`。
+
+28. **KCP ACK 存储必须包含 timestamp**: C 参考用 `(sn, ts)` 对存储 ACK 列表，
+    flush 时用 ts 填写 segment header。Zig 旧版只存 sn → acklist 改为
+    `ArrayList([2]u32)`。
+
+29. **flush() 批量编码提高效率**: C 参考在 flush() 中用 scratch buffer 将多个
+    segment 打包到一个 MTU 大小的 UDP 数据报中。Zig 旧版每个 segment 单独调用
+    output callback → 改为 `encodeSeg()` + `outputData()` 批量发送。
+
+30. **nodelay 语义澄清**: C 参考中 `nc` 参数值为 0/1（int），`if (nc >= 0) kcp->nocwnd = nc`。
+    Zig 版用 bool → `self.nocwnd = nc` 即可，无需 `if (nc)` 守卫。
+
+31. **测试与实际使用的一致性**: KCP 单元测试使用 cross-wired 实例（直接调用
+    `input()`），UDP datagram 不经过真实网络。大文件传输验证需要用实际
+    exec 命令生成大输出（`dd if=/dev/urandom bs=1024 count=N`）通过 KCP tunnel
+    回传来确认重写效果。
+
+## Phase 33: sessions_mutex 死锁修复 (2026-07-25)
+
+### 32. `catch {}` 静默吞掉 `Io.Mutex.lock` 错误导致死锁
+
+`sessions_mutex.lock(io) catch {}` 模式在 8 个调用位置使用。当 `Io.Mutex.lock()`
+返回 `error.Canceled`（macOS `__ulock_wait2` 被取消）时，代码在没有持有锁的
+情况下继续执行，而 `defer unlock()` 仍然运行 —— 释放未持有的锁，永久破坏 mutex
+状态。所有后续 lock 调用全部阻塞，系统死锁。
+
+**修复**：
+| 文件 | 位置 | 修复 |
+|------|------|------|
+| `tunnel.zig` | `send()`, `lock()`, `recv()` | `catch {}` → `try` 传播错误 |
+| `tunnel.zig` | `isAlive()`, `peekSize()`, `flush()`, `enableFastMode()`, `waiting()` | 保留 `catch return <默认值>`（defer 前返回，不会 unlock） |
+| `mesh.zig` | `periodicTasks()`, `handleKcpData()` | `catch { return; }` 跳过本周期（返回 void） |
+| `mesh.zig` | `connect()` | `catch { return error.Canceled; }`（返回 `!*MeshSession`） |
+| `mesh.zig` | `closeSession()`, `closeSessionFor()` | 保留 `catch { return; }`（返回 void） |
+| `host_http.zig` | exec handler | 手动 lock+sendLocked+flushLocked+unlock → `tun.send()` + `tun.flush()` |
+| `host_http.zig` | pty_spawn handler | 同上 |
+| `host_http.zig` | upgrade batch send | `tun.lock()` → `tun.lock() catch return` |
+| `host.zig` | tunnel manager (upgrading 分支) | `catch {}` → `catch continue` |
+
+### 33. 跨 Io 实例 Mutex 锁不兼容
+
+`broadcast.zig:waitForHostTunnel` 和 `upgrade.zig:connectToHost` 使用 `m.io`
+（mesh 线程 Io）调用 `sessions_mutex.lock()`，但这两个函数从主线程调用，
+使用的 Io 实例与 mesh 线程不同。在 Zig 0.16.0 中，不同的 Io 实例锁定
+同一个 Mutex 可能失败（返回 `error.Canceled`）。
+
+这些位置的 `catch {}` **必须保留**：
+- 没有 `defer unlock()`（手动 unlock 在 return 路径中）
+- 无锁读取 sessions HashMap 的风险：最多错过一个刚创建的 session，500ms 后重试
+- `catch continue` 会导致死循环：锁每次失败，Guest 永远找不到 tunnel
+
+### 34. 多 Host 进程端口冲突
+
+两次从不同位置启动 Host（LaunchDaemon 的 `/opt/utmm/utmm` 和前景的
+`zig-out/bin/utmm`）导致两个进程争用 UDP 2121 和 TCP 2121。
+LaunchDaemon 自动重启加剧了冲突。macOS `launchctl kickstart -k`
+会重启服务但可能导致新旧进程短暂共存。
+
+**教训**：测试前景 Host 前必须 `launchctl bootout` 停掉 LaunchDaemon；
+不要假设端口会因为进程退出而自动释放。
+
+### 35. exec 超时是本次会话前的既有问题
+
+~~使用 `git stash` 恢复原始代码（v0.11.1）构建并测试，exec 同样超时。
+sessions_mutex 修复是必要的（防止死锁），但不足以解决 exec 超时。
+根本原因在于 KCP 隧道数据流问题：pty_spawn 被发送和 ACK，但 pty_output
+（shell 输出）从未到达 `handleMeshGuest` 的 `tun.recv()`。~~
+
+**已解决**: 根因是 cross-Io mutex 问题（见 Finding #36）。`waitForHostTunnel` 使用
+主线程的 `io` 创建 Tunnel，而 `sessions_mutex` 用 mesh 线程的 `m.io` 创建，
+不同 Io 实例导致 `Mutex.lock()` 返回 `error.Canceled` → `tun.recv()` 失败 →
+pty_output 永远无法被 Host 读取。
+
+### 36. Zig 0.16.0 Io.Mutex 跨 Io 实例不兼容 (2026-07-25)
+
+**发现**: `std.Io.Mutex.lock(io)` 要求传入的 `io` 与创建 mutex 时使用的 `io` 是
+**同一个实例**。不同的 `Io.Threaded` 实例之间 mutex lock 会返回 `error.Canceled`。
+
+**影响位置**: `src/broadcast.zig:1232` — `waitForHostTunnel` 创建 Tunnel 时使用
+主线程的 `io`，但 `Tunnel.recv()/send()` 调用的 `sessions_mutex.lock(self.io)`
+中的 mutex 是用 mesh 线程的 `m.io` 创建的。
+
+**症状**: `tun.recv()` 立即返回 `error.Canceled`（不等待数据），导致
+`handleMeshGuest` recv loop 退出，pty_spawn 被写入但 pty_output 无法被读取。
+
+**为什么 `catch {}` 时期未暴露**:
+- 旧代码: `lock() catch {}` 静默吞掉错误 → `recv()` 在无锁状态下调用 `kcp_inst.recv()`
+  → 数据竞争但偶尔能读到数据（行为不确定）
+- 新代码: `try lock()` 传播错误 → `recv()` 立即失败，确定性出错
+- Phase 38 (KCP 重写) 将 `catch {}` 改为 `try`，使问题从静默变为 fatal
+
+**修复**: `waitForHostTunnel` 中 `Tunnel.init(allocator, m.io, sess)` —
+使用 mesh 的 Io（`m.io`），与 `sessions_mutex` 创建时一致。
+
+**为什么 Host 侧不受影响**: Host 在 `host.zig:728` 创建 Tunnel 时已经使用 `m.io`。
+
+**教训**: Zig 0.16.0 的 `Io.Mutex` 与 Go 的 `sync.Mutex` 不同 — Go 的 mutex
+可在任意 goroutine 中 lock/unlock；Zig 的 `Io.Mutex` 绑定到特定 `Io` 实例。
+跨线程共享 mutex 时必须确保所有访问者使用相同的 `Io` 实例。
