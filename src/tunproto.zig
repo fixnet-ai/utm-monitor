@@ -38,6 +38,16 @@ pub const MsgType = enum(u8) {
 // Serialization helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Maximum blob length from untrusted network data (1 MB).
+/// KCP messages are MTU-bounded (~1300 bytes), so any blob exceeding
+/// this is either malicious or a protocol bug.
+pub const MAX_BLOB_LEN: u32 = 1024 * 1024;
+
+/// Maximum string length from untrusted network data (8 KB).
+/// cmd_id paths are typically < 256 bytes; 8 KB allows for future
+/// expansion while preventing memory exhaustion.
+pub const MAX_STRING_LEN: u32 = 8192;
+
 fn writeString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     try buf.appendSlice(allocator, s);
     try buf.append(allocator, 0);
@@ -64,17 +74,32 @@ fn writeU32(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u32) !void
 }
 
 pub fn readString(data: []const u8, pos: *usize) ?[]const u8 {
+    return readStringMax(data, pos, MAX_STRING_LEN);
+}
+
+/// Read a null-terminated string with an explicit maximum length.
+/// Returns null if the string exceeds max_len, no null terminator found,
+/// or reads past the data boundary.
+pub fn readStringMax(data: []const u8, pos: *usize, max_len: u32) ?[]const u8 {
     const start = pos.*;
     const remaining = data[start..];
     const end = std.mem.indexOfScalar(u8, remaining, 0) orelse return null;
+    if (end > max_len) return null;
     pos.* = start + end + 1;
     return remaining[0..end];
 }
 
 pub fn readBlob(data: []const u8, pos: *usize) ?[]const u8 {
+    return readBlobMax(data, pos, MAX_BLOB_LEN);
+}
+
+/// Read a length-prefixed blob with an explicit maximum size.
+/// Returns null if the blob exceeds max_len or runs past the data boundary.
+pub fn readBlobMax(data: []const u8, pos: *usize, max_len: u32) ?[]const u8 {
     const start = pos.*;
     if (start + 4 > data.len) return null;
     const len = std.mem.readInt(u32, data[start..][0..4], .big);
+    if (len > max_len) return null;
     const blob_start = start + 4;
     if (blob_start + len > data.len) return null;
     pos.* = blob_start + len;
@@ -555,4 +580,66 @@ test "chunked file transfer flow: upload_cmd → file_chunk × N → file_eof" {
     try std.testing.expectEqual(@as(i32, 0), parsed_eof.exit_code);
     try std.testing.expectEqual(@as(u32, 16), parsed_eof.file_size);
     try std.testing.expectEqualStrings(file_hash, parsed_eof.file_hash);
+}
+
+test "readBlobMax - respects max_len" {
+    // Build a blob with 8 bytes of data
+    var buf: [4 + 8]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 8, .big);
+    @memset(buf[4..12], 0xAB);
+
+    var pos: usize = 0;
+    const blob = readBlobMax(&buf, &pos, 8) orelse return error.ParseFailed;
+    try std.testing.expectEqual(@as(usize, 8), blob.len);
+
+    // Same blob but with max_len=4 should fail
+    pos = 0;
+    try std.testing.expect(readBlobMax(&buf, &pos, 4) == null);
+}
+
+test "readBlobMax - returns null on len=0xFFFFFFFF (would exceed max)" {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 0xFFFFFFFF, .big);
+    var pos: usize = 0;
+    try std.testing.expect(readBlobMax(&buf, &pos, MAX_BLOB_LEN) == null);
+}
+
+test "readBlobMax - returns null on truncated data" {
+    var buf: [4 + 2]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 8, .big); // claims 8 bytes but only 2 follow
+    var pos: usize = 0;
+    try std.testing.expect(readBlobMax(&buf, &pos, 16) == null);
+}
+
+test "readStringMax - respects max_len" {
+    const s: [6]u8 = "hello".* ++ [_]u8{0};
+    var pos: usize = 0;
+    const result = readStringMax(&s, &pos, 5) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("hello", result);
+
+    // Same string with max_len=3 should fail
+    pos = 0;
+    try std.testing.expect(readStringMax(&s, &pos, 3) == null);
+}
+
+test "readStringMax - returns null on missing null terminator" {
+    const s: [4]u8 = "test".*;
+    var pos: usize = 0;
+    try std.testing.expect(readStringMax(&s, &pos, MAX_STRING_LEN) == null);
+}
+
+test "readBlob - default max is MAX_BLOB_LEN" {
+    var buf: [4 + 4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 4, .big);
+    @memset(buf[4..8], 0xCD);
+    var pos: usize = 0;
+    const blob = readBlob(&buf, &pos) orelse return error.ParseFailed;
+    try std.testing.expectEqual(@as(usize, 4), blob.len);
+}
+
+test "readString - default max is MAX_STRING_LEN" {
+    const s: [6]u8 = "hello".* ++ [_]u8{0};
+    var pos: usize = 0;
+    const result = readString(&s, &pos) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("hello", result);
 }

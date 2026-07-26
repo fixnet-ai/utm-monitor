@@ -11,7 +11,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const fail = @import("fail.zig");
-const install_mod = @import("install.zig");
 
 /// POSIX canonical install path.
 pub const CANONICAL_PATH_POSIX = "/opt/utmm/utmm";
@@ -173,7 +172,7 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
     defer alloc.free(plist_path);
 
     const exe_path = canonicalPath();
-    const env = install_mod.detectServiceEnv(.macos);
+    const env = .{ .shell = "/bin/zsh", .home = "/var/root" };
 
     // Build ProgramArguments string
     var args_list: std.ArrayListAligned(u8, null) = .empty;
@@ -262,7 +261,7 @@ fn installLinux(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
     defer alloc.free(unit_path);
 
     const exe_path = canonicalPath();
-    const env = install_mod.detectServiceEnv(.linux);
+    const env = .{ .shell = "/bin/bash", .home = "/root" };
 
     // Build ExecStart args
     var exec_args: std.ArrayListAligned(u8, null) = .empty;
@@ -347,8 +346,10 @@ fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra
     }
 
     // Delete old service if exists
-    _ = runCmd(alloc, io, &[_][]const u8{ "sc", "stop", name });
-    _ = runCmd(alloc, io, &[_][]const u8{ "sc", "delete", name });
+    _ = runCmd(alloc, io, &[_][]const u8{ "sc", "stop", name }); // best-effort: may not exist
+    if (!runCmd(alloc, io, &[_][]const u8{ "sc", "delete", name })) {
+        std.log.warn("[svc] sc delete {s} failed (may not be installed)", .{name});
+    }
 
     // Create service
     if (!runCmd(alloc, io, &[_][]const u8{
@@ -368,12 +369,12 @@ fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra
         fail.msg("install/sc-failure", "failed to configure failure actions for {s}", .{name});
     }
 
-    // Add firewall rule
+    // Add firewall rule (delete any previous rule first, ignore error if not found)
     const rule_name = "UTM Monitor";
     _ = runCmd(alloc, io, &[_][]const u8{
         "netsh", "advfirewall", "firewall", "delete", "rule",
         "name=" ++ rule_name,
-    });
+    }); // best-effort: may not exist
     if (!runCmd(alloc, io, &[_][]const u8{
         "netsh", "advfirewall", "firewall", "add", "rule",
         "name=" ++ rule_name,
@@ -441,7 +442,9 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
     };
 
     // Kill any remaining utmm processes
-    killAllUtmm(io, alloc) catch {};
+    killAllUtmm(io, alloc) catch |err| {
+        std.log.warn("[svc] uninstall killAllUtmm failed: {}", .{err});
+    };
 
     std.log.info("[svc] uninstall complete", .{});
 }
@@ -485,13 +488,19 @@ pub fn stop(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
     const name = svcName(role);
     switch (builtin.os.tag) {
         .macos => {
-            _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", name });
+            if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", name })) {
+                std.log.warn("[svc] stop {s}: bootout returned non-zero (may not be running)", .{name});
+            }
         },
         .linux => {
-            _ = runCmd(alloc, io, &[_][]const u8{ "systemctl", "stop", name });
+            if (!runCmd(alloc, io, &[_][]const u8{ "systemctl", "stop", name })) {
+                std.log.warn("[svc] stop {s}: systemctl stop returned non-zero (may not be running)", .{name});
+            }
         },
         .windows => {
-            _ = runCmd(alloc, io, &[_][]const u8{ "sc", "stop", name });
+            if (!runCmd(alloc, io, &[_][]const u8{ "sc", "stop", name })) {
+                std.log.warn("[svc] stop {s}: sc stop returned non-zero (may not be running)", .{name});
+            }
         },
         else => {},
     }
@@ -604,10 +613,14 @@ fn copyFile(io: std.Io, alloc: std.mem.Allocator, src_path: []const u8, dst_path
             fail.err("selfCopy/write", err);
         };
     }
-    writer.interface.flush() catch {};
+    writer.interface.flush() catch |err| {
+        std.log.warn("[svc] copyFile flush failed: {}", .{err});
+    };
 
     // fsync to ensure data is on disk before rename
-    dst.sync(io) catch {};
+    dst.sync(io) catch |err| {
+        std.log.warn("[svc] copyFile sync failed: {}", .{err});
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -628,7 +641,9 @@ pub fn forceInstall(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, ext
     };
 
     // 2. Kill any lingering utmm processes
-    killAllUtmm(io, alloc) catch {};
+    killAllUtmm(io, alloc) catch |err| {
+        std.log.warn("[svc] forceInstall killAllUtmm failed: {}", .{err});
+    };
 
     // 3. Copy self to canonical path
     selfCopy(io, alloc) catch |err| {
@@ -755,6 +770,8 @@ extern "advapi32" fn StartServiceCtrlDispatcherW(lpServiceStartTable: [*]const S
 extern "advapi32" fn RegisterServiceCtrlHandlerExW(lpServiceName: [*:0]const u16, lpHandlerProc: ?*const fn (dwControl: u32, dwEventType: u32, lpEventData: ?*anyopaque, lpContext: ?*anyopaque) callconv(.winapi) u32, lpContext: ?*anyopaque) callconv(.winapi) ?SERVICE_STATUS_HANDLE;
 extern "advapi32" fn SetServiceStatus(hServiceStatus: ?SERVICE_STATUS_HANDLE, lpServiceStatus: *SERVICE_STATUS) callconv(.winapi) u32;
 
+const MAX_SVC_NAME_UTF16 = 64; // "UTM-Monitor-Guest" = 17 chars + null = 18 u16
+
 const SvcGlobals = struct {
     var io: std.Io = undefined;
     var gpa: std.mem.Allocator = undefined;
@@ -766,6 +783,7 @@ const SvcGlobals = struct {
     var host_ip: ?[]const u8 = null;
     var status_handle: ?SERVICE_STATUS_HANDLE = null;
     var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+    var svc_name_utf16: [MAX_SVC_NAME_UTF16]u16 = [_]u16{0} ** MAX_SVC_NAME_UTF16;
 };
 
 fn svcCtrlHandler(dwControl: u32, _: u32, _: ?*anyopaque, _: ?*anyopaque) callconv(.winapi) u32 {
@@ -784,8 +802,7 @@ fn svcCtrlHandler(dwControl: u32, _: u32, _: ?*anyopaque, _: ?*anyopaque) callco
 }
 
 fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
-    const svc_name_utf16 = [_:0]u16{ 'u', 't', 'm', 'm', 0 };
-    const h = RegisterServiceCtrlHandlerExW(&svc_name_utf16, svcCtrlHandler, null);
+    const h = RegisterServiceCtrlHandlerExW(@ptrCast(&SvcGlobals.svc_name_utf16), svcCtrlHandler, null);
     SvcGlobals.status_handle = h;
 
     if (h) |handle| {
@@ -797,7 +814,7 @@ fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
     }
 
     const host_mod = @import("host.zig");
-    const guest_mod = @import("guest.zig");
+    const broadcast_mod = @import("broadcast.zig");
 
     if (SvcGlobals.is_host) {
         host_mod.runWithIo(SvcGlobals.io, SvcGlobals.gpa, .{
@@ -811,7 +828,7 @@ fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
             std.log.err("[svc] host run failed: {}", .{err});
         };
     } else {
-        guest_mod.runWithIo(SvcGlobals.io, SvcGlobals.gpa, .{
+        broadcast_mod.guestRunWithIo(SvcGlobals.io, SvcGlobals.gpa, .{
             .hostname = SvcGlobals.hostname_override,
             .port = SvcGlobals.port,
             .mesh_port = SvcGlobals.mesh_port,
@@ -851,9 +868,18 @@ pub fn winServiceRun(
     SvcGlobals.peer_mesh = peer_mesh;
     SvcGlobals.host_ip = host_ip;
 
-    const svc_name_utf16 = [_:0]u16{ 'u', 't', 'm', 'm', 0 };
+    // Build correct UTF-16 service name from role
+    const svc_name_utf8 = svcName(if (is_host) .host else .guest);
+    var i: usize = 0;
+    for (svc_name_utf8) |c| {
+        if (i >= MAX_SVC_NAME_UTF16 - 1) break;
+        SvcGlobals.svc_name_utf16[i] = @intCast(c);
+        i += 1;
+    }
+    SvcGlobals.svc_name_utf16[i] = 0;
+
     var svc_table = [2]SERVICE_TABLE_ENTRYW{
-        .{ .lpServiceName = &svc_name_utf16, .lpServiceProc = svcMain },
+        .{ .lpServiceName = @ptrCast(&SvcGlobals.svc_name_utf16), .lpServiceProc = svcMain },
         .{ .lpServiceName = null, .lpServiceProc = null },
     };
 

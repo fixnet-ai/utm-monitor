@@ -12,6 +12,9 @@ pub const Tunnel = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     session: *mesh.MeshSession,
+    /// Debug-mode sentinel to detect use-after-deinit.
+    /// In ReleaseFast/ReleaseSmall the check is elided by the compiler.
+    _alive: bool = true,
 
     /// Create a tunnel from an existing MeshSession.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, sess: *mesh.MeshSession) Tunnel {
@@ -19,7 +22,16 @@ pub const Tunnel = struct {
             .allocator = allocator,
             .io = io,
             .session = sess,
+            ._alive = true,
         };
+    }
+
+    /// Assert the tunnel is still alive (debug-only, compile-time elided in ReleaseFast/ReleaseSmall).
+    inline fn assertAlive(self: *const Tunnel) void {
+        if (!self._alive) {
+            @branchHint(.cold);
+            std.debug.panic("use-after-deinit: Tunnel.deinit() was already called", .{});
+        }
     }
 
     /// Connect to a remote node via mesh. Returns a Tunnel on success.
@@ -35,6 +47,7 @@ pub const Tunnel = struct {
     /// For batch sends, prefer lock() + sendLocked() + unlock() to avoid
     /// mutex starvation of the mesh thread's ACK processing loop.
     pub fn send(self: *Tunnel, data: []const u8) !usize {
+        self.assertAlive();
         try self.session.mesh.sessions_mutex.lock(self.io);
         defer self.session.mesh.sessions_mutex.unlock(self.io);
         try self.session.kcp_inst.send(data);
@@ -54,6 +67,7 @@ pub const Tunnel = struct {
     /// update() won't flush if called within the same interval since the last
     /// mesh thread periodicTasks, which would defeat this optimization.
     pub fn sendAndFlush(self: *Tunnel, data: []const u8, current_ms: u32) !usize {
+        self.assertAlive();
         try self.session.mesh.sessions_mutex.lock(self.io);
         defer self.session.mesh.sessions_mutex.unlock(self.io);
         try self.session.kcp_inst.send(data);
@@ -67,6 +81,7 @@ pub const Tunnel = struct {
     /// Always pair with unlock() — prefer defer.
     /// Returns LockFailed if the Io context is canceled.
     pub fn lock(self: *Tunnel) !void {
+        self.assertAlive();
         try self.session.mesh.sessions_mutex.lock(self.io);
     }
 
@@ -78,6 +93,7 @@ pub const Tunnel = struct {
     /// Send data assuming sessions_mutex is already held (via lock()).
     /// Does NOT lock/unlock — caller is responsible for synchronization.
     pub fn sendLocked(self: *Tunnel, data: []const u8) !usize {
+        self.assertAlive();
         try self.session.kcp_inst.send(data);
         return data.len;
     }
@@ -87,6 +103,7 @@ pub const Tunnel = struct {
     /// NOTE: Does NOT call kcp.update() — only mesh.run() thread updates KCP state.
     /// Locks sessions_mutex to synchronize with mesh thread's kcp.input().
     pub fn recv(self: *Tunnel, buf: []u8) !usize {
+        self.assertAlive();
         try self.session.mesh.sessions_mutex.lock(self.io);
         defer self.session.mesh.sessions_mutex.unlock(self.io);
         return try self.session.kcp_inst.recv(buf);
@@ -110,6 +127,7 @@ pub const Tunnel = struct {
     /// use this to allocate the correct buffer size before calling recv().
     /// Locks sessions_mutex to synchronize with mesh thread.
     pub fn peekSize(self: *Tunnel) i32 {
+        self.assertAlive();
         self.session.mesh.sessions_mutex.lock(self.io) catch return -1;
         defer self.session.mesh.sessions_mutex.unlock(self.io);
         return self.session.kcp_inst.peekSize();
@@ -121,6 +139,7 @@ pub const Tunnel = struct {
     /// current_ms should come from the mesh's clock for consistency.
     /// Locks sessions_mutex to synchronize with mesh thread.
     pub fn flush(self: *Tunnel, current_ms: u32) void {
+        self.assertAlive();
         self.session.mesh.sessions_mutex.lock(self.io) catch return;
         defer self.session.mesh.sessions_mutex.unlock(self.io);
         self.session.kcp_inst.update(current_ms);
@@ -128,6 +147,7 @@ pub const Tunnel = struct {
 
     /// Flush assuming sessions_mutex is already held (via lock()).
     pub fn flushLocked(self: *Tunnel, current_ms: u32) void {
+        self.assertAlive();
         self.session.kcp_inst.update(current_ms);
     }
 
@@ -138,6 +158,7 @@ pub const Tunnel = struct {
     ///   and recv returns exactly one message per call.
     /// Locks sessions_mutex to synchronize with mesh thread.
     pub fn enableFastMode(self: *Tunnel) void {
+        self.assertAlive();
         self.session.mesh.sessions_mutex.lock(self.io) catch return;
         defer self.session.mesh.sessions_mutex.unlock(self.io);
         self.session.kcp_inst.setNoDelay(false, 10, 0, true);
@@ -146,6 +167,7 @@ pub const Tunnel = struct {
     /// Number of KCP segments waiting to be sent (snd_queue) + in flight (snd_buf).
     /// Returns 0 when all data has been acknowledged by the peer.
     pub fn waiting(self: *Tunnel) usize {
+        self.assertAlive();
         self.session.mesh.sessions_mutex.lock(self.io) catch return 0;
         defer self.session.mesh.sessions_mutex.unlock(self.io);
         return self.session.kcp_inst.waiting();
@@ -155,7 +177,9 @@ pub const Tunnel = struct {
     /// The caller must have access to the Mesh to properly close.
     pub fn deinit(self: *Tunnel) void {
         // Note: actual session cleanup is done by mesh.closeSession()
-        // This just marks the tunnel as invalid.
+        // This just marks the tunnel as invalid. Debug mode will panic
+        // on subsequent use via assertAlive() checks.
+        self._alive = false;
         self.* = undefined;
     }
 

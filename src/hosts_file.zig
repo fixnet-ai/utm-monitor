@@ -95,8 +95,13 @@ pub fn updateHosts(
 
     try writeFile(io, tmp_path, new_content.items);
 
-    // Atomic rename
-    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), file_path, io);
+    // Atomic rename using the file's parent directory (not cwd, which may change).
+    // For absolute paths like /etc/hosts, this opens /etc as the dir handle.
+    const parent_dir_path = std.fs.path.dirname(file_path) orelse "/";
+    const parent_dir = try std.Io.Dir.cwd().openDir(io, parent_dir_path, .{});
+    defer parent_dir.close(io);
+    const file_basename = std.fs.path.basename(file_path);
+    try parent_dir.rename(tmp_path, parent_dir, file_basename, io);
 }
 
 /// Read entire file content

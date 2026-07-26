@@ -115,7 +115,9 @@ pub const NeighborEntry = struct {
     cost: u8, // 1 = direct, higher = worse
 };
 
-/// Encode an LSA into a buffer. Returns encoded length.
+/// Encode an LSA into a buffer. Returns encoded length, or 0 if the buffer
+/// is too small to hold all neighbors (neighbors are truncated silently by
+/// callers; encodeLsa asserts in debug mode but returns 0 in release).
 /// Format: type(1) origin(6) seq(4) ttl(1) flags(1) node_info_len(2) node_info(variable) neighbor_count(1) neighbors(variable)
 pub fn encodeLsa(
     buf: []u8,
@@ -126,7 +128,13 @@ pub fn encodeLsa(
     node_info: []const u8,
     neighbors: []const NeighborEntry,
 ) usize {
-    assert(buf.len >= 15 + node_info.len + 1 + neighbors.len * 7);
+    const needed = 15 + node_info.len + 1 + neighbors.len * 7;
+    if (buf.len < needed) {
+        std.log.warn("[mesh] encodeLsa: buffer too small (need {d}, have {d})", .{ needed, buf.len });
+        // Try to fit as many neighbors as possible
+        const max_neighbors = (buf.len -| (15 + node_info.len + 1)) / 7;
+        return encodeLsa(buf, origin, seq, ttl, flags, node_info, neighbors[0..@min(neighbors.len, max_neighbors)]);
+    }
 
     buf[0] = protocol.MESH_TYPE_LSA;
     @memcpy(buf[1..7], &origin);
@@ -413,7 +421,7 @@ pub const Mesh = struct {
                 switch (err) {
                     error.Timeout => {
                         self.clock_ms +%= 1000;
-                        try self.periodicTasks();
+                        self.periodicTasks();
                         continue;
                     },
                     else => {
@@ -428,14 +436,18 @@ pub const Mesh = struct {
             if (msg.data.len == 0) continue;
 
             switch (msg.data[0]) {
-                protocol.MESH_TYPE_LSA => try self.handleLsa(msg.data[1..], msg.from),
-                protocol.MESH_TYPE_KCP => try self.handleKcpData(msg.data[1..], msg.from),
+                protocol.MESH_TYPE_LSA => self.handleLsa(msg.data[1..], msg.from) catch |err| {
+                    std.log.err("[mesh] handleLsa failed: {}", .{err});
+                },
+                protocol.MESH_TYPE_KCP => self.handleKcpData(msg.data[1..], msg.from) catch |err| {
+                    std.log.err("[mesh] handleKcpData failed: {}", .{err});
+                },
                 protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
                 protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
                 else => {},
             }
 
-            try self.periodicTasks();
+            self.periodicTasks();
         }
 
         std.log.info("[mesh] Shutting down", .{});
@@ -470,14 +482,18 @@ pub const Mesh = struct {
             if (msg.data.len == 0) continue;
 
             switch (msg.data[0]) {
-                protocol.MESH_TYPE_LSA => try self.handleLsa(msg.data[1..], msg.from),
-                protocol.MESH_TYPE_KCP => try self.handleKcpData(msg.data[1..], msg.from),
+                protocol.MESH_TYPE_LSA => self.handleLsa(msg.data[1..], msg.from) catch |err| {
+                    std.log.err("[mesh] handleLsa failed: {}", .{err});
+                },
+                protocol.MESH_TYPE_KCP => self.handleKcpData(msg.data[1..], msg.from) catch |err| {
+                    std.log.err("[mesh] handleKcpData failed: {}", .{err});
+                },
                 protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
                 protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
                 else => {},
             }
 
-            try self.periodicTasks();
+            self.periodicTasks();
         }
 
         std.log.info("[mesh] Shutting down", .{});
@@ -496,7 +512,7 @@ pub const Mesh = struct {
             Sleep(1000);
             if (self.shutdown.load(.acquire)) break;
             self.clock_ms +%= 1000;
-            self.periodicTasks() catch {};
+            self.periodicTasks();
         }
     }
 
@@ -536,7 +552,7 @@ pub const Mesh = struct {
     // Periodic tasks
     // ──────────────────────────────────────────────────────────────────────────
 
-    fn periodicTasks(self: *Mesh) !void {
+    fn periodicTasks(self: *Mesh) void {
         // Broadcast own LSA every MESH_LSA_INTERVAL_MS
         if (self.clock_ms - self.last_lsa_broadcast_ms >= protocol.MESH_LSA_INTERVAL_MS) {
             self.broadcastOwnLsa();
@@ -733,6 +749,12 @@ pub const Mesh = struct {
 
         // Relay LSA: decrement TTL, re-broadcast to our neighbors
         if (decoded.ttl > 2) {
+            // Safety: reject oversized LSA data that would overflow the relay buffer.
+            // relay_buf is 1500 bytes (standard MTU); data > 1499 would corrupt the stack.
+            if (data.len > 1499) {
+                std.log.warn("[mesh] LSA relay dropped: data too large ({d} bytes)", .{data.len});
+                return;
+            }
             var relay_buf: [1500]u8 = undefined;
             relay_buf[0] = protocol.MESH_TYPE_LSA;
             @memcpy(relay_buf[1..][0..data.len], data);
@@ -776,6 +798,7 @@ pub const Mesh = struct {
             // the mutex state.
             return;
         };
+            defer self.sessions_mutex.unlock(self.io);
             const existing = self.sessions.get(kcp_conv);
             if (existing) |sess| {
                 const prev_peek = sess.kcp_inst.peekSize();
@@ -812,7 +835,6 @@ pub const Mesh = struct {
                     neighbor.last_seen_ms = self.clock_ms;
                     neighbor.addr = from;
                 }
-                self.sessions_mutex.unlock(self.io);
             } else {
                 std.log.info("[mesh] New KCP session from {any} conv={d}", .{ from, kcp_conv });
                 // New incoming session — create KCP instance and store.
@@ -834,7 +856,6 @@ pub const Mesh = struct {
                     std.log.err("[mesh] KCP input error (new session): {}", .{err});
                 };
                 try self.sessions.put(kcp_conv, new_sess);
-                self.sessions_mutex.unlock(self.io);
 
                 // Auto-add the source as a neighbor so we can send KCP
                 // ACKs/output back.

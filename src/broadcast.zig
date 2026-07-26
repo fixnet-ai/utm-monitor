@@ -925,6 +925,9 @@ fn killChild(pid: std.posix.pid_t) void {
         },
         .linux, .macos => {
             _ = kill(pid, SIGKILL);
+            // Reap child to prevent zombie processes.
+            // After SIGKILL the child should exit immediately, so blocking waitpid is fine.
+            _ = std.posix.system.waitpid(pid, null, 0);
         },
         else => @compileError("unsupported OS for killChild"),
     }
@@ -1143,8 +1146,14 @@ pub fn meshSessionLoop(
         }
 
         // Spawn pty session
-        const shell = detectShell(allocator) catch "/bin/sh";
-        defer allocator.free(shell);
+        // detectShell only fails on OOM; "/bin/sh" is a compile-time literal.
+        // Track allocation origin so defer free doesn't release .rodata memory.
+        var shell_is_heap = true;
+        const shell = detectShell(allocator) catch blk: {
+            shell_is_heap = false;
+            break :blk "/bin/sh";
+        };
+        defer if (shell_is_heap) allocator.free(shell);
         const pty = ptySpawn(allocator, shell) catch |err| {
             std.log.err("[guest-mesh] ptySpawn failed: {}", .{err});
             tunnel.deinit();
@@ -1177,7 +1186,7 @@ pub fn meshSessionLoop(
 
         // Deliver any exec command buffered from reconnect race
         if (pending_cmd_data.len > 0) {
-            cmd_mutex.lock(io) catch {};
+            cmd_mutex.lock(io) catch continue;
             if (active_cmd_id.len > 0) allocator.free(active_cmd_id);
             active_cmd_id = pending_cmd_id;
             pending_cmd_id = &.{}; // ownership transferred
@@ -1223,7 +1232,7 @@ pub fn meshSessionLoop(
                 @intFromEnum(tunproto.MsgType.pty_exec_input) => {
                     if (tunproto.parsePtyExecInput(payload)) |input| {
                         // Update active_cmd_id under mutex
-                        cmd_mutex.lock(io) catch {};
+                        cmd_mutex.lock(io) catch continue;
                         if (active_cmd_id.len > 0) allocator.free(active_cmd_id);
                         active_cmd_id = allocator.dupe(u8, input.cmd_id) catch &.{};
                         cmd_mutex.unlock(io);
@@ -1277,7 +1286,7 @@ pub fn meshSessionLoop(
 fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_mod.Mesh) !tunnel_mod.Tunnel {
     while (true) {
         if (mesh_opt.*) |*m| {
-            m.sessions_mutex.lock(m.io) catch {};
+            m.sessions_mutex.lock(m.io) catch continue;
             const count = m.sessions.count();
             if (count > 0) {
                 var it = m.sessions.iterator();
@@ -1536,4 +1545,68 @@ test "zigTarget - valid format" {
             std.mem.containsAtLeast(u8, target, 1, "macos") or
             std.mem.containsAtLeast(u8, target, 1, "windows"),
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Guest mode entry points (曾 guest.zig)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Guest mode entry point (from std.process.Init)
+pub fn guestRun(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
+    return guestRunWithIo(init.io, init.gpa, cli, null);
+}
+
+/// Guest mode entry point (called from Windows service or direct process start).
+/// shutdown is an optional atomic flag — when set (Windows service stop), the
+/// mesh session loop exits cleanly so the SCM receives STOPPED instead of a
+/// broken pipe error.
+pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
+    // Collect system information (sync, uses blocking Io for process.run etc.)
+    var sysinfo = try getSystemInfo(io, gpa);
+    defer {
+        gpa.free(sysinfo.hostname);
+        gpa.free(sysinfo.ip);
+        gpa.free(sysinfo.mac);
+        gpa.free(sysinfo.iface_name);
+        gpa.free(sysinfo.shell);
+    }
+
+    if (cli.hostname) |n| {
+        gpa.free(sysinfo.hostname);
+        sysinfo.hostname = try gpa.dupe(u8, n);
+    }
+
+    std.debug.print("[guest] Hostname: {s}\n", .{sysinfo.hostname});
+    std.debug.print("[guest] Target: {s}\n", .{sysinfo.target});
+    std.debug.print("[guest] IP: {s}\n", .{sysinfo.ip});
+    std.debug.print("[guest] MAC: {s}\n", .{sysinfo.mac});
+    std.debug.print("[guest] Shell: {s}\n", .{sysinfo.shell});
+
+    // Ensure CWD is /opt/utmm/ (or C:\opt\utmm\ on Windows)
+    if (builtin.os.tag == .windows) {
+        const msvcrt = struct {
+            extern "c" fn _chdir(path: [*:0]const u8) c_int;
+        };
+        if (msvcrt._chdir("C:\\opt\\utmm\\") != 0) {
+            std.log.warn("[guest] chdir to C:\\opt\\utmm failed", .{});
+        }
+    } else {
+        const libc = struct {
+            extern "c" fn chdir(path: [*:0]const u8) c_int;
+        };
+        if (libc.chdir("/opt/utmm") != 0) {
+            std.log.warn("[guest] chdir to /opt/utmm failed", .{});
+        }
+    }
+
+    // Build host URL from --host-ip or default gateway (pass empty string to auto-detect)
+    const host_url = if (cli.host_ip) |ip| blk: {
+        break :blk try std.fmt.allocPrint(gpa, "{s}", .{ip});
+    } else "";
+
+    // Mesh session loop — persistent KCP tunnel, real-time push.
+    // UpgradeSignal allows mesh LSA version check to signal the main loop
+    // when a version mismatch is detected from Host broadcast.
+    var upgrade_signal = UpgradeSignal{};
+    try meshSessionLoop(io, gpa, sysinfo, host_url, &upgrade_signal, cli.mesh_port, cli.peer_mesh, shutdown);
 }

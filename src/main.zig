@@ -9,23 +9,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
-const guest = @import("guest.zig");
 const host_mod = @import("host.zig");
-const priv = @import("priv.zig");
+const broadcast = @import("broadcast.zig");
 const svc = @import("svc.zig");
 const fail = @import("fail.zig");
 
 comptime {
     _ = @import("hosts_file.zig");
-    _ = @import("broadcast.zig");
-    _ = @import("install.zig");
     _ = @import("config.zig");
-    _ = @import("mcp.zig");
     _ = @import("kcp.zig");
     _ = @import("mesh.zig");
     _ = @import("tunnel.zig");
     _ = @import("tunproto.zig");
-    _ = @import("priv.zig");
     _ = svc;
     _ = fail;
 }
@@ -254,7 +249,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── 3. Admin privilege check — required for everything below ──
-    if (!priv.isAdmin()) {
+    if (!isAdmin()) {
         if (builtin.os.tag == .windows) {
             std.debug.print(
                 \\[ERROR] Administrator privileges required.
@@ -293,7 +288,7 @@ pub fn main(init: std.process.Init) !void {
         if (cli.is_host) {
             try host_mod.runWithIo(init.io, init.gpa, cli, null);
         } else {
-            try guest.runWithIo(init.io, init.gpa, cli, null);
+            try broadcast.guestRunWithIo(init.io, init.gpa, cli, null);
         }
         return;
     }
@@ -432,4 +427,67 @@ test "parseArgs - version" {
     const args = &[_][:0]const u8{ "utmm", "--version" };
     const cli = try parseArgs(args);
     try std.testing.expect(cli.cmd_version);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Admin privilege check (曾 priv.zig)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Check whether the current process has admin/root privileges.
+fn isAdmin() bool {
+    if (builtin.os.tag == .windows) {
+        return isWindowsAdmin();
+    }
+    return std.c.geteuid() == 0;
+}
+
+/// Windows: check token membership in the Administrators group (S-1-5-32-544).
+fn isWindowsAdmin() bool {
+    const w = std.os.windows;
+    const BOOL = w.BOOL;
+    const HANDLE = w.HANDLE;
+
+    const NtAuthority: [6]u8 = [_]u8{ 0, 0, 0, 0, 0, 5 };
+    const SECURITY_BUILTIN_DOMAIN_RID: u32 = 32;
+    const DOMAIN_ALIAS_RID_ADMINS: u32 = 544;
+
+    const AllocateAndInitializeSid = @extern(
+        *const fn (pIdentifierAuthority: *const [6]u8, nSubAuthorityCount: u8, nSubAuthority0: u32, nSubAuthority1: u32, nSubAuthority2: u32, nSubAuthority3: u32, nSubAuthority4: u32, nSubAuthority5: u32, nSubAuthority6: u32, nSubAuthority7: u32, ppSid: *?*anyopaque) callconv(.winapi) BOOL,
+        .{ .name = "AllocateAndInitializeSid", .library_name = "advapi32" },
+    );
+    const FreeSid = @extern(
+        *const fn (pSid: ?*anyopaque) callconv(.winapi) ?*anyopaque,
+        .{ .name = "FreeSid", .library_name = "advapi32" },
+    );
+    const CheckTokenMembership = @extern(
+        *const fn (TokenHandle: ?HANDLE, SidToCheck: ?*anyopaque, IsMember: *BOOL) callconv(.winapi) BOOL,
+        .{ .name = "CheckTokenMembership", .library_name = "advapi32" },
+    );
+
+    var admin_sid: ?*anyopaque = null;
+    if (@intFromEnum(AllocateAndInitializeSid(
+        @ptrCast(&NtAuthority),
+        2,
+        SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0,
+        &admin_sid,
+    )) == 0) return false;
+    defer _ = FreeSid(admin_sid);
+
+    var is_member: BOOL = .FALSE;
+    _ = CheckTokenMembership(null, admin_sid, &is_member);
+    return is_member != .FALSE;
+}
+
+test "isAdmin does not crash" {
+    _ = isAdmin();
+}
+
+test "isAdmin returns bool" {
+    const result = isAdmin();
+    _ = switch (result) {
+        true => "admin",
+        false => "not admin",
+    };
 }

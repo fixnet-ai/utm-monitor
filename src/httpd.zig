@@ -1,7 +1,7 @@
 //! Minimal HTTP server on top of std.http.Server.
 //!
 //! Provides:
-//!   - TCP accept loop with detached threads (same pattern as mcp.zig runHttp)
+//!   - TCP accept loop with detached threads
 //!   - URL router dispatching on method + path
 //!   - HostState: mutex-protected guest table + pending command queue
 //!   - JSON helpers for reading POST bodies and building responses
@@ -12,7 +12,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const http = std.http;
+const protocol = @import("protocol.zig");
+const hosts_file = @import("hosts_file.zig");
 const tunnel_mod = @import("tunnel.zig");
+const tunproto = @import("tunproto.zig");
 
 pub const DEFAULT_PORT: u16 = 2121;
 
@@ -61,10 +64,62 @@ pub fn jsonEscape(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
             '\n' => try buf.appendSlice(allocator, "\\n"),
             '\r' => try buf.appendSlice(allocator, "\\r"),
             '\t' => try buf.appendSlice(allocator, "\\t"),
-            0...7, 11, 14...31 => try buf.print(allocator, "\\u{d:0>4}", .{c}),
+            // Control characters and DEL: escape as \uXXXX
+            // JSON requires escaping all control chars (0x00-0x1F)
+            // except the ones handled above. 0x7F (DEL) should also
+            // be escaped for safety.
+            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F => try buf.print(allocator, "\\u{d:0>4}", .{c}),
             else => try buf.append(allocator, c),
         }
     }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Get a nested object field from a JSON object. Returns null if missing or wrong type.
+pub fn jsonGetNestedObject(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const val = obj.get(key) orelse return null;
+    return switch (val) {
+        .object => |inner| inner,
+        else => null,
+    };
+}
+
+/// Append a JSON-RPC id value to a buffer (handles all id types).
+pub fn jsonAppendId(list: *std.ArrayList(u8), allocator: std.mem.Allocator, id: std.json.Value) !void {
+    switch (id) {
+        .null => try list.appendSlice(allocator, "null"),
+        .integer => |n| try list.print(allocator, "{d}", .{n}),
+        .string => |s| try list.print(allocator, "\"{s}\"", .{s}),
+        .float => |f| try list.print(allocator, "{d}", .{f}),
+        .number_string => |s| try list.appendSlice(allocator, s),
+        .bool => |b| try list.appendSlice(allocator, if (b) "true" else "false"),
+        else => try list.appendSlice(allocator, "null"),
+    }
+}
+
+/// Build a JSON-RPC success response.
+pub fn jsonBuildResponse(allocator: std.mem.Allocator, id: std.json.Value, result_json: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try jsonAppendId(&buf, allocator, id);
+    try buf.appendSlice(allocator, ",\"result\":");
+    try buf.appendSlice(allocator, result_json);
+    try buf.appendSlice(allocator, "}");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a JSON-RPC error response.
+pub fn jsonBuildError(allocator: std.mem.Allocator, id: std.json.Value, code: i64, message: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
+    try jsonAppendId(&buf, allocator, id);
+    try buf.print(allocator, ",\"error\":{{\"code\":{d},\"message\":\"", .{code});
+    const escaped_msg = try jsonEscape(allocator, message);
+    defer allocator.free(escaped_msg);
+    try buf.appendSlice(allocator, escaped_msg);
+    try buf.appendSlice(allocator, "\"}}");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -94,7 +149,19 @@ pub const OpState = struct {
     /// File metadata from file_eof (for x-file-hash/x-file-size trailers).
     file_hash: []const u8 = "",
     file_size_meta: u32 = 0,
+    /// Monotonic ms timestamp when this op was created.
+    /// Used for automatic cleanup of orphaned operations
+    /// (client disconnected before receiving the result).
+    created_ms: u64 = 0,
 };
+
+/// Maximum number of concurrent file transfers (upload + download).
+/// Prevents unbounded transfers HashMap growth.
+pub const MAX_CONCURRENT_TRANSFERS: usize = 16;
+
+/// Stale OpState older than this is eligible for automatic cleanup
+/// (client disconnected before receiving the result).
+const OP_STATE_TIMEOUT_MS: u64 = 5 * 60 * 1000; // 5 minutes
 
 /// Tracks an in-flight file transfer for singleton deduplication.
 /// Key format: "<vm>:<path>" — destination path determines uniqueness,
@@ -202,7 +269,7 @@ pub const HostState = struct {
     /// Upsert a guest from announce data (caller must own the strings — they are duplicated).
     /// Returns true if this is a new guest or IP/target/version/shell changed.
     pub fn upsertGuest(self: *HostState, hostname: []const u8, ip: []const u8, target: []const u8, mac: []const u8, version: []const u8, shell: []const u8, status: []const u8) bool {
-        self.mutex.lock(self.io.?) catch {};
+        self.mutex.lock(self.io.?) catch return false;
         defer self.mutex.unlock(self.io.?);
 
         const now_ms = @as(i64, @intCast(@divFloor(std.Io.Timestamp.now(self.io.?, .real).nanoseconds, std.time.ns_per_ms)));
@@ -287,7 +354,7 @@ pub const HostState = struct {
     /// Register a KCP tunnel for a guest. Called by the LSA callback when
     /// Host establishes a tunnel to a discovered guest.
     pub fn registerGuestTunnel(self: *HostState, hostname: []const u8, tun: *tunnel_mod.Tunnel) !void {
-        self.mutex.lock(self.io.?) catch {};
+        self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
 
         const gop = try self.guest_tunnels.getOrPut(hostname);
@@ -321,7 +388,7 @@ pub const HostState = struct {
 
     /// Initialize an OpState for a new command. cmd_id must be unique.
     pub fn createOpState(self: *HostState, cmd_id: []const u8) !void {
-        self.mutex.lock(self.io.?) catch {};
+        self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
 
         const gop = try self.op_states.getOrPut(cmd_id);
@@ -330,12 +397,15 @@ pub const HostState = struct {
         } else {
             gop.key_ptr.* = try self.allocator.dupe(u8, cmd_id);
         }
-        gop.value_ptr.* = .{ .output = .empty };
+        gop.value_ptr.* = .{
+            .output = .empty,
+            .created_ms = @intCast(@divFloor(std.Io.Timestamp.now(self.io.?, .awake).nanoseconds, std.time.ns_per_ms)),
+        };
     }
 
     /// Append data to an operation's accumulated output.
     pub fn appendOpOutput(self: *HostState, cmd_id: []const u8, data: []const u8) void {
-        self.mutex.lock(self.io.?) catch {};
+        self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
 
         const op = self.op_states.getPtr(cmd_id) orelse return;
@@ -345,7 +415,7 @@ pub const HostState = struct {
     /// Scan accumulated output for MDELIM:N\n marker.
     /// If found, strips the marker, sets exit_code and marks done.
     pub fn scanForMarker(self: *HostState, cmd_id: []const u8) void {
-        self.mutex.lock(self.io.?) catch {};
+        self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
 
         const op = self.op_states.getPtr(cmd_id) orelse return;
@@ -409,7 +479,7 @@ pub const HostState = struct {
     /// Mark an operation as complete with explicit exit code.
     /// Used for upload/download responses.
     pub fn completeOpState(self: *HostState, cmd_id: []const u8, exit_code: i32) void {
-        self.mutex.lock(self.io.?) catch {};
+        self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
 
         const op = self.op_states.getPtr(cmd_id) orelse return;
@@ -474,8 +544,42 @@ pub const HostState = struct {
         return self.transfers.get(key);
     }
 
+    /// Clean up op states that have been idle for too long (5 min).
+    /// These are operations where the client disconnected before completion.
+    /// Safe to call periodically — only removes stale, non-done ops.
+    pub fn cleanupStaleOps(self: *HostState) void {
+        self.mutex.lock(self.io.?) catch return;
+        defer self.mutex.unlock(self.io.?);
+
+        const now_ms = @divFloor(std.Io.Timestamp.now(self.io.?, .monotonic).nanoseconds, std.time.ns_per_ms);
+        var stale: std.ArrayList([]const u8) = .empty;
+        defer stale.deinit(self.allocator);
+
+        var it = self.op_states.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.done) continue; // don't clean done ops (takeOpResult handles those)
+            const age = now_ms -| entry.value_ptr.created_ms;
+            if (age > OP_STATE_TIMEOUT_MS) {
+                stale.append(self.allocator, entry.key_ptr.*) catch {};
+            }
+        }
+
+        for (stale.items) |cmd_id| {
+            std.log.info("[httpd] cleaning up stale OpState: {s}", .{cmd_id});
+            if (self.op_states.fetchRemove(cmd_id)) |kv| {
+                var output = kv.value.output;
+                output.deinit(self.allocator);
+                self.allocator.free(kv.key);
+            }
+        }
+    }
+
     /// Register a new transfer. Caller MUST hold mutex.
     pub fn registerTransfer(self: *HostState, key: []const u8, cmd_id: []const u8, file_size: u32) !void {
+        // Reject new transfers if at capacity
+        if (self.transfers.count() >= MAX_CONCURRENT_TRANSFERS) {
+            return error.TransferLimitExceeded;
+        }
         const gop = try self.transfers.getOrPut(key);
         if (gop.found_existing) {
             // Replace existing — free old cmd_id
@@ -716,6 +820,1082 @@ fn handleConnection(ctx: *ConnCtx) void {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// MCP JSON-RPC (曾 mcp.zig)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SERVER_INFO =
+    \\{"protocolVersion":"2024-11-05",
+    \\"serverInfo":{"name":"utmm","version":"__VERSION__"},
+    \\"capabilities":{"tools":{}}}
+;
+
+const TOOLS_JSON =
+    \\[{"name":"vm_status","description":"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.","inputSchema":{"type":"object","properties":{},"required":[]}},
+    \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check vm_status first to see each VM's shell type, then write compatible commands.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)"}},"required":["vm","command"]}}]
+;
+
+/// Build vm_status result from HostState guest table.
+fn mcpHandleVmStatus(allocator: std.mem.Allocator, state: *HostState) ![]const u8 {
+    state.mutex.lock(state.io.?) catch |e| return e;
+    defer state.mutex.unlock(state.io.?);
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+
+    if (state.guests.items.len == 0) {
+        return try allocator.dupe(u8, "{\"text\":\"No VMs currently online.\"}");
+    }
+
+    try text.appendSlice(allocator, "**UTM Virtual Machines:**\\n");
+
+    for (state.guests.items) |g| {
+        try text.print(allocator,
+            "- **{s}** — {s} | IP: {s} | MAC: {s} | v{s} | shell: {s}\\n",
+            .{ g.hostname, g.target, g.ip, g.mac, g.version, if (g.shell.len > 0) g.shell else "unknown" },
+        );
+    }
+
+    const text_json = try jsonEscape(allocator, text.items);
+    defer allocator.free(text_json);
+
+    var result: std.ArrayList(u8) = .empty;
+    try result.print(allocator, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{text_json});
+    return result.toOwnedSlice(allocator);
+}
+
+/// Handle vm_exec via pty model: build pty_input, enqueue frame, poll for marker.
+fn mcpHandleVmExec(allocator: std.mem.Allocator, state: *HostState, vm: []const u8, command: []const u8) ![]const u8 {
+    // Check guest exists and get shell type
+    state.mutex.lock(state.io.?) catch |e| return e;
+    defer state.mutex.unlock(state.io.?);
+
+    const guest_shell = for (state.guests.items) |g| {
+        if (std.mem.eql(u8, g.hostname, vm)) break try allocator.dupe(u8, g.shell);
+    } else {
+        return error.GuestNotFound;
+    };
+    defer allocator.free(guest_shell);
+
+    // Generate unique cmd_id
+    const cmd_id = blk: {
+        const ts = std.Io.Timestamp.now(state.io.?, .real).nanoseconds;
+        break :blk try std.fmt.allocPrint(allocator, "mcp_{d}", .{ts});
+    };
+    defer allocator.free(cmd_id);
+
+    // Build pty_input frame with shell-appropriate marker
+    const cmd_with_marker = try buildCmdWithMarker(allocator, guest_shell, command);
+    defer allocator.free(cmd_with_marker);
+
+    const frame = try tunproto.buildPtyExecInput(allocator, cmd_id, cmd_with_marker);
+    defer allocator.free(frame);
+
+    try state.createOpState(cmd_id);
+
+    const tun = state.getGuestTunnel(vm) orelse {
+        return error.GuestNotConnected;
+    };
+    _ = tun.send(frame) catch {
+        return error.TunnelSendFailed;
+    };
+
+    // Wait for result — woken by mesh handler thread via wake_event
+    while (true) {
+        if (state.takeOpResult(cmd_id)) |result| {
+            defer allocator.free(result.stdout);
+
+            const trimmed = std.mem.trim(u8, result.stdout, " \n\r");
+            const esc_vm = try jsonEscape(allocator, vm);
+            defer allocator.free(esc_vm);
+            const esc_cmd = try jsonEscape(allocator, command);
+            defer allocator.free(esc_cmd);
+            const esc_out = try jsonEscape(allocator, trimmed);
+            defer allocator.free(esc_out);
+
+            var buf: std.ArrayList(u8) = .empty;
+            try buf.print(allocator,
+                "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** `$ {s}`:\\n```\\n{s}\\n```\"}}]}}",
+                .{ esc_vm, esc_cmd, esc_out },
+            );
+            return buf.toOwnedSlice(allocator);
+        }
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(30), .clock = .awake } }) catch {
+            return error.ExecTimeout;
+        };
+        state.wake_event.reset();
+    }
+}
+
+/// Process a raw JSON-RPC request string using HostState, return JSON-RPC response.
+/// Called from the unified HTTP server's /mcp endpoint.
+pub fn processJsonRpcWithState(
+    allocator: std.mem.Allocator,
+    state: *HostState,
+    json_str: []const u8,
+) ![]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{ .allocate = .alloc_always }) catch |err| {
+        return jsonBuildError(allocator, .{ .null = {} }, -32700, @errorName(err));
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    const obj = switch (root) {
+        .object => |o| o,
+        else => return jsonBuildError(allocator, .{ .null = {} }, -32600, "Invalid Request"),
+    };
+
+    const method_raw = jsonGetString(obj, "method") orelse
+        return jsonBuildError(allocator, .{ .null = {} }, -32600, "Missing method");
+
+    const id_val = if (obj.get("id")) |v| v else std.json.Value{ .null = {} };
+    const is_notification = switch (id_val) {
+        .null => true,
+        else => false,
+    };
+
+    const method = try allocator.dupe(u8, method_raw);
+    defer allocator.free(method);
+
+    if (std.mem.eql(u8, method, "initialize")) {
+        var info: std.ArrayList(u8) = .empty;
+        defer info.deinit(allocator);
+        var iter = std.mem.splitSequence(u8, SERVER_INFO, "__VERSION__");
+        var first = true;
+        while (iter.next()) |part| {
+            if (!first) try info.appendSlice(allocator, protocol.VERSION);
+            try info.appendSlice(allocator, part);
+            first = false;
+        }
+        return jsonBuildResponse(allocator, id_val, info.items);
+    }
+
+    if (std.mem.eql(u8, method, "notifications/initialized")) {
+        if (is_notification) return allocator.dupe(u8, "");
+        return jsonBuildResponse(allocator, id_val, "{}");
+    }
+
+    if (std.mem.eql(u8, method, "ping")) {
+        return jsonBuildResponse(allocator, id_val, "{}");
+    }
+
+    if (std.mem.eql(u8, method, "tools/list")) {
+        var tools: std.ArrayList(u8) = .empty;
+        defer tools.deinit(allocator);
+        try tools.appendSlice(allocator, "{\"tools\":");
+        var iter = std.mem.splitSequence(u8, TOOLS_JSON, "__VERSION__");
+        var first = true;
+        while (iter.next()) |part| {
+            if (!first) try tools.appendSlice(allocator, protocol.VERSION);
+            try tools.appendSlice(allocator, part);
+            first = false;
+        }
+        try tools.appendSlice(allocator, "}");
+        return jsonBuildResponse(allocator, id_val, tools.items);
+    }
+
+    if (std.mem.eql(u8, method, "tools/call")) {
+        const params = jsonGetNestedObject(obj, "params") orelse {
+            if (is_notification) return allocator.dupe(u8, "");
+            return jsonBuildError(allocator, id_val, -32602, "Missing params");
+        };
+
+        const tool_name = jsonGetString(params, "name") orelse {
+            if (is_notification) return allocator.dupe(u8, "");
+            return jsonBuildError(allocator, id_val, -32602, "Missing tool name");
+        };
+
+        const args = jsonGetNestedObject(params, "arguments");
+
+        if (std.mem.eql(u8, tool_name, "vm_status")) {
+            const result = mcpHandleVmStatus(allocator, state) catch |err| {
+                if (is_notification) return allocator.dupe(u8, "");
+                return jsonBuildError(allocator, id_val, -32603, @errorName(err));
+            };
+            defer allocator.free(result);
+            return jsonBuildResponse(allocator, id_val, result);
+        }
+
+        if (std.mem.eql(u8, tool_name, "vm_exec")) {
+            if (args == null) {
+                if (is_notification) return allocator.dupe(u8, "");
+                return jsonBuildError(allocator, id_val, -32602, "Missing arguments: vm, command");
+            }
+            const vm = jsonGetString(args.?, "vm") orelse {
+                if (is_notification) return allocator.dupe(u8, "");
+                return jsonBuildError(allocator, id_val, -32602, "Missing argument: vm");
+            };
+            const command = jsonGetString(args.?, "command") orelse {
+                if (is_notification) return allocator.dupe(u8, "");
+                return jsonBuildError(allocator, id_val, -32602, "Missing argument: command");
+            };
+            const result = mcpHandleVmExec(allocator, state, vm, command) catch |err| {
+                if (is_notification) return allocator.dupe(u8, "");
+                return jsonBuildError(allocator, id_val, -32603, @errorName(err));
+            };
+            defer allocator.free(result);
+            return jsonBuildResponse(allocator, id_val, result);
+        }
+
+        if (is_notification) return allocator.dupe(u8, "");
+        return jsonBuildError(allocator, id_val, -32601, "Unknown tool");
+    }
+
+    if (is_notification) return allocator.dupe(u8, "");
+    return jsonBuildError(allocator, id_val, -32601, "Method not found");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HTTP endpoint handlers (曾 host_http.zig)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Read the request body as raw bytes. Caller owns the returned buffer.
+fn readBody(allocator: std.mem.Allocator, request: *http.Server.Request) ![]const u8 {
+    const content_length = request.head.content_length orelse return error.MissingContentLength;
+    if (content_length == 0) return error.EmptyBody;
+    if (content_length > 10 * 1024 * 1024) return error.BodyTooLarge;
+
+    const buf = try allocator.alloc(u8, @intCast(content_length));
+    errdefer allocator.free(buf);
+
+    var body_reader = request.readerExpectNone(buf);
+    var writer: std.Io.Writer = .fixed(buf);
+    try body_reader.streamExact(&writer, @intCast(content_length));
+    return buf;
+}
+
+/// Read the request body as raw bytes with custom size limit.
+fn readRawBody(allocator: std.mem.Allocator, request: *http.Server.Request, max_size: usize) ![]const u8 {
+    const content_length = request.head.content_length orelse return error.MissingContentLength;
+    if (content_length == 0) return error.EmptyBody;
+    if (content_length > max_size) return error.BodyTooLarge;
+
+    const buf = try allocator.alloc(u8, @intCast(content_length));
+    errdefer allocator.free(buf);
+
+    var body_reader = request.readerExpectNone(buf);
+    var writer: std.Io.Writer = .fixed(buf);
+    try body_reader.streamExact(&writer, @intCast(content_length));
+    return buf;
+}
+
+/// Get a request header value by name (case-insensitive). Returns null if not found.
+fn getRequestHeader(request: *http.Server.Request, name: []const u8) ?[]const u8 {
+    var it = request.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) {
+            return h.value;
+        }
+    }
+    return null;
+}
+
+/// Respond with a JSON body and status 200.
+fn respondJson(request: *http.Server.Request, json: []const u8) !void {
+    try request.respond(json, .{
+        .status = .ok,
+        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+    });
+}
+
+/// Respond with a simple text error.
+fn respondError(request: *http.Server.Request, status: http.Status, message: []const u8) !void {
+    try request.respond(message, .{
+        .status = status,
+        .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+    });
+}
+
+// ── POST /exec ────────────────────────────────────────────────────────────
+
+pub fn handleExec(allocator: std.mem.Allocator, state: *HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+    _ = body;
+    const body_str = readBody(allocator, request) catch |err| {
+        std.log.err("[exec] readBody failed: {}", .{err});
+        try respondError(request, .bad_request, "Missing body");
+        return;
+    };
+    defer allocator.free(body_str);
+
+    const parsed = parseJson(allocator, body_str) catch {
+        try respondError(request, .bad_request, "Invalid JSON");
+        return;
+    };
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            try respondError(request, .bad_request, "Expected JSON object");
+            return;
+        },
+    };
+
+    const vm = jsonGetString(obj, "vm") orelse {
+        try respondError(request, .bad_request, "Missing 'vm' field");
+        return;
+    };
+    const command = jsonGetString(obj, "command") orelse {
+        try respondError(request, .bad_request, "Missing 'command' field");
+        return;
+    };
+
+    std.log.info("[exec] cmd for {s}: {s}", .{ vm, command });
+
+    // Check guest exists and get shell type
+    state.mutex.lock(state.io.?) catch return;
+    defer state.mutex.unlock(state.io.?);
+
+    const guest_shell = for (state.guests.items) |g| {
+        if (std.mem.eql(u8, g.hostname, vm)) break try allocator.dupe(u8, g.shell);
+    } else {
+        std.log.err("[exec] GuestNotFound: vm='{s}'", .{vm});
+        try respondError(request, .not_found, "GuestNotFound");
+        return;
+    };
+    defer allocator.free(guest_shell);
+
+    // Generate unique cmd_id
+    const cmd_id = blk: {
+        const ts = std.Io.Timestamp.now(state.io.?, .real).nanoseconds;
+        break :blk try std.fmt.allocPrint(allocator, "exec_{d}", .{ts});
+    };
+    defer allocator.free(cmd_id);
+
+    // Build pty_input frame with shell-appropriate marker
+    const cmd_with_marker = try buildCmdWithMarker(allocator, guest_shell, command);
+    defer allocator.free(cmd_with_marker);
+
+    const frame = try tunproto.buildPtyExecInput(allocator, cmd_id, cmd_with_marker);
+    defer allocator.free(frame);
+
+    // Create operation state and send via KCP tunnel
+    try state.createOpState(cmd_id);
+
+    const tun = state.getGuestTunnel(vm) orelse {
+        try respondError(request, .service_unavailable, "GuestNotConnected");
+        return;
+    };
+    _ = tun.send(frame) catch |err| {
+        std.log.err("[exec] tunnel send failed for {s}: {}", .{ vm, err });
+        try respondError(request, .service_unavailable, "TunnelSendFailed");
+        return;
+    };
+    tun.flush(tun.session.mesh.clock_ms);
+
+    std.log.info("[exec] Sent pty cmd {s} for {s}", .{ cmd_id, vm });
+
+    // Stream response using chunked transfer encoding
+    var stream_buf: [4096]u8 = undefined;
+    var body_writer = try request.respondStreaming(&stream_buf, .{
+        .respond_options = .{
+            .status = .ok,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
+        },
+    });
+    body_writer.flush() catch |err| {
+        std.log.err("[exec] header flush failed for {s}: {}", .{ cmd_id, err });
+        return;
+    };
+    var chunked_ended = false;
+    defer if (!chunked_ended) {
+        body_writer.endChunked(.{}) catch {};
+    };
+
+    // Loop: write new output chunks as they arrive
+    while (true) {
+        const new_chunk = blk: {
+            state.mutex.lock(state.io.?) catch {
+                break :blk @as(?[]const u8, null);
+            };
+            defer state.mutex.unlock(state.io.?);
+
+            const op = state.op_states.getPtr(cmd_id) orelse {
+                break :blk @as(?[]const u8, null);
+            };
+
+            if (op.output.items.len > op.sent_pos) {
+                const start = op.sent_pos;
+                op.sent_pos = op.output.items.len;
+                break :blk op.output.items[start..];
+            }
+            break :blk @as(?[]const u8, null);
+        };
+
+        if (new_chunk) |chunk| {
+            body_writer.writer.writeAll(chunk) catch |err| {
+                std.log.err("[exec] write chunk failed: {}", .{err});
+                break;
+            };
+            body_writer.writer.flush() catch |err| {
+                std.log.err("[exec] flush chunk failed: {}", .{err});
+                break;
+            };
+            body_writer.flush() catch |err| {
+                std.log.err("[exec] body flush failed: {}", .{err});
+                break;
+            };
+            continue;
+        }
+
+        // Done?
+        const done = blk: {
+            state.mutex.lock(state.io.?) catch break :blk false;
+            defer state.mutex.unlock(state.io.?);
+            const op = state.op_states.getPtr(cmd_id) orelse break :blk true;
+            break :blk op.done;
+        };
+
+        if (done) break;
+
+        // Wait for more data
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(5), .clock = .awake } }) catch break;
+        state.wake_event.reset();
+    }
+
+    // Get exit code
+    const exit_code = blk: {
+        state.mutex.lock(state.io.?) catch break :blk @as(i32, -1);
+        defer state.mutex.unlock(state.io.?);
+        const op = state.op_states.getPtr(cmd_id) orelse break :blk @as(i32, -1);
+        break :blk op.exit_code;
+    };
+
+    // End chunked with x-exit-code trailer
+    var trailers: [1]http.Header = undefined;
+    var buf: [32]u8 = undefined;
+    const exit_str = std.fmt.bufPrint(&buf, "{}", .{exit_code}) catch "0";
+    trailers[0] = .{ .name = "x-exit-code", .value = exit_str };
+    body_writer.endChunked(.{ .trailers = &trailers }) catch {};
+    chunked_ended = true;
+
+    // Clean up op state
+    state.mutex.lock(state.io.?) catch return;
+    defer state.mutex.unlock(state.io.?);
+    state.cleanupOpState(cmd_id);
+    std.log.info("[exec] done {s} exit={d}", .{ cmd_id, exit_code });
+}
+
+// ── POST /upload ───────────────────────────────────────────────────────────
+
+pub fn handleUpload(allocator: std.mem.Allocator, state: *HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+    _ = body;
+    const vm = getRequestHeader(request, "x-vm") orelse {
+        try respondError(request, .bad_request, "Missing x-vm header");
+        return;
+    };
+    const remote_path = getRequestHeader(request, "x-path") orelse {
+        try respondError(request, .bad_request, "Missing x-path header");
+        return;
+    };
+
+    std.log.info("[upload] {s} → {s}:{s}", .{ vm, vm, remote_path });
+
+    // Get guest tunnel
+    const tun = blk: {
+        state.mutex.lock(state.io.?) catch return;
+        defer state.mutex.unlock(state.io.?);
+        break :blk state.getGuestTunnel(vm) orelse {
+            try respondError(request, .service_unavailable, "GuestNotConnected");
+            return;
+        };
+    };
+
+    const content_length = request.head.content_length orelse 0;
+
+    // Transfer key for singleton dedup
+    const transfer_key = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ vm, remote_path });
+    defer allocator.free(transfer_key);
+
+    // Build upload command
+    const cmd_id = blk: {
+        const ts = std.Io.Timestamp.now(state.io.?, .real).nanoseconds;
+        break :blk try std.fmt.allocPrint(allocator, "up_{d}", .{ts});
+    };
+    defer allocator.free(cmd_id);
+
+    // Register transfer
+    state.registerTransfer(transfer_key, cmd_id, @intCast(content_length)) catch |err| {
+        std.log.err("[upload] transfer limit: {}", .{err});
+        try respondError(request, .service_unavailable, "Too many concurrent transfers");
+        return;
+    };
+
+    // Send upload_cmd
+    const up_cmd = try tunproto.buildUploadCmd(allocator, cmd_id, remote_path, @intCast(content_length), "");
+    defer allocator.free(up_cmd);
+    _ = tun.send(up_cmd) catch |err| {
+        std.log.err("[upload] tunnel send failed: {}", .{err});
+        state.removeTransfer(transfer_key);
+        try respondError(request, .service_unavailable, "TunnelSendFailed");
+        return;
+    };
+
+    // Stream body chunks → KCP tunnel
+    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
+    var total: u64 = 0;
+    var chunk_buf: [8192]u8 = undefined;
+    var body_reader = request.readerExpectNone(&chunk_buf);
+
+    while (true) {
+        const chunk_size = @min(content_length - total, chunk_buf.len);
+        if (chunk_size == 0) break;
+
+        var chunk_writer: std.Io.Writer = .fixed(chunk_buf[0..chunk_size]);
+        body_reader.streamExact(&chunk_writer, chunk_size) catch |err| {
+            std.log.err("[upload] body read failed: {}", .{err});
+            state.removeTransfer(transfer_key);
+            return;
+        };
+
+        sha256.update(chunk_buf[0..chunk_size]);
+
+        const fchunk = try tunproto.buildFileChunk(allocator, cmd_id, chunk_buf[0..chunk_size]);
+        defer allocator.free(fchunk);
+
+        // Lock once per chunk — mesh thread flush competition is rare
+        tun.lock() catch |err| {
+            std.log.err("[upload] lock failed: {}", .{err});
+            state.removeTransfer(transfer_key);
+            return;
+        };
+        defer tun.unlock();
+        _ = tun.sendLocked(fchunk) catch |err| {
+            std.log.err("[upload] chunk send failed: {}", .{err});
+            state.removeTransfer(transfer_key);
+            return;
+        };
+        tun.flushLocked(tun.session.mesh.clock_ms);
+
+        total += chunk_size;
+    }
+
+    // Send EOF
+    var hash_bin: [32]u8 = undefined;
+    sha256.final(&hash_bin);
+    var hash_hex: [64]u8 = undefined;
+    for (hash_bin, 0..) |b, j| {
+        hash_hex[j * 2] = "0123456789abcdef"[b >> 4];
+        hash_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+
+    const eof_frame = try tunproto.buildFileEof(allocator, cmd_id, 0, @intCast(total), &hash_hex);
+    defer allocator.free(eof_frame);
+
+    {
+        tun.lock() catch return;
+        defer tun.unlock();
+        _ = tun.sendLocked(eof_frame) catch |err| {
+            std.log.err("[upload] EOF send failed: {}", .{err});
+            state.removeTransfer(transfer_key);
+            return;
+        };
+        tun.flushLocked(tun.session.mesh.clock_ms);
+    }
+    // Release lock — mesh thread gets time to deliver EOF
+    std.Io.sleep(state.io.?, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    state.removeTransfer(transfer_key);
+    try request.respond("OK", .{ .status = .ok });
+}
+
+// ── POST /download ─────────────────────────────────────────────────────────
+
+pub fn handleDownload(allocator: std.mem.Allocator, state: *HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+    _ = body;
+    const vm = getRequestHeader(request, "x-vm") orelse {
+        try respondError(request, .bad_request, "Missing x-vm header");
+        return;
+    };
+    const remote_path = getRequestHeader(request, "x-path") orelse {
+        try respondError(request, .bad_request, "Missing x-path header");
+        return;
+    };
+
+    std.log.info("[download] {s}:{s}", .{ vm, remote_path });
+
+    const tun = blk: {
+        state.mutex.lock(state.io.?) catch return;
+        defer state.mutex.unlock(state.io.?);
+        break :blk state.getGuestTunnel(vm) orelse {
+            try respondError(request, .service_unavailable, "GuestNotConnected");
+            return;
+        };
+    };
+
+    const cmd_id = blk: {
+        const ts = std.Io.Timestamp.now(state.io.?, .real).nanoseconds;
+        break :blk try std.fmt.allocPrint(allocator, "dl_{d}", .{ts});
+    };
+    defer allocator.free(cmd_id);
+
+    // Create op state
+    try state.createOpState(cmd_id);
+    defer {
+        state.mutex.lock(state.io.?) catch {};
+        defer state.mutex.unlock(state.io.?);
+        state.cleanupOpState(cmd_id);
+    }
+
+    // Send download command
+    const dl_cmd = try tunproto.buildDownloadCmd(allocator, cmd_id, remote_path);
+    defer allocator.free(dl_cmd);
+
+    _ = tun.send(dl_cmd) catch |err| {
+        std.log.err("[download] tunnel send failed: {}", .{err});
+        try respondError(request, .service_unavailable, "TunnelSendFailed");
+        return;
+    };
+
+    // Wait for EOF marker — Guest sends chunks as file_chunk → file_eof.
+    // appendOpOutput accumulates, scanForMarker detects file_eof arrival.
+    var got_eof = false;
+    while (!got_eof) {
+        const op = blk: {
+            state.mutex.lock(state.io.?) catch break :blk null;
+            defer state.mutex.unlock(state.io.?);
+            break :blk state.op_states.getPtr(cmd_id);
+        };
+        const done = if (op) |o| o.done else false;
+        if (done) {
+            got_eof = true;
+            break;
+        }
+        // Wait for more data
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(5), .clock = .awake } }) catch |err| {
+            std.log.err("[download] wait failed: {}", .{err});
+            break;
+        };
+        state.wake_event.reset();
+    }
+
+    // Collect all chunk data
+    const file_data = blk: {
+        state.mutex.lock(state.io.?) catch return;
+        defer state.mutex.unlock(state.io.?);
+        const op = state.op_states.getPtr(cmd_id) orelse return;
+        break :blk try allocator.dupe(u8, op.output.items);
+    };
+    defer allocator.free(file_data);
+
+    if (!got_eof) {
+        try respondError(request, .gateway_timeout, "Download timeout");
+        return;
+    }
+
+    // Respond with raw file bytes
+    try request.respond(file_data, .{
+        .status = .ok,
+        .extra_headers = &.{.{ .name = "Content-Type", .value = "application/octet-stream" }},
+    });
+}
+
+// ── GET /bin/<file> ────────────────────────────────────────────────────────
+
+pub fn handleBin(allocator: std.mem.Allocator, state: *HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+    _ = body;
+    const path = request.head.target;
+    // Strip "/bin/" prefix (5 chars)
+    if (path.len <= 5) {
+        try respondError(request, .not_found, "No filename");
+        return;
+    }
+    const filename = path[5..];
+
+    // Security: only allow simple filenames (no directory traversal)
+    for (filename) |c| {
+        if (c == '/' or c == '\\') {
+            try respondError(request, .forbidden, "Invalid filename");
+            return;
+        }
+    }
+
+    const io = state.io orelse {
+        try respondError(request, .internal_server_error, "No I/O");
+        return;
+    };
+    const dir = std.Io.Dir.cwd().openDir(io, state.serve_dir, .{}) catch {
+        try respondError(request, .not_found, "Serve dir not found");
+        return;
+    };
+    defer dir.close(io);
+
+    const content = dir.readFileAlloc(io, filename, allocator, @enumFromInt(50 * 1024 * 1024)) catch {
+        try respondError(request, .not_found, "File not found");
+        return;
+    };
+    defer allocator.free(content);
+
+    try request.respond(content, .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = "application/octet-stream" },
+            .{ .name = "Content-Disposition", .value = "attachment" },
+        },
+    });
+}
+
+// ── GET /version ────────────────────────────────────────────────────────────
+
+pub fn handleVersion(allocator: std.mem.Allocator, state: *HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+    _ = body;
+    _ = state;
+    const buf = try std.fmt.allocPrint(allocator, "{s}\n", .{protocol.VERSION});
+    defer allocator.free(buf);
+    try respondJson(request, buf);
+}
+
+// ── GET /api/guests ────────────────────────────────────────────────────────
+
+pub fn handleApiGuests(allocator: std.mem.Allocator, state: *HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+    _ = body;
+    state.mutex.lock(state.io.?) catch return;
+    defer state.mutex.unlock(state.io.?);
+
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(allocator);
+    try json.append(allocator, '[');
+
+    for (state.guests.items, 0..) |g, i| {
+        if (i > 0) try json.append(allocator, ',');
+        try json.print(allocator,
+            \\{{"hostname":"{s}","target":"{s}","ip":"{s}","mac":"{s}","version":"{s}","shell":"{s}"}}
+        , .{ g.hostname, g.target, g.ip, g.mac, g.version, g.shell });
+    }
+
+    try json.append(allocator, ']');
+    try respondJson(request, json.items);
+}
+
+// ── GET / ──────────────────────────────────────────────────────────────────
+
+pub fn handleRoot(allocator: std.mem.Allocator, state: *HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+    _ = body;
+    state.mutex.lock(state.io.?) catch return;
+    defer state.mutex.unlock(state.io.?);
+
+    var html: std.ArrayList(u8) = .empty;
+    defer html.deinit(allocator);
+    try html.appendSlice(allocator,
+        \\<!DOCTYPE html>
+        \\<html lang="en">
+        \\<head>
+        \\<meta charset="UTF-8">
+        \\<meta name="viewport" content="width=device-width, initial-scale=1.0">
+        \\<title>UTM Monitor</title>
+        \\<style>
+        \\  body { font-family: system-ui, sans-serif; background: #0d1117; color: #c9d1d9; margin: 2em; }
+        \\  h1 { color: #58a6ff; }
+        \\  table { border-collapse: collapse; width: 100%%; }
+        \\  th, td { border: 1px solid #30363d; padding: 8px; text-align: left; }
+        \\  th { background: #161b22; color: #8b949e; }
+        \\  tr:hover { background: #1c2129; }
+        \\  .online { color: #3fb950; }
+        \\  .version { color: #d2a8ff; }
+        \\</style>
+        \\</head>
+        \\<body>
+        \\<h1>🖥️ UTM Monitor</h1>
+    );
+
+    if (state.guests.items.len == 0) {
+        try html.appendSlice(allocator, "<p>No VMs currently online.</p>");
+    } else {
+        try html.appendSlice(allocator,
+            \\<table>
+            \\<tr><th>Status</th><th>Hostname</th><th>Target</th><th>IP</th><th>MAC</th><th>Version</th><th>Shell</th></tr>
+        );
+        for (state.guests.items) |g| {
+            try html.print(allocator,
+                \\<tr>
+                \\  <td class="online">● ONLINE</td>
+                \\  <td>{s}</td>
+                \\  <td>{s}</td>
+                \\  <td>{s}</td>
+                \\  <td>{s}</td>
+                \\  <td class="version">{s}</td>
+                \\  <td>{s}</td>
+                \\</tr>
+            , .{ g.hostname, g.target, g.ip, g.mac, g.version, g.shell });
+        }
+        try html.appendSlice(allocator, "</table>");
+    }
+
+    try html.appendSlice(allocator,
+        \\<p style="margin-top:2em;color:#8b949e;">UTM Monitor v
+    );
+    try html.appendSlice(allocator, protocol.VERSION);
+    try html.appendSlice(allocator, "</p></body></html>");
+
+    try request.respond(html.items, .{
+        .status = .ok,
+        .extra_headers = &.{.{ .name = "Content-Type", .value = "text/html; charset=utf-8" }},
+    });
+}
+
+// ── POST /mcp ──────────────────────────────────────────────────────────────
+
+pub fn handleMcp(allocator: std.mem.Allocator, state: *HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+    _ = body;
+    const body_str = readRawBody(allocator, request, 65536) catch |err| {
+        std.log.err("[mcp] readBody failed: {}", .{err});
+        try respondError(request, .bad_request, "Missing body");
+        return;
+    };
+    defer allocator.free(body_str);
+
+    const result = try processJsonRpcWithState(allocator, state, body_str);
+    defer allocator.free(result);
+
+    try respondJson(request, result);
+}
+
+// ── Mesh guest handler (tunnel per guest) ───────────────────────────────────
+
+/// Per-guest mesh session handler spawned as a new thread.
+/// Reads pty_output + file_chunk + file_eof messages from the KCP tunnel
+/// and updates the shared HostState.
+pub fn handleMeshGuest(
+    allocator: std.mem.Allocator,
+    state: *HostState,
+    hostname: []const u8,
+    tun: *tunnel_mod.Tunnel,
+) void {
+    defer {
+        allocator.free(hostname);
+        state.removeGuestTunnel(hostname);
+        tun.deinit();
+        allocator.destroy(tun);
+    }
+
+    var rbuf: [262144]u8 = undefined;
+    std.log.info("[tun-hdl] mesh handler started for {s}", .{hostname});
+
+    while (tun.isAlive()) {
+        // Peek message size first (message mode, each recv = one complete message)
+        const peek_size = tun.peekSize();
+        if (peek_size <= 0) {
+            // No complete message yet — sleep briefly to avoid busy-wait
+            std.Io.sleep(state.io.?, std.Io.Duration.fromMilliseconds(100), .awake) catch break;
+            continue;
+        }
+        if (peek_size > rbuf.len) {
+            std.log.err("[tun-hdl] Message too large for {s}: {d} bytes", .{ hostname, peek_size });
+            break;
+        }
+
+        const n = tun.recv(rbuf[0..@intCast(peek_size)]) catch |err| {
+            std.log.err("[tun-hdl] recv error for {s}: {}", .{ hostname, err });
+            break;
+        };
+        if (n == 0) {
+            std.Io.sleep(state.io.?, std.Io.Duration.fromMilliseconds(100), .awake) catch break;
+            continue;
+        }
+
+        const data = rbuf[0..n];
+        if (data.len == 0) continue;
+
+        const msg_type = data[0];
+        switch (msg_type) {
+            @intFromEnum(tunproto.MsgType.pty_exec_output) => {
+                var pos: usize = 1;
+                const cmd_id_opt = tunproto.readString(data, &pos);
+                const payload_opt = tunproto.readBlob(data, &pos);
+                if (cmd_id_opt == null or payload_opt == null) {
+                    std.log.err("[tun-hdl] pty_output parse failed for {s}", .{hostname});
+                    continue;
+                }
+                const cmd_id = cmd_id_opt.?;
+                const payload = payload_opt.?;
+
+                state.appendOpOutput(cmd_id, payload);
+                // Scan for MDELIM marker in accumulated output
+                state.scanForMarker(cmd_id);
+            },
+            @intFromEnum(tunproto.MsgType.file_chunk) => {
+                var pos: usize = 1;
+                const cmd_id_opt = tunproto.readString(data, &pos);
+                const payload_opt = tunproto.readBlob(data, &pos);
+                if (cmd_id_opt == null or payload_opt == null) {
+                    std.log.err("[tun-hdl] file_chunk parse failed for {s}", .{hostname});
+                    continue;
+                }
+                state.appendOpOutput(cmd_id_opt.?, payload_opt.?);
+            },
+            @intFromEnum(tunproto.MsgType.file_eof) => {
+                const eof = tunproto.parseFileEof(data) orelse {
+                    std.log.err("[tun-hdl] file_eof parse failed for {s}", .{hostname});
+                    // Mark the op done anyway so the handler doesn't hang.
+                    // Extract cmd_id before falling through to manual extraction.
+                    var pos2: usize = 1;
+                    const cmd_id_str = tunproto.readString(data, &pos2) orelse {
+                        std.log.err("[tun-hdl] file_eof missing cmd_id for {s}", .{hostname});
+                        continue;
+                    };
+                    if (!std.mem.eql(u8, cmd_id_str, "dl_") and !std.mem.eql(u8, cmd_id_str, "up_")) {
+                        state.completeOpState(cmd_id_str, -1);
+                    } else {
+                        state.completeOpState(cmd_id_str, 0);
+                    }
+                    state.wake_event.set(state.io.?);
+                    state.wake_event.reset();
+                    continue;
+                };
+                std.log.info("[tun-hdl] file_eof for {s}: {d} bytes, sha256={s}", .{ eof.cmd_id, eof.file_size, eof.file_hash });
+                state.completeOpState(eof.cmd_id, eof.exit_code);
+                if (eof.file_hash.len > 0) {
+                    state.setOpFileMeta(eof.cmd_id, eof.file_hash, eof.file_size);
+                }
+                state.wake_event.set(state.io.?);
+                state.wake_event.reset();
+            },
+            @intFromEnum(tunproto.MsgType.upgrade_req) => {
+                var pos: usize = 1;
+                const cmd_id_opt = tunproto.readString(data, &pos);
+                const target_opt = tunproto.readString(data, &pos);
+                if (cmd_id_opt == null or target_opt == null) {
+                    std.log.err("[tun-hdl] upgrade_req parse failed for {s}", .{hostname});
+                    continue;
+                }
+                std.log.info("[tun-hdl] upgrade request from {s} target={s}", .{ hostname, target_opt.? });
+                serveUpgradeFile(state.io.?, allocator, tun, cmd_id_opt.?, target_opt.?) catch |err| {
+                    std.log.err("[tun-hdl] serveUpgradeFile failed: {}", .{err});
+                };
+            },
+            else => {
+                std.log.err("[tun-hdl] unknown msg type 0x{x:0>2} for {s}", .{ msg_type, hostname });
+            },
+        }
+    }
+
+    std.log.info("[tun-hdl] mesh handler exiting for {s}", .{hostname});
+}
+
+/// Serve upgrade binary to Guest via file_chunk + file_eof over KCP tunnel.
+fn serveUpgradeFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    tun: *tunnel_mod.Tunnel,
+    cmd_id: []const u8,
+    target: []const u8,
+) !void {
+    const filename = protocol.deploymentFilename(target) orelse {
+        std.log.err("[upgrade] Unknown target: {s}", .{target});
+        const eof_frame = try tunproto.buildFileEof(allocator, cmd_id, 1, 0, &[_]u8{0} ** 64);
+        defer allocator.free(eof_frame);
+        _ = tun.sendLocked(eof_frame) catch {};
+        return;
+    };
+
+    // Use exe_dir to find the binary (same directory as running utmm)
+    var exe_path_buf: [4096]u8 = undefined;
+    const exe_len = try std.process.executablePath(io, &exe_path_buf);
+    const exe_path = exe_path_buf[0..exe_len];
+    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+
+    var path_buf: [1024]u8 = undefined;
+    const file_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ exe_dir, filename });
+
+    const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch |err| {
+        std.log.err("[upgrade] Cannot open {s}: {}", .{ file_path, err });
+        const eof_frame = try tunproto.buildFileEof(allocator, cmd_id, 1, 0, &[_]u8{0} ** 64);
+        defer allocator.free(eof_frame);
+        _ = tun.send(eof_frame) catch {};
+        return;
+    };
+    defer file.close(io);
+
+    const file_size = try file.length(io);
+    std.log.info("[upgrade] Serving {s} ({d} bytes) to {s}", .{ filename, file_size, cmd_id });
+
+    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
+    var total: u64 = 0;
+    var file_buf: [8192]u8 = undefined;
+    var file_reader = file.reader(io, &file_buf);
+
+    while (true) {
+        const remaining = file_size - total;
+        const chunk_size = @min(remaining, file_buf.len);
+        if (chunk_size == 0) break;
+
+        try file_reader.interface.readSliceAll(file_buf[0..chunk_size]);
+
+        sha256.update(file_buf[0..chunk_size]);
+
+        const fchunk = try tunproto.buildFileChunk(allocator, cmd_id, file_buf[0..chunk_size]);
+        defer allocator.free(fchunk);
+
+        // Lock once per chunk — mesh thread runs in same Io, competition is rare
+        tun.lock() catch return;
+        defer tun.unlock();
+        _ = tun.sendLocked(fchunk) catch |err| {
+            std.log.err("[upgrade] Failed to send chunk: {}", .{err});
+            return;
+        };
+        tun.flushLocked(tun.session.mesh.clock_ms);
+
+        total += chunk_size;
+    }
+
+    var hash_bin: [32]u8 = undefined;
+    sha256.final(&hash_bin);
+    var hash_hex: [64]u8 = undefined;
+    for (hash_bin, 0..) |b, j| {
+        hash_hex[j * 2] = "0123456789abcdef"[b >> 4];
+        hash_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+
+    const eof_frame = try tunproto.buildFileEof(allocator, cmd_id, 0, @intCast(total), &hash_hex);
+    defer allocator.free(eof_frame);
+
+    {
+        tun.lock() catch return;
+        defer tun.unlock();
+        _ = tun.sendLocked(eof_frame) catch |err| {
+            std.log.err("[upgrade] Failed to send file_eof: {}", .{err});
+            return;
+        };
+        tun.flushLocked(tun.session.mesh.clock_ms);
+    }
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+
+    std.log.info("[upgrade] Sent {s} ({d} bytes, sha256={s}) to {s}", .{
+        filename, total, &hash_hex, cmd_id,
+    });
+}
+
+// ── /etc/hosts sync ────────────────────────────────────────────────────────
+
+pub fn syncHostsFromState(state: *HostState, allocator: std.mem.Allocator) void {
+    state.mutex.lock(state.io.?) catch return;
+    defer state.mutex.unlock(state.io.?);
+
+    var entries: std.ArrayList(hosts_file.HostEntry) = .empty;
+    defer entries.deinit(allocator);
+    var allocated_names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (allocated_names.items) |n| allocator.free(n);
+        allocated_names.deinit(allocator);
+    }
+
+    for (state.guests.items) |g| {
+        const name_str = std.fmt.allocPrint(allocator, "{s}.{s}.utm", .{ g.hostname, g.target }) catch continue;
+        allocated_names.append(allocator, name_str) catch {
+            allocator.free(name_str);
+            continue;
+        };
+        entries.append(allocator, .{
+            .ip = g.ip,
+            .name = name_str,
+        }) catch continue;
+    }
+
+    hosts_file.updateHosts(state.io.?, allocator, "/etc/hosts", entries.items) catch |err| {
+        std.log.err("[host-http] Failed to sync /etc/hosts: {}", .{err});
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -766,6 +1946,25 @@ test "jsonEscape - control characters" {
     const result = try jsonEscape(std.testing.allocator, &.{ 0, 7, 11, 14, 31 });
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("\\u0000\\u0007\\u000b\\u000e\\u001f", result);
+}
+
+test "jsonEscape - DEL and other edge control chars" {
+    // Test BS (0x08), FF (0x0C), DEL (0x7F)
+    {
+        const result = try jsonEscape(std.testing.allocator, &.{0x08});
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqualStrings("\\u0008", result);
+    }
+    {
+        const result = try jsonEscape(std.testing.allocator, &.{0x0C});
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqualStrings("\\u000c", result);
+    }
+    {
+        const result = try jsonEscape(std.testing.allocator, &.{0x7F});
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqualStrings("\\u007f", result);
+    }
 }
 
 test "jsonEscape - all safe printable" {
@@ -1177,4 +2376,67 @@ test "HostState router add and dispatch" {
 
 test "DEFAULT_PORT is 2121" {
     try std.testing.expectEqual(@as(u16, 2121), DEFAULT_PORT);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MCP tests (曾 mcp.zig)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "mcp jsonAppendId - null" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try jsonAppendId(&list, std.testing.allocator, .{ .null = {} });
+    try std.testing.expectEqualStrings("null", list.items);
+}
+
+test "mcp jsonAppendId - integer" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try jsonAppendId(&list, std.testing.allocator, .{ .integer = 42 });
+    try std.testing.expectEqualStrings("42", list.items);
+}
+
+test "mcp jsonAppendId - string" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try jsonAppendId(&list, std.testing.allocator, .{ .string = "abc" });
+    try std.testing.expectEqualStrings("\"abc\"", list.items);
+}
+
+test "mcp jsonAppendId - bool true" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try jsonAppendId(&list, std.testing.allocator, .{ .bool = true });
+    try std.testing.expectEqualStrings("true", list.items);
+}
+
+test "mcp jsonAppendId - bool false" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+    try jsonAppendId(&list, std.testing.allocator, .{ .bool = false });
+    try std.testing.expectEqualStrings("false", list.items);
+}
+
+test "mcp jsonGetString - present" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    try map.put(std.testing.allocator, "key", .{ .string = "value" });
+    const result = jsonGetString(map, "key");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("value", result.?);
+}
+
+test "mcp jsonGetString - missing" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    const result = jsonGetString(map, "nope");
+    try std.testing.expect(result == null);
+}
+
+test "mcp jsonGetString - wrong type" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    try map.put(std.testing.allocator, "key", .{ .integer = 42 });
+    const result = jsonGetString(map, "key");
+    try std.testing.expect(result == null);
 }

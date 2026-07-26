@@ -9,7 +9,6 @@ const Io = std.Io;
 const protocol = @import("protocol.zig");
 const http = std.http;
 const httpd = @import("httpd.zig");
-const host_http = @import("host_http.zig");
 const broadcast = @import("broadcast.zig");
 const mesh_mod = @import("mesh.zig");
 const tunnel_mod = @import("tunnel.zig");
@@ -26,15 +25,14 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
     if (cli.cmd_download) return cmdDownload(block_io, gpa, cli.port, cli.download_target.?, cli.download_remote.?, cli.download_local.?);
     // --gen-init
     if (cli.cmd_gen_init) {
-        const install_mod = @import("install.zig");
         const platform_str = cli.gen_init_platform orelse "linux";
-        const platform: install_mod.Platform = if (std.mem.eql(u8, platform_str, "macos"))
+        const platform: Platform = if (std.mem.eql(u8, platform_str, "macos"))
             .macos
         else if (std.mem.eql(u8, platform_str, "windows"))
             .windows
         else
             .linux;
-        const script = install_mod.genInit(platform);
+        const script = genInit(platform);
         std.debug.print("{s}", .{script});
         return;
     }
@@ -58,6 +56,16 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
         break :blk try gpa.dupe(u8, dir);
     };
     defer if (cli.serve_dir == null) gpa.free(serve_dir);
+
+    // Validate serve_dir: must be absolute and must not contain ".." traversal.
+    if (!std.fs.path.isAbsolute(serve_dir)) {
+        std.debug.print("[serve-dir] serve directory must be an absolute path, got: {s}\n", .{serve_dir});
+        std.process.exit(1);
+    }
+    if (std.mem.indexOf(u8, serve_dir, "..") != null) {
+        std.debug.print("[serve-dir] serve directory must not contain '..' traversal, got: {s}\n", .{serve_dir});
+        std.process.exit(1);
+    }
 
     // --host (via --svc): start HTTP server
     if (cli.is_host) {
@@ -119,7 +127,10 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
     std.debug.print("\n{s: <16} {s: <18} {s: <16} {s: <18} {s: <10} {s}\n", .{ "Hostname", "Target", "IP", "MAC", "Version", "Shell" });
     std.debug.print("{s:-<85}\n", .{""});
     for (guests.items) |guest_val| {
-        const g = guest_val.object;
+        const g = switch (guest_val) {
+            .object => |o| o,
+            else => continue,
+        };
         const hostname = httpd.jsonGetString(g, "hostname") orelse "?";
         const target = httpd.jsonGetString(g, "target") orelse "?";
         const ip = httpd.jsonGetString(g, "ip") orelse "?";
@@ -200,7 +211,7 @@ fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
     var trailers = response.iterateTrailers();
     while (trailers.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "x-exit-code")) {
-            exit_code = std.fmt.parseInt(i32, h.value, 10) catch 0;
+            exit_code = std.fmt.parseInt(i32, h.value, 10) catch 127; // default to 127 (command not found) on parse error
         }
     }
 
@@ -375,7 +386,11 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
             file_hash = h.value;
         }
         if (std.ascii.eqlIgnoreCase(h.name, "x-file-size")) {
-            file_size = @intCast(std.fmt.parseInt(u64, h.value, 10) catch 0);
+            const parsed = std.fmt.parseInt(u64, h.value, 10) catch 0;
+            file_size = std.math.cast(u32, parsed) orelse blk: {
+                std.log.warn("[download] file size {d} exceeds u32 max, clamping", .{parsed});
+                break :blk std.math.maxInt(u32);
+            };
         }
     }
 
@@ -437,15 +452,15 @@ fn startHttpHost(
     // Build router with all endpoints
     var router = httpd.Router{};
     // Order matters: longer prefixes first, "/" last (prefix match)
-    try router.add(gpa, .GET, "/api/guests", host_http.handleApiGuests);
-    try router.add(gpa, .POST, "/download", host_http.handleDownload);
-    try router.add(gpa, .POST, "/upload", host_http.handleUpload);
-    try router.add(gpa, .POST, "/exec", host_http.handleExec);
+    try router.add(gpa, .GET, "/api/guests", httpd.handleApiGuests);
+    try router.add(gpa, .POST, "/download", httpd.handleDownload);
+    try router.add(gpa, .POST, "/upload", httpd.handleUpload);
+    try router.add(gpa, .POST, "/exec", httpd.handleExec);
     // Guest discovery now via mesh LSA — /announce and /ws removed
-    try router.add(gpa, .GET, "/bin/", host_http.handleBin);
-    try router.add(gpa, .GET, "/version", host_http.handleVersion);
-    try router.add(gpa, .POST, "/mcp", host_http.handleMcp);
-    try router.add(gpa, .GET, "/", host_http.handleRoot);
+    try router.add(gpa, .GET, "/bin/", httpd.handleBin);
+    try router.add(gpa, .GET, "/version", httpd.handleVersion);
+    try router.add(gpa, .POST, "/mcp", httpd.handleMcp);
+    try router.add(gpa, .GET, "/", httpd.handleRoot);
 
     // Initialize shared state (guest table + pending commands)
     var state = httpd.HostState.init(gpa);
@@ -649,7 +664,7 @@ fn tunnelManager(
                 // Upsert to guest table
                 const changed = state.upsertGuest(hostname, ip, target, mac_str, version, shell, status);
                 if (changed and hostname.len > 0) {
-                    host_http.syncHostsFromState(state, allocator);
+                    httpd.syncHostsFromState(state, allocator);
                 }
 
                 // Phase 2: Establish tunnel if not already active.
@@ -763,7 +778,7 @@ fn tunnelManager(
                         std.log.err("[tun-mgr] hostname dup failed for {s}", .{hostname});
                         continue;
                     };
-                    const t = std.Thread.spawn(.{}, host_http.handleMeshGuest, .{
+                    const t = std.Thread.spawn(.{}, httpd.handleMeshGuest, .{
                         allocator, state, hostname_dup, tun_ptr,
                     }) catch |err| {
                         std.log.err("[tun-mgr] handleMeshGuest spawn failed for {s}: {}", .{ hostname, err });
@@ -783,4 +798,142 @@ fn tunnelManager(
         // Sleep 5s between scans
         std.Io.sleep(state.io.?, std.Io.Duration.fromSeconds(5), .awake) catch {};
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Platform detection + init script generation (曾 install.zig)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Supported operating system platforms
+pub const Platform = enum {
+    linux,
+    macos,
+    windows,
+
+    pub fn detect() Platform {
+        return switch (builtin.os.tag) {
+            .linux => .linux,
+            .macos => .macos,
+            .windows => .windows,
+            else => .linux,
+        };
+    }
+
+    pub fn asStr(self: Platform) []const u8 {
+        return switch (self) {
+            .linux => "linux",
+            .macos => "macos",
+            .windows => "windows",
+        };
+    }
+};
+
+/// Generate auto-start script/config template for the given platform.
+pub fn genInit(platform: Platform) []const u8 {
+    return switch (platform) {
+        .macos =>
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+        \\  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>Label</key>
+        \\    <string>com.utmm.guest</string>
+        \\    <key>ProgramArguments</key>
+        \\    <array>
+        \\        <string>/opt/utmm/utmm</string>
+        \\        <string>--svc</string>
+        \\    </array>
+        \\    <key>EnvironmentVariables</key>
+        \\    <dict>
+        \\        <key>SHELL</key>
+        \\        <string>/bin/zsh</string>
+        \\        <key>HOME</key>
+        \\        <string>/var/root</string>
+        \\    </dict>
+        \\    <key>RunAtLoad</key>
+        \\    <true/>
+        \\    <key>KeepAlive</key>
+        \\    <dict>
+        \\        <key>SuccessfulExit</key>
+        \\        <false/>
+        \\    </dict>
+        \\    <key>ThrottleInterval</key>
+        \\    <integer>5</integer>
+        \\    <key>StandardOutPath</key>
+        \\    <string>/var/log/utmm-guest.log</string>
+        \\</dict>
+        \\</plist>
+        \\
+        \\<!-- Install: sudo cp this file to /Library/LaunchDaemons/com.utmm.guest.plist -->
+        \\<!-- Load:    sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmm.guest.plist -->
+        \\
+        \\<!-- Host mode: replace --svc with --svc --host, change Label/Log to utmm-host -->
+        ,
+        .linux =>
+        \\[Unit]
+        \\Description=UTM Monitor Guest Service
+        \\After=network.target
+        \\
+        \\[Service]
+        \\Type=simple
+        \\Environment=SHELL=/bin/bash
+        \\Environment=HOME=/root
+        \\ExecStart=/opt/utmm/utmm --svc
+        \\WorkingDirectory=/opt/utmm
+        \\Restart=on-failure
+        \\RestartSec=5
+        \\StartLimitBurst=3
+        \\StartLimitIntervalSec=30
+        \\StandardOutput=journal
+        \\
+        \\[Install]
+        \\WantedBy=multi-user.target
+        \\
+        \\<!-- Install: sudo cp this file to /etc/systemd/system/utmm-guest.service -->
+        \\<!-- Enable:  sudo systemctl daemon-reload && sudo systemctl enable utmm-guest -->
+        \\
+        \\<!-- Host mode: add --host to ExecStart, change Description to Host -->
+        ,
+        .windows =>
+        \\:: UTM Monitor Guest auto-start service
+        \\::
+        \\:: Install: sc create "UTM-Monitor-Guest" binPath= "\"C:\opt\utmm\utmm.exe\" --svc" start= auto
+        \\::           sc failure "UTM-Monitor-Guest" reset=30 actions=restart/5000/restart/5000/restart/5000/none/5000
+        \\::           sc start "UTM-Monitor-Guest"
+        \\:: Remove:  sc stop "UTM-Monitor-Guest" & sc delete "UTM-Monitor-Guest"
+        \\
+        \\:: Host mode: replace UTM-Monitor-Guest with UTM-Monitor-Host, add --host to binPath
+        ,
+    };
+}
+
+test "Platform.detect returns valid platform" {
+    const p = Platform.detect();
+    _ = switch (p) {
+        .macos, .linux, .windows => true,
+    };
+}
+
+test "genInit - linux has systemd service" {
+    const script = genInit(.linux);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "[Unit]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "[Service]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--svc") != null);
+}
+
+test "genInit - macos has launchd plist" {
+    const script = genInit(.macos);
+    try std.testing.expect(std.mem.indexOf(u8, script, "com.utmm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "plist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--svc") != null);
+}
+
+test "genInit - windows has sc command" {
+    const script = genInit(.windows);
+    try std.testing.expect(std.mem.indexOf(u8, script, "sc create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "UTM-Monitor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "C:\\opt\\utmm\\utmm.exe") != null);
 }
