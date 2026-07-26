@@ -1,6 +1,6 @@
 //! Host mode — unified HTTP server on port 2121.
 //!
-//! Single std.http.Server replaces UDP broadcast + TCP binary frames + MCP :2122.
+//! Single std.http.Server replaces UDP broadcast + TCP binary frames + MCP :2121.
 //! Management commands (--status/--exec/--upload/--download) are HTTP clients.
 
 const std = @import("std");

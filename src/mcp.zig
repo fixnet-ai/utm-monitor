@@ -21,8 +21,8 @@ const SERVER_INFO =
 ;
 
 const TOOLS_JSON =
-    \\[{"name":"vm_status","description":"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, shell (cmd.exe or /bin/sh — use this to write compatible commands), and whether an upgrade is available for each VM.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell: /bin/sh on Linux/macOS, cmd.exe on Windows. Check vm_status first to see each VM's shell type, then write compatible commands.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)"}},"required":["vm","command"]}}]
+    \\[{"name":"vm_status","description":"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.","inputSchema":{"type":"object","properties":{},"required":[]}},
+    \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check vm_status first to see each VM's shell type, then write compatible commands.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)"}},"required":["vm","command"]}}]
 ;
 
 // ── JSON value helpers ─────────────────────────────────────────────────────
