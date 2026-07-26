@@ -56,6 +56,14 @@ pub fn formatNodeId(id: NodeId, allocator: std.mem.Allocator) ![]const u8 {
     });
 }
 
+/// Format NodeId into a caller-provided buffer (17 bytes needed: 12 hex + 5 colons).
+/// Returns the formatted slice, or "??:??:??:??:??:??" on overflow.
+pub fn formatNodeIdBuf(id: NodeId, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+        id[0], id[1], id[2], id[3], id[4], id[5],
+    }) catch "??:??:??:??:??:??";
+}
+
 /// Compute KCP conversation ID from two NodeIds (XOR of MACs → u32).
 pub fn computeConv(a: NodeId, b: NodeId, nonce: u32) u32 {
     var conv: u32 = nonce;
@@ -298,6 +306,7 @@ pub const Mesh = struct {
     // LSA state
     lsa_seq: u32,
     last_lsa_broadcast_ms: u32,
+    periodic_tick: u32 = 0, // incremented each periodicTasks call
 
     // Topology
     neighbors: std.AutoHashMap(NodeId, Neighbor),
@@ -339,6 +348,12 @@ pub const Mesh = struct {
 
     // Clock (monotonic ms, advanced in run loop)
     clock_ms: u32,
+
+    // Last pong received (for --ping command). Set by handlePong.
+    last_pong_src: NodeId = [_]u8{0} ** 6,
+    last_pong_rtt: u32 = 0,
+    last_pong_time: u32 = 0, // clock_ms when received
+    last_pong_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     /// Create a new Mesh instance. Takes ownership of node_info (will free on deinit).
     /// socket should be a UDP socket already bound to :2121 with broadcast enabled.
@@ -621,6 +636,32 @@ pub const Mesh = struct {
             self.last_lsa_broadcast_ms = self.clock_ms;
         }
 
+        // Periodic ping of all known nodes (every ~60 periodicTasks calls,
+        // roughly 60s when idle) — measures RTT for both direct neighbors
+        // and relayed paths.
+        self.periodic_tick +%= 1;
+        if (self.periodic_tick % 60 == 0) {
+            // Collect known node IDs (release lsas_mutex before calling sendPing
+            // to avoid holding lsas → neighbors/routes lock nesting)
+            var ping_targets: [64]NodeId = undefined;
+            var ping_count: usize = 0;
+            {
+                self.lsas_mutex.lock(self.io) catch return;
+                defer self.lsas_mutex.unlock(self.io);
+                var l_iter = self.lsas.iterator();
+                while (l_iter.next()) |entry| {
+                    const node = entry.key_ptr.*;
+                    if (std.mem.eql(u8, &node, &self.node_id)) continue;
+                    if (ping_count >= ping_targets.len) break;
+                    ping_targets[ping_count] = node;
+                    ping_count += 1;
+                }
+            }
+            for (ping_targets[0..ping_count]) |node| {
+                self.sendPing(node);
+            }
+        }
+
         // Expire stale neighbors every 5 seconds
         if (self.clock_ms % 5000 < 10) {
             self.expireStale();
@@ -777,8 +818,11 @@ pub const Mesh = struct {
         }
         // ── lsas_mutex released here ──
 
-        // ── neighbors section: lock, update, unlock ──
-        {
+        // ── neighbors section: only add as direct neighbor if received
+        // directly from the origin (TTL == MESH_MAX_TTL, not relayed).
+        // Relayed LSAs go into the LSA database but don't create direct
+        // neighbor entries — Dijkstra will route through the relay source.
+        if (decoded.ttl == protocol.MESH_MAX_TTL) {
             self.neighbors_mutex.lock(self.io) catch return;
             defer self.neighbors_mutex.unlock(self.io);
 
@@ -1065,34 +1109,165 @@ pub const Mesh = struct {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
-    // Ping/Pong handling
+    // Ping/Pong handling (supports both direct and relayed ping)
     // ──────────────────────────────────────────────────────────────────────────
+    //
+    // Ping format: [src_mac:6][timestamp:4] (10 bytes, direct neighbor)
+    //              [src_mac:6][dst_mac:6][ttl:1][timestamp:4] (17 bytes, relayed)
+    // Pong format: [src_mac:6][timestamp:4] — always 10 bytes (direct reply to sender)
 
     fn handlePing(self: *Mesh, data: []const u8, from: net.IpAddress) void {
-        if (data.len < 10) return; // src_mac(6) + timestamp(4)
-        // Respond with pong
+        if (data.len < 10) return;
+
+        // Relayed ping format: src(6) + dst(6) + ttl(1) + ts(4) = 17 bytes
+        if (data.len >= 17) {
+            var src_mac: NodeId = undefined;
+            @memcpy(&src_mac, data[0..6]);
+            var dst_mac: NodeId = undefined;
+            @memcpy(&dst_mac, data[6..12]);
+            const ttl = data[12];
+
+            // Is this node the target?
+            if (std.mem.eql(u8, &dst_mac, &self.node_id)) {
+                // Yes — respond with pong (direct reply to relay source)
+                var src_buf: [18]u8 = undefined;
+                std.log.info("[mesh] relayed ping reached target from {s}", .{formatNodeIdBuf(src_mac, &src_buf)});
+                var pong: [11]u8 = undefined;
+                pong[0] = protocol.MESH_TYPE_PONG;
+                @memcpy(pong[1..7], &self.node_id);
+                std.mem.writeInt(u32, pong[7..11], self.clock_ms, .big);
+                self.socket.send(self.io, &from, &pong) catch {};
+                return;
+            }
+
+            // Not the target — relay to next hop if TTL > 0
+            if (ttl > 0) {
+                if (self.routeTo(dst_mac)) |next_hop| {
+                    // Rewrite the packet with decremented TTL and forward
+                    var relayed: [18]u8 = undefined;
+                    relayed[0] = protocol.MESH_TYPE_PING;
+                    @memcpy(relayed[1..13], data[0..12]);  // src + dst
+                    relayed[13] = ttl - 1;                  // decrement TTL
+                    @memcpy(relayed[14..18], data[13..17]);  // timestamp
+
+                    self.neighbors_mutex.lock(self.io) catch return;
+                    defer self.neighbors_mutex.unlock(self.io);
+                    if (self.neighbors.get(next_hop)) |nb| {
+                        var src_buf: [18]u8 = undefined;
+                        var dst_buf: [18]u8 = undefined;
+                        var hop_buf: [18]u8 = undefined;
+                        std.log.info("[mesh] ping relay fwd: {s} → {s} via {s} ttl={d}", .{
+                            formatNodeIdBuf(src_mac, &src_buf),
+                            formatNodeIdBuf(dst_mac, &dst_buf),
+                            formatNodeIdBuf(next_hop, &hop_buf),
+                            ttl - 1,
+                        });
+                        self.socket.send(self.io, &nb.addr, &relayed) catch {};
+                    }
+                }
+            }
+            return;
+        }
+
+        // Direct ping (10 bytes): always respond with pong.
+        // Include responder's MAC so the sender knows who replied.
         var pong: [11]u8 = undefined;
         pong[0] = protocol.MESH_TYPE_PONG;
-        @memcpy(pong[1..], data[0..10]);
+        @memcpy(pong[1..7], &self.node_id);                  // responder MAC
+        std.mem.writeInt(u32, pong[7..11], std.mem.readInt(u32, data[6..10], .big), .big); // original timestamp
         self.socket.send(self.io, &from, &pong) catch {};
     }
 
     fn handlePong(self: *Mesh, data: []const u8) void {
         if (data.len < 10) return;
-        // Used for RTT measurement — could update neighbor cost based on RTT
-        _ = .{ self, data };
+        var src_mac: NodeId = undefined;
+        @memcpy(&src_mac, data[0..6]);
+        const send_ts = std.mem.readInt(u32, data[6..10], .big);
+        const rtt = self.clock_ms -% send_ts;
+        var mac_buf: [18]u8 = undefined;
+        std.log.info("[mesh] pong from {s} rtt={d}ms", .{ formatNodeIdBuf(src_mac, &mac_buf), rtt });
+
+        // Store for --ping command (lock-free read: worst case is stale data)
+        self.last_pong_mutex.lock(self.io) catch return;
+        defer self.last_pong_mutex.unlock(self.io);
+        self.last_pong_src = src_mac;
+        self.last_pong_rtt = rtt;
+        self.last_pong_time = self.clock_ms;
     }
 
-    /// Send a ping to a specific neighbor (for RTT/cost measurement).
+    /// Send a ping and wait for the pong from the specific target.
+    /// Returns RTT in milliseconds, or null on timeout (10s real time).
+    pub fn pingAndWait(self: *Mesh, dest_id: NodeId) ?u32 {
+        // Record current pong state so we can detect a new one
+        self.last_pong_mutex.lock(self.io) catch return null;
+        const prev_time = self.last_pong_time;
+        self.last_pong_mutex.unlock(self.io);
+
+        // Send the ping
+        self.sendPing(dest_id);
+
+        // Wait for a fresh pong from the target (up to 10 seconds, real time).
+        // We poll in 50ms increments — 200 iterations = 10 seconds.
+        var iterations: u32 = 0;
+        while (iterations < 200) : (iterations += 1) {
+            self.last_pong_mutex.lock(self.io) catch return null;
+            const fresh = (self.last_pong_time -% prev_time < 0x80000000) and self.last_pong_time != prev_time;
+            const matches = std.mem.eql(u8, &self.last_pong_src, &dest_id);
+            const rtt = self.last_pong_rtt;
+            self.last_pong_mutex.unlock(self.io);
+
+            if (fresh and matches) return rtt;
+
+            // Yield before polling again (50ms sleep)
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(50), .awake) catch return null;
+        }
+        return null; // timeout after ~10 seconds
+    }
+
+    /// Send a ping to any node (direct neighbor or via relay).
+    /// Uses the routing table to decide direct vs relayed format.
     pub fn sendPing(self: *Mesh, dest_id: NodeId) void {
+        const next_hop = self.routeTo(dest_id) orelse {
+            var mac_buf: [18]u8 = undefined;
+            std.log.info("[mesh] ping: no route to {s}", .{formatNodeIdBuf(dest_id, &mac_buf)});
+            return;
+        };
+
+        // Direct ping if next hop IS the destination itself
+        if (std.mem.eql(u8, &next_hop, &dest_id)) {
+            self.neighbors_mutex.lock(self.io) catch return;
+            defer self.neighbors_mutex.unlock(self.io);
+            if (self.neighbors.get(dest_id)) |neighbor| {
+                var ping: [11]u8 = undefined;
+                ping[0] = protocol.MESH_TYPE_PING;
+                @memcpy(ping[1..7], &self.node_id);
+                std.mem.writeInt(u32, ping[7..11], self.clock_ms, .big);
+                self.socket.send(self.io, &neighbor.addr, &ping) catch {};
+                var dst_buf: [18]u8 = undefined;
+                std.log.info("[mesh] ping direct: → {s} addr={any}", .{ formatNodeIdBuf(dest_id, &dst_buf), neighbor.addr });
+            }
+            return;
+        }
+
+        // Relayed ping — send via next_hop with dst_mac + ttl
         self.neighbors_mutex.lock(self.io) catch return;
         defer self.neighbors_mutex.unlock(self.io);
-        if (self.neighbors.get(dest_id)) |neighbor| {
-            var ping: [11]u8 = undefined;
+        if (self.neighbors.get(next_hop)) |nb| {
+            var ping: [18]u8 = undefined;
             ping[0] = protocol.MESH_TYPE_PING;
-            @memcpy(ping[1..7], &self.node_id);
-            std.mem.writeInt(u32, ping[7..11], self.clock_ms, .big);
-            self.socket.send(self.io, &neighbor.addr, &ping) catch {};
+            @memcpy(ping[1..7], &self.node_id);     // src_mac
+            @memcpy(ping[7..13], &dest_id);          // dst_mac
+            ping[13] = protocol.MESH_MAX_TTL;        // ttl
+            std.mem.writeInt(u32, ping[14..18], self.clock_ms, .big); // timestamp
+            self.socket.send(self.io, &nb.addr, &ping) catch {};
+            var src_buf: [18]u8 = undefined;
+            var dst_buf: [18]u8 = undefined;
+            var hop_buf: [18]u8 = undefined;
+            std.log.info("[mesh] ping relay: {s} → {s} via {s}", .{
+                formatNodeIdBuf(self.node_id, &src_buf),
+                formatNodeIdBuf(dest_id, &dst_buf),
+                formatNodeIdBuf(next_hop, &hop_buf),
+            });
         }
     }
 

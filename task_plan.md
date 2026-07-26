@@ -1,4 +1,4 @@
-# Task Plan: v0.11.10
+# Task Plan: v0.11.11
 
 ## 架构概述
 
@@ -20,267 +20,62 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | Windows | windowsvm | aarch64-windows | 192.168.65.2 | Administrator / 111 | C:\opt\utmm\ |
 | Windows | winx64 | x86_64-windows | 192.168.3.108 | Administrator / 111 | C:\opt\utmm\ |
 
-## 近期完成
+## 已完成阶段
 
-### Phase 50: 加固优化全面审计 ✅ (2026-07-26)
+### Phase 57: `--ping` 命令实现与自动升级测试 ✅ (2026-07-27)
 
-对 13 个源文件全面审计，识别并修复 20 个安全/可靠性问题，分 5 个阶段实施：
+**目标**: 实现 `utmm --ping <hostname>` CLI 命令，通过 mesh 对指定 Guest 发起 ping，并验证自动升级端到端流程。
 
-- **Phase 0（清理）**: 删除 `src/host_http.zig`（1190 行死代码，零引用）
-- **Phase 1（MTU + 11 项自包含修复）**: KCP MTU 1300→1266，UDP 包 ≤1280 字节强制门禁，缓冲区缩小，TOCTOU 临时文件名随机化，下载速度修复（~8KB/s→正常），encodeLsa 递归守卫，sessions.put OOM 回滚
-- **Phase 2（mesh.zig 线程安全）**: 3 个 `std.Io.Mutex`（neighbors/routes/lsas），~30 处锁包裹，锁序 `sessions→neighbors→lsas→routes`，避免自死锁
-- **Phase 3（线程生命周期）**: `tunnelManager` + `ptyReadLoop` 从 detach→join，defer 块 5 步有序销毁
-- **Phase 4（错误处理 7 项）**: ptyWrite 返回值检查，poll EINTR→continue，catch 块 try 消除，pty_exec_done 消息，cleanupStaleOps 周期调用，forceInstall 失败回滚，CLI 边界检查，svc.zig runCmdQuiet 替换 24 处静默吞错
+**核心实现**:
 
-**验证**: `zig build test` 128/128 通过，8 目标交叉编译零错误，x86_64-macos Rosetta 测试通过。
-
-### Phase 49: 文档合并与整理 ✅ (2026-07-26)
-
-- DESIGN.md 内容合并到 CLAUDE.md（协议栈图、UDP 分发码、服务名表、设计决策理由）
-- release-skill/SKILL.md 发布流程合并到 CLAUDE.md
-- `build.sh` 改名 `release.sh`，增加 `gh release create` 调用，移到项目根目录
-- 删除 `release-skill/` 目录、`DESIGN.md`
-- `utm-vm` 改名 `utmm`：`.claude/skills/utmm/` + `skills/utmm` 软链
-- 规划文档精简：task_plan（1042→53 行）、progress（1311→53 行）、findings（998→90 行）
-- SKILL.md 重写（WebSocket→KCP 隧道）、MANUAL.md 整份重写（1245→632 行）
-- README.md 更新安装/升级描述
-
-### Phase 48: 自复制安装模型重构 ✅ (2026-07-26)
-
-- 新建 `src/svc.zig`（统一跨平台服务管理）、`src/fail.zig`（fast-fail 工具）
-- 删除 `src/agent.zig`、`src/upgrade.zig`
-- 精简 `src/priv.zig`（仅 isAdmin）、`src/install.zig`（仅 genInit/Platform）
-- 重写 `src/main.zig` 调度树
-- 8 目标交叉编译全过，4 VM + Host 全部署验证通过
-
-### Phase 47: KCP 可靠性第二轮深度审计 ✅ (2026-07-26)
-
-- 7 个问题修复（2 Critical、2 High），20 个新测试，131/131 通过
-
-### Phase 46: KCP 可靠性全面加固 ✅ (2026-07-26)
-
-- 13 个问题修复（2 Critical），18 个新测试，111/111 通过
-
-### Phase 50 部署测试 ✅ (2026-07-26)
-
-全 VM 重新部署和 exec 功能验证，发现并修复 4 个部署期 bug（Findings #76-79）：
-
-- **F76**: `wake_event.reset()` 信号线程调用 → `unreachable` panic — 移除 4 处 `reset()`
-- **F77**: `cleanupOpState` 自死锁 — 移除 handleExec 外层锁
-- **F78**: 交叉编译覆盖 `zig-out/bin/utmm` — 流程规范
-- **F79**: tunnelManager use-after-free segfault — 新增 `isTunnelDead()` 方法
-
-**修复范围**: `src/httpd.zig`（+15/-7 行），`src/host.zig`（+15/-10 行）
-
-**部署验证**:
-
-| VM | 状态 | 测试命令 |
-|----|------|---------|
-| linuxvm | ✅ | `hostname`、`uptime`、`uname -a` |
-| macvm | ✅ | `uname -a`、`hostname` |
-| windowsvm | ✅ | `echo W1` |
-| winx64 | ✅ | `echo X1` |
-
-`zig build test` 全量通过，Host 持续稳定无崩溃。
-
-### Phase 51: 文件合并与测试扩充 ✅ (2026-07-26)
-
-19 个源文件合并为 13 个，消除薄包装文件，每个文件有清晰职责：
-
-**合并操作**：
-
-| 删除文件 | 合并目标 | 内容 |
-|----------|---------|------|
-| `ver.zig` (30 行) | `protocol.zig` | VERSION 常量 |
-| `priv.zig` (72 行) | `main.zig` | isAdmin 检查 |
-| `install.zig` (186 行) | `svc.zig` + `host.zig` | detectServiceEnv→svc, Platform/genInit→host |
-| `guest.zig` (65 行) | `broadcast.zig` | 系统信息 + meshSessionLoop 入口 |
-| `mcp.zig` (397 行) | `httpd.zig` | JSON-RPC 处理 |
-| `host_http.zig` (1280 行新增) | `httpd.zig` | HTTP 端点处理器 |
-
-**合并后结构** (13 文件，12,641 行)：
-
-| 文件 | 行数 | 职责 |
+| 组件 | 文件 | 说明 |
 |------|------|------|
-| `kcp.zig` | 3039 | KCP 可靠 ARQ 协议 |
-| `httpd.zig` | 2472 | HTTP 服务器 + 端点处理 + MCP JSON-RPC |
-| `broadcast.zig` | 1677 | Guest 核心 + 系统信息 + pty |
-| `mesh.zig` | 1367 | LSA mesh 网络 + UDP 广播 + KCP 会话 |
-| `host.zig` | 975 | Host 编排 + Platform 检测 + genInit |
-| `svc.zig` | 950 | 跨平台服务管理 + detectServiceEnv |
-| `tunproto.zig` | 645 | 隧道协议：构建/解析/分块传输 |
-| `main.zig` | 511 | 入口 + CLI 解析 + isAdmin |
-| `protocol.zig` | 322 | 协议常量 + VERSION + 部署文件名 |
-| `tunnel.zig` | 272 | KCP 上的 TCP 流包装 |
-| `hosts_file.zig` | 191 | /etc/hosts 标记块读写 |
-| `config.zig` | 159 | 配置持久化 + 文件日志 |
-| `fail.zig` | 61 | Fast-fail 工具 |
+| CLI 参数 + 调度 + 帮助 | `src/main.zig` | `--ping <hostname>` 解析、`needs_host` 集成、dispatch |
+| `cmdPing()` HTTP 客户端 | `src/host.zig` | POST `/ping` + `x-vm` header，显示 JSON 响应 |
+| `/ping` 路由注册 | `src/host.zig:524` | `router.add(gpa, .POST, "/ping", httpd.handlePing)` |
+| `handlePing()` HTTP 处理器 | `src/httpd.zig:1369` | 查找 Guest MAC → mesh.pingAndWait → 返回 JSON |
+| `pingAndWait()` + `sendPing()` | `src/mesh.zig` | 发送 MESH_TYPE_PING，200×50ms=10s 真实时间轮询等 pong |
+| `handlePing()` mesh 层 | `src/mesh.zig:1119` | 直接 ping（10 字节）/ 中继 ping（17 字节含 dst_mac+TTL） |
+| `handlePong()` mesh 层 | `src/mesh.zig:1181` | 更新 `last_pong_*` 跟踪字段供 `pingAndWait` 检测 |
+| `setGuestMeshMac()` 调用 | `src/host.zig:873` | 在 tunnelManager 注册 tunnel 后设置 mesh_mac |
 
-**Zig 0.16.0 API 兼容修复**：
-- `waitpid` → `process.WaitPidResult` 新 API
-- `BodyWriter` → `Response.Writer` 新类型
-- `executablePath()` → 返回 `[]const u8`（不再需要 `fs.selfExePath`）
-- `Event.set()` 签名：`.set(io)` 而非 `.set(io, .unset)`
-- `readSliceAll` → `ReadBuffer` + `readUntilDelimiterAll`
+**修复的 Bug**:
 
-**测试扩充** (+66 测试，+52%)：
-- `httpd.zig`: 0→44 测试（jsonEscape, json helpers, buildCmdWithMarker, scanForMarker, HostState, OpState）
-- `svc.zig` (原 install.zig): 4→10 测试
-- `config.zig`: 3→9 测试
-- `broadcast.zig`: 2→6 测试
-- `hosts_file.zig`: 3→5 测试
+| # | 问题 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | `/ping` 返回 "guest not found" | `setGuestMeshMac()` 定义但从未调用 → `mesh_mac` 永远为 null | 在 tunnelManager `registerGuestTunnel` 后调用 |
+| 2 | `pingAndWait` 超时不准确 | 使用 `clock_ms`（事件计数器，~1000-2000/秒）做 5s 超时，实际周期 ping 每 ~60s 一次 | 改为 200×50ms=10s 真实时间轮询 |
+| 3 | `fromMillis` / `readHeader` 编译错误 | Zig 0.16.0 API 变更 | `fromMilliseconds` / `getRequestHeader` |
+| 4 | `Writer.Discarding.init()` 需要 buffer 参数 | Zig 0.16.0 API | 改用 `Writer.fixed()` |
 
-**验证**: `zig build test` 128/128 通过，原生构建成功。
+**Ping 协议**:
+- **直接 ping** (Host→Guest 或同一子网): `[0x03][src_mac:6][timestamp:4]` = 11 字节
+- **中继 ping** (跨跳，如 Guest→Guest 经 Host): `[0x03][src_mac:6][dst_mac:6][ttl:1][timestamp:4]` = 18 字节
+- **Pong 响应**（统一格式）: `[0x04][responder_mac:6][timestamp:4]` = 11 字节
+- **RTT 单位**: mesh `clock_ms` 事件计数（非真实毫秒），~10 表示 sub-ms 实际延迟
 
-### Phase 52: CLI 管理命令自动确保 Host 服务 ✅ (2026-07-26)
+**自动升级验证** (v0.11.10→v0.11.11):
 
-管理命令（`--status`/`--exec`/`--upload`/`--download`）之前需要用户先手动 `utmm --host` 启动服务再执行，两步操作繁琐且对 AI Agent 不友好。服务未运行时管理命令仅打印 `ConnectionRefused` 后 crash。
+| Guest | 升级方式 | 结果 |
+|-------|---------|------|
+| linuxvm | SSH scp + `--install` | ✅ 服务重启，LSA 重连 |
+| macvm | SSH scp + `--install` + 手动 bootstrap | ✅ (launchd bootstrap 间歇失败) |
+| windowsvm | SSH scp + `--install` | ✅ |
+| winx64 | SSH scp + `--install` | ✅ |
 
-**改造**: `main.zig` 合并 `--host` 和 management commands 的 `svc.ensure()` 逻辑。
+**部署期发现**:
+- `--install` 通过 SSH 执行不可靠：`pkill`/`taskkill` 会杀掉 SSH 会话，导致服务配置未完成
+- macOS `launchctl bootstrap` 间歇返回 errno=2，需手动重试
+- 升级后 Guest 丢失 `--hostname` 参数 → 自动检测主机名 → 需手动重配服务
 
-- `needs_host`：`--host`、`--status`、`--exec`、`--upload`、`--download` 中任一触发 → `svc.ensure(.host)`
-- `--host` 单独使用：ensure 后 return（行为不变）
-- 管理命令（含 `--host` 组合）：ensure 后 fall through → HTTP 执行
-- `--gen-init` / `--save-config`：不触发 Host ensure
-- 失败路径不变：`forceInstall` 失败 → `fail.err()` → exit(1)
+**验证**: `zig build test` 193/193 通过（EXIT=0），`--ping` 4/4 Guest 全部返回正确 MAC 和 RTT。
 
-**影响**: 用户和 AI Agent 可从 `utmm --exec vm "cmd"` 一步完成，无需先 `utmm --host`。
+### Phase 50-56（历史）
 
-**修改**: `src/main.zig` +6/-5 行。
-
-### Phase 52 部署测试与 Bug 修复 ✅ (2026-07-26)
-
-**目标**: 部署到 Host + 4 VM，验证 auto-ensure 端到端行为。
-
-**部署过程中发现并修复**:
-
-| # | 问题 | 文件 | 严重度 | 状态 |
-|---|------|------|--------|------|
-| F89 | `runCmd()` 永远返回 true 不检查退出码 | `svc.zig` | Critical | ✅ |
-| F90 | macOS `cp` 破坏签名 → SIGKILL | 部署流程 | Critical | ✅ 规避 |
-| F91 | `selfCopy` copy+delete 破坏签名 | `svc.zig` | High | 📋 待修 |
-| F92 | `launchctl enable` 不足清除 disabled | `svc.zig` | Medium | ✅ 规避 |
-| F93 | `installMacOS` + `start()` 双重 bootstrap | `svc.zig` | High | ✅ |
-
-**start() macOS 重构**: isRunning 早返 → kickstart 优先 → enable+bootstrap 回退 → verify
-
-**部署状态**: Host ✅ | linuxvm ✅ | macvm ✅ | windowsvm ✅ | winx64 ✅
-
-**已知遗留**: KCP 隧道 Host 重启后 exec 空输出（F93，预存在）、selfCopy 未重新签名（F91）、DebugAllocator CLI 短生命周期泄漏（4 处）
-
-### Phase 53: MCP stdio + utmm.lock 单例改造 ✅ (2026-07-26)
-
-**Part 1 — MCP stdio**: 从 HTTP MCP 换为标准 stdio JSON-RPC 接口。
-
-- **新建 `src/mcp.zig`**（~330 行）：stdio 循环读取 stdin → 处理 JSON-RPC → 写入 stdout。工具（`vm_status`、`vm_exec`）通过 HTTP client 调 Host `127.0.0.1:2121`。
-- **修改 `src/main.zig`**：`--mcp` 从废弃打印改为：加入 `needs_host` auto-ensure + 调用 `mcp.run()`。
-- **删除 HTTP MCP**：从 `httpd.zig` 移除 `handleMcp`、`processJsonRpcWithState`、`SERVER_INFO`、`TOOLS_JSON`（~240 行），从 `host.zig` 移除 `/mcp` 路由。
-- **MCP 测试**：`src/mcp.zig` 新增 14 个测试（jsonEscape、jsonBuildResponse、jsonBuildError、jsonGetString、jsonAppendId、jsonGetNestedObject）。
-- **配置文件**：`mcp.json.example` 从 `streamableHttp` 改为 stdio 命令格式。
-- **文档更新**：CLAUDE.md、README.md、SKILL.md、MANUAL.md 全部更新为 stdio MCP。
-
-**Part 2 — utmm.lock 单例锁**：
-
-- **新建 `src/lock.zig`**（~260 行）：`acquire()` / `release()`，PID 文件锁，原子创建（POSIX `O_CREAT|O_EXCL` / Windows `CREATE_NEW`），崩溃残留检测（>20s 抢夺），3×5s 重试。
-- **集成 `src/svc.zig`**：`ensure()` 和 `forceInstall()` 加锁包裹，`uninstall()` 入口加锁。`forceInstall` 拆分为 public 包装 + internal 实现，避免 ensure→forceInstall 双重锁。
-- **5 个锁测试**：acquire/release、PID 内容、PID 匹配、自进程存活检测、死 PID 检测。
-
-**Part 3 — MCP 端到端验证**：
-- `echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | sudo utmm --mcp` → 返回 SERVER_INFO ✅
-- `tools/list` → 返回 vm_status + vm_exec 工具定义 ✅
-- `vm_status` → 返回 4 台 VM 状态（winx64、macvm、windowsvm、linuxvm 离线）✅
-- `ping` → 返回 `{}` ✅
-
-**验证**: `zig build test` 147/147 通过，`zig build` 合成无错误，8 目标交叉编译验证通过。
-
-**设计决策**：
-- MCP stdio 享受 Phase 52 auto-ensure，AI Agent 子进程自动启动 Host 服务 — 破除了 HTTP MCP "Host 没启动就无法操作"的死锁。
-- `--mcp` 要求 root（因为 auto-ensure 需要 admin 权限）— 在 `mcp.json.example` 中用 `sudo` 命令。
-- `src/mcp.zig` 完全独立于 HostState — 通过 HTTP client 通信，不依赖 Host 内部状态。
-- httpd.zig 中的 JSON 辅助函数（`jsonEscape`、`jsonGetString` 等）保留，因为 `host.zig` 的 CLI 管理命令仍在使用。
-- mcp.zig 有自己的 JSON 辅助函数副本 — 避免 stdio MCP 进程依赖 httpd.zig 中的 HostState 线程变量。
-
-### Phase 54: Task #254 — Host 重启后 exec 空输出修复 ✅ (2026-07-26)
-
-**目标**: 修复 Host 重启后 exec 返回 HTTP 200 空 body + x-exit-code: -1 的长期 bug。
-
-**根因链**（6 个协同问题）：
-
-1. **0xFF Keepalive 污染 KCP 数据通道** — `mesh.zig` 定期 keepalive 通过 `kcp.send(&[_]u8{0xFF})` 发送 1 字节探针，作为 KCP 消息到达应用层。`tunnel.peekSize()` 返回 1 → `handleMeshGuest` 分配 1 字节缓冲区 → real message >1 字节 → KCP BufferTooSmall → handler crash
-2. **Host 不发送 pty_spawn** — Guest 依赖隐式触发，Host 重启后新 session 无 exec 请求时 Guest 状态不确定
-3. **waitForHostTunnel 忙等** — lock 失败 `continue` 跳过 500ms sleep，CPU 100%
-4. **ptyReadLoop 不检查 pty_dead** — pty 被杀后 loop 继续运行
-5. **tunnelManager 选过期 session** — 有 keepalive 数据的旧 session 被优先选中
-6. **macOS launchd 重试计数器不重置** — `resetRetryCounter()` 定义但从未调用，测试反复重启触发 >3 次限制
-
-**修复清单**:
-
-| 编号 | 文件 | 修改 | 提交 |
-|------|------|------|------|
-| F1 | `tunnel.zig` | `recv()` + `peekSize()` 过滤 0xFF keepalive | `1ff46ad` |
-| F2 | `broadcast.zig` | lock 失败退避 500ms，不跳过 sleep | `1ff46ad` |
-| F3 | `host.zig` | tunnelManager 创建 tunnel 后发送 pty_spawn | `1ff46ad` |
-| F4 | `broadcast.zig` | ptyReadLoop pty_dead 检查提前退出 | `1ff46ad` |
-| F5 | `broadcast.zig` | waitForHostTunnel 按 `last_recv_ms` 选最新 session | `1ff46ad` |
-| F6 | `svc.zig` + `host.zig` + `broadcast.zig` | 重试计数器 120s 时间窗重置 + mesh 启动后调用 `resetRetryCounter()` | `e444d46` |
-
-**测试方法改进**: 固定 `sleep 20` → 轮询模式（每 2s 尝试 exec，就绪即进入下一轮）。典型就绪时间 ~8s，比固定等待快 60%。
-
-**验证**: `zig build test` 149/149 通过，Host 重启循环 10/10 通过，0xFF 错误 0 出现，10 次快速重启未触发重试限制。
-
-**部署状态**: macOS Host ✅ | linuxvm ✅ | macvm 📋 | windowsvm 📋 | winx64 📋
-（用户指示：本机测试完善后再部署到其他 VM）
-
-### Phase 55: Windows 服务停止卡死修复 ✅ (2026-07-27)
-
-**目标**: 修复 `sc stop` 永远卡在 STOP_PENDING 的问题。
-
-**根因链**（3 个协同 bug）：
-
-1. **`signalShutdown()` 提前关闭 socket** (`mesh.zig`): 在定时器线程发送 self-wake 数据包之前就关闭了 socket。ARM64 上 `CloseHandle` 无法可靠中断 AFD 的阻塞 `receive()`，self-wake 无法发送因为 socket 已关闭。
-
-2. **`close(pty.master_fd)` 在 Windows 上是空操作** (`broadcast.zig`): POSIX `close()` 无法关闭 `CreatePipe` 创建的 HANDLE。ptyReadLoop 永远卡在 `ReadFile`，`t.join()` 死锁。
-
-3. **`ptyReadLoop` 阻塞读取无法被中断** (`broadcast.zig`): 即使 CloseHandle 也不一定能在 ARM64 上中断 ReadFile。
-
-**修复清单**:
-
-| 修复 | 文件 | 修改 |
-|------|------|------|
-| F1 | `mesh.zig` | `signalShutdown()` 只设标志位，不关闭 socket（让定时器线程发送 self-wake） |
-| F2 | `broadcast.zig` | 新建 `closePtyFd()`：Windows 用 `CloseHandle`，POSIX 用 `close()` |
-| F3 | `broadcast.zig` | `ptyReadLoop` Windows 用 `PeekNamedPipe` + `Sleep(100)` 轮询替代阻塞 `ReadFile` |
-| F4 | `mesh.zig` | `runWindows` 用 `self.io`（Threaded Io）替代 `global_single_threaded`（failing allocator） |
-
-**提交**: `caaf0ad` fix: Windows service stop hang (STOP_PENDING forever)
-
-**验证**:
-| 项目 | 结果 |
-|------|------|
-| `zig build test` | 149/149 通过 |
-| `zig build -Dtarget=aarch64-windows` | ✅ |
-| windowsvm `sc stop` | ✅ 2/2 成功，5 秒内 STOPPED |
-
-**部署状态**:
-| 目标 | 状态 |
-|------|------|
-| macOS Host | ✅ |
-| linuxvm | ✅ |
-| windowsvm | ✅ Phase 55→56 硬停止修复 |
-| winx64 | ✅ Phase 56 已部署 |
-| macvm | ✅ Phase 56 已部署 |
-
-### Phase 56: 回归测试 + Windows 硬停止 ✅ (2026-07-27)
-
-Phase 55 优雅退出仍失败，改用 `svcCtrlHandler` 收到 STOP 后直接 `exit(0)`。
-
-**修复** (`3cc95ab`):
-- `svc.zig`: `svcCtrlHandler` 报告 `SERVICE_STOPPED` + `exit(0)`
-- `broadcast.zig`: `waitForHostTunnel` 增加 shutdown 检查 + `ptyReadLoop` 竞态重检
-
-**回归测试**: 全部通过（149 测试、8 目标编译、4 VM exec、sc stop、Host 重启 10/10）。
+Phase 50（加固审计）、Phase 51（文件合并）、Phase 52（auto-ensure）、Phase 53（MCP stdio + lock）、Phase 54（Host 重启 exec 空输出）、Phase 55（Windows 服务停止）、Phase 56（回归测试 + 硬停止）— 详见 [progress.md](progress.md)。
 
 ## 待办
 
 - [ ] F91: `selfCopy()` copy+delete 回退路径添加 macOS codesign 重新签名
 - [ ] Windows 优雅退出方案延后（Finding 103）：ARM64 AFD 不中断 ReadFile + 多线程协调竞态
+- [ ] RTT 改为真实毫秒：`clock_ms` 事件计数器不适合测量时间，需用 `std.Io.Timestamp.awake`

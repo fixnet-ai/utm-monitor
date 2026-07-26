@@ -22,6 +22,7 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
 pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
     // Management commands: stateless, no Host daemon needed
     if (cli.cmd_status) return cmdStatus(block_io, gpa, cli.port);
+    if (cli.cmd_ping) return cmdPing(block_io, gpa, cli.port, cli.ping_target.?);
     if (cli.cmd_exec) return cmdExec(block_io, gpa, cli.port, cli.exec_target.?, cli.exec_cmd.?);
     if (cli.cmd_upload) return cmdUpload(block_io, gpa, cli.port, cli.upload_target.?, cli.upload_file.?);
     if (cli.cmd_download) return cmdDownload(block_io, gpa, cli.port, cli.download_target.?, cli.download_remote.?, cli.download_local.?);
@@ -142,6 +143,60 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         std.debug.print("{s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s}\n", .{ hostname, target, ip, mac, version, shell });
     }
     std.debug.print("\n", .{});
+}
+
+fn cmdPing(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8) !void {
+    var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
+    defer client.deinit();
+
+    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/ping", .{port});
+    defer gpa.free(url);
+
+    var redirect_buf: [4096]u8 = undefined;
+
+    const uri = std.Uri.parse(url) catch |err| {
+        std.debug.print("[ping] Bad URL: {s}\n", .{url});
+        return err;
+    };
+
+    var req = client.request(.POST, uri, .{
+        .extra_headers = &.{
+            .{ .name = "x-vm", .value = target },
+            .{ .name = "Content-Type", .value = "application/json" },
+        },
+        .keep_alive = false,
+    }) catch |err| {
+        std.debug.print("[ping] HTTP request failed: {} — is Host running?\n", .{err});
+        return err;
+    };
+    defer req.deinit();
+
+    // sendBodyComplete("") for empty POST body (not sendBodiless — panics with chunked encoding)
+    req.sendBodyComplete("") catch |err| {
+        std.debug.print("[ping] sendBody failed: {}\n", .{err});
+        return err;
+    };
+
+    var response = req.receiveHead(&redirect_buf) catch |err| {
+        std.debug.print("[ping] receiveHead failed: {}\n", .{err});
+        return err;
+    };
+
+    if (response.head.status != .ok) {
+        var err_body_buf: [4096]u8 = undefined;
+        var err_reader = response.reader(&err_body_buf);
+        const err_line = err_reader.takeDelimiter('\n') catch null orelse "unknown error";
+        std.debug.print("[ping] Error ({d}): {s}\n", .{ @intFromEnum(response.head.status), err_line });
+        return error.PingFailed;
+    }
+
+    // Read JSON response
+    var read_buf: [4096]u8 = undefined;
+    var body_buf: [4096]u8 = undefined;
+    var body_reader = response.reader(&read_buf);
+    var body_writer: std.Io.Writer = .fixed(&body_buf);
+    _ = body_reader.stream(&body_writer, std.Io.Limit.limited(4096)) catch {};
+    std.debug.print("{s}\n", .{body_writer.buffered()});
 }
 
 fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, cmd: []const u8) !void {
@@ -466,6 +521,7 @@ fn startHttpHost(
     try router.add(gpa, .POST, "/download", httpd.handleDownload);
     try router.add(gpa, .POST, "/upload", httpd.handleUpload);
     try router.add(gpa, .POST, "/exec", httpd.handleExec);
+    try router.add(gpa, .POST, "/ping", httpd.handlePing);
     // Guest discovery now via mesh LSA — /announce and /ws removed
     try router.add(gpa, .GET, "/bin/", httpd.handleBin);
     try router.add(gpa, .GET, "/version", httpd.handleVersion);
@@ -820,6 +876,7 @@ fn tunnelManager(
                         allocator.destroy(tun_ptr);
                         continue;
                     };
+                    state.setGuestMeshMac(hostname, saved_node_id);
 
                     // Send pty_spawn to trigger the Guest's pty shell creation.
                     // Without this, the Guest waits for the first pty_exec_input

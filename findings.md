@@ -1,4 +1,4 @@
-# Findings: v0.11.10
+# Findings: v0.11.11
 
 仅保留当前仍相关的重要发现。历史发现（WebSocket 时代、utmm-old、agent.zig 等）已随架构演进过时，不再收录。
 
@@ -380,3 +380,46 @@ Phase 55 部署后 windowsvm 和 winx64 的 `sc stop` 仍卡 STOP_PENDING。两�
 **修复提交**: `3cc95ab`
 
 **教训**: Windows ARM64 上多线程协调退出的可靠性受 AFD 行为限制，某些场景下"硬停止"比"优雅退出"更可靠。此方案同时适用于 Guest 和 Host（Host 同理在停止时直接 exit，让 SCM 或 watchdog 自动重启）。
+
+---
+
+## Phase 57: `--ping` 命令实现与自动升级测试 (2026-07-27)
+
+### Finding 104: `setGuestMeshMac()` 定义但从未调用（Critical）
+
+`httpd.zig:343` 中 `setGuestMeshMac()` 方法已定义，但全项目零调用。`GuestEntry.mesh_mac` 字段永远为 `null`。导致 `/ping` handler 在 `handlePing` 中查找 Guest 时始终走到 `"guest not found or no mesh MAC"` 错误。
+
+**修复**: 在 `host.zig` 的 tunnelManager 中，`registerGuestTunnel` 之后调用 `state.setGuestMeshMac(hostname, saved_node_id)`。`saved_node_id` 来自 LSA 数据库的 MAC 地址，tunnelManager 循环中已可用。
+
+### Finding 105: `pingAndWait` 用事件计数器做超时（clock_ms）
+
+原实现用 `self.clock_ms +% 5000` 做 5 秒 deadline。但 `clock_ms` 是事件计数器（+10/收包、+1000/1秒超时），不是真实毫秒。Host 上 `clock_ms` 约 1000-2000 tick/秒，5000 tick 约 2.5-5 秒。而周期性 ping 每 60 tick 触发一次，周期过长无法在 5 秒窗口内命中。
+
+**修复**: 改为真实时间轮询：200 次迭代 × 50ms sleep = 10 秒。每次迭代检查 `last_pong_*` 是否匹配目标 MAC。
+
+**已知局限**: RTT 值仍为 `clock_ms` 事件计数（非真实毫秒）。Guest 将原始时间戳复制回 pong，Host 用 `clock_ms -% send_ts` 计算差值。对于本地 VM，RTT 通常为 10-50 "tick"。
+
+### Finding 106: `zig build -Dtarget=...` 覆盖 `zig-out/bin/utmm`
+
+每次交叉编译（`zig build -Dtarget=aarch64-linux-musl` 等）会将输出写入 `zig-out/bin/utmm`，覆盖上一次构建。部署到本机时必须使用命名目标二进制（如 `utmm-aarch64-macos`），而非 `utmm`。
+
+**规避**: 交叉编译后运行 `zig build`（无 target）恢复原生二进制；或始终从命名文件部署。
+
+### Finding 107: SSH `--install` 不可靠 — pkill/taskkill 杀掉自身
+
+`--install` 流程包含 `stop → kill → copy → install → start`。`kill` 步骤（POSIX `pkill utmm`、Windows `taskkill /f /im utmm.exe`）会杀掉所有 utmm 进程，包括 SSH 会话中正在执行 `--install` 的进程。服务重配置（写 systemd/launchd/sc 配置、重启服务）被中断。
+
+**症状**: Guest 升级后服务配置文件缺少 `--hostname` 参数（服务未完成重配置），Guest 启动后使用自动检测的主机名而非配置的主机名。
+
+**规避**: 
+- Linux: 直接用 `systemctl` 修改服务文件 + daemon-reload + restart
+- macOS: 手动 bootout + bootstrap + kickstart 序列
+- Windows: `sc config` 单独修改 binPath + `sc start`，不在 SSH 中执行 `--install`
+
+### Finding 108: 升级后 Guest 丢失 hostname 导致 mesh 重连使用自动检测名
+
+Phase 50-56 中 Guest 通过 `--install --hostname <name>` 部署，服务配置含 hostname。通过 SSH `--install` 升级时（Finding 107），`pkill` 中断 SSH 会话导致 service config 未更新，Guest 重启后使用自动检测的主机名（如 ubuntu、WIN-Q0JNGDDBE28、MODASIAIPC）。
+
+Host 的 `--status` 显示新旧两条记录（旧 hostname 的 stale entry 和新的自动检测名 entry），exec/upload 命令需用新主机名。Host 的 `guestIndex` 按 hostname 精确匹配，`/ping` 端点也按 hostname 查找。
+
+**解决方案**: 升级后手动修复服务配置（systemd unit / launchd plist / sc config），重启服务以使用正确 hostname。或改进 `--install` 流程避免 pkill 自伤。

@@ -16,6 +16,7 @@ const protocol = @import("protocol.zig");
 const hosts_file = @import("hosts_file.zig");
 const tunnel_mod = @import("tunnel.zig");
 const tunproto = @import("tunproto.zig");
+const mesh_mod = @import("mesh.zig");
 
 pub const DEFAULT_PORT: u16 = 2121;
 
@@ -1359,6 +1360,54 @@ pub fn handleVersion(allocator: std.mem.Allocator, state: *HostState, request: *
     _ = body;
     _ = state;
     const buf = try std.fmt.allocPrint(allocator, "{s}\n", .{protocol.VERSION});
+    defer allocator.free(buf);
+    try respondJson(request, buf);
+}
+
+// ── POST /ping ──────────────────────────────────────────────────────────────
+
+pub fn handlePing(allocator: std.mem.Allocator, state: *HostState, request: *http.Server.Request, body: ?[]const u8) !void {
+    _ = body;
+    // Read target hostname from x-vm header
+    const vm = getRequestHeader(request, "x-vm") orelse {
+        try respondJson(request, "{\"error\":\"missing x-vm header\"}");
+        return;
+    };
+
+    // Find guest and get mesh MAC
+    const mesh_ptr = state.mesh orelse {
+        try respondJson(request, "{\"error\":\"mesh not available\"}");
+        return;
+    };
+    const mesh: *mesh_mod.Mesh = @ptrCast(@alignCast(mesh_ptr));
+
+    const node_id = blk: {
+        state.mutex.lock(state.io.?) catch return error.InternalError;
+        defer state.mutex.unlock(state.io.?);
+        for (state.guests.items) |g| {
+            if (std.mem.eql(u8, g.hostname, vm)) {
+                if (g.mesh_mac) |mac| break :blk mac;
+                break :blk null;
+            }
+        }
+        break :blk null;
+    } orelse {
+        try respondJson(request, "{\"error\":\"guest not found or no mesh MAC\"}");
+        return;
+    };
+
+    // Send ping and wait for pong
+    const rtt = mesh.pingAndWait(node_id) orelse {
+        try respondJson(request, "{\"error\":\"ping timeout\"}");
+        return;
+    };
+
+    var mac_buf: [18]u8 = undefined;
+    const mac_str = mesh_mod.formatNodeIdBuf(node_id, &mac_buf);
+    const buf = try std.fmt.allocPrint(allocator,
+        "{{\"hostname\":\"{s}\",\"mac\":\"{s}\",\"rtt_ms\":{d}}}",
+        .{ vm, mac_str, rtt },
+    );
     defer allocator.free(buf);
     try respondJson(request, buf);
 }

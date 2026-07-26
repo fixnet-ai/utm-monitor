@@ -72,6 +72,10 @@ pub const CliArgs = struct {
     exec_cmd: ?[]const u8 = null,
     gen_init_platform: ?[]const u8 = null,
 
+    // Ping command
+    cmd_ping: bool = false,
+    ping_target: ?[]const u8 = null,
+
     // Upload/download commands
     cmd_upload: bool = false,
     upload_file: ?[]const u8 = null,
@@ -148,6 +152,12 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             if (i + 1 < args.len) {
                 i += 1;
                 cli.exec_cmd = args[i];
+            }
+        } else if (std.mem.eql(u8, arg, "--ping")) {
+            cli.cmd_ping = true;
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.ping_target = args[i];
             }
         } else if (std.mem.eql(u8, arg, "--save-config")) {
             cli.save_config = true;
@@ -235,6 +245,7 @@ pub fn printHelp() void {
         \\
         \\Management commands (require Host service running):
         \\  --status            Query all online guest status
+        \\  --ping TARGET       Ping a guest via mesh (Host→Guest or relayed)
         \\  --exec TARGET CMD   Execute command on target guest
         \\  --upload FILE VM    Upload a file to Guest VM
         \\  --download VM REMOTE LOCAL  Download file from Guest VM
@@ -333,7 +344,7 @@ pub fn main(init: std.process.Init) !void {
     // --status, --exec, --upload, --download all need the Host HTTP server.
     // Auto-start it if not running so users and AI agents can go directly
     // from "utmm --exec vm cmd" without a separate "utmm --host" step.
-    const needs_host = cli.is_host or cli.cmd_status or cli.cmd_exec
+    const needs_host = cli.is_host or cli.cmd_status or cli.cmd_exec or cli.cmd_ping
         or cli.cmd_upload or cli.cmd_download or cli.is_mcp;
     if (needs_host) {
         const was_running = svc.isRunning(init.io, init.gpa, .host);
@@ -341,7 +352,7 @@ pub fn main(init: std.process.Init) !void {
         defer extra_args.deinit(init.gpa);
         svc.ensure(init.io, init.gpa, .host, extra_args.items);
         // --host alone (no management command): ensure + exit
-        if (cli.is_host and !cli.cmd_status and !cli.cmd_exec
+        if (cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_ping
             and !cli.cmd_upload and !cli.cmd_download
             and !cli.cmd_gen_init and !cli.save_config and !cli.is_mcp) {
             return;
@@ -355,7 +366,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── 8. Management commands ──
-    if (cli.cmd_status or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config) {
+    if (cli.cmd_status or cli.cmd_exec or cli.cmd_ping or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config) {
         cli.is_host = false; // management commands don't need --host
         try host_mod.run(init, cli);
         return;

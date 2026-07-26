@@ -34,6 +34,9 @@ Example prompts your AI agent can handle:
 ## CLI Quick Start
 
 ```bash
+# Ping any machine over the mesh — test connectivity
+utmm --ping linuxvm     # {"hostname":"linuxvm","mac":"16:a0:6c:...","rtt_ms":10}
+
 # Peek inside any machine — instantly
 utmm --exec linuxvm "ps aux | grep myapp"
 utmm --exec macvm "tail -50 /var/log/system.log"
@@ -105,6 +108,7 @@ Or use the CLI: `claude mcp add utmm -- sudo /opt/utmm/utmm --mcp`
 
 ```bash
 utmm --status                      # All machines at a glance
+utmm --ping linuxvm                # Ping a guest (Host→Guest mesh ping, returns JSON)
 utmm --exec linuxvm "uname -a"     # Command (streaming output, no timeout)
 utmm --exec linuxvm "gdb ..."      # Attach debugger
 utmm --exec macvm "lldb ..."       # Same on macOS
