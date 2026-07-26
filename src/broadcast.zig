@@ -1364,8 +1364,6 @@ fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_
                 continue;
             };
             const count = m.sessions.count();
-            // Log on each scan to trace waitForHostTunnel liveness
-            std.log.debug("[guest-wait] scan: sessions={d}", .{count});
             if (count > 0) {
                 var best: ?*mesh_mod.MeshSession = null;
                 var best_ms: u32 = 0;
@@ -1387,9 +1385,11 @@ fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_
                         }
                     }
                 }
-                std.log.info("[guest-wait] sessions={d} dead={d} data={d}", .{ count, total_dead, total_with_data });
+                if (total_with_data > 0) {
+                    std.log.debug("[guest-wait] sessions={d} dead={d} data={d}", .{ count, total_dead, total_with_data });
+                }
                 if (best) |sess| {
-                    std.log.info("[guest-wait] selected conv={d} peek={d}", .{ sess.conv, sess.kcp_inst.peekSize() });
+                    std.log.debug("[guest-wait] selected conv={d} peek={d}", .{ sess.conv, sess.kcp_inst.peekSize() });
                     m.sessions_mutex.unlock(m.io);
                     return tunnel_mod.Tunnel.init(allocator, m.io, sess);
                 }
