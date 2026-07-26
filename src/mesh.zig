@@ -427,15 +427,14 @@ pub const Mesh = struct {
     }
 
     /// Signal shutdown (thread-safe). The run() loop will exit.
-    /// On Windows, also closes the socket to unblock a pending
-    /// blocking receive() call (receiveTimeout is unsupported).
+    /// On Windows the caller MUST close the socket after join() to
+    /// clean up — do NOT close it here. The timer thread needs the
+    /// socket open to send the self-wake dummy packet that unblocks
+    /// the mesh thread's blocking receive(). Closing the socket early
+    /// prevents the self-wake and causes a permanent hang on ARM64
+    /// where AFD close does not reliably cancel a pending receive.
     pub fn signalShutdown(self: *Mesh) void {
         self.shutdown.store(true, .release);
-        if (builtin.os.tag == .windows) {
-            // Closing the socket unblocks any pending receive() call
-            // in the mesh thread, allowing it to check shutdown and exit.
-            self.socket.close(self.io);
-        }
     }
 
     /// Replace the LSA node_info string dynamically (e.g. to signal
@@ -450,9 +449,6 @@ pub const Mesh = struct {
     /// Should be run in its own thread.
     pub fn run(self: *Mesh) !void {
         // Broadcast initial LSA before entering receive loop.
-        // On Windows, receive() blocks without timeout and periodicTasks
-        // only runs after received packets, so we need this initial
-        // broadcast to announce our presence immediately.
         self.broadcastOwnLsaInit();
         self.last_lsa_broadcast_ms = self.clock_ms;
 
@@ -504,13 +500,14 @@ pub const Mesh = struct {
         std.log.info("[mesh] Shutting down", .{});
     }
 
-    /// Windows: blocking receive on global_single_threaded with a separate
-    /// timer thread that drives periodicTasks every second. Zig 0.16.0
-    /// Io.Threaded on ARM64 Windows may return error.ConcurrencyUnavailable
-    /// for receiveTimeout, and the service Io may not support concurrent
-    /// socket ops — blocking receive is the most reliable approach.
+    /// Windows: blocking receive on mesh Io with a separate timer thread.
+    /// Zig 0.16.0 Io.Threaded on Windows does NOT support receiveTimeout —
+    /// net_receive with concurrency=true is an explicit TODO in the stdlib
+    /// (Threaded.zig:3197-3199) and always returns ConcurrencyUnavailable.
+    /// Workaround: blocking receive() + CloseHandle from service control
+    /// handler to interrupt on shutdown. The timer thread uses raw Win32
+    /// Sleep() to drive periodicTasks independently of the Io.
     fn runWindows(self: *Mesh) !void {
-        const local_io = std.Io.Threaded.global_single_threaded.io();
         var buf: [4096]u8 = undefined;
 
         // Periodic timer thread: wake every 1s to drive KCP flush + keepalive.
@@ -521,7 +518,7 @@ pub const Mesh = struct {
         timer_thread.detach();
 
         while (!self.shutdown.load(.acquire)) {
-            const msg = self.socket.receive(local_io, &buf) catch |err| {
+            const msg = self.socket.receive(self.io, &buf) catch |err| {
                 if (self.shutdown.load(.acquire)) break;
                 std.log.err("[mesh] receive error: {}", .{err});
                 std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
@@ -554,6 +551,10 @@ pub const Mesh = struct {
     /// Drives KCP flush, keepalive, and LSA broadcasts every 1 second.
     /// Uses raw Windows Sleep() to avoid any Io dependency — timer must
     /// run regardless of Io.Threaded configuration.
+    /// On shutdown, sends a dummy 1-byte UDP packet to the mesh socket
+    /// (self-wake) to unblock the main thread's blocking receive().
+    /// socket.close() from another thread does NOT reliably unblock AFD
+    /// receive on ARM64, but a real incoming packet does.
     fn runWindowsTimer(self: *Mesh) void {
         const Sleep = @extern(
             *const fn (std.os.windows.DWORD) callconv(.winapi) void,
@@ -565,6 +566,13 @@ pub const Mesh = struct {
             self.clock_ms +%= 1000;
             self.periodicTasks();
         }
+        // Shutdown signaled — send a dummy packet to our own socket to
+        // unblock the main thread's blocking receive(). AFD does not
+        // reliably cancel pending receive on close (ARM64 kernel quirk),
+        // but an actual incoming datagram always wakes it.
+        const dummy: [1]u8 = .{0xFF};
+        const loopback: net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = protocol.DEFAULT_PORT } };
+        self.socket.send(self.io, &loopback, &dummy) catch {};
     }
 
     /// Broadcast own LSA once before entering receive loop.

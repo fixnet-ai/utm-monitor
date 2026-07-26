@@ -876,8 +876,37 @@ fn ptyReadLoop(
             std.log.info("[guest-pty] pty_dead signaled, exiting", .{});
             break;
         }
-        // POSIX: poll master_fd with 100ms timeout to check pty_dead
-        if (builtin.os.tag != .windows) {
+
+        if (builtin.os.tag == .windows) {
+            // Windows: use PeekNamedPipe to check for data without blocking.
+            // Blocking ReadFile cannot be interrupted by CloseHandle from
+            // another thread on ARM64, so we must poll cooperatively and
+            // check pty_dead between iterations.
+            const PeekNamedPipe = @extern(
+                *const fn (std.os.windows.HANDLE, ?[*]u8, std.os.windows.DWORD, ?*std.os.windows.DWORD, ?*std.os.windows.DWORD, ?*std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL,
+                .{ .name = "PeekNamedPipe", .library_name = "kernel32" },
+            );
+            var available: std.os.windows.DWORD = 0;
+            if (@intFromEnum(PeekNamedPipe(master_fd, null, 0, null, &available, null)) == 0) {
+                // Pipe broken or closed — shell process exited.
+                std.log.info("[guest-pty] pty pipe broken (shell exited)", .{});
+                pty_dead.store(true, .release);
+                break;
+            }
+            if (available == 0) {
+                // No data available — sleep 100ms then re-check pty_dead.
+                // The main thread sets pty_dead before calling closePtyFd,
+                // so we will detect shutdown within one sleep interval.
+                const Sleep = @extern(
+                    *const fn (std.os.windows.DWORD) callconv(.winapi) void,
+                    .{ .name = "Sleep", .library_name = "kernel32" },
+                );
+                Sleep(100);
+                continue;
+            }
+            // Data available — fall through to ptyRead below.
+        } else {
+            // POSIX: poll master_fd with 100ms timeout to check pty_dead
             var fds: [1]std.posix.pollfd = .{
                 .{ .fd = master_fd, .events = std.posix.POLL.IN, .revents = 0 },
             };
@@ -953,6 +982,22 @@ fn killChild(pid: std.posix.pid_t) void {
             _ = std.posix.system.waitpid(pid, null, 0);
         },
         else => @compileError("unsupported OS for killChild"),
+    }
+}
+
+/// Close a pty master fd. On Windows the fd is a pipe HANDLE from
+/// CreatePipe — POSIX close() does nothing on it, so we must call
+/// CloseHandle directly. Without this, ptyReadLoop stays blocked
+/// in ReadFile and t.join() deadlocks the shutdown path.
+fn closePtyFd(fd: std.posix.fd_t) void {
+    if (builtin.os.tag == .windows) {
+        const CloseHandle = @extern(
+            *const fn (std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL,
+            .{ .name = "CloseHandle", .library_name = "kernel32" },
+        );
+        _ = CloseHandle(@ptrCast(fd));
+    } else {
+        _ = close(fd);
     }
 }
 
@@ -1188,7 +1233,7 @@ pub fn meshSessionLoop(
         defer {
             allocator.free(pty.shell);
             killChild(pty.child_pid);
-            _ = close(pty.master_fd);
+            closePtyFd(pty.master_fd);
         }
 
         // Shared state between main loop and ptyReadLoop thread
@@ -1331,7 +1376,7 @@ pub fn meshSessionLoop(
         // (The defer above will also close master_fd, but we need to do it
         // now so ptyReadLoop's poll() wakes up before we join.)
         pty_dead.store(true, .release);
-        _ = close(pty.master_fd);
+        closePtyFd(pty.master_fd);
         if (pty_read_thread) |t| {
             t.join();
         }
