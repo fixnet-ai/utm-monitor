@@ -366,3 +366,17 @@ SCM → svcCtrlHandler → shutdown_flag = true
 1. socket 提前关闭 → self-wake 无法发送
 2. POSIX close() 不工作 → pty 管道不关闭
 3. CloseHandle 不中断 ReadFile → ptyReadLoop 不退出
+
+### Finding 103: Phase 55 优雅退出仍失败 — waitForHostTunnel + ReadFile 竞态 (2026-07-27)
+
+Phase 55 部署后 windowsvm 和 winx64 的 `sc stop` 仍卡 STOP_PENDING。两个额外根因：
+
+1. **`waitForHostTunnel` 无 shutdown 检查**: Guest 在重连等待中（`waitForHostTunnel` 的 `while(true)` 循环）时收到停止通知，外部主循环的 `checkShutdown` 永远无法调到 → 永不退出。
+
+2. **`PeekNamedPipe` + `ReadFile` 竞态**: `ptyReadLoop` 在 `PeekNamedPipe` 报告数据可用后、`ReadFile` 调用前存在竞态窗口。若主线程在此期间调用 `CloseHandle`，ARM64 AFD 不取消 pending ReadFile → `t.join()` 死锁。
+
+**最终方案**: 放弃优雅退出。`svcCtrlHandler` 收到 STOP 后直接报告 `SERVICE_STOPPED` + `exit(0)`。副作用（`sc stop` error 109 pipe broken）是 cosmetic 的，服务实际已正确停止。
+
+**修复提交**: `3cc95ab`
+
+**教训**: Windows ARM64 上多线程协调退出的可靠性受 AFD 行为限制，某些场景下"硬停止"比"优雅退出"更可靠。此方案同时适用于 Guest 和 Host（Host 同理在停止时直接 exit，让 SCM 或 watchdog 自动重启）。

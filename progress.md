@@ -2,14 +2,16 @@
 
 ## 当前状态
 
-- **分支**: `main`（领先 origin/main 5 个提交）
-- **最新提交**: `caaf0ad` — Windows 服务停止卡死修复
+- **分支**: `main`（与 origin/main 同步）
+- **最新提交**: `3cc95ab` — Windows 服务收到停止通知立即终止
 - **测试**: 149/149 通过
-- **部署**: macOS Host ✅ | linuxvm ✅ | windowsvm ✅ | macvm 📋 | winx64 📋
+- **部署**: macOS Host ✅ | linuxvm ✅ | windowsvm ✅ | macvm ✅ | winx64 ✅
 
 ## 最近提交
 
 ```
+3cc95ab fix: Windows service immediate hard-stop on SERVICE_CONTROL_STOP
+000f3fd docs: update planning files with Phase 55 Windows service stop fix
 caaf0ad fix: Windows service stop hang (STOP_PENDING forever)
 d97f2bb docs: update planning files with Phase 54 results and macvm test status
 73b7535 fix: silence verbose debug logs in waitForHostTunnel scan loop
@@ -273,3 +275,42 @@ ed7985b v0.11.10: Phase 50-52 hardening, consolidation, auto-ensure + deployment
 | F4 | `mesh.zig` | `runWindows` 用 `self.io`（Threaded Io）替代 `global_single_threaded` |
 
 **验证**: `zig build test` 149/149 通过，windowsvm 上 `sc stop` 2/2 成功（5 秒内 STOPPED）。
+
+## Phase 56: 回归测试 + Windows 硬停止修复 ✅ (2026-07-27)
+
+**目标**: 全面回归测试，修复 Phase 55 遗留的 STOP_PENDING 问题。
+
+**发现**: Phase 55 的优雅退出方案在实践中仍不工作。`sc stop` 在 windowsvm 和 winx64 上都卡在 STOP_PENDING。根因有两个：
+
+1. **`waitForHostTunnel` 无 shutdown 检查**: 当 Guest 在重连等待中收到停止通知时，`waitForHostTunnel` 的 `while(true)` 循环永远无法退出，因为外部 `checkShutdown` 不会被调到。
+
+2. **`ptyReadLoop` 仍可能阻塞 ReadFile**: `PeekNamedPipe` + `ReadFile` 之间存在竞态窗口 — 如果在 `PeekNamedPipe` 报告有数据后、`ReadFile` 调用前，`CloseHandle` 被主线程调用，ARM64 AFD 不会取消 pending ReadFile → `t.join()` 死锁。
+
+**修复** (提交 `3cc95ab`):
+
+| # | 文件 | 修改 |
+|---|------|------|
+| F1 | `svc.zig` | `svcCtrlHandler` 收到 STOP 后直接报告 `SERVICE_STOPPED` + `exit(0)`，跳过复杂线程协调 |
+| F2 | `broadcast.zig` | `waitForHostTunnel` 增加 `shutdown` 参数，循环内检查；`ptyReadLoop` 在 `PeekNamedPipe` 和 ReadFile 之间重检 `pty_dead` |
+
+**硬停止方案**: `svcCtrlHandler` 不再设置 `shutdown_flag` 等待优雅退出，而是直接 `exit(0)`。副作用（`sc stop` 报 error 109 pipe broken）是 cosmetic 的，服务实际已正确停止且 SCM 会自动重启。
+
+**回归测试结果**:
+
+| 测试项 | 结果 |
+|--------|------|
+| `zig build test` | ✅ 149/149 |
+| 8 目标交叉编译 | ✅ 零错误 |
+| linuxvm exec | ✅ |
+| macvm exec | ✅ |
+| windowsvm exec | ✅ |
+| winx64 exec | ✅ |
+| windowsvm sc stop | ✅ 立即退出，无 STOP_PENDING |
+| winx64 sc stop | ✅ 立即退出，无 STOP_PENDING |
+| Host 重启循环 | ✅ 10/10 (15s 等) |
+
+**部署**: 全 5 目标已部署（macOS Host、linuxvm、macvm、windowsvm、winx64）。
+
+**遗留**:
+- 优雅退出方案（Finding 103）：Windows 线程协调受 ARM64 AFD 限制，延后处理
+- `selfCopy()` copy+delete 路径 macOS codesign 重新签名（F91）

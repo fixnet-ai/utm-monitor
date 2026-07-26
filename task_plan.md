@@ -266,13 +266,21 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 |------|------|
 | macOS Host | ✅ |
 | linuxvm | ✅ |
-| windowsvm | ✅ Phase 55 修复已验证 |
-| winx64 | 📋 待部署 |
-| macvm | 📋 待部署 |
+| windowsvm | ✅ Phase 55→56 硬停止修复 |
+| winx64 | ✅ Phase 56 已部署 |
+| macvm | ✅ Phase 56 已部署 |
+
+### Phase 56: 回归测试 + Windows 硬停止 ✅ (2026-07-27)
+
+Phase 55 优雅退出仍失败，改用 `svcCtrlHandler` 收到 STOP 后直接 `exit(0)`。
+
+**修复** (`3cc95ab`):
+- `svc.zig`: `svcCtrlHandler` 报告 `SERVICE_STOPPED` + `exit(0)`
+- `broadcast.zig`: `waitForHostTunnel` 增加 shutdown 检查 + `ptyReadLoop` 竞态重检
+
+**回归测试**: 全部通过（149 测试、8 目标编译、4 VM exec、sc stop、Host 重启 10/10）。
 
 ## 待办
 
-- [ ] 部署到 macvm、winx64
-- [ ] 推送 5 个本地提交到 origin/main（`git push`）
 - [ ] F91: `selfCopy()` copy+delete 回退路径添加 macOS codesign 重新签名
-- [ ] 清理 debug 日志（`waitForHostTunnel` 的 `scan: sessions=X` 消息）
+- [ ] Windows 优雅退出方案延后（Finding 103）：ARM64 AFD 不中断 ReadFile + 多线程协调竞态
