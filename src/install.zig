@@ -131,23 +131,56 @@ fn defaultHome(platform: Platform) []const u8 {
     };
 }
 
-test "Platform.detect" {
-    _ = Platform.detect();
+test "Platform.detect returns valid platform" {
+    const p = Platform.detect();
+    _ = switch (p) {
+        .macos, .linux, .windows => true,
+    };
 }
 
-test "genInit - linux" {
+test "defaultShell - linux" {
+    try std.testing.expectEqualStrings("/bin/bash", defaultShell(.linux));
+}
+
+test "defaultShell - macos" {
+    try std.testing.expectEqualStrings("/bin/zsh", defaultShell(.macos));
+}
+
+test "defaultShell - windows" {
+    try std.testing.expectEqualStrings("cmd.exe", defaultShell(.windows));
+}
+
+test "defaultHome - linux" {
+    try std.testing.expectEqualStrings("/root", defaultHome(.linux));
+}
+
+test "defaultHome - macos" {
+    try std.testing.expectEqualStrings("/var/root", defaultHome(.macos));
+}
+
+test "defaultHome - windows" {
+    try std.testing.expectEqualStrings("C:\\", defaultHome(.windows));
+}
+
+test "genInit - linux has systemd service" {
     const script = genInit(.linux);
     try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmm") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "[Unit]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "[Service]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--svc") != null);
 }
 
-test "genInit - macos" {
+test "genInit - macos has launchd plist" {
     const script = genInit(.macos);
     try std.testing.expect(std.mem.indexOf(u8, script, "com.utmm") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "plist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--svc") != null);
 }
 
-test "genInit - windows" {
+test "genInit - windows has sc command" {
     const script = genInit(.windows);
     try std.testing.expect(std.mem.indexOf(u8, script, "sc create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "UTM-Monitor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "C:\\opt\\utmm\\utmm.exe") != null);
 }

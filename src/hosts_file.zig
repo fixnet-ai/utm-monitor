@@ -149,24 +149,38 @@ fn writeNewHosts(
 
 // ========== Tests ==========
 
-test "updateHosts - create new file" {
-    const io = std.Io.failing; // Not actually writing to disk
-    _ = io;
-    // This is an integration test that requires a real filesystem; here we only validate data structures
-    const entries = &[_]HostEntry{
-        .{ .ip = "192.168.64.5", .name = "macvm" },
-        .{ .ip = "192.168.64.8", .name = "linuxvm" },
-    };
-    try std.testing.expectEqual(@as(usize, 2), entries.len);
-}
-
-test "updateHosts - empty list" {
-    const entries: [0]HostEntry = .{};
-    try std.testing.expectEqual(@as(usize, 0), entries.len);
-}
-
-test "HostEntry struct" {
+test "HostEntry struct basics" {
     const e = HostEntry{ .ip = "10.0.0.1", .name = "testvm" };
     try std.testing.expectEqualStrings("10.0.0.1", e.ip);
     try std.testing.expectEqualStrings("testvm", e.name);
+}
+
+test "HostEntry with FQDN" {
+    const e = HostEntry{ .ip = "192.168.1.100", .name = "linuxvm.aarch64-linux-musl.utm" };
+    try std.testing.expectEqualStrings("192.168.1.100", e.ip);
+    try std.testing.expectEqualStrings("linuxvm.aarch64-linux-musl.utm", e.name);
+}
+
+test "HostEntry with IPv6 address" {
+    const e = HostEntry{ .ip = "fe80::1", .name = "ipv6host" };
+    try std.testing.expectEqualStrings("fe80::1", e.ip);
+    try std.testing.expectEqualStrings("ipv6host", e.name);
+}
+
+test "HostEntry with empty name" {
+    const e = HostEntry{ .ip = "1.2.3.4", .name = "" };
+    try std.testing.expectEqualStrings("1.2.3.4", e.ip);
+    try std.testing.expectEqualStrings("", e.name);
+}
+
+test "multiple entries with different IPs" {
+    const entries = [_]HostEntry{
+        .{ .ip = "10.0.0.1", .name = "vm1" },
+        .{ .ip = "10.0.0.2", .name = "vm2" },
+        .{ .ip = "10.0.0.3", .name = "vm3" },
+    };
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings("10.0.0.1", entries[0].ip);
+    try std.testing.expectEqualStrings("vm2", entries[1].name);
+    try std.testing.expectEqualStrings("10.0.0.3", entries[2].ip);
 }

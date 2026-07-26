@@ -108,17 +108,52 @@ pub fn loadConfig(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !C
     return Config{};
 }
 
-test "saveConfig - basic" {
-    _ = saveConfig;
-}
-
-test "Logger default" {
-    _ = Logger;
-}
-
-test "Config defaults" {
+test "Config default port is 2121" {
     const cfg = Config{};
     try std.testing.expectEqual(@as(u16, 2121), cfg.port);
+}
+
+test "Config default empty name" {
+    const cfg = Config{};
+    try std.testing.expectEqualStrings("", cfg.name);
+}
+
+test "Config default hosts_file" {
+    const cfg = Config{};
     try std.testing.expectEqualStrings("/etc/hosts", cfg.hosts_file);
+}
+
+test "Config default marker" {
+    const cfg = Config{};
     try std.testing.expectEqualStrings("UTM-MONITOR", cfg.marker);
+}
+
+test "Config default no VMs" {
+    const cfg = Config{};
+    try std.testing.expectEqual(@as(usize, 0), cfg.vms.len);
+}
+
+test "Config custom port" {
+    const cfg = Config{ .port = 8080 };
+    try std.testing.expectEqual(@as(u16, 8080), cfg.port);
+}
+
+test "VmConfig fields" {
+    const vm = VmConfig{ .name = "test", .ssh = "ssh cmd", .path = "/opt/app" };
+    try std.testing.expectEqualStrings("test", vm.name);
+    try std.testing.expectEqualStrings("ssh cmd", vm.ssh);
+    try std.testing.expectEqualStrings("/opt/app", vm.path);
+}
+
+test "LogLevel order" {
+    try std.testing.expect(@intFromEnum(LogLevel.debug) < @intFromEnum(LogLevel.info));
+    try std.testing.expect(@intFromEnum(LogLevel.info) < @intFromEnum(LogLevel.warn));
+    try std.testing.expect(@intFromEnum(LogLevel.warn) < @intFromEnum(LogLevel.err));
+}
+
+test "LogLevel enum values" {
+    _ = LogLevel.debug;
+    _ = LogLevel.info;
+    _ = LogLevel.warn;
+    _ = LogLevel.err;
 }

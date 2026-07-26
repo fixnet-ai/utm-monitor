@@ -572,8 +572,6 @@ fn getGatewayWindows(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     return error.GatewayNotFound;
 }
 
-test "getDefaultGateway - signature" { _ = getDefaultGateway; }
-
 // ═══════════════════════════════════════════════════════════════════════════
 // v0.11.0: pty session model — persistent pty per KCP tunnel connection
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1480,4 +1478,62 @@ fn sendChunkedFile(
     };
 }
 
-test "getSubnetBroadcasts - signature" { _ = getSubnetBroadcasts; }
+test "detectShell - returns valid string" {
+    const shell = try detectShell(std.testing.allocator);
+    defer std.testing.allocator.free(shell);
+    // On POSIX, should be at least "/bin/sh" or the value of $SHELL
+    try std.testing.expect(shell.len > 0);
+}
+
+test "detectShell - windows returns cmd.exe" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const shell = try detectShell(std.testing.allocator);
+    defer std.testing.allocator.free(shell);
+    try std.testing.expectEqualStrings("cmd.exe", shell);
+}
+
+test "isPhysicalInterface - real interfaces" {
+    try std.testing.expect(isPhysicalInterface("eth0"));
+    try std.testing.expect(isPhysicalInterface("en0"));
+    try std.testing.expect(isPhysicalInterface("wlan0"));
+    try std.testing.expect(isPhysicalInterface("Ethernet"));
+    try std.testing.expect(isPhysicalInterface("Wi-Fi"));
+}
+
+test "isPhysicalInterface - virtual interfaces excluded" {
+    try std.testing.expect(!isPhysicalInterface("utun0"));
+    try std.testing.expect(!isPhysicalInterface("tun0"));
+    try std.testing.expect(!isPhysicalInterface("tap0"));
+    try std.testing.expect(!isPhysicalInterface("llw0"));
+    try std.testing.expect(!isPhysicalInterface("awdl0"));
+    try std.testing.expect(!isPhysicalInterface("bridge0"));
+    try std.testing.expect(!isPhysicalInterface("vmnet0"));
+    try std.testing.expect(!isPhysicalInterface("docker0"));
+    try std.testing.expect(!isPhysicalInterface("gif0"));
+    try std.testing.expect(!isPhysicalInterface("stf0"));
+    try std.testing.expect(!isPhysicalInterface("veth0"));
+    try std.testing.expect(!isPhysicalInterface("vboxnet0"));
+    try std.testing.expect(!isPhysicalInterface("virbr0"));
+}
+
+test "isPhysicalInterface - loopback excluded" {
+    try std.testing.expect(!isPhysicalInterface("lo0"));
+    try std.testing.expect(!isPhysicalInterface("lo"));
+}
+
+test "zigTarget - valid format" {
+    const target = zigTarget();
+    try std.testing.expect(target.len > 0);
+    // Should contain arch (aarch64, x86_64, or x86)
+    try std.testing.expect(
+        std.mem.startsWith(u8, target, "aarch64") or
+            std.mem.startsWith(u8, target, "x86_64") or
+            std.mem.startsWith(u8, target, "x86"),
+    );
+    // Should contain OS
+    try std.testing.expect(
+        std.mem.containsAtLeast(u8, target, 1, "linux") or
+            std.mem.containsAtLeast(u8, target, 1, "macos") or
+            std.mem.containsAtLeast(u8, target, 1, "windows"),
+    );
+}

@@ -55,3 +55,18 @@ fn isWindowsAdmin() bool {
     _ = CheckTokenMembership(null, admin_sid, &is_member);
     return is_member != .FALSE;
 }
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+test "isAdmin does not crash" {
+    // isAdmin should at minimum return a bool without panicking
+    _ = isAdmin();
+}
+
+test "isAdmin returns bool" {
+    const result = isAdmin();
+    _ = switch (result) {
+        true => "admin",
+        false => "not admin",
+    };
+}

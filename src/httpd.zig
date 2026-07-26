@@ -714,3 +714,467 @@ fn handleConnection(ctx: *ConnCtx) void {
         if (!request.head.keep_alive) break;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "jsonEscape - basic" {
+    const result = try jsonEscape(std.testing.allocator, "hello");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("hello", result);
+}
+
+test "jsonEscape - with quotes" {
+    const result = try jsonEscape(std.testing.allocator, "say \"hi\"");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("say \\\"hi\\\"", result);
+}
+
+test "jsonEscape - with newlines" {
+    const result = try jsonEscape(std.testing.allocator, "line1\nline2");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("line1\\nline2", result);
+}
+
+test "jsonEscape - with backslash" {
+    const result = try jsonEscape(std.testing.allocator, "path\\to\\file");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("path\\\\to\\\\file", result);
+}
+
+test "jsonEscape - with tab" {
+    const result = try jsonEscape(std.testing.allocator, "col1\tcol2");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("col1\\tcol2", result);
+}
+
+test "jsonEscape - with CR" {
+    const result = try jsonEscape(std.testing.allocator, "line\r");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("line\\r", result);
+}
+
+test "jsonEscape - empty string" {
+    const result = try jsonEscape(std.testing.allocator, "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "jsonEscape - control characters" {
+    // Test \uXXXX escaping for control chars 0-7, 11, 14-31
+    const result = try jsonEscape(std.testing.allocator, &.{ 0, 7, 11, 14, 31 });
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("\\u0000\\u0007\\u000b\\u000e\\u001f", result);
+}
+
+test "jsonEscape - all safe printable" {
+    const result = try jsonEscape(std.testing.allocator, "abc123!@# ");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("abc123!@# ", result);
+}
+
+test "jsonGetString - present" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    try map.put(std.testing.allocator, "key", .{ .string = "value" });
+    const result = jsonGetString(map, "key");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("value", result.?);
+}
+
+test "jsonGetString - missing" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    const result = jsonGetString(map, "nope");
+    try std.testing.expect(result == null);
+}
+
+test "jsonGetString - wrong type" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    try map.put(std.testing.allocator, "key", .{ .integer = 42 });
+    const result = jsonGetString(map, "key");
+    try std.testing.expect(result == null);
+}
+
+test "jsonGetString - empty string value" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    try map.put(std.testing.allocator, "key", .{ .string = "" });
+    const result = jsonGetString(map, "key");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("", result.?);
+}
+
+test "jsonGetInt - present" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    try map.put(std.testing.allocator, "key", .{ .integer = 42 });
+    const result = jsonGetInt(map, "key");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(i64, 42), result.?);
+}
+
+test "jsonGetInt - negative" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    try map.put(std.testing.allocator, "key", .{ .integer = -1 });
+    const result = jsonGetInt(map, "key");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(i64, -1), result.?);
+}
+
+test "jsonGetInt - missing" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    const result = jsonGetInt(map, "nope");
+    try std.testing.expect(result == null);
+}
+
+test "jsonGetInt - wrong type" {
+    var map: std.json.ObjectMap = .empty;
+    defer map.deinit(std.testing.allocator);
+    try map.put(std.testing.allocator, "key", .{ .string = "42" });
+    const result = jsonGetInt(map, "key");
+    try std.testing.expect(result == null);
+}
+
+test "parseJson - valid object" {
+    const parsed = try parseJson(std.testing.allocator, "{\"a\":1}");
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+}
+
+test "parseJson - invalid" {
+    _ = parseJson(std.testing.allocator, "not json") catch |err| {
+        try std.testing.expectEqual(error.UnexpectedToken, err);
+        return;
+    };
+    try std.testing.expect(false); // should have errored
+}
+
+test "buildJson - simple" {
+    const result = try buildJson(std.testing.allocator, "{{\"x\":{d}}}", .{42});
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("{\"x\":42}", result);
+}
+
+test "buildCmdWithMarker - bash" {
+    const result = try buildCmdWithMarker(std.testing.allocator, "/bin/bash", "ls -la");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("ls -la; echo MDELIM:$?\n", result);
+}
+
+test "buildCmdWithMarker - zsh" {
+    const result = try buildCmdWithMarker(std.testing.allocator, "/bin/zsh", "uname -a");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("uname -a; echo MDELIM:$?\n", result);
+}
+
+test "buildCmdWithMarker - sh fallback" {
+    const result = try buildCmdWithMarker(std.testing.allocator, "/bin/sh", "echo hi");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("echo hi; echo MDELIM:$?\n", result);
+}
+
+test "buildCmdWithMarker - cmd.exe" {
+    const result = try buildCmdWithMarker(std.testing.allocator, "cmd.exe", "dir");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("dir & echo MDELIM:%errorlevel%\r\n", result);
+}
+
+test "buildCmdWithMarker - empty command POSIX" {
+    const result = try buildCmdWithMarker(std.testing.allocator, "/bin/bash", "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("; echo MDELIM:$?\n", result);
+}
+
+test "buildCmdWithMarker - empty command Windows" {
+    const result = try buildCmdWithMarker(std.testing.allocator, "cmd.exe", "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(" & echo MDELIM:%errorlevel%\r\n", result);
+}
+
+test "scanForMarker - normal exit 0" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("test1");
+    state.appendOpOutput("test1", "hello world");
+    state.appendOpOutput("test1", "MDELIM:0\n");
+
+    state.scanForMarker("test1");
+
+    try std.testing.expectEqualStrings("hello world", state.op_states.get("test1").?.output.items);
+    try std.testing.expectEqual(@as(i32, 0), state.op_states.get("test1").?.exit_code);
+    try std.testing.expect(state.op_states.get("test1").?.done);
+}
+
+test "scanForMarker - exit code 127" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("test2");
+    state.appendOpOutput("test2", "command not found\n");
+    state.appendOpOutput("test2", "MDELIM:127\n");
+
+    state.scanForMarker("test2");
+
+    try std.testing.expect(state.op_states.get("test2").?.done);
+    try std.testing.expectEqual(@as(i32, 127), state.op_states.get("test2").?.exit_code);
+    try std.testing.expectEqualStrings("command not found\n", state.op_states.get("test2").?.output.items);
+}
+
+test "scanForMarker - negative exit code" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("test3");
+    state.appendOpOutput("test3", "output");
+    state.appendOpOutput("test3", "MDELIM:-1\n");
+
+    state.scanForMarker("test3");
+
+    try std.testing.expect(state.op_states.get("test3").?.done);
+    try std.testing.expectEqual(@as(i32, -1), state.op_states.get("test3").?.exit_code);
+}
+
+test "scanForMarker - no marker yet" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("test4");
+    state.appendOpOutput("test4", "partial output...");
+
+    state.scanForMarker("test4");
+
+    try std.testing.expect(!state.op_states.get("test4").?.done);
+    try std.testing.expectEqual(@as(i32, -1), state.op_states.get("test4").?.exit_code);
+}
+
+test "scanForMarker - partial marker (no newline)" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("test5");
+    state.appendOpOutput("test5", "data");
+    state.appendOpOutput("test5", "MDELIM:0"); // no newline yet
+
+    state.scanForMarker("test5");
+
+    try std.testing.expect(!state.op_states.get("test5").?.done);
+}
+
+test "scanForMarker - echo with MDELIM reference (macOS pty)" {
+    // macOS pty echoes the command which contains "MDELIM:$?".
+    // scanForMarker must use lastIndexOf and not match the echo.
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("test6");
+    // Simulate macOS pty: echoed command then actual output then real marker
+    state.appendOpOutput("test6", "echo MDELIM:$\n");
+    state.appendOpOutput("test6", "actual command output\n");
+    state.appendOpOutput("test6", "MDELIM:0\n");
+
+    state.scanForMarker("test6");
+
+    try std.testing.expect(state.op_states.get("test6").?.done);
+    try std.testing.expectEqual(@as(i32, 0), state.op_states.get("test6").?.exit_code);
+    // Should strip only the real marker, leaving echoed text + output
+    try std.testing.expectEqualStrings("echo MDELIM:$\nactual command output\n", state.op_states.get("test6").?.output.items);
+}
+
+test "scanForMarker - no digits in marker (invalid echo text)" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("test7");
+    // Only echoed text with no valid exit code
+    state.appendOpOutput("test7", "echo MDELIM:$\n");
+
+    state.scanForMarker("test7");
+
+    try std.testing.expect(!state.op_states.get("test7").?.done);
+}
+
+test "scanForMarker - CRLF line ending" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("test8");
+    state.appendOpOutput("test8", "output\r\n");
+    state.appendOpOutput("test8", "MDELIM:0\r\n");
+
+    state.scanForMarker("test8");
+
+    try std.testing.expect(state.op_states.get("test8").?.done);
+    try std.testing.expectEqual(@as(i32, 0), state.op_states.get("test8").?.exit_code);
+}
+
+test "scanForMarker - multiple markers, picks last valid" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("test9");
+    // Two markers: first invalid (echo), second real
+    state.appendOpOutput("test9", "MDELIM:$\n"); // invalid, skipped
+    state.appendOpOutput("test9", "some output\n");
+    state.appendOpOutput("test9", "MDELIM:42\n"); // real marker
+
+    state.scanForMarker("test9");
+
+    try std.testing.expect(state.op_states.get("test9").?.done);
+    try std.testing.expectEqual(@as(i32, 42), state.op_states.get("test9").?.exit_code);
+    // Should strip at the real marker position
+    try std.testing.expectEqualStrings("MDELIM:$\nsome output\n", state.op_states.get("test9").?.output.items);
+}
+
+test "HostState init and deinit" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), state.guests.items.len);
+}
+
+test "HostState createOpState and takeOpResult" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("cmd1");
+    state.appendOpOutput("cmd1", "hello");
+    state.completeOpState("cmd1", 0);
+
+    const result = state.takeOpResult("cmd1");
+    try std.testing.expect(result != null);
+    defer allocator.free(result.?.stdout);
+
+    try std.testing.expectEqual(@as(i32, 0), result.?.exit);
+    try std.testing.expectEqualStrings("hello", result.?.stdout);
+
+    // Should be removed after takeOpResult
+    try std.testing.expect(!state.op_states.contains("cmd1"));
+}
+
+test "HostState cleanupOpState" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("cmd2");
+    state.cleanupOpState("cmd2");
+    try std.testing.expect(!state.op_states.contains("cmd2"));
+
+    // cleanupOpState on non-existent should be no-op
+    state.cleanupOpState("non_existent");
+}
+
+test "HostState appendOpOutput" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("cmd3");
+    state.appendOpOutput("cmd3", "part1");
+    state.appendOpOutput("cmd3", "part2");
+
+    const op = state.op_states.get("cmd3").?;
+    try std.testing.expectEqualStrings("part1part2", op.output.items);
+}
+
+test "HostState completeOpState" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("cmd4");
+    state.completeOpState("cmd4", 5);
+
+    const op = state.op_states.get("cmd4").?;
+    try std.testing.expect(op.done);
+    try std.testing.expectEqual(@as(i32, 5), op.exit_code);
+}
+
+test "HostState failAllPendingOps" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("pending1");
+    try state.createOpState("pending2");
+    state.completeOpState("pending2", 0); // one already done
+
+    state.failAllPendingOps();
+
+    const op1 = state.op_states.get("pending1").?;
+    try std.testing.expect(op1.done);
+    try std.testing.expectEqual(@as(i32, -1), op1.exit_code);
+}
+
+test "HostState setOpFileMeta" {
+    const allocator = std.testing.allocator;
+    var state = HostState.init(allocator);
+    defer state.deinit();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    state.io = threaded.io();
+
+    try state.createOpState("cmd5");
+    state.setOpFileMeta("cmd5", "abcdef", 1024);
+
+    const op = state.op_states.get("cmd5").?;
+    try std.testing.expectEqualStrings("abcdef", op.file_hash);
+    try std.testing.expectEqual(@as(u32, 1024), op.file_size_meta);
+}
+
+test "HostState router add and dispatch" {
+    const allocator = std.testing.allocator;
+    var router: Router = .{};
+    defer router.deinit(allocator);
+
+    // Just verify we can create and deinit a router without crashes
+    try std.testing.expectEqual(@as(usize, 0), router.routes.items.len);
+}
+
+test "DEFAULT_PORT is 2121" {
+    try std.testing.expectEqual(@as(u16, 2121), DEFAULT_PORT);
+}
