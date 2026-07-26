@@ -6,17 +6,13 @@ Check processes, read logs, attach debuggers, profile performance on any machine
 running the Guest agent. Virtual or bare-metal — Linux, macOS, Windows. No SSH,
 no IP tracking, no context switching. Just `utmm --exec linuxvm "..."` and you're in.
 
-**MCP integration** 
-lets AI coding agents do the same — debug across platforms through
+**MCP integration** lets AI coding agents do the same — debug across platforms through
 natural language.
 
-**Mesh network & Zero config** 
-Ties everything together Under the hood. Guests auto-discover the
-Host over the local network — no fixed IPs, no DNS, no manual wiring. A Linux VM on a
-bridge, a Windows laptop on Wi-Fi, a Raspberry Pi on Ethernet — they all show up in one
-flat `utmm --status`. From there, `utmm --exec <hostname> "..."` reaches any machine
-instantly. When a bug surfaces on a specific device, you don't SSH around hunting for IPs
-or reconnecting to different networks — you just type the hostname and attach a debugger.
+**Mesh network & Zero config** ties everything together under the hood. Guests
+auto-discover the Host over the local network — no fixed IPs, no DNS, no manual
+wiring. A Linux VM on a bridge, a Windows laptop on Wi-Fi, a Raspberry Pi on
+Ethernet — they all show up in one flat `utmm --status`.
 
 ## AI Agent Experience
 
@@ -31,10 +27,7 @@ Example prompts your AI agent can handle:
 - "Check the status of all my machines"
 - "linuxvm is slow — check CPU, memory, and disk IO"
 - "Attach lldb to my program on macvm, set a breakpoint at main, and show the backtrace"
-- "Is the utmm service running on all machines?"
-- "My app crashed on windowsvm — find the crash dump and analyze it"
 - "Upload the new build to all machines and restart the service"
-- "Profile my app on linux with perf, show me the hot functions"
 
 ## CLI Quick Start
 
@@ -60,49 +53,34 @@ utmm --upload build.zip linuxvm
 utmm --download linuxvm core ./core.dump
 ```
 
-## VM or Physical Machine — Same Workflow
-
-Unlike tools that only work inside hypervisors, utmm monitors anything that runs
-the Guest agent. A Raspberry Pi on your desk, a Linux server in the rack, a
-Windows laptop on Wi-Fi, and three UTM VMs on your Mac — all appear in
-`utmm --status`, all respond to `utmm --exec`.
-
-| Machine | Hostname | OS | Connection |
-|---------|----------|-----|------------|
-| macOS VM | macvm | aarch64-macos | UTM bridge |
-| Linux VM | linuxvm | aarch64-linux | UTM bridge |
-| Windows VM | windowsvm | aarch64-windows | UTM bridge |
-| Windows laptop | winx64 | x86_64-windows | LAN Wi-Fi |
-| Raspberry Pi | raspigw | aarch64-linux | LAN Ethernet |
-
-Guest auto-discovers Host via default gateway. LAN machines just need the binary
-and `utmm --install`. UTM VMs get the binary from the Host directly:
-`curl http://<gateway>:2121/bin/install.sh | sh -s -- --guest --hostname myvm`.
-
 ## One-Time Setup
 
-### 1. Install on Host
+### 1. Install Host Service
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
+# Build for host platform, SCP to host machine
+zig build
+scp zig-out/bin/utmm root@<host>:/tmp/utmm
+
+# Force install as system auto-start service
+ssh root@<host> "chmod +x /tmp/utmm && /tmp/utmm --host --install"
 ```
 
-This installs to `/opt/utmm/` and creates `/usr/local/bin/utmm`.
+Service auto-starts on boot. Binary self-copies to `/opt/utmm/utmm` (POSIX) or
+`C:\opt\utmm\utmm.exe` (Windows).
 
-### 2. Start Host
+### 2. Install Guest Service
 
 ```bash
-# macOS / Linux
-sudo utmm --host
-sudo utmm --host --install   # Auto-start on boot
+# Build for target, SCP to guest
+zig build -Dtarget=aarch64-linux-musl
+scp zig-out/bin/utmm-aarch64-linux root@<guest>:/tmp/utmm
 
-# Windows (Administrator terminal)
-utmm --host
-utmm --host --install        # Auto-start on boot (Windows Service)
+# Force install with hostname
+ssh root@<guest> "chmod +x /tmp/utmm && /tmp/utmm --install --hostname myvm"
 ```
 
-> **Linux note:** Port 2121 < 1024 requires root or `sudo setcap cap_net_bind_service=+ep $(which utmm)`.
-> **Windows note:** The installer adds a firewall rule automatically. On first run, confirm the UAC prompt.
+Guest auto-discovers Host via default gateway (UTM VMs) or `--host-ip` (physical machines).
 
 ### 3. Register with AI Agent
 
@@ -118,26 +96,6 @@ Add to your MCP config (`~/.claude/mcp.json` or `.mcp.json` in project):
   }
 }
 ```
-
-### 4. Install on Each Guest
-
-**UTM VM** (no internet needed — downloads from Host at gateway IP):
-```bash
-curl http://<gateway>:2121/bin/install.sh | sh -s -- --guest --hostname myvm
-```
-
-**Physical machine** (needs internet or pre-copied binary):
-```bash
-# Option A: copy binary + install manually
-scp utmm-aarch64-linux pi@raspigw:/opt/utmm/
-ssh pi@raspigw "sudo chmod +x /opt/utmm/utmm && sudo utmm --install --hostname raspigw"
-
-# Option B: if the machine can reach GitHub
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh -s -- --guest --hostname raspigw
-```
-
-The Guest auto-discovers the Host via the default gateway. After setup, all
-debugging happens through `utmm --exec` — no more SSH into individual machines.
 
 ## CLI Reference
 
@@ -164,29 +122,40 @@ Guest (linuxvm)      ──KCP/Mesh──┐
 Guest (macvm)        ──KCP/Mesh──┤──→ Host HTTP :2121 ── MCP /mcp (AI agents)
 Guest (windowsvm)    ──KCP/Mesh──┤                      ── CLI (--status, --exec)
 Guest (raspigw, LAN) ──KCP/Mesh──┘                      ── Static files (/bin/)
-                         ┌── LSA broadcast discovery ───┘   (topology + auto-upgrade trigger)
+                         ┌── LSA broadcast discovery ───┘   (topology + version detection)
 ```
 
 - **Streaming exec**: output flows in real time via HTTP chunked encoding with
   `x-exit-code` trailer. No JSON wrapping, no timeout. Upload/download use chunked
   stream (8KB blocks) over KCP tunnel.
-- **Auto-upgrade**: Host broadcasts version in LSA every 2s. Guest detects
-  mismatch, spawns `utmm-old` process to stop→download 8KB chunks via KCP→SHA256
-  verify→replace→restart. Zero shell commands.
+- **Self-copy install**: binary copies itself to `/opt/utmm/utmm` (POSIX) or
+  `C:\opt\utmm\utmm.exe` (Windows). `--install` = unconditional force overwrite.
+  Upgrade = scp new binary + `--install`. Zero shell commands.
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
-- **Single port number**: 2121 for MCP + CLI + static file serving (TCP) and mesh networking (UDP)
+- **Single port**: 2121 for MCP + CLI + static file serving (TCP) and mesh networking (UDP)
 - **Auto IP tracking**: Host syncs Guest IPs to `/etc/hosts` — hostnames always resolve
-- **Cross-platform**: macOS, Linux, Windows — both Host and Guest (aarch64, x86_64, x86 32-bit)
+- **Cross-platform**: macOS, Linux, Windows — both Host and Guest (aarch64, x86_64, x86)
 - **Persistent shell session**: shell state survives across `--exec` calls (pty model)
 - **Reliable transport**: KCP ARQ protocol matching C reference — sliding window,
   congestion control, fast retransmit, window probing
+
+## Upgrade
+
+```bash
+# Build new binary → SCP to VM → force reinstall
+scp zig-out/bin/utmm-aarch64-linux root@<vm>:/tmp/utmm-new
+ssh root@<vm> "chmod +x /tmp/utmm-new && /tmp/utmm-new --install --hostname <name>"
+```
+
+The force install flow: stop service → kill processes → self-copy to canonical
+path → overwrite service config → start. No KCP download, no utmm-old process.
 
 ## Docs
 
 | Document | For |
 |----------|-----|
-| [SKILL.md](utm-vm/SKILL.md) | AI agent instructions (MCP tool details, workflows) |
-| [MANUAL.md](utm-vm/MANUAL.md) | Full user manual (architecture, deployment, troubleshooting) |
+| [SKILL.md](skills/utmm/SKILL.md) | AI agent instructions (MCP tool details, workflows) |
+| [MANUAL.md](skills/utmm/MANUAL.md) | Full user manual (architecture, deployment, troubleshooting) |
 | [mcp.json.example](mcp.json.example) | MCP configuration with Claude Code install guide |
 
 ## License

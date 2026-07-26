@@ -1,10 +1,24 @@
 #!/bin/bash
-# Release helper — build all 8 targets and create utmm.zip
-# Called by the release skill, or run standalone:
-#   ./release-skill/build.sh
+# Release helper — build all 8 targets, create utmm.zip, publish GitHub release.
+# Prerequisites: gh CLI authenticated, Zig 0.16.0, clean working tree.
+#
+# Usage:
+#   ./release.sh v0.11.11 "Release notes (markdown)"
+#
+# The version must match the tag already pushed (git tag + git push --tags
+# should be done before running this script).
 
 set -e
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")"
+
+VERSION="${1:-}"
+NOTES="${2:-}"
+
+if [ -z "$VERSION" ]; then
+    echo "Usage: ./release.sh <version> [notes]"
+    echo "Example: ./release.sh v0.11.11 \"Bug fixes and performance improvements\""
+    exit 1
+fi
 
 echo "==> Running tests..."
 zig build test --summary all
@@ -31,18 +45,26 @@ build_target x86_64-linux-musl    utmm-x86_64-linux
 build_target aarch64-linux-musl   utmm-aarch64-linux
 
 echo ""
-echo "==> Copying install scripts..."
-cp install.sh release/
-cp install.bat release/
-
-echo ""
 echo "==> Creating utmm.zip..."
 rm -f utmm.zip
 cd release && zip "../utmm.zip" * && cd ..
 ls -lh utmm.zip
 
 echo ""
-echo "==> Done. utmm.zip ready."
+echo "==> Creating GitHub release $VERSION..."
+if [ -n "$NOTES" ]; then
+    gh release create "$VERSION" \
+        --title "$VERSION" \
+        --notes "$NOTES" \
+        utmm.zip
+else
+    gh release create "$VERSION" \
+        --title "$VERSION" \
+        utmm.zip
+fi
+
+echo ""
+echo "==> Release $VERSION published."
 
 # Rebuild native target so zig-out/bin/utmm is usable for local testing
 echo ""
