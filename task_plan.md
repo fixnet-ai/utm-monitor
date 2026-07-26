@@ -231,10 +231,48 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 **部署状态**: macOS Host ✅ | linuxvm ✅ | macvm 📋 | windowsvm 📋 | winx64 📋
 （用户指示：本机测试完善后再部署到其他 VM）
 
+### Phase 55: Windows 服务停止卡死修复 ✅ (2026-07-27)
+
+**目标**: 修复 `sc stop` 永远卡在 STOP_PENDING 的问题。
+
+**根因链**（3 个协同 bug）：
+
+1. **`signalShutdown()` 提前关闭 socket** (`mesh.zig`): 在定时器线程发送 self-wake 数据包之前就关闭了 socket。ARM64 上 `CloseHandle` 无法可靠中断 AFD 的阻塞 `receive()`，self-wake 无法发送因为 socket 已关闭。
+
+2. **`close(pty.master_fd)` 在 Windows 上是空操作** (`broadcast.zig`): POSIX `close()` 无法关闭 `CreatePipe` 创建的 HANDLE。ptyReadLoop 永远卡在 `ReadFile`，`t.join()` 死锁。
+
+3. **`ptyReadLoop` 阻塞读取无法被中断** (`broadcast.zig`): 即使 CloseHandle 也不一定能在 ARM64 上中断 ReadFile。
+
+**修复清单**:
+
+| 修复 | 文件 | 修改 |
+|------|------|------|
+| F1 | `mesh.zig` | `signalShutdown()` 只设标志位，不关闭 socket（让定时器线程发送 self-wake） |
+| F2 | `broadcast.zig` | 新建 `closePtyFd()`：Windows 用 `CloseHandle`，POSIX 用 `close()` |
+| F3 | `broadcast.zig` | `ptyReadLoop` Windows 用 `PeekNamedPipe` + `Sleep(100)` 轮询替代阻塞 `ReadFile` |
+| F4 | `mesh.zig` | `runWindows` 用 `self.io`（Threaded Io）替代 `global_single_threaded`（failing allocator） |
+
+**提交**: `caaf0ad` fix: Windows service stop hang (STOP_PENDING forever)
+
+**验证**:
+| 项目 | 结果 |
+|------|------|
+| `zig build test` | 149/149 通过 |
+| `zig build -Dtarget=aarch64-windows` | ✅ |
+| windowsvm `sc stop` | ✅ 2/2 成功，5 秒内 STOPPED |
+
+**部署状态**:
+| 目标 | 状态 |
+|------|------|
+| macOS Host | ✅ |
+| linuxvm | ✅ |
+| windowsvm | ✅ Phase 55 修复已验证 |
+| winx64 | 📋 待部署 |
+| macvm | 📋 待部署 |
+
 ## 待办
 
-- [ ] 部署到 macvm、windowsvm、winx64（本机测试完善后）
-- [ ] 推送 2 个本地提交到 origin/main（`git push`）
+- [ ] 部署到 macvm、winx64
+- [ ] 推送 5 个本地提交到 origin/main（`git push`）
 - [ ] F91: `selfCopy()` copy+delete 回退路径添加 macOS codesign 重新签名
 - [ ] 清理 debug 日志（`waitForHostTunnel` 的 `scan: sessions=X` 消息）
-- [ ] 改进 `waitForHostTunnel` 对仅含 keepalive 数据的过期 session 的过滤

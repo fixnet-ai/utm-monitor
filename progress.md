@@ -2,21 +2,20 @@
 
 ## 当前状态
 
-- **分支**: `main`（领先 origin/main 2 个提交）
-- **最新提交**: `e444d46` — macOS 重试计数器永久累积修复
+- **分支**: `main`（领先 origin/main 5 个提交）
+- **最新提交**: `caaf0ad` — Windows 服务停止卡死修复
 - **测试**: 149/149 通过
-- **部署**: macOS Host ✅ | linuxvm ✅ | macvm 📋 | windowsvm 📋 | winx64 📋
+- **部署**: macOS Host ✅ | linuxvm ✅ | windowsvm ✅ | macvm 📋 | winx64 📋
 
 ## 最近提交
 
 ```
-e444d46 fix: macOS retry counter accumulates permanently, blocking restart tests
+caaf0ad fix: Windows service stop hang (STOP_PENDING forever)
+d97f2bb docs: update planning files with Phase 54 results and macvm test status
+73b7535 fix: silence verbose debug logs in waitForHostTunnel scan loop
 1ff46ad fix: Host restart exec returning empty (0xFF keepalive pollution + stale session races)
+e444d46 fix: macOS retry counter accumulates permanently, blocking restart tests
 ed7985b v0.11.10: Phase 50-52 hardening, consolidation, auto-ensure + deployment fixes
-717d6e1 refactor: consolidate 19 source files into 13 by merging thin wrappers
-52aa0c3 test: add 66 unit tests, coverage from 127 to 193 (+52%)
-1484e5e fix: correct MCP tool descriptions and port references
-1aa5de0 refactor: unified install/upgrade self-copy model + doc consolidation (#1)
 ```
 
 ## Phase 50: 加固优化全面审计 ✅ (2026-07-26)
@@ -249,6 +248,28 @@ ed7985b v0.11.10: Phase 50-52 hardening, consolidation, auto-ensure + deployment
 | macvm、windowsvm、winx64 | 📋 待部署（用户指示：本机测试完善后） |
 
 **遗留**:
-- 待推送到 origin/main
-- debug 日志过于冗长（`scan: sessions=X`）
+- 待推送到 origin/main（5 个提交）
 - `selfCopy()` copy+delete 路径未重新签名（F91）
+
+## Phase 55: Windows 服务停止卡死修复 ✅ (2026-07-27)
+
+**目标**: 修复 `sc stop` 永远卡在 STOP_PENDING 的问题。
+
+**根因**（3 个协同 bug）:
+
+1. **`signalShutdown()` 提前关闭 socket** (`mesh.zig`): 在定时器线程发送 self-wake 之前关闭了 socket。ARM64 上 AFD close 不中断 receive → mesh 线程永久阻塞 → `t.join()` 永不返回。
+
+2. **`close(pty.master_fd)` 在 Windows 上是空操作** (`broadcast.zig`): POSIX `close()` 无法关闭 `CreatePipe` 创建的 HANDLE → ptyReadLoop 卡在 `ReadFile` → 主线程 `t.join()` 死锁。
+
+3. **`ptyReadLoop` 阻塞读取无法被中断** (`broadcast.zig`): 即使改用 `CloseHandle` 也不一定能在 ARM64 上中断 `ReadFile`。
+
+**修复** (提交 `caaf0ad`):
+
+| # | 文件 | 修改 |
+|---|------|------|
+| F1 | `mesh.zig` | `signalShutdown()` 只设标志位，不关闭 socket；定时器线程的 self-wake 负责唤醒 mesh 线程 |
+| F2 | `broadcast.zig` | 新建 `closePtyFd()`：Windows 用 `CloseHandle`，POSIX 用 `close()` |
+| F3 | `broadcast.zig` | `ptyReadLoop` Windows 用 `PeekNamedPipe` + `Sleep(100)` 轮询替代阻塞 `ReadFile` |
+| F4 | `mesh.zig` | `runWindows` 用 `self.io`（Threaded Io）替代 `global_single_threaded` |
+
+**验证**: `zig build test` 149/149 通过，windowsvm 上 `sc stop` 2/2 成功（5 秒内 STOPPED）。

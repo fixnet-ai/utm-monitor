@@ -319,3 +319,50 @@ tunnelManager 有检测逻辑（搜索 Guest-initiated session），但在 Host 
 ### Finding 98: Zig 0.16.0 `zig build test` 管道模式 EndOfStream
 
 `zig build test` 使用内部 `--listen=-` 管道模式与测试 runner 通信时，偶尔报 `error.EndOfStream`。绕过方案：直接运行测试二进制 `./.zig-cache/o/<hash>/test --seed=0x1`。
+
+---
+
+## Phase 55: Windows 服务停止卡死修复 (2026-07-27)
+
+### Finding 99: `signalShutdown()` 提前关闭 socket 阻止 self-wake（Critical）
+
+`mesh.zig:signalShutdown()` 在 Windows 上调用 `self.socket.close(self.io)` 试图中断 mesh 线程的阻塞 `receive()`。但这同时阻止了定时器线程的 self-wake 数据包——`self.socket.send()` 对已关闭的 socket 失败（被 `catch {}` 静默吞掉）。ARM64 上 AFD close 不保证中断 receive → 三重失败：close 不中断 + self-wake 无法发送 + timer join 永久阻塞。
+
+**修复**: `signalShutdown()` 只设置 `self.shutdown = true`，不关闭 socket。定时器线程（1s 周期）检测标志位后发送 self-wake UDP 包到 127.0.0.1:2121。Socket 在 `t.join()` 返回后由调用者的 defer 块关闭。
+
+**关键洞察**: 修复前的问题不是定时器线程不工作，而是 `signalShutdown()` 销毁了定时器线程需要的工作资源（socket）。
+
+### Finding 100: POSIX `close()` 在 Windows 上是空操作
+
+`broadcast.zig` 在 defer 块和命令循环退出后调用 `_ = close(pty.master_fd)` 关闭 pty 管道。但 `extern "c" fn close(fd: std.posix.fd_t) c_int` 调用的是 C 运行时的 `_close()`，期望 CRT 文件描述符。`CreatePipe` 返回的是 `HANDLE`（`*anyopaque`），传给 `_close()` 无效——管道不被关闭，`ReadFile` 继续保持阻塞。
+
+Zig 0.16.0 在 Windows 上 `std.posix.fd_t` = `HANDLE` = `*anyopaque`，但不能假设所有 POSIX 函数都正确处理它。`@ptrCast(fd)` → `CloseHandle` 是正确的 Windows 管道关闭方式。
+
+**修复**: 新建 `closePtyFd()` 辅助函数，Windows 上用 `CloseHandle(@ptrCast(fd))`。
+
+### Finding 101: `ReadFile` 不能被 `CloseHandle` 可靠中断（ARM64）
+
+即使正确调用了 `CloseHandle`，ARM64 Windows 上 `CloseHandle` 从另一个线程关闭管道不一定能中断当前线程的阻塞 `ReadFile`。这与 AFD socket `CloseHandle` 不中断 `receive()` 的问题类似——ARM64 内核的 I/O 取消机制与 x86_64 有微妙差异。
+
+**修复**: 在 `ptyReadLoop` Windows 路径中使用 `PeekNamedPipe` + `Sleep(100)` 轮询，替代阻塞 `ReadFile`。每 100ms 检查一次 `pty_dead` 标志位，100ms 内即可响应关闭信号。
+
+**架构意义**: 这个修复将 Windows pty 读取从"被动阻塞模式"改为"主动轮询模式"，与 POSIX `poll(fd, 100)` 的设计一致——两者都在 100ms 内可响应关闭信号。
+
+### Finding 102: 服务停止的完整线程依赖链
+
+Windows 服务停止 (`sc stop`) 涉及 4 个线程的协调退出：
+
+```
+SCM → svcCtrlHandler → shutdown_flag = true
+  → 主线程 (meshSessionLoop): 命令循环检测 shutdown_flag
+    → pty_dead = true + closePtyFd → ptyReadLoop 退出
+    → defer: signalShutdown() → mesh.shutdown = true
+    → 定时器线程: 检测 mesh.shutdown → self-wake 包
+    → mesh 线程: receive 被 self-wake 唤醒 → 检测 shutdown → 退出
+  → svcMain: SetServiceStatus(STOPPED)
+```
+
+任意一环断裂都导致 STOP_PENDING。Phase 55 修复了其中 3 个断裂点：
+1. socket 提前关闭 → self-wake 无法发送
+2. POSIX close() 不工作 → pty 管道不关闭
+3. CloseHandle 不中断 ReadFile → ptyReadLoop 不退出
