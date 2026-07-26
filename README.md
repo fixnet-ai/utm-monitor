@@ -1,5 +1,7 @@
 # UTM Monitor
 
+![UTM Monitor](WHATIAM.png)
+
 **Remote debugging sidekick — VMs and physical machines, one command away.**
 
 Check processes, read logs, attach debuggers, profile performance on any machine
