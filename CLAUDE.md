@@ -274,7 +274,7 @@ utmm --host --install                # Force install as system service (Host mod
 utmm --host --uninstall              # Remove system service
 utmm --host --save-config            # Save current parameters to config file
 
-# Management Commands (HTTP to 127.0.0.1:2121)
+# Management Commands (auto-start Host if not running)
 utmm --status                        # All guest status
 utmm --exec linuxvm "uname -a"       # Remote exec (pty, env/cd persist)
 utmm --upload file.txt linuxvm       # Upload file
@@ -282,6 +282,12 @@ utmm --download linuxvm f.txt ./f.txt  # Download file
 utmm --gen-init linux                # Generate auto-start script (linux/macos/windows)
 utmm --version                       # Print version and exit
 ```
+
+> Management commands (`--status`/`--exec`/`--upload`/`--download`) connect to
+> `127.0.0.1:2121`. If the Host service is not running, they auto-start it via
+> `svc.ensure(.host)` before executing. A standalone `utmm --host` also ensures
+> the service and exits. `--host` combined with a management command ensures
+> once then executes. `--gen-init` and `--save-config` do not require the Host.
 
 ## Release Process
 
@@ -291,17 +297,17 @@ utmm --version                       # Print version and exit
 - Clean working tree (no uncommitted changes)
 
 ### Step 1: Determine version
-Read `src/ver.zig` for the current version. Ask the user what the next version
-should be (suggest patch bump, e.g. `0.11.10` → `0.11.11`). If already bumped
-and not yet tagged, use that.
+Read `src/protocol.zig` for the current version (VERSION constant). Ask the user
+what the next version should be (suggest patch bump, e.g. `0.11.10` → `0.11.11`).
+If already bumped and not yet tagged, use that.
 
 ### Step 2: Bump version (if needed)
 Update two files:
-- `src/ver.zig`: `pub const VERSION = "X.Y.Z";`
+- `src/protocol.zig`: `pub const VERSION = "X.Y.Z";`
 - `build.zig.zon`: `.version = "X.Y.Z",`
 
 > `build.zig.zon` version is for the Zig package manager. Single source of truth
-> for runtime version is `src/ver.zig`.
+> for runtime version is `src/protocol.zig`.
 
 ### Step 3: Commit & tag
 ```bash
@@ -350,26 +356,25 @@ scp + `--install`).
 
 ```
 src/
-├── main.zig           # Entry point, CLI parsing, mode dispatch
-├── ver.zig            # Single source of truth for version
-├── svc.zig            # Unified cross-platform service management (selfCopy, forceInstall, ensure)
-├── fail.zig           # Fast-fail helpers (err, msg — noreturn)
-├── protocol.zig       # Protocol constants, deployment filename mapping
+├── main.zig           # Entry point, CLI parsing, mode dispatch (+ priv.zig isAdmin)
+├── protocol.zig       # Protocol constants, VERSION, deployment filename mapping (+ ver.zig)
 ├── tunproto.zig       # Tunnel protocol over KCP: 10+ msg types, build/parse, chunked file transfer
 ├── kcp.zig            # KCP reliable ARQ protocol (matches C reference skywind3000/kcp)
 ├── mesh.zig           # LSA mesh networking: UDP broadcast, KCP session mgmt, relay
 ├── tunnel.zig         # TCP-like stream wrapper over KCP sessions (send/recv/flush)
-├── httpd.zig          # HTTP server core: accept loop + Router + HostState
-├── host_http.zig      # HTTP endpoint handlers: /exec, /upload, /download, /mcp, /bin/
-├── host.zig           # Host orchestration: cmd dispatch + HTTP server + mesh start
-├── guest.zig          # Guest entry: system info + meshSessionLoop start
-├── broadcast.zig      # Guest core: system info, ptySpawn, ptyReadLoop, meshSessionLoop
+├── httpd.zig          # HTTP server + endpoint handlers + MCP JSON-RPC (+ host_http.zig + mcp.zig)
+├── host.zig           # Host orchestration: cmd dispatch + HTTP server + mesh start (+ install.zig Platform/genInit)
+├── broadcast.zig      # Guest core: system info, ptySpawn, ptyReadLoop, meshSessionLoop (+ guest.zig)
+├── svc.zig            # Unified cross-platform service management (+ install.zig detectServiceEnv)
 ├── hosts_file.zig     # /etc/hosts marked block read/write
-├── mcp.zig            # MCP JSON-RPC: processJsonRpcWithState — reads HostState
-├── install.zig        # Platform detection + genInit() templates
-├── priv.zig           # Admin privilege check (isAdmin only, no elevation)
-└── config.zig         # Config persistence + file logger
+├── config.zig         # Config persistence + file logger
+└── fail.zig           # Fast-fail helpers (err, msg — noreturn)
 ```
+
+> v0.11.10 consolidated from 19 to 13 source files. Merged: ver.zig→protocol.zig,
+> priv.zig→main.zig, install.zig→svc.zig+host.zig, guest.zig→broadcast.zig,
+> mcp.zig+host_http.zig→httpd.zig. Each deleted file's functionality lives on
+> in its merge target.
 
 ## Code of Conduct / Guidelines
 

@@ -128,8 +128,8 @@ fn readSysFs(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]cons
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
 
-    var buf: [64]u8 = undefined;
-    var read_buf: [64]u8 = undefined;
+    var buf: [4096]u8 = undefined;
+    var read_buf: [4096]u8 = undefined;
     var reader = file.reader(io, &read_buf);
     const n = try reader.interface.readSliceShort(&buf);
     const trimmed = std.mem.trimEnd(u8, buf[0..n], "\n\r");
@@ -606,16 +606,28 @@ const PtySession = struct {
 };
 
 /// Write data to the pty/stdin. Cross-platform wrapper.
-fn ptyWrite(session: *const PtySession, data: []const u8) void {
+/// Returns error.WriteFailed if the write fails (OS error or short write on Windows).
+fn ptyWrite(session: *const PtySession, data: []const u8) error{ WriteFailed, Interrupted }!void {
     if (builtin.os.tag == .windows) {
         const WriteFile = @extern(
             *const fn (std.os.windows.HANDLE, [*]const u8, std.os.windows.DWORD, *std.os.windows.DWORD, ?*anyopaque) callconv(.winapi) std.os.windows.BOOL,
             .{ .name = "WriteFile", .library_name = "kernel32" },
         );
         var written: std.os.windows.DWORD = 0;
-        _ = WriteFile(session.stdin_fd, data.ptr, @intCast(data.len), &written, null);
+        if (@intFromEnum(WriteFile(session.stdin_fd, data.ptr, @intCast(data.len), &written, null)) == 0) {
+            return error.WriteFailed;
+        }
+        if (written < data.len) {
+            return error.WriteFailed;
+        }
     } else {
-        _ = write(session.master_fd, data.ptr, data.len);
+        var offset: usize = 0;
+        while (offset < data.len) {
+            const n = write(session.master_fd, data.ptr + offset, data.len - offset);
+            if (n < 0) return error.WriteFailed;
+            if (n == 0) return error.WriteFailed; // unexpected EOF on pty write
+            offset += @intCast(n);
+        }
     }
 }
 
@@ -860,6 +872,7 @@ fn ptyReadLoop(
                 .{ .fd = master_fd, .events = std.posix.POLL.IN, .revents = 0 },
             };
             _ = std.posix.poll(&fds, 100) catch |err| {
+                if (err == error.Interrupted) continue;
                 std.log.err("[guest-pty] pty poll error: {}", .{err});
                 break;
             };
@@ -1170,9 +1183,10 @@ pub fn meshSessionLoop(
         var cmd_mutex: std.Io.Mutex = std.Io.Mutex.init;
         var pty_dead: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-        // Start ptyReadLoop thread
+        // Start ptyReadLoop thread (stored for join on exit — no detach)
+        var pty_read_thread: ?std.Thread = null;
         {
-            const t = try std.Thread.spawn(.{}, ptyReadLoop, .{
+            pty_read_thread = try std.Thread.spawn(.{}, ptyReadLoop, .{
                 pty.master_fd,
                 &tunnel,
                 io,
@@ -1181,7 +1195,6 @@ pub fn meshSessionLoop(
                 &cmd_mutex,
                 &pty_dead,
             });
-            t.detach();
         }
 
         // Deliver any exec command buffered from reconnect race
@@ -1191,7 +1204,9 @@ pub fn meshSessionLoop(
             active_cmd_id = pending_cmd_id;
             pending_cmd_id = &.{}; // ownership transferred
             cmd_mutex.unlock(io);
-            ptyWrite(&pty, pending_cmd_data);
+            ptyWrite(&pty, pending_cmd_data) catch |err| {
+                std.log.err("[guest-mesh] ptyWrite pending failed: {}", .{err});
+            };
         }
 
         std.log.info("[guest-mesh] Pty session started, entering command loop", .{});
@@ -1240,7 +1255,10 @@ pub fn meshSessionLoop(
                         // Write command data to pty master (stdin of shell).
                         // Ctrl+C (0x03) and other control chars are forwarded
                         // through pty stdin — termios generates signal automatically.
-                        ptyWrite(&pty, input.command);
+                        ptyWrite(&pty, input.command) catch |err| {
+                            std.log.err("[guest-mesh] ptyWrite cmd failed: {}", .{err});
+                            continue;
+                        };
                     }
                 },
                 @intFromEnum(tunproto.MsgType.upload_cmd) => {
@@ -1278,6 +1296,33 @@ pub fn meshSessionLoop(
         }
 
         std.log.info("[guest-mesh] Pty session ended, waiting for reconnect...", .{});
+
+        // Send pty_exec_done for active command — notifies Host immediately
+        // that the pty session has ended. The Host normally detects command
+        // completion via MDELIM marker scanning, but this covers edge cases
+        // where the shell exits without producing a marker (e.g. Ctrl+D).
+        {
+            cmd_mutex.lock(io) catch {};
+            defer cmd_mutex.unlock(io);
+            const final_cmd_id = active_cmd_id;
+            if (final_cmd_id.len > 0) {
+                const done_msg = tunproto.buildPtyExecDone(allocator, final_cmd_id, -1) catch null;
+                if (done_msg) |msg| {
+                    defer allocator.free(msg);
+                    _ = tunnel.sendAndFlush(msg, tunnel.session.mesh.clock_ms) catch {};
+                }
+            }
+        }
+
+        // Signal ptyReadLoop to exit, then wait for it.
+        // (The defer above will also close master_fd, but we need to do it
+        // now so ptyReadLoop's poll() wakes up before we join.)
+        pty_dead.store(true, .release);
+        _ = close(pty.master_fd);
+        if (pty_read_thread) |t| {
+            t.join();
+        }
+
         tunnel.deinit();
     }
 }
@@ -1325,10 +1370,17 @@ fn receiveChunkedFile(
     dest_path: []const u8,
     expected_hash: []const u8,
 ) !void {
-    // Create temp file in the same directory as destination
+    // Create temp file in the same directory as destination.
+    // Use random hex suffix to prevent TOCTOU symlink attacks.
     const dirname = std.fs.path.dirname(dest_path) orelse ".";
-    const basename = std.fs.path.basename(dest_path);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}/.utmm-tmp-{s}", .{ dirname, basename });
+    var rand_bytes: [8]u8 = undefined;
+    io.random(&rand_bytes);
+    var temp_hex: [16]u8 = undefined;
+    for (rand_bytes, 0..) |b, j| {
+        temp_hex[j * 2] = "0123456789abcdef"[b >> 4];
+        temp_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}/.utmm-{s}", .{ dirname, &temp_hex });
     defer allocator.free(temp_path);
 
     std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
@@ -1384,7 +1436,10 @@ fn receiveChunkedFile(
                     continue;
                 }
 
-                writer.interface.flush() catch {};
+                writer.interface.flush() catch |err| {
+                    std.log.err("[guest-mesh] flush temp file failed: {}", .{err});
+                    return error.WriteFailed;
+                };
 
                 // Verify SHA256 (incremental: sha256.update per chunk, final here)
                 var hash: [32]u8 = undefined;
@@ -1438,9 +1493,12 @@ fn sendChunkedFile(
 ) !void {
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         std.log.err("[guest-mesh] Download open failed: {}", .{err});
-        const eof = try tunproto.buildFileEof(allocator, cmd_id, -1, 0, "");
-        defer allocator.free(eof);
-        _ = tun.sendAndFlush(eof, tun.session.mesh.clock_ms) catch {};
+        if (tunproto.buildFileEof(allocator, cmd_id, -1, 0, "")) |eof| {
+            defer allocator.free(eof);
+            _ = tun.sendAndFlush(eof, tun.session.mesh.clock_ms) catch {};
+        } else |build_err| {
+            std.log.err("[guest-mesh] buildFileEof failed for open error: {}", .{build_err});
+        }
         return;
     };
     defer file.close(io);
@@ -1454,9 +1512,12 @@ fn sendChunkedFile(
     while (true) {
         const n = file_reader.interface.readSliceShort(&chunk_buf) catch |err2| {
             std.log.err("[guest-mesh] Download read error: {}", .{err2});
-            const eof = try tunproto.buildFileEof(allocator, cmd_id, -1, 0, "");
-            defer allocator.free(eof);
-            _ = tun.sendAndFlush(eof, tun.session.mesh.clock_ms) catch {};
+            if (tunproto.buildFileEof(allocator, cmd_id, -1, 0, "")) |eof| {
+                defer allocator.free(eof);
+                _ = tun.sendAndFlush(eof, tun.session.mesh.clock_ms) catch {};
+            } else |build_err| {
+                std.log.err("[guest-mesh] buildFileEof failed for read error: {}", .{build_err});
+            }
             return err2;
         };
         if (n == 0) break; // EOF
@@ -1469,6 +1530,10 @@ fn sendChunkedFile(
             std.log.err("[guest-mesh] file_chunk send failed: {}", .{e});
             return e;
         };
+        // Flush KCP after each chunk so data is sent immediately.
+        // Without this, chunks are buffered until the next periodic
+        // mesh update (up to 1s), limiting download to ~8KB/s.
+        tun.flush(tun.session.mesh.clock_ms);
         total += @intCast(n);
     }
 

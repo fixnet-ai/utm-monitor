@@ -2,19 +2,67 @@
 
 ## 当前状态
 
-- **分支**: `refactor/install-upgrade-selfcopy`（已推送到 GitHub）
-- **最新提交**: `868a9e1` — fix: pkill -x exact match and --hostname persistence in service config
-- **所有 4 VM + Host**: 运行自复制模型，验证通过
+- **分支**: `main`
+- **最新提交**: Phase 50 加固优化（20 项修复，128/128 测试通过）
+- **8 目标交叉编译**: 全部通过，x86_64-macos Rosetta 测试 128/128
 
 ## 最近提交
 
 ```
-868a9e1 fix: pkill -x exact match and --hostname persistence in service config
-c71dead docs: update planning docs for Phase 48 refactoring + KCP hardening
-ca1d7fe refactor: unified install/upgrade via self-copy model, remove privilege elevation
-4cbb61f fix: launchctl bootstrap reliability + RunResult memory leaks in install.zig
-0cfbb11 docs: Phase 43-45 planning docs update — KCP tunnel fixes, IP retry, ensureAdmin skip
+717d6e1 refactor: consolidate 19 source files into 13 by merging thin wrappers
+52aa0c3 test: add 66 unit tests, coverage from 127 to 193 (+52%)
+1484e5e fix: correct MCP tool descriptions and port references
+1aa5de0 refactor: unified install/upgrade self-copy model + doc consolidation (#1)
+3fa0b5e fix: add IP detection retry for all platforms including Windows
+fba0a9f fix: add IP detection retry for DHCP race on Guest startup
+adffa15 fix: KCP tunnel session matching and reconnect race conditions
 ```
+
+## Phase 50: 加固优化全面审计 ✅ (2026-07-26)
+
+**目标**: 对 13 个源文件进行全面安全/可靠性审计，识别并修复 20 个问题。
+
+### Phase 0: 清理（1 项）
+- **F3**: 删除 `src/host_http.zig`（1190 行，全项目零引用）
+
+### Phase 1: UDP MTU + 自包含修复（11 项）
+| 编号 | 文件 | 修改 |
+|------|------|------|
+| M1 | `kcp.zig:30` | `IKCP_MTU_DEFAULT` 1300→1266，MSS 1242 |
+| M2 | `mesh.zig:873` | KCP relay 前 `data.len > 1279` 门禁 |
+| M3 | `mesh.zig:754` | LSA relay 1499→1279 |
+| M4 | `mesh.zig:533,639` | LSA 广播 buf `[1500]`→`[1280]`（2 处） |
+| D1 | `broadcast.zig:131` | `readSysFs` buf `[64]`→`[4096]` |
+| D2 | `broadcast.zig`+`host.zig` | TOCTOU: 临时文件名 `io.random()` 8 字节 hex |
+| D3 | `broadcast.zig:1387` | `flush() catch {}`→error propagation |
+| P1 | `broadcast.zig:1468` | sendChunkedFile 每 chunk flush，修复 ~8KB/s |
+| E2 | `httpd.zig:1434` | mutex.lock catch→flag 守卫 cleanup |
+| F2 | `mesh.zig:122` | encodeLsa 递归守卫（buf 不足时 0 邻居） |
+| A4 | `mesh.zig:858` | sessions.put OOM→errdefer 回滚 |
+
+### Phase 2: mesh.zig 线程安全（3 个互斥锁）
+- 新增 `neighbors_mutex`、`lsas_mutex`、`routes_mutex`（`std.Io.Mutex`）
+- ~30 处锁包裹，锁序 `sessions→neighbors→lsas→routes`
+- 避免自死锁：`handleLsa` block-scoped 先释放→再调 `rebuildRoutes`
+
+### Phase 3: 线程生命周期（2 处）
+- **B1+B2+B3** (`host.zig`): tunnelManager detach→join，defer 5 步有序销毁
+- **C1** (`broadcast.zig`): ptyReadLoop detach→join，先 signal→close→join
+
+### Phase 4: 错误处理和代码质量（7 项）
+| 编号 | 文件 | 修改 |
+|------|------|------|
+| E1a | `broadcast.zig:609` | ptyWrite 返回值检查 + 短写 while 重试 |
+| E1b | `broadcast.zig:862` | poll EINTR→continue |
+| E1c | `broadcast.zig:1483` | catch 块 try buildFileEof→if/else 安全处理 |
+| P2 | `broadcast.zig`+`httpd.zig` | pty_exec_done 消息发送+接收，新增 `isOpDone()` |
+| E3 | `host.zig:628` | tunnelManager 循环顶端 `cleanupStaleOps()` |
+| E4 | `svc.zig` | forceInstall 失败回滚（删二进制/卸载服务），`uninstallServiceConfig()` |
+| E5 | `main.zig` | 9 个 CLI 标志 `i+=1` 前先检查 `i+1<args.len` |
+| F1 | `svc.zig` | `runCmdQuiet()` 替换 24 处 `_ = runCmd(...)` 静默吞错 |
+
+**验证**: `zig build test` 128/128 通过，8 目标交叉编译零错误。
+**平台兼容修复**: Windows `BOOL` vs comptime_int（`@intFromEnum`），Zig 0.16 `std.c.getErrno` 不存在，`catch {} else {}` 非法语法。
 
 ## Phase 49: 文档合并与整理 ✅ (2026-07-26)
 
@@ -58,3 +106,108 @@ ca1d7fe refactor: unified install/upgrade via self-copy model, remove privilege 
 ## Phase 46: KCP 可靠性加固 ✅ (2026-07-26)
 
 13 个问题（2 Critical），18 个新测试，111/111 通过。
+
+## Phase 50 部署测试 ✅ (2026-07-26)
+
+**目标**: 全 VM 重新部署和验证 exec 功能。
+
+**发现并修复 4 个 bug**:
+- **Finding 76**: `wake_event.reset()` 在信号线程调用导致 `unreachable` panic（堆栈追踪确认）
+- **Finding 77**: `cleanupOpState` 前持有 `state.mutex` 导致自死锁（3 线程死锁链）
+- **Finding 78**: 交叉编译 `zig-out/bin/utmm` 被覆盖（流程问题）
+- **Finding 79**: tunnelManager 使用已释放 Tunnel 指针导致 segfault（use-after-free）
+
+**修复文件**: `src/httpd.zig`（+15 行 isTunnelDead 方法，-7 行 reset/双重锁），`src/host.zig`（+15/-10 行 tunnelManager 重构）
+
+**部署状态**:
+| VM | 状态 | exec 验证 |
+|----|------|----------|
+| linuxvm | ✅ 已部署 | `hostname`、`uptime`、`uname -a` 通过 |
+| macvm | ✅ 已部署 | `uname -a`、`hostname` 通过 |
+| windowsvm | ✅ 已验证 | `echo W1` 通过（运行旧二进制，Host 侧修复） |
+| winx64 | ✅ 已验证 | `echo X1` 通过（运行旧二进制，Host 侧修复） |
+
+**验证**: `zig build test` 全量通过，Host 持续运行无崩溃，4 VM 全部 exec 成功。
+
+## Phase 51: 文件合并与测试扩充 ✅ (2026-07-26)
+
+**目标**: 消除薄包装文件，减少文件数量、降低模块间导航成本。
+
+**合并操作** (19→13 文件):
+| 删除 | 并入 | 行数 |
+|------|------|------|
+| `ver.zig` | `protocol.zig` | 30 |
+| `priv.zig` | `main.zig` | 72 |
+| `install.zig` | `svc.zig` (`detectServiceEnv`) + `host.zig` (`Platform`/`genInit`) | 186 |
+| `guest.zig` | `broadcast.zig` | 65 |
+| `mcp.zig` | `httpd.zig` | 397 |
+| `host_http.zig` | `httpd.zig` | 1280 (新增) |
+
+**Zig 0.16.0 API 兼容修复** (5 处):
+- `waitpid` → `process.WaitPidResult` 新 API
+- `BodyWriter` → `Response.Writer` 新类型  
+- `executablePath()` 新签名（返回 slice 而非错误联合）
+- `Event.set(io)` 新签名（不再接受第二个参数）
+- `readSliceAll` → `ReadBuffer` + `readUntilDelimiterAll`
+
+**测试扩充** (+66 测试):
+| 文件 | 变更 | 测试数 |
+|------|------|--------|
+| `httpd.zig` | jsonEscape, json helpers, buildCmdWithMarker, scanForMarker, HostState, OpState | 0→44 |
+| `svc.zig` (原 install.zig) | defaultShell, defaultHome, genInit 细节 | 4→10 |
+| `config.zig` | 替换签名测试为实际验证 | 3→9 |
+| `broadcast.zig` | detectShell, isPhysicalInterface, zigTarget | 2→6 |
+| `hosts_file.zig` | HostEntry 边缘情况 | 3→5 |
+
+**验证**: `zig build test` 128/128 通过，原生构建成功，13 文件结构清晰。
+
+## Phase 52: CLI 管理命令自动确保 Host ✅ (2026-07-26)
+
+**目标**: 消除"先 `--host` 再管理命令"的两步操作，一步完成。
+
+**问题**: 管理命令（`--status`/`--exec`/`--upload`/`--download`）在 Host 未运行时仅打印 `ConnectionRefused` 后 crash，用户必须手动先启动 Host。
+
+**改造**: `main.zig` 合并分发逻辑（+6/-5 行）：
+- `needs_host` 统一判断：`--host`、`--status`、`--exec`、`--upload`、`--download` 任一触发
+- `svc.ensure(.host)` 幂等：已运行则跳过，未运行则自动安装+启动
+- `--host` 单独使用 → ensure 后 exit（行为不变）
+- 管理命令 → ensure 后 fall through 执行
+
+**验证**: `zig build test` 128/128 通过，`zig build` 成功。
+
+### Phase 52 部署测试与 Bug 修复 (2026-07-26)
+
+**目标**: 部署到 Host + 4 VM，验证 auto-ensure 端到端行为。
+
+**部署过程发现并修复的 Bug**:
+
+| 编号 | 问题 | 文件 | 修复 |
+|------|------|------|------|
+| F89 | `runCmd()` 永远返回 true 不检查退出码 | `svc.zig:66-70` | 改为检查 `result.term` |
+| F90 | macOS `cp` 破坏 ad-hoc 代码签名 → SIGKILL | 部署流程 | 部署后 `codesign --force --sign -` |
+| F91 | `selfCopy` copy+delete 路径也破坏签名 | `svc.zig` | 文档化，待修复 |
+| F92 | `launchctl enable` 不足于清除 disabled 状态 | `svc.zig` | installMacOS 添加 enable + PlistBuddy 兜底 |
+| F93 | `installMacOS` + `start()` 双重 bootstrap | `svc.zig:514-544` | start() 改为 isRunning→kickstart→bootstrap |
+
+**start() macOS 重构** (F93):
+- 先 `isRunning()` 检查 → 已运行则直接返回（幂等）
+- `launchctl kickstart -k` 优先（重启已加载的服务）
+- `launchctl enable` + `launchctl bootstrap` 回退（加载未安装的服务）
+- 验证步骤：`launchctl list` 确认服务出现
+
+**installMacOS 增强** (F92):
+- `launchctl enable` 在 bootstrap 之前调用，清除 disabled 标志
+
+**部署状态**:
+| 目标 | 二进制 | 状态 |
+|------|--------|------|
+| Host (macOS) | `/opt/utmm/utmm` | ✅ 已签名，服务运行中 |
+| linuxvm | `utmm-aarch64-linux` | ✅ 已部署 |
+| macvm | `utmm-aarch64-macos` | ✅ 已部署 |
+| windowsvm | `utmm-aarch64-windows.exe` | ✅ 已部署 |
+| winx64 | `utmm-x86_64-windows.exe` | ✅ 已部署 |
+
+**已知遗留问题**:
+- KCP 隧道在 Host 重启后 exec 返回空输出（dual-session mismatch，F93）
+- `selfCopy()` 的 copy+delete 路径未重新签名（F91）
+- 4 个 DebugAllocator 内存泄漏（`buildServiceArgs` CLI 短生命周期，OS 回收）

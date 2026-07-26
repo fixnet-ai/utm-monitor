@@ -149,32 +149,50 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
         } else if (std.mem.eql(u8, arg, "--save-config")) {
             cli.save_config = true;
         } else if (std.mem.eql(u8, arg, "--port")) {
-            i += 1;
-            if (i < args.len) cli.port = try std.fmt.parseInt(u16, args[i], 10);
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.port = try std.fmt.parseInt(u16, args[i], 10);
+            } else fail.msg("arg", "--port requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--mesh-port")) {
-            i += 1;
-            if (i < args.len) cli.mesh_port = try std.fmt.parseInt(u16, args[i], 10);
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.mesh_port = try std.fmt.parseInt(u16, args[i], 10);
+            } else fail.msg("arg", "--mesh-port requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--peer-mesh")) {
-            i += 1;
-            if (i < args.len) cli.peer_mesh = args[i];
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.peer_mesh = args[i];
+            } else fail.msg("arg", "--peer-mesh requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--hostname")) {
-            i += 1;
-            if (i < args.len) cli.hostname = args[i];
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.hostname = args[i];
+            } else fail.msg("arg", "--hostname requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--hosts-file")) {
-            i += 1;
-            if (i < args.len) cli.hosts_file = args[i];
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.hosts_file = args[i];
+            } else fail.msg("arg", "--hosts-file requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--serve-dir")) {
-            i += 1;
-            if (i < args.len) cli.serve_dir = args[i];
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.serve_dir = args[i];
+            } else fail.msg("arg", "--serve-dir requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--marker")) {
-            i += 1;
-            if (i < args.len) cli.marker = args[i];
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.marker = args[i];
+            } else fail.msg("arg", "--marker requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--config")) {
-            i += 1;
-            if (i < args.len) cli.config_path = args[i];
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.config_path = args[i];
+            } else fail.msg("arg", "--config requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--log-file")) {
-            i += 1;
-            if (i < args.len) cli.log_file = args[i];
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.log_file = args[i];
+            } else fail.msg("arg", "--log-file requires a value", .{});
         }
     }
 
@@ -308,12 +326,29 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // ── 7. --host: ensure Host service is running ──
-    if (cli.is_host) {
+    // ── 7. Ensure Host service for --host and management commands ──
+    // --status, --exec, --upload, --download all need the Host HTTP server.
+    // Auto-start it if not running so users and AI agents can go directly
+    // from "utmm --exec vm cmd" without a separate "utmm --host" step.
+    const needs_host = cli.is_host or cli.cmd_status or cli.cmd_exec
+        or cli.cmd_upload or cli.cmd_download;
+    if (needs_host) {
+        const was_running = svc.isRunning(init.io, init.gpa, .host);
         var extra_args = try buildServiceArgs(init.gpa, cli);
         defer extra_args.deinit(init.gpa);
         svc.ensure(init.io, init.gpa, .host, extra_args.items);
-        return;
+        // --host alone (no management command): ensure + exit
+        if (cli.is_host and !cli.cmd_status and !cli.cmd_exec
+            and !cli.cmd_upload and !cli.cmd_download
+            and !cli.cmd_gen_init and !cli.save_config) {
+            return;
+        }
+        // If the service was just started, give it time to bind the HTTP port
+        // before the management command connects. Service managers return before
+        // the process has fully initialized.
+        if (!was_running) {
+            std.Io.sleep(init.io, std.Io.Duration.fromSeconds(1), .awake) catch {};
+        }
     }
 
     // ── 8. Management commands ──

@@ -372,6 +372,20 @@ pub const HostState = struct {
         return self.guest_tunnels.get(hostname);
     }
 
+    /// Check if a guest's tunnel is dead. Returns true if:
+    /// - no tunnel is registered for this guest
+    /// - the tunnel's isAlive() returns false
+    /// Safe to call from tunnelManager — holds state.mutex across the
+    /// lookup + isAlive check, preventing use-after-free when the mesh
+    /// handler thread concurrently frees the tunnel.
+    pub fn isTunnelDead(self: *HostState, hostname: []const u8) bool {
+        self.mutex.lock(self.io.?) catch return true;
+        defer self.mutex.unlock(self.io.?);
+
+        const tun = self.guest_tunnels.get(hostname) orelse return true;
+        return !tun.isAlive();
+    }
+
     /// Remove a guest's tunnel registration. Called when tunnel disconnects.
     pub fn removeGuestTunnel(self: *HostState, hostname: []const u8) void {
         self.mutex.lock(self.io.?) catch return;
@@ -488,6 +502,16 @@ pub const HostState = struct {
         self.wake_event.set(self.io.?);
     }
 
+    /// Check if an operation is already marked done (thread-safe).
+    /// Used to avoid redundant completions (e.g. MDELIM + pty_exec_done).
+    pub fn isOpDone(self: *HostState, cmd_id: []const u8) bool {
+        self.mutex.lock(self.io.?) catch return false;
+        defer self.mutex.unlock(self.io.?);
+
+        const op = self.op_states.getPtr(cmd_id) orelse return false;
+        return op.done;
+    }
+
     /// Set file metadata on an op state (for download x-file-hash/x-file-size trailers).
     pub fn setOpFileMeta(self: *HostState, cmd_id: []const u8, file_hash: []const u8, file_size_meta: u32) void {
         self.mutex.lock(self.io.?) catch return;
@@ -551,7 +575,7 @@ pub const HostState = struct {
         self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
 
-        const now_ms = @divFloor(std.Io.Timestamp.now(self.io.?, .monotonic).nanoseconds, std.time.ns_per_ms);
+        const now_ms = @divFloor(std.Io.Timestamp.now(self.io.?, .awake).nanoseconds, std.time.ns_per_ms);
         var stale: std.ArrayList([]const u8) = .empty;
         defer stale.deinit(self.allocator);
 
@@ -865,13 +889,14 @@ fn mcpHandleVmStatus(allocator: std.mem.Allocator, state: *HostState) ![]const u
 
 /// Handle vm_exec via pty model: build pty_input, enqueue frame, poll for marker.
 fn mcpHandleVmExec(allocator: std.mem.Allocator, state: *HostState, vm: []const u8, command: []const u8) ![]const u8 {
-    // Check guest exists and get shell type
-    state.mutex.lock(state.io.?) catch |e| return e;
-    defer state.mutex.unlock(state.io.?);
-
-    const guest_shell = for (state.guests.items) |g| {
-        if (std.mem.eql(u8, g.hostname, vm)) break try allocator.dupe(u8, g.shell);
-    } else {
+    // Check guest exists and get shell type (block-scoped lock to avoid
+    // self-deadlock with internal locking in createOpState/getGuestTunnel).
+    const guest_shell = blk: {
+        state.mutex.lock(state.io.?) catch |e| return e;
+        defer state.mutex.unlock(state.io.?);
+        for (state.guests.items) |g| {
+            if (std.mem.eql(u8, g.hostname, vm)) break :blk try allocator.dupe(u8, g.shell);
+        }
         return error.GuestNotFound;
     };
     defer allocator.free(guest_shell);
@@ -1045,7 +1070,7 @@ pub fn processJsonRpcWithState(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// HTTP endpoint handlers (曾 host_http.zig)
+// HTTP endpoint handlers
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Read the request body as raw bytes. Caller owns the returned buffer.
@@ -1141,13 +1166,16 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *HostState, request: *htt
 
     std.log.info("[exec] cmd for {s}: {s}", .{ vm, command });
 
-    // Check guest exists and get shell type
-    state.mutex.lock(state.io.?) catch return;
-    defer state.mutex.unlock(state.io.?);
-
-    const guest_shell = for (state.guests.items) |g| {
-        if (std.mem.eql(u8, g.hostname, vm)) break try allocator.dupe(u8, g.shell);
-    } else {
+    // Check guest exists and get shell type (block-scoped lock to avoid
+    // self-deadlock with internal locking in createOpState/getGuestTunnel).
+    const guest_shell = blk: {
+        state.mutex.lock(state.io.?) catch return;
+        defer state.mutex.unlock(state.io.?);
+        for (state.guests.items) |g| {
+            if (std.mem.eql(u8, g.hostname, vm)) {
+                break :blk try allocator.dupe(u8, g.shell);
+            }
+        }
         std.log.err("[exec] GuestNotFound: vm='{s}'", .{vm});
         try respondError(request, .not_found, "GuestNotFound");
         return;
@@ -1268,9 +1296,7 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *HostState, request: *htt
     body_writer.endChunked(.{ .trailers = &trailers }) catch {};
     chunked_ended = true;
 
-    // Clean up op state
-    state.mutex.lock(state.io.?) catch return;
-    defer state.mutex.unlock(state.io.?);
+    // Clean up op state (cleanupOpState locks internally — do NOT pre-lock state.mutex)
     state.cleanupOpState(cmd_id);
     std.log.info("[exec] done {s} exit={d}", .{ cmd_id, exit_code });
 }
@@ -1290,14 +1316,10 @@ pub fn handleUpload(allocator: std.mem.Allocator, state: *HostState, request: *h
 
     std.log.info("[upload] {s} → {s}:{s}", .{ vm, vm, remote_path });
 
-    // Get guest tunnel
-    const tun = blk: {
-        state.mutex.lock(state.io.?) catch return;
-        defer state.mutex.unlock(state.io.?);
-        break :blk state.getGuestTunnel(vm) orelse {
-            try respondError(request, .service_unavailable, "GuestNotConnected");
-            return;
-        };
+    // Get guest tunnel (getGuestTunnel has its own internal locking)
+    const tun = state.getGuestTunnel(vm) orelse {
+        try respondError(request, .service_unavailable, "GuestNotConnected");
+        return;
     };
 
     const content_length = request.head.content_length orelse 0;
@@ -1413,13 +1435,9 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *HostState, request: 
 
     std.log.info("[download] {s}:{s}", .{ vm, remote_path });
 
-    const tun = blk: {
-        state.mutex.lock(state.io.?) catch return;
-        defer state.mutex.unlock(state.io.?);
-        break :blk state.getGuestTunnel(vm) orelse {
-            try respondError(request, .service_unavailable, "GuestNotConnected");
-            return;
-        };
+    const tun = state.getGuestTunnel(vm) orelse {
+        try respondError(request, .service_unavailable, "GuestNotConnected");
+        return;
     };
 
     const cmd_id = blk: {
@@ -1428,13 +1446,9 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *HostState, request: 
     };
     defer allocator.free(cmd_id);
 
-    // Create op state
+    // Create op state (cleanupOpState has its own internal locking)
     try state.createOpState(cmd_id);
-    defer {
-        state.mutex.lock(state.io.?) catch {};
-        defer state.mutex.unlock(state.io.?);
-        state.cleanupOpState(cmd_id);
-    }
+    defer state.cleanupOpState(cmd_id);
 
     // Send download command
     const dl_cmd = try tunproto.buildDownloadCmd(allocator, cmd_id, remote_path);
@@ -1661,8 +1675,12 @@ pub fn handleMeshGuest(
     tun: *tunnel_mod.Tunnel,
 ) void {
     defer {
-        allocator.free(hostname);
+        // Remove from guest table BEFORE freeing hostname — removeGuestTunnel
+        // does a HashMap lookup by hostname. If we free hostname first, the
+        // allocator could reuse the memory, corrupting the lookup and leaving
+        // a stale tunnel pointer in the map (use-after-free crash, Finding 79).
         state.removeGuestTunnel(hostname);
+        allocator.free(hostname);
         tun.deinit();
         allocator.destroy(tun);
     }
@@ -1698,19 +1716,37 @@ pub fn handleMeshGuest(
         const msg_type = data[0];
         switch (msg_type) {
             @intFromEnum(tunproto.MsgType.pty_exec_output) => {
-                var pos: usize = 1;
-                const cmd_id_opt = tunproto.readString(data, &pos);
-                const payload_opt = tunproto.readBlob(data, &pos);
-                if (cmd_id_opt == null or payload_opt == null) {
+                // Use dedicated parser — buildPtyExecOutput writes raw data
+                // (not a length-prefixed blob). The payload is every byte
+                // after the null-terminated cmd_id.
+                const out = tunproto.parsePtyExecOutput(data[1..]) orelse {
                     std.log.err("[tun-hdl] pty_output parse failed for {s}", .{hostname});
                     continue;
-                }
-                const cmd_id = cmd_id_opt.?;
-                const payload = payload_opt.?;
-
-                state.appendOpOutput(cmd_id, payload);
+                };
+                state.appendOpOutput(out.cmd_id, out.data);
                 // Scan for MDELIM marker in accumulated output
-                state.scanForMarker(cmd_id);
+                state.scanForMarker(out.cmd_id);
+                // Wake the waiting HTTP handler.
+                // Do NOT call reset() here — the waiting thread resets
+                // after returning from waitTimeout(). Calling reset() from
+                // this thread while waitTimeout() is still in-flight causes
+                // unreachable panic in std.Io.Event.waitTimeout.
+                state.wake_event.set(state.io.?);
+            },
+            @intFromEnum(tunproto.MsgType.pty_exec_done) => {
+                const done = tunproto.parsePtyExecDone(data[1..]) orelse {
+                    std.log.err("[tun-hdl] pty_exec_done parse failed for {s}", .{hostname});
+                    continue;
+                };
+                std.log.debug("[tun-hdl] pty_exec_done for {s}: cmd={s} exit={d}", .{ hostname, done.cmd_id, done.exit_code });
+                // Scan for any remaining MDELIM marker (arrived in last pty_output).
+                // If the op is already done (MDELIM detected), this is a no-op.
+                state.scanForMarker(done.cmd_id);
+                // If still not done, complete with the received exit code.
+                if (!state.isOpDone(done.cmd_id)) {
+                    state.completeOpState(done.cmd_id, done.exit_code);
+                    state.wake_event.set(state.io.?);
+                }
             },
             @intFromEnum(tunproto.MsgType.file_chunk) => {
                 var pos: usize = 1;
@@ -1738,7 +1774,6 @@ pub fn handleMeshGuest(
                         state.completeOpState(cmd_id_str, 0);
                     }
                     state.wake_event.set(state.io.?);
-                    state.wake_event.reset();
                     continue;
                 };
                 std.log.info("[tun-hdl] file_eof for {s}: {d} bytes, sha256={s}", .{ eof.cmd_id, eof.file_size, eof.file_hash });
@@ -1747,7 +1782,6 @@ pub fn handleMeshGuest(
                     state.setOpFileMeta(eof.cmd_id, eof.file_hash, eof.file_size);
                 }
                 state.wake_event.set(state.io.?);
-                state.wake_event.reset();
             },
             @intFromEnum(tunproto.MsgType.upgrade_req) => {
                 var pos: usize = 1;

@@ -67,7 +67,22 @@ fn runCmd(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
     const result = std.process.run(alloc, io, .{ .argv = argv }) catch return false;
     alloc.free(result.stdout);
     alloc.free(result.stderr);
-    return true;
+    return result.term == .exited and result.term.exited == 0;
+}
+
+/// Run a command for best-effort cleanup — failure is expected and logged
+/// at debug level (not warn, since many of these intentionally target
+/// services/files that may not exist).
+fn runCmdQuiet(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) void {
+    const result = std.process.run(alloc, io, .{ .argv = argv }) catch |err| {
+        std.log.debug("[svc] cmd failed: {s}: {}", .{ argv[0], err });
+        return;
+    };
+    alloc.free(result.stdout);
+    alloc.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        std.log.debug("[svc] cmd non-zero exit: {s}", .{argv[0]});
+    }
 }
 
 /// Run a command and return its stdout (caller owns), or null on failure.
@@ -97,7 +112,19 @@ pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) bool {
             const result = runCmdStdout(alloc, io, &[_][]const u8{ "launchctl", "list" });
             if (result) |stdout| {
                 defer alloc.free(stdout);
-                break :blk std.mem.indexOf(u8, stdout, name) != null;
+                // launchctl list format: "PID\tExitCode\tName"
+                // PID is "-" when loaded but not running. Look for the
+                // service name line and verify the first column is a number.
+                var lines = std.mem.splitScalar(u8, stdout, '\n');
+                while (lines.next()) |line| {
+                    if (std.mem.indexOf(u8, line, name)) |_| {
+                        const trimmed = std.mem.trimStart(u8, line, " \t");
+                        if (trimmed.len > 0 and std.ascii.isDigit(trimmed[0])) {
+                            break :blk true;
+                        }
+                        break :blk false;
+                    }
+                }
             }
             break :blk false;
         },
@@ -134,15 +161,15 @@ pub fn install(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_ar
             for (legacy_labels) |legacy| {
                 const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{legacy});
                 defer alloc.free(plist_path);
-                _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", legacy });
+                runCmdQuiet(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", legacy });
                 std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
             }
         },
         .linux => {
             const legacy_names = [_][]const u8{"utmm"};
             for (legacy_names) |legacy| {
-                _ = runCmd(alloc, io, &[_][]const u8{ "systemctl", "stop", legacy });
-                _ = runCmd(alloc, io, &[_][]const u8{ "systemctl", "disable", legacy });
+                runCmdQuiet(alloc, io, &[_][]const u8{ "systemctl", "stop", legacy });
+                runCmdQuiet(alloc, io, &[_][]const u8{ "systemctl", "disable", legacy });
                 const unit_path = try std.fmt.allocPrint(alloc, "/etc/systemd/system/{s}.service", .{legacy});
                 defer alloc.free(unit_path);
                 std.Io.Dir.cwd().deleteFile(io, unit_path) catch {};
@@ -151,8 +178,8 @@ pub fn install(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_ar
         .windows => {
             const legacy_names = [_][]const u8{"UTM-Monitor"};
             for (legacy_names) |legacy| {
-                _ = runCmd(alloc, io, &[_][]const u8{ "sc", "stop", legacy });
-                _ = runCmd(alloc, io, &[_][]const u8{ "sc", "delete", legacy });
+                runCmdQuiet(alloc, io, &[_][]const u8{ "sc", "stop", legacy });
+                runCmdQuiet(alloc, io, &[_][]const u8{ "sc", "delete", legacy });
             }
         },
         else => {},
@@ -239,7 +266,10 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
         };
     }
 
-    // Bootstrap
+    // Enable then bootstrap (also starts via RunAtLoad=true).
+    // Enable clears any persisted disabled flag from a previous
+    // uninstall/disable cycle.
+    _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
     if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path })) {
         fail.msg("install/launchctl-bootstrap", "failed to bootstrap {s}", .{name});
     }
@@ -346,7 +376,7 @@ fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra
     }
 
     // Delete old service if exists
-    _ = runCmd(alloc, io, &[_][]const u8{ "sc", "stop", name }); // best-effort: may not exist
+    runCmdQuiet(alloc, io, &[_][]const u8{ "sc", "stop", name }); // best-effort: may not exist
     if (!runCmd(alloc, io, &[_][]const u8{ "sc", "delete", name })) {
         std.log.warn("[svc] sc delete {s} failed (may not be installed)", .{name});
     }
@@ -371,7 +401,7 @@ fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra
 
     // Add firewall rule (delete any previous rule first, ignore error if not found)
     const rule_name = "UTM Monitor";
-    _ = runCmd(alloc, io, &[_][]const u8{
+    runCmdQuiet(alloc, io, &[_][]const u8{
         "netsh", "advfirewall", "firewall", "delete", "rule",
         "name=" ++ rule_name,
     }); // best-effort: may not exist
@@ -389,6 +419,37 @@ fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra
     std.log.info("[svc] Windows service {s} installed", .{name});
 }
 
+/// Remove service configuration only (no binary deletion, no process killing).
+/// Used as rollback when forceInstall's start step fails.
+fn uninstallServiceConfig(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) void {
+    const name = svcName(role);
+    switch (builtin.os.tag) {
+        .macos => {
+            const plist_path = std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name}) catch return;
+            defer alloc.free(plist_path);
+            runCmdQuiet(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", name });
+            std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
+        },
+        .linux => {
+            const unit_path = std.fmt.allocPrint(alloc, "/etc/systemd/system/{s}.service", .{name}) catch return;
+            defer alloc.free(unit_path);
+            runCmdQuiet(alloc, io, &[_][]const u8{ "systemctl", "stop", name });
+            runCmdQuiet(alloc, io, &[_][]const u8{ "systemctl", "disable", name });
+            std.Io.Dir.cwd().deleteFile(io, unit_path) catch {};
+            runCmdQuiet(alloc, io, &[_][]const u8{ "systemctl", "daemon-reload" });
+        },
+        .windows => {
+            runCmdQuiet(alloc, io, &[_][]const u8{ "sc", "stop", name });
+            runCmdQuiet(alloc, io, &[_][]const u8{ "sc", "delete", name });
+            runCmdQuiet(alloc, io, &[_][]const u8{
+                "netsh", "advfirewall", "firewall", "delete", "rule",
+                "name=UTM Monitor",
+            });
+        },
+        else => {},
+    }
+}
+
 /// Uninstall service: stop, remove config, delete binary.
 pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
     // Stop and remove all service names (current + legacy)
@@ -398,7 +459,7 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
             for (all_names) |name| {
                 const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name});
                 defer alloc.free(plist_path);
-                _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", name });
+                runCmdQuiet(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", name });
                 std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
             }
         },
@@ -407,20 +468,20 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
             for (all_names) |name| {
                 const unit_path = try std.fmt.allocPrint(alloc, "/etc/systemd/system/{s}.service", .{name});
                 defer alloc.free(unit_path);
-                _ = runCmd(alloc, io, &[_][]const u8{ "systemctl", "stop", name });
-                _ = runCmd(alloc, io, &[_][]const u8{ "systemctl", "disable", name });
+                runCmdQuiet(alloc, io, &[_][]const u8{ "systemctl", "stop", name });
+                runCmdQuiet(alloc, io, &[_][]const u8{ "systemctl", "disable", name });
                 std.Io.Dir.cwd().deleteFile(io, unit_path) catch {};
             }
-            _ = runCmd(alloc, io, &[_][]const u8{ "systemctl", "daemon-reload" });
+            runCmdQuiet(alloc, io, &[_][]const u8{ "systemctl", "daemon-reload" });
         },
         .windows => {
             const all_names = [_][]const u8{ SERVICE_NAMES.guest, SERVICE_NAMES.host, "UTM-Monitor" };
             for (all_names) |name| {
-                _ = runCmd(alloc, io, &[_][]const u8{ "sc", "stop", name });
-                _ = runCmd(alloc, io, &[_][]const u8{ "sc", "delete", name });
+                runCmdQuiet(alloc, io, &[_][]const u8{ "sc", "stop", name });
+                runCmdQuiet(alloc, io, &[_][]const u8{ "sc", "delete", name });
             }
             // Remove firewall rules
-            _ = runCmd(alloc, io, &[_][]const u8{
+            runCmdQuiet(alloc, io, &[_][]const u8{
                 "netsh", "advfirewall", "firewall", "delete", "rule",
                 "name=UTM Monitor",
             });
@@ -454,17 +515,30 @@ pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
     const name = svcName(role);
     switch (builtin.os.tag) {
         .macos => {
-            const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name});
-            defer alloc.free(plist_path);
-            if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path })) {
-                fail.msg("start/launchctl-bootstrap", "failed to bootstrap {s}", .{name});
+            // If already running, do nothing. Otherwise kickstart (restarts
+            // a loaded-but-dead service) or bootstrap (loads from scratch).
+            // installMacOS already bootstraps the service, so start is
+            // normally a no-op; kickstart handles the edge case where the
+            // service was installed but later stopped.
+            if (isRunning(io, alloc, role)) {
+                std.log.info("[svc] {s} already running in start()", .{name});
+                return;
+            }
+            if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "kickstart", "-k", "system", name })) {
+                // kickstart failed — service may not be loaded. Try bootstrap.
+                const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name});
+                defer alloc.free(plist_path);
+                _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
+                if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path })) {
+                    fail.msg("start/launchctl-bootstrap", "failed to bootstrap {s}", .{name});
+                }
             }
             // Verify
             const list_out = runCmdStdout(alloc, io, &[_][]const u8{ "launchctl", "list" });
             if (list_out) |stdout| {
                 defer alloc.free(stdout);
                 if (std.mem.indexOf(u8, stdout, name) == null) {
-                    fail.msg("start/verify", "service {s} not found in launchctl list after bootstrap", .{name});
+                    fail.msg("start/verify", "service {s} not found in launchctl list after start", .{name});
                 }
             }
         },
@@ -510,10 +584,10 @@ pub fn stop(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
 fn killAllUtmm(io: std.Io, alloc: std.mem.Allocator) !void {
     switch (builtin.os.tag) {
         .macos, .linux => {
-            _ = runCmd(alloc, io, &[_][]const u8{ "pkill", "-9", "-x", "utmm" });
+            runCmdQuiet(alloc, io, &[_][]const u8{ "pkill", "-9", "-x", "utmm" });
         },
         .windows => {
-            _ = runCmd(alloc, io, &[_][]const u8{ "taskkill", "/f", "/im", "utmm.exe" });
+            runCmdQuiet(alloc, io, &[_][]const u8{ "taskkill", "/f", "/im", "utmm.exe" });
         },
         else => {},
     }
@@ -633,6 +707,7 @@ fn copyFile(io: std.Io, alloc: std.mem.Allocator, src_path: []const u8, dst_path
 /// Fail-fast: any unexpected error calls fail() and does not return.
 pub fn forceInstall(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) void {
     const name = svcName(role);
+    const dest_path = canonicalPath();
     std.log.info("[svc] force installing {s}...", .{name});
 
     // 1. Stop any running service (ignore errors — may not be installed)
@@ -650,13 +725,26 @@ pub fn forceInstall(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, ext
         fail.err("forceInstall/selfCopy", err);
     };
 
-    // 4. Install/overwrite service configuration
+    // 4. Install/overwrite service configuration.
+    // If this fails, remove the binary we just copied so the system isn't
+    // left in a state with a binary but no service.
     install(io, alloc, role, extra_args) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, dest_path) catch |rm_err| {
+            std.log.warn("[svc] cleanup binary after install failure: {}", .{rm_err});
+        };
         fail.err("forceInstall/install", err);
     };
 
-    // 5. Start service
+    // 5. Start service.
+    // If this fails, uninstall the service + remove binary so the system
+    // isn't left with a service that won't start.
     start(io, alloc, role) catch |err| {
+        std.log.warn("[svc] start failed, rolling back install of {s}", .{name});
+        stop(io, alloc, role) catch {}; // best-effort stop
+        uninstallServiceConfig(io, alloc, role);
+        std.Io.Dir.cwd().deleteFile(io, dest_path) catch |rm_err| {
+            std.log.warn("[svc] cleanup binary after start failure: {}", .{rm_err});
+        };
         fail.err("forceInstall/start", err);
     };
 

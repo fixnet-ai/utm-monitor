@@ -27,7 +27,7 @@ pub const IKCP_CMD_WASK: u8 = 83;
 pub const IKCP_CMD_WINS: u8 = 84;
 
 pub const IKCP_OVERHEAD: u32 = 24; // KCP header size in bytes
-pub const IKCP_MTU_DEFAULT: u32 = 1300;
+pub const IKCP_MTU_DEFAULT: u32 = 1266; // = 1280 - 14 (mesh header), so UDP packet ≤ 1280 bytes
 pub const IKCP_INTERVAL: u32 = 100; // default internal update interval (ms)
 pub const IKCP_DEAD_LINK: u32 = 20; // max retransmissions before dead link
 pub const IKCP_RTO_MIN: i32 = 100; // minimum RTO (ms)

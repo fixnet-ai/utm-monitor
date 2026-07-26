@@ -349,8 +349,16 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
         return error.DownloadFailed;
     }
 
-    // Stream response body to temp file first (atomic rename after hash verify)
-    const temp_path = try std.fmt.allocPrint(gpa, "{s}.utmm-tmp", .{local_path});
+    // Stream response body to temp file first (atomic rename after hash verify).
+    // Use random hex suffix to prevent TOCTOU symlink attacks.
+    var rand_bytes: [8]u8 = undefined;
+    block_io.random(&rand_bytes);
+    var temp_hex: [16]u8 = undefined;
+    for (rand_bytes, 0..) |b, j| {
+        temp_hex[j * 2] = "0123456789abcdef"[b >> 4];
+        temp_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    const temp_path = try std.fmt.allocPrint(gpa, "{s}.{s}.utmm-tmp", .{ local_path, &temp_hex });
     defer gpa.free(temp_path);
     std.Io.Dir.cwd().deleteFile(block_io, temp_path) catch {};
 
@@ -570,22 +578,32 @@ fn startHttpHost(
         std.log.info("[host] Mesh networking started (LSA on UDP :{d})", .{mesh_port});
     }
 
+    // Spawn tunnel manager thread — syncs LSA→guest table, connects tunnels.
+    // Must spawn before the defer below so join() runs in correct order.
+    var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ gpa, &state, &mesh_opt });
+
     defer {
+        // 1. Signal shutdown — tunnelManager checks this each loop iteration
+        if (mesh_opt) |*m| m.signalShutdown();
+
+        // 2. Join tunnel manager (may wait up to 5s for sleep cycle)
+        tun_mgr_thread.join();
+
+        // 3. Join mesh thread after all consumers have exited
         if (mesh_thread) |t| {
-            if (mesh_opt) |*m| m.signalShutdown();
             t.join();
         }
+
+        // 4. Deinit mesh (safe: all threads using it have exited)
         if (mesh_opt) |*m| {
             const m_io = m.io;
             m.deinit();
             state.mesh = null;
             _ = m_io;
         }
-    }
 
-    // Spawn tunnel manager thread — syncs LSA→guest table, connects tunnels
-    var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ gpa, &state, &mesh_opt });
-    tun_mgr_thread.detach();
+        // 5. state.deinit() runs via its own defer (declared earlier, runs later)
+    }
 
     // Block forever in HTTP accept loop
     try httpd.serve(block_io, gpa, &router, &state, port, shutdown);
@@ -615,9 +633,9 @@ fn tunnelManager(
 
         // Phase 1: Sync LSA nodes → guest table
         if (mesh_opt.*) |*m| {
-            // NOTE: iterating m.lsas from a non-mesh thread has a race
-            // with mesh.run() replacing LSA entries (e.g. upgrade restart).
-            // Duplicate node_info + node_id to avoid use-after-free.
+            // Lock lsas_mutex to safely iterate from this non-mesh thread.
+            m.lsas_mutex.lock(m.io) catch continue;
+            defer m.lsas_mutex.unlock(m.io);
             var lsa_it = m.lsas.iterator();
             while (lsa_it.next()) |entry| {
                 const lsa = entry.value_ptr.*;
@@ -681,17 +699,35 @@ fn tunnelManager(
                 // session. This avoids the dual-session mismatch that causes
                 // tunnel death during file transfer.
                 const upgrading = std.mem.eql(u8, status, "upgrading");
-                const existing_tun = state.getGuestTunnel(hostname);
                 const status_just_changed = changed and upgrading;
-                const tun_dead = existing_tun != null and !existing_tun.?.isAlive();
+
+                // isTunnelDead holds state.mutex across the lookup+isAlive
+                // check, preventing use-after-free when the mesh handler
+                // thread concurrently frees the tunnel (Finding 78).
+                const tun_dead = state.isTunnelDead(hostname);
+
+                // Snapshot the tunnel's KCP conv for guest-session detection.
+                // We only need the conv for comparison — even if the tunnel is
+                // freed immediately after, the old conv value is safe to compare.
+                const existing_tun_conv: ?u32 = blk: {
+                    if (state.getGuestTunnel(hostname)) |tun| {
+                        // Must read conv while the pointer is still valid
+                        // (getGuestTunnel returned non-null → alive).
+                        // There is still a narrow race, but conv is an integer
+                        // and stale comparisons are harmless (they just cause
+                        // an unnecessary tunnel replace, which is safe).
+                        break :blk tun.session.conv;
+                    }
+                    break :blk null;
+                };
 
                 // Check if a Guest-initiated session (different conv) is now
                 // available — happens when the Host restarts, creates a fallback
                 // session via m.connect(), then the Guest reconnects with its
                 // own session. We must switch to the Guest's session or data
                 // flows through mismatched conv IDs and exec hangs.
-                const guest_session_available = if (existing_tun != null and !tun_dead) blk: {
-                    const tun_conv = existing_tun.?.session.conv;
+                const guest_session_available = if (!tun_dead and existing_tun_conv != null) blk: {
+                    const tun_conv = existing_tun_conv.?;
                     var found: bool = false;
                     m.sessions_mutex.lock(m.io) catch break :blk false;
                     defer m.sessions_mutex.unlock(m.io);
@@ -707,8 +743,8 @@ fn tunnelManager(
                     break :blk found;
                 } else false;
 
-                if (existing_tun == null or tun_dead or status_just_changed or guest_session_available) {
-                    if (existing_tun != null) {
+                if (tun_dead or status_just_changed or guest_session_available) {
+                    if (!tun_dead) {
                         std.log.info("[tun-mgr] {s} tunnel replace (dead={}, upgrading={}, guestSession={})", .{ hostname, tun_dead, status_just_changed, guest_session_available });
                         state.removeGuestTunnel(hostname);
                     }

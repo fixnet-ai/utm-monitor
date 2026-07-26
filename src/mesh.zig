@@ -131,6 +131,13 @@ pub fn encodeLsa(
     const needed = 15 + node_info.len + 1 + neighbors.len * 7;
     if (buf.len < needed) {
         std.log.warn("[mesh] encodeLsa: buffer too small (need {d}, have {d})", .{ needed, buf.len });
+        // Guard: if buffer can't even hold the header, encode with zero neighbors
+        // to avoid infinite recursion (buf.len -| X saturating to 0 → 0 neighbors → try again).
+        const min_header = 16 + node_info.len;
+        if (buf.len < min_header) {
+            std.log.err("[mesh] encodeLsa: buffer too small for header (need {d}, have {d})", .{ min_header, buf.len });
+            return encodeLsa(buf, origin, seq, ttl, flags, node_info, &[0]NeighborEntry{});
+        }
         // Try to fit as many neighbors as possible
         const max_neighbors = (buf.len -| (15 + node_info.len + 1)) / 7;
         return encodeLsa(buf, origin, seq, ttl, flags, node_info, neighbors[0..@min(neighbors.len, max_neighbors)]);
@@ -280,8 +287,11 @@ pub const Mesh = struct {
 
     // Topology
     neighbors: std.AutoHashMap(NodeId, Neighbor),
+    neighbors_mutex: std.Io.Mutex,
     lsas: std.AutoHashMap(NodeId, LsaEntry),
+    lsas_mutex: std.Io.Mutex,
     routes: std.ArrayList(Route),
+    routes_mutex: std.Io.Mutex,
 
     // KCP sessions (keyed by conv)
     sessions: std.AutoHashMap(u32, *MeshSession),
@@ -331,8 +341,11 @@ pub const Mesh = struct {
             .lsa_seq = 0,
             .last_lsa_broadcast_ms = 0,
             .neighbors = std.AutoHashMap(NodeId, Neighbor).init(allocator),
+            .neighbors_mutex = std.Io.Mutex.init,
             .lsas = std.AutoHashMap(NodeId, LsaEntry).init(allocator),
+            .lsas_mutex = std.Io.Mutex.init,
             .routes = .empty,
+            .routes_mutex = std.Io.Mutex.init,
             .sessions = std.AutoHashMap(u32, *MeshSession).init(allocator),
             .sessions_mutex = std.Io.Mutex.init,
             .shutdown = std.atomic.Value(bool).init(false),
@@ -521,6 +534,9 @@ pub const Mesh = struct {
     fn broadcastOwnLsaInit(self: *Mesh) void {
         self.lsa_seq +%= 1;
 
+        self.neighbors_mutex.lock(self.io) catch return;
+        defer self.neighbors_mutex.unlock(self.io);
+
         var neighbor_list: [32]NeighborEntry = undefined;
         var neighbor_count: usize = 0;
         var n_iter = self.neighbors.iterator();
@@ -530,7 +546,7 @@ pub const Mesh = struct {
             neighbor_count += 1;
         }
 
-        var lsa_buf: [1500]u8 = undefined;
+        var lsa_buf: [1280]u8 = undefined;
         const len = encodeLsa(
             &lsa_buf,
             self.node_id,
@@ -626,6 +642,9 @@ pub const Mesh = struct {
     fn broadcastOwnLsa(self: *Mesh) void {
         self.lsa_seq +%= 1;
 
+        self.neighbors_mutex.lock(self.io) catch return;
+        defer self.neighbors_mutex.unlock(self.io);
+
         // Collect neighbor list
         var neighbor_list: [32]NeighborEntry = undefined;
         var neighbor_count: usize = 0;
@@ -636,7 +655,7 @@ pub const Mesh = struct {
             neighbor_count += 1;
         }
 
-        var lsa_buf: [1500]u8 = undefined;
+        var lsa_buf: [1280]u8 = undefined;
         const len = encodeLsa(
             &lsa_buf,
             self.node_id,
@@ -663,49 +682,50 @@ pub const Mesh = struct {
         // TTL check
         if (decoded.ttl <= 1) return;
 
-        // Check if we already have a newer or same-seq LSA
-        if (self.lsas.getPtr(decoded.origin)) |existing| {
-            // Use wrapping comparison: treat seq as wrapping, ignore if not newer
-            const diff: i32 = @bitCast(decoded.seq -% existing.seq);
-            if (diff <= 0) {
-                // If node_info changed (e.g. Guest restart with different
-                // hostname), treat as a restart — accept the new LSA even
-                // though the seq number is lower/non-increasing.
-                if (!std.mem.eql(u8, decoded.node_info, existing.node_info)) {
-                    std.log.info("[mesh] LSA restart detected: node_info changed, accepting lower seq", .{});
-                    existing.deinit(self.allocator);
-                } else {
-                    return; // existing is same or newer
-                }
-            } else {
-                // Replace: free old entry
-                existing.deinit(self.allocator);
-            }
-        }
-
-        // Store LSA
-        const info_dup = try self.allocator.dupe(u8, decoded.node_info);
-        errdefer self.allocator.free(info_dup);
-
-        var neighbors = try parseLsaNeighbors(self.allocator, data, @intCast(decoded.node_info.len));
-        errdefer neighbors.deinit(self.allocator);
-
-        try self.lsas.put(decoded.origin, .{
-            .origin = decoded.origin,
-            .seq = decoded.seq,
-            .ttl = decoded.ttl,
-            .flags = decoded.flags,
-            .node_info = info_dup,
-            .neighbors = neighbors,
-            .received_ms = self.clock_ms,
-        });
-
-        // Update neighbor table (directly connected = LSA from that node).
-        // Force port to DEFAULT_PORT: LSA broadcasts may arrive from an
-        // ephemeral source port on some platforms (e.g. Windows), but all
-        // mesh KCP traffic uses the well-known port. Using the ephemeral
-        // port would cause KCP data to be sent to a port nothing listens on.
+        // ── lsas section: lock, check + store, unlock ──
         {
+            self.lsas_mutex.lock(self.io) catch return;
+            defer self.lsas_mutex.unlock(self.io);
+
+            // Check if we already have a newer or same-seq LSA
+            if (self.lsas.getPtr(decoded.origin)) |existing| {
+                const diff: i32 = @bitCast(decoded.seq -% existing.seq);
+                if (diff <= 0) {
+                    if (!std.mem.eql(u8, decoded.node_info, existing.node_info)) {
+                        std.log.info("[mesh] LSA restart detected: node_info changed, accepting lower seq", .{});
+                        existing.deinit(self.allocator);
+                    } else {
+                        return; // existing is same or newer
+                    }
+                } else {
+                    existing.deinit(self.allocator);
+                }
+            }
+
+            // Store LSA
+            const info_dup = try self.allocator.dupe(u8, decoded.node_info);
+            errdefer self.allocator.free(info_dup);
+
+            var neighbors = try parseLsaNeighbors(self.allocator, data, @intCast(decoded.node_info.len));
+            errdefer neighbors.deinit(self.allocator);
+
+            try self.lsas.put(decoded.origin, .{
+                .origin = decoded.origin,
+                .seq = decoded.seq,
+                .ttl = decoded.ttl,
+                .flags = decoded.flags,
+                .node_info = info_dup,
+                .neighbors = neighbors,
+                .received_ms = self.clock_ms,
+            });
+        }
+        // ── lsas_mutex released here ──
+
+        // ── neighbors section: lock, update, unlock ──
+        {
+            self.neighbors_mutex.lock(self.io) catch return;
+            defer self.neighbors_mutex.unlock(self.io);
+
             const result = try self.neighbors.getOrPut(decoded.origin);
             result.value_ptr.* = .{
                 .id = decoded.origin,
@@ -717,13 +737,10 @@ pub const Mesh = struct {
                 .cost = 1, // direct neighbor
             };
         }
+        // ── neighbors_mutex released here ──
 
         // Check for version mismatch (upgrade signal).
-        // Only fire when host_gateway_ip is set (Guest mode) AND the LSA
-        // comes from the Host (matched by IP). This prevents false upgrades
-        // triggered by peer Guests running different versions.
         if (!self.upgrade_needed.load(.acquire) and self.host_gateway_ip.len > 0) {
-            // Extract IP from node_info to verify this LSA is from the Host
             var remote_ip: []const u8 = "";
             if (std.mem.indexOf(u8, decoded.node_info, "ip:")) |ip_start| {
                 const ip_line = decoded.node_info[ip_start + "ip:".len ..];
@@ -731,7 +748,6 @@ pub const Mesh = struct {
                 remote_ip = ip_line[0..ip_end];
             }
             if (remote_ip.len > 0 and std.mem.eql(u8, remote_ip, self.host_gateway_ip)) {
-                // Parse version from node_info
                 if (std.mem.indexOf(u8, decoded.node_info, "version:")) |v_start| {
                     const v_line = decoded.node_info[v_start + "version:".len ..];
                     const v_end = std.mem.indexOfScalar(u8, v_line, '\n') orelse v_line.len;
@@ -744,26 +760,26 @@ pub const Mesh = struct {
             }
         }
 
-        // Rebuild routes on topology change
+        // Rebuild routes on topology change (no locks held)
         self.rebuildRoutes();
 
-        // Relay LSA: decrement TTL, re-broadcast to our neighbors
+        // ── relay section: lock, iterate, send, unlock ──
         if (decoded.ttl > 2) {
-            // Safety: reject oversized LSA data that would overflow the relay buffer.
-            // relay_buf is 1500 bytes (standard MTU); data > 1499 would corrupt the stack.
-            if (data.len > 1499) {
+            if (data.len > 1279) {
                 std.log.warn("[mesh] LSA relay dropped: data too large ({d} bytes)", .{data.len});
                 return;
             }
-            var relay_buf: [1500]u8 = undefined;
+            var relay_buf: [1280]u8 = undefined;
             relay_buf[0] = protocol.MESH_TYPE_LSA;
             @memcpy(relay_buf[1..][0..data.len], data);
             relay_buf[1 + 6 + 4] = decoded.ttl - 1; // decrement TTL in-place
             const total_len = 1 + data.len;
 
+            self.neighbors_mutex.lock(self.io) catch return;
+            defer self.neighbors_mutex.unlock(self.io);
             var n_iter = self.neighbors.iterator();
             while (n_iter.next()) |entry| {
-                if (std.mem.eql(u8, &entry.key_ptr.*, &decoded.origin)) continue; // don't send back to origin
+                if (std.mem.eql(u8, &entry.key_ptr.*, &decoded.origin)) continue;
                 self.socket.send(self.io, &entry.value_ptr.addr, relay_buf[0..total_len]) catch {};
             }
         }
@@ -829,12 +845,13 @@ pub const Mesh = struct {
                 }
                 sess.last_recv_ms = self.clock_ms;
                 sess.keepalive_probes = 0;
-                // Keep neighbor alive: update last_seen_ms so expireStale
-                // doesn't remove it while this KCP session is still active.
+                // Keep neighbor alive (sessions_mutex → neighbors_mutex lock order)
+                self.neighbors_mutex.lock(self.io) catch {};
                 if (self.neighbors.getPtr(src_mac)) |neighbor| {
                     neighbor.last_seen_ms = self.clock_ms;
                     neighbor.addr = from;
                 }
+                self.neighbors_mutex.unlock(self.io);
             } else {
                 std.log.info("[mesh] New KCP session from {any} conv={d}", .{ from, kcp_conv });
                 // New incoming session — create KCP instance and store.
@@ -856,9 +873,14 @@ pub const Mesh = struct {
                     std.log.err("[mesh] KCP input error (new session): {}", .{err});
                 };
                 try self.sessions.put(kcp_conv, new_sess);
+                errdefer {
+                    _ = self.sessions.remove(kcp_conv);
+                    self.allocator.destroy(new_sess);
+                }
 
                 // Auto-add the source as a neighbor so we can send KCP
-                // ACKs/output back.
+                // ACKs/output back (sessions_mutex → neighbors_mutex lock order).
+                self.neighbors_mutex.lock(self.io) catch {};
                 {
                     const n_result = try self.neighbors.getOrPut(src_mac);
                     n_result.value_ptr.* = .{
@@ -868,12 +890,20 @@ pub const Mesh = struct {
                         .cost = 1,
                     };
                 }
+                self.neighbors_mutex.unlock(self.io);
             }
         } else {
             // Relay: forward to next hop toward dst
+            // Guard against UDP amplification: 1 (type) + data.len must not exceed 1280.
+            if (data.len > 1279) {
+                std.log.warn("[mesh] KCP relay dropped: data too large ({d} bytes)", .{data.len});
+                return;
+            }
             if (self.routeTo(dst_mac)) |next_hop| {
+                self.neighbors_mutex.lock(self.io) catch return;
+                defer self.neighbors_mutex.unlock(self.io);
                 if (self.neighbors.get(next_hop)) |neighbor| {
-                    var relay_buf: [4096]u8 = undefined;
+                    var relay_buf: [1280]u8 = undefined;
                     relay_buf[0] = protocol.MESH_TYPE_KCP;
                     relay_buf[1] = ttl - 1;
                     @memcpy(relay_buf[2..][0..data.len-1], data[1..][0..data.len - 1]); // copy src+dst+kcp
@@ -892,6 +922,8 @@ pub const Mesh = struct {
         const sess: *MeshSession = @ptrCast(@alignCast(user_ptr));
         const mesh = sess.mesh;
         // Look up next-hop neighbor for sending
+        mesh.neighbors_mutex.lock(mesh.io) catch return;
+        defer mesh.neighbors_mutex.unlock(mesh.io);
         if (mesh.neighbors.get(sess.next_hop)) |neighbor| {
             std.log.info("[mesh] kcp_output: conv={d} len={d} to={} next_hop={any}", .{ conv, data.len, neighbor.addr, sess.next_hop });
             var buf: [4096]u8 = undefined;
@@ -934,6 +966,8 @@ pub const Mesh = struct {
 
     /// Send a ping to a specific neighbor (for RTT/cost measurement).
     pub fn sendPing(self: *Mesh, dest_id: NodeId) void {
+        self.neighbors_mutex.lock(self.io) catch return;
+        defer self.neighbors_mutex.unlock(self.io);
         if (self.neighbors.get(dest_id)) |neighbor| {
             var ping: [11]u8 = undefined;
             ping[0] = protocol.MESH_TYPE_PING;
@@ -949,6 +983,8 @@ pub const Mesh = struct {
 
     /// Find the next hop toward a destination. Returns null if unreachable.
     pub fn routeTo(self: *Mesh, dest: NodeId) ?NodeId {
+        self.routes_mutex.lock(self.io) catch return null;
+        defer self.routes_mutex.unlock(self.io);
         for (self.routes.items) |r| {
             if (std.mem.eql(u8, &r.dest, &dest)) return r.next_hop;
         }
@@ -958,7 +994,15 @@ pub const Mesh = struct {
     /// Rebuild routing table using Dijkstra's algorithm.
     /// Builds new routes in a temporary list and only replaces the live table
     /// on success — avoids losing existing routes on allocation failure.
+    /// Caller must NOT hold any topology locks (to avoid self-deadlock).
     fn rebuildRoutes(self: *Mesh) void {
+        self.neighbors_mutex.lock(self.io) catch return;
+        defer self.neighbors_mutex.unlock(self.io);
+        self.lsas_mutex.lock(self.io) catch return;
+        defer self.lsas_mutex.unlock(self.io);
+        self.routes_mutex.lock(self.io) catch return;
+        defer self.routes_mutex.unlock(self.io);
+
         var new_routes: std.ArrayList(Route) = .empty;
 
         // Build adjacency list from LSA database
@@ -1143,6 +1187,9 @@ pub const Mesh = struct {
 
         // Expire stale neighbors
         {
+            self.neighbors_mutex.lock(self.io) catch return;
+            defer self.neighbors_mutex.unlock(self.io);
+
             var to_remove: std.ArrayList(NodeId) = .empty;
             var n_iter = self.neighbors.iterator();
             while (n_iter.next()) |entry| {
@@ -1159,6 +1206,9 @@ pub const Mesh = struct {
 
         // Expire stale LSAs
         {
+            self.lsas_mutex.lock(self.io) catch return;
+            defer self.lsas_mutex.unlock(self.io);
+
             var to_remove: std.ArrayList(NodeId) = .empty;
             var l_iter = self.lsas.iterator();
             while (l_iter.next()) |entry| {
@@ -1176,14 +1226,26 @@ pub const Mesh = struct {
             to_remove.deinit(self.allocator);
         }
 
-        // Rebuild routes if we removed anything
-        if (self.neighbors.count() > 0) {
-            self.rebuildRoutes();
+        // Rebuild routes if we removed anything (no locks held to avoid self-deadlock)
+        {
+            self.neighbors_mutex.lock(self.io) catch return;
+            const has_neighbors = self.neighbors.count() > 0;
+            self.neighbors_mutex.unlock(self.io);
+            if (has_neighbors) {
+                self.rebuildRoutes();
+            }
         }
     }
 
     /// List known nodes (for --status display).
     pub fn listNodes(self: *Mesh, allocator: std.mem.Allocator) !std.ArrayList(NodeInfo) {
+        self.neighbors_mutex.lock(self.io) catch return error.LockFailed;
+        defer self.neighbors_mutex.unlock(self.io);
+        self.lsas_mutex.lock(self.io) catch return error.LockFailed;
+        defer self.lsas_mutex.unlock(self.io);
+        self.routes_mutex.lock(self.io) catch return error.LockFailed;
+        defer self.routes_mutex.unlock(self.io);
+
         var list: std.ArrayList(NodeInfo) = .empty;
         var seen = std.AutoHashMap(NodeId, void).init(allocator);
         defer seen.deinit();
