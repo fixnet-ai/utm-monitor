@@ -1332,14 +1332,17 @@ pub fn meshSessionLoop(
                     }
                 },
                 @intFromEnum(tunproto.MsgType.download_cmd) => {
+                    std.log.info("[guest-mesh] Download cmd received (type=0x14)", .{});
                     if (tunproto.parseDownloadCmd(payload)) |cmd| {
-                        std.log.debug("[guest-mesh] Download cmd: {s}", .{cmd.path});
+                        std.log.info("[guest-mesh] Download cmd: {s}", .{cmd.path});
                         sendChunkedFile(io, allocator, &tunnel, cmd.cmd_id, cmd.path) catch |e| {
                             std.log.err("[guest-mesh] Download send failed: {}", .{e});
                             const eof = tunproto.buildFileEof(allocator, cmd.cmd_id, -1, 0, "") catch continue;
                             defer allocator.free(eof);
                             _ = tunnel.sendAndFlush(eof, tunnel.session.mesh.clock_ms) catch {};
                         };
+                    } else {
+                        std.log.err("[guest-mesh] Download cmd parse failed!", .{});
                     }
                 },
                 @intFromEnum(tunproto.MsgType.file_chunk) => {
@@ -1349,7 +1352,7 @@ pub fn meshSessionLoop(
                     std.log.debug("[guest-mesh] Unexpected file_eof in command loop (ignored)", .{});
                 },
                 else => {
-                    std.log.debug("[guest-mesh] Unknown msg type: {d}", .{msg_type});
+                    std.log.info("[guest-mesh] Unknown msg type: {d} (0x{x:0>2})", .{ msg_type, msg_type });
                 },
             }
         }
@@ -1629,14 +1632,10 @@ fn sendChunkedFile(
 
         const chunk = try tunproto.buildFileChunk(allocator, cmd_id, chunk_buf[0..n]);
         defer allocator.free(chunk);
-        _ = tun.send(chunk) catch |e| {
+        _ = tun.sendAndFlush(chunk, tun.session.mesh.clock_ms) catch |e| {
             std.log.err("[guest-mesh] file_chunk send failed: {}", .{e});
             return e;
         };
-        // Flush KCP after each chunk so data is sent immediately.
-        // Without this, chunks are buffered until the next periodic
-        // mesh update (up to 1s), limiting download to ~8KB/s.
-        tun.flush(tun.session.mesh.clock_ms);
         total += @intCast(n);
     }
 

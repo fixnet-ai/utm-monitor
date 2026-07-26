@@ -1260,7 +1260,7 @@ pub fn handleDownload(allocator: std.mem.Allocator, state: *HostState, request: 
     const dl_cmd = try tunproto.buildDownloadCmd(allocator, cmd_id, remote_path);
     defer allocator.free(dl_cmd);
 
-    _ = tun.send(dl_cmd) catch |err| {
+    _ = tun.sendAndFlush(dl_cmd, tun.session.mesh.clock_ms) catch |err| {
         std.log.err("[download] tunnel send failed: {}", .{err});
         try respondError(request, .service_unavailable, "TunnelSendFailed");
         return;
@@ -1596,7 +1596,7 @@ pub fn handleMeshGuest(
                 state.appendOpOutput(cmd_id_opt.?, payload_opt.?);
             },
             @intFromEnum(tunproto.MsgType.file_eof) => {
-                const eof = tunproto.parseFileEof(data) orelse {
+                const eof = tunproto.parseFileEof(data[1..]) orelse {
                     std.log.err("[tun-hdl] file_eof parse failed for {s}", .{hostname});
                     // Mark the op done anyway so the handler doesn't hang.
                     // Extract cmd_id before falling through to manual extraction.

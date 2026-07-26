@@ -11,6 +11,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const http = std.http;
+const ipc_mod = @import("ipc.zig");
 
 /// Maximum JSON-RPC request size (64KB).
 const MAX_REQUEST_SIZE = 65536;
@@ -188,8 +189,97 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
     return jsonBuildError(gpa, id_val, -32601, "Method not found");
 }
 
-/// Handle vm_status: HTTP GET /api/guests, format as MCP content.
+/// Handle vm_status via IPC. HTTP handler preserved for future WebUI.
 fn handleVmStatus(gpa: std.mem.Allocator, io: std.Io, port: u16) ![]const u8 {
+    _ = port; // HTTP handlers preserved for future WebUI
+    const json = try ipc_mod.ipcStatus(io, gpa);
+    defer gpa.free(json);
+    return formatStatusMCP(gpa, json);
+}
+
+/// Format a JSON guest list string into MCP content markdown.
+fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_str, .{ .allocate = .alloc_always }) catch |err| {
+        std.log.err("[mcp] vm_status JSON parse: {}", .{err});
+        return error.StatusFailed;
+    };
+    defer parsed.deinit();
+
+    const guests = switch (parsed.value) {
+        .array => |arr| arr,
+        else => {
+            const text = try gpa.dupe(u8, "{\"text\":\"No VMs currently online.\"}");
+            return std.fmt.allocPrint(gpa, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{text});
+        },
+    };
+
+    if (guests.items.len == 0) {
+        return try gpa.dupe(u8, "{\"content\":[{\"type\":\"text\",\"text\":\"No VMs currently online.\"}]}");
+    }
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+
+    try text.appendSlice(gpa, "**UTM Virtual Machines:**\\n");
+
+    for (guests.items) |guest_val| {
+        const g = switch (guest_val) {
+            .object => |o| o,
+            else => continue,
+        };
+        const hostname = jsonGetString(g, "hostname") orelse "?";
+        const target = jsonGetString(g, "target") orelse "?";
+        const ip = jsonGetString(g, "ip") orelse "?";
+        const mac = jsonGetString(g, "mac") orelse "?";
+        const version = jsonGetString(g, "version") orelse "?";
+        const shell = jsonGetString(g, "shell") orelse "?";
+        try text.print(gpa,
+            "- **{s}** — {s} | IP: {s} | MAC: {s} | v{s} | shell: {s}\\n",
+            .{ hostname, target, ip, mac, version, if (shell.len > 0) shell else "unknown" },
+        );
+    }
+
+    const text_json = try jsonEscape(gpa, text.items);
+    defer gpa.free(text_json);
+
+    return std.fmt.allocPrint(gpa, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{text_json});
+}
+
+/// Handle vm_exec via IPC. HTTP handler preserved for future WebUI.
+fn handleVmExec(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, command: []const u8) ![]const u8 {
+    _ = port; // HTTP handlers preserved for future WebUI
+    // IPC-only — capture output in a fixed buffer
+    var output_buf: [65536]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buf);
+    const exit_code = try ipc_mod.ipcExec(io, gpa, vm, command, &output_writer);
+    return formatExecMCP(gpa, vm, command, output_writer.buffered(), exit_code);
+}
+
+/// Format exec output into MCP content markdown.
+fn formatExecMCP(gpa: std.mem.Allocator, vm: []const u8, command: []const u8, output: []const u8, exit_code: i32) ![]const u8 {
+    const trimmed = std.mem.trim(u8, output, " \n\r");
+    const esc_vm = try jsonEscape(gpa, vm);
+    defer gpa.free(esc_vm);
+    const esc_cmd = try jsonEscape(gpa, command);
+    defer gpa.free(esc_cmd);
+    const esc_out = try jsonEscape(gpa, trimmed);
+    defer gpa.free(esc_out);
+
+    if (exit_code != 0) {
+        return std.fmt.allocPrint(gpa,
+            "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** `$ {s}` (exit {d}):\\n```\\n{s}\\n```\"}}]}}",
+            .{ esc_vm, esc_cmd, exit_code, esc_out },
+        );
+    }
+
+    return std.fmt.allocPrint(gpa,
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** `$ {s}`:\\n```\\n{s}\\n```\"}}]}}",
+        .{ esc_vm, esc_cmd, esc_out },
+    );
+}
+
+// 保留备用：HTTP 处理器留存，未来 WebUI 使用
+fn handleVmStatusHttp(gpa: std.mem.Allocator, io: std.Io, port: u16) ![]const u8 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
@@ -262,8 +352,8 @@ fn handleVmStatus(gpa: std.mem.Allocator, io: std.Io, port: u16) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{text_json});
 }
 
-/// Handle vm_exec: HTTP POST /exec with {"vm":"...","command":"..."}, stream output.
-fn handleVmExec(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, command: []const u8) ![]const u8 {
+// 保留备用：HTTP 处理器留存，未来 WebUI 使用
+fn handleVmExecHttp(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, command: []const u8) ![]const u8 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 

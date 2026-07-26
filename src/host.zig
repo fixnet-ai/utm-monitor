@@ -82,7 +82,53 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
-    // Query the Host HTTP API for guest list (LSA-based discovery, v0.10.0+)
+    _ = port; // HTTP handlers preserved for future WebUI
+    const ipc_mod = @import("ipc.zig");
+
+    // IPC-only — HTTP handlers preserved for future WebUI
+    const json_str = try ipc_mod.ipcStatus(block_io, gpa);
+    defer gpa.free(json_str);
+
+    // Parse JSON and print table (same as HTTP path)
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_str, .{ .allocate = .alloc_always }) catch |err| {
+        std.debug.print("[status] JSON parse error: {}\n", .{err});
+        return err;
+    };
+    defer parsed.deinit();
+
+    const guests = switch (parsed.value) {
+        .array => |arr| arr,
+        else => {
+            std.debug.print("No UTM guests found.\n\n", .{});
+            return;
+        },
+    };
+
+    if (guests.items.len == 0) {
+        std.debug.print("No UTM guests found.\n\n", .{});
+        return;
+    }
+
+    std.debug.print("\n{s: <16} {s: <18} {s: <16} {s: <18} {s: <10} {s}\n", .{ "Hostname", "Target", "IP", "MAC", "Version", "Shell" });
+    std.debug.print("{s:-<85}\n", .{""});
+    for (guests.items) |guest_val| {
+        const g = switch (guest_val) {
+            .object => |o| o,
+            else => continue,
+        };
+        const hostname = httpd.jsonGetString(g, "hostname") orelse "?";
+        const target = httpd.jsonGetString(g, "target") orelse "?";
+        const ip = httpd.jsonGetString(g, "ip") orelse "?";
+        const mac = httpd.jsonGetString(g, "mac") orelse "?";
+        const version = httpd.jsonGetString(g, "version") orelse "?";
+        const shell = httpd.jsonGetString(g, "shell") orelse "?";
+        std.debug.print("{s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s}\n", .{ hostname, target, ip, mac, version, shell });
+    }
+    std.debug.print("\n", .{});
+}
+
+// 保留备用：HTTP 处理器留存，未来 WebUI 使用
+fn cmdStatusHttp(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
     var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
     defer client.deinit();
 
@@ -107,7 +153,6 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         return error.StatusFailed;
     }
 
-    // Parse JSON response: array of guest objects
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, resp_writer.buffered(), .{ .allocate = .alloc_always }) catch |err| {
         std.debug.print("[status] JSON parse error: {}\n", .{err});
         return err;
@@ -146,6 +191,17 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
 }
 
 fn cmdPing(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8) !void {
+    _ = port; // HTTP handlers preserved for future WebUI
+    const ipc_mod = @import("ipc.zig");
+
+    // IPC-only — HTTP handlers preserved for future WebUI
+    const json = try ipc_mod.ipcPing(block_io, gpa, target);
+    defer gpa.free(json);
+    std.debug.print("{s}\n", .{json});
+}
+
+// 保留备用：HTTP 处理器留存，未来 WebUI 使用
+fn cmdPingHttp(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8) !void {
     var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
     defer client.deinit();
 
@@ -171,7 +227,6 @@ fn cmdPing(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
     };
     defer req.deinit();
 
-    // sendBodyComplete("") for empty POST body (not sendBodiless — panics with chunked encoding)
     req.sendBodyComplete("") catch |err| {
         std.debug.print("[ping] sendBody failed: {}\n", .{err});
         return err;
@@ -190,7 +245,6 @@ fn cmdPing(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
         return error.PingFailed;
     }
 
-    // Read JSON response
     var read_buf: [4096]u8 = undefined;
     var body_buf: [4096]u8 = undefined;
     var body_reader = response.reader(&read_buf);
@@ -200,6 +254,24 @@ fn cmdPing(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
 }
 
 fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, cmd: []const u8) !void {
+    _ = port; // HTTP handlers preserved for future WebUI
+    const ipc_mod = @import("ipc.zig");
+
+    // IPC-only — HTTP handlers preserved for future WebUI
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(block_io, &stdout_buf);
+    const stdout_iface = &stdout_writer.interface;
+
+    const exit_code = try ipc_mod.ipcExec(block_io, gpa, target, cmd, stdout_iface);
+
+    if (exit_code != 0) {
+        const code: u8 = if (exit_code <= 0 or exit_code > 255) 1 else @intCast(exit_code);
+        std.process.exit(code);
+    }
+}
+
+// 保留备用：HTTP 处理器留存，未来 WebUI 使用
+fn cmdExecHttp(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, cmd: []const u8) !void {
     var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
     defer client.deinit();
 
@@ -248,46 +320,59 @@ fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
 
     // Stream response body to stdout in real-time
     var body_reader = response.reader(&transfer_buf);
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(block_io, &stdout_buf);
-    const stdout = &stdout_writer.interface;
+    var stdout_buf2: [4096]u8 = undefined;
+    var stdout_writer2 = std.Io.File.stdout().writer(block_io, &stdout_buf2);
+    const stdout2 = &stdout_writer2.interface;
 
     // Pump chunks from HTTP body to stdout until EOF
     while (true) {
-        const n = body_reader.stream(stdout, std.Io.Limit.limited(4096)) catch |err| {
+        const n = body_reader.stream(stdout2, std.Io.Limit.limited(4096)) catch |err| {
             std.debug.print("[exec] read error: {}\n", .{err});
             break;
         };
         if (n == 0) break;
-        stdout.flush() catch {};
+        stdout2.flush() catch {};
     }
-    stdout.flush() catch {};
+    stdout2.flush() catch {};
 
     // Parse x-exit-code from trailers
     var exit_code: i32 = 0;
     var trailers = response.iterateTrailers();
     while (trailers.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "x-exit-code")) {
-            exit_code = std.fmt.parseInt(i32, h.value, 10) catch 127; // default to 127 (command not found) on parse error
+            exit_code = std.fmt.parseInt(i32, h.value, 10) catch 127;
         }
     }
 
     if (exit_code != 0) {
-        // Clamp to u8: negative or >255 → exit 1, otherwise @intCast
         const code: u8 = if (exit_code <= 0 or exit_code > 255) 1 else @intCast(exit_code);
         std.process.exit(code);
     }
 }
 
 fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, local_file: []const u8) !void {
-    // Read local file
+    _ = port; // HTTP handlers preserved for future WebUI
+    const ipc_mod = @import("ipc.zig");
+
+    const basename = std.fs.path.basename(local_file);
+    const dest = try std.fmt.allocPrint(gpa, "/opt/utmm/{s}", .{basename});
+    defer gpa.free(dest);
+
+    std.debug.print("[upload] Uploading {s} -> {s} ({s})...\n", .{ local_file, target, dest });
+
+    // IPC-only — HTTP handlers preserved for future WebUI
+    try ipc_mod.ipcUpload(block_io, gpa, target, local_file, dest);
+    std.debug.print("[upload] OK\n", .{});
+}
+
+// 保留备用：HTTP 处理器留存，未来 WebUI 使用
+fn cmdUploadHttp(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, local_file: []const u8) !void {
     const file_data = std.Io.Dir.cwd().readFileAlloc(block_io, local_file, gpa, @enumFromInt(50 * 1024 * 1024)) catch |err| {
         std.debug.print("[upload] Cannot read {s}: {}\n", .{ local_file, err });
         return err;
     };
     defer gpa.free(file_data);
 
-    // Compute SHA256 hash
     var sha256_hex: [64]u8 = undefined;
     var file_hash: []const u8 = "";
     {
@@ -306,7 +391,6 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
 
     std.debug.print("[upload] Uploading {s} -> {s} ({s}) ({d} bytes, sha256={s})...\n", .{ local_file, target, dest, file_data.len, file_hash });
 
-    // HTTP POST raw binary body with x-vm, x-path, x-file-hash headers
     var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
     defer client.deinit();
 
@@ -356,7 +440,43 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
 }
 
 fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, remote_file: []const u8, local_path: []const u8) !void {
+    _ = port; // HTTP handlers preserved for future WebUI
+    const ipc_mod = @import("ipc.zig");
+
     std.debug.print("[download] Downloading {s} from {s} -> {s}...\n", .{ remote_file, target, local_path });
+
+    // IPC-only — HTTP handlers preserved for future WebUI
+    // Write to temp file first, then rename atomically
+    var rand_bytes: [8]u8 = undefined;
+    block_io.random(&rand_bytes);
+    var temp_hex: [16]u8 = undefined;
+    for (rand_bytes, 0..) |b, j| {
+        temp_hex[j * 2] = "0123456789abcdef"[b >> 4];
+        temp_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    const temp_path = try std.fmt.allocPrint(gpa, "{s}.{s}.utmm-tmp", .{ local_path, &temp_hex });
+    defer gpa.free(temp_path);
+    std.Io.Dir.cwd().deleteFile(block_io, temp_path) catch {};
+
+    const tmp_file = try std.Io.Dir.cwd().createFile(block_io, temp_path, .{});
+    defer tmp_file.close(block_io);
+    var file_wb: [65536]u8 = undefined;
+    var fw = tmp_file.writer(block_io, &file_wb);
+    const file_iface = &fw.interface;
+
+    const total_bytes = try ipc_mod.ipcDownload(block_io, gpa, target, remote_file, file_iface);
+
+    file_iface.flush() catch {};
+
+    // Atomic rename from temp to final path
+    std.Io.Dir.cwd().deleteFile(block_io, local_path) catch {};
+    try std.Io.Dir.cwd().rename(temp_path, std.Io.Dir.cwd(), local_path, block_io);
+
+    std.debug.print("[download] Received {d} bytes -> {s}\n", .{ total_bytes, local_path });
+}
+
+// 保留备用：HTTP 处理器留存，未来 WebUI 使用
+fn cmdDownloadHttp(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, remote_file: []const u8, local_path: []const u8) !void {
 
     // HTTP POST with x-vm and x-path headers, stream raw binary response to file
     var client: std.http.Client = .{ .allocator = gpa, .io = block_io };
@@ -640,19 +760,30 @@ fn startHttpHost(
     // Must spawn before the defer below so join() runs in correct order.
     var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ gpa, &state, &mesh_opt });
 
+    // Spawn IPC server thread — Unix domain socket (POSIX) / named pipe (Windows).
+    // Shares HostState and Mesh with the HTTP server.
+    var ipc_shutdown = std.atomic.Value(bool).init(false);
+    const ipc_mod = @import("ipc.zig");
+    var ipc_thread = try std.Thread.spawn(.{}, ipc_mod.startServer, .{
+        block_io, gpa, @as(*anyopaque, @ptrCast(&state)), @as(*anyopaque, @ptrCast(&mesh_opt)), &ipc_shutdown,
+    });
+
     defer {
-        // 1. Signal shutdown — tunnelManager checks this each loop iteration
+        // 1. Signal IPC server to stop — unblock accept loop
+        ipc_shutdown.store(true, .release);
+        // 2. Signal mesh shutdown — tunnelManager checks this each loop iteration
         if (mesh_opt) |*m| m.signalShutdown();
 
-        // 2. Join tunnel manager (may wait up to 5s for sleep cycle)
+        // 3. Join threads (order: IPC → tunnel mgr → mesh)
+        ipc_thread.join();
         tun_mgr_thread.join();
 
-        // 3. Join mesh thread after all consumers have exited
+        // 4. Join mesh thread after all consumers have exited
         if (mesh_thread) |t| {
             t.join();
         }
 
-        // 4. Deinit mesh (safe: all threads using it have exited)
+        // 5. Deinit mesh (safe: all threads using it have exited)
         if (mesh_opt) |*m| {
             const m_io = m.io;
             m.deinit();
@@ -660,7 +791,7 @@ fn startHttpHost(
             _ = m_io;
         }
 
-        // 5. state.deinit() runs via its own defer (declared earlier, runs later)
+        // 6. state.deinit() runs via its own defer (declared earlier, runs later)
     }
 
     // Block forever in HTTP accept loop
