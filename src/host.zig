@@ -13,6 +13,7 @@ const broadcast = @import("broadcast.zig");
 const mesh_mod = @import("mesh.zig");
 const tunnel_mod = @import("tunnel.zig");
 const tunproto = @import("tunproto.zig");
+const svc = @import("svc.zig");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     return runWithIo(init.io, init.gpa, cli, null);
@@ -576,6 +577,7 @@ fn startHttpHost(
         state.mesh = @ptrCast(@alignCast(&mesh_opt.?));
 
         std.log.info("[host] Mesh networking started (LSA on UDP :{d})", .{mesh_port});
+        svc.resetRetryCounter(block_io, gpa, .host);
     }
 
     // Spawn tunnel manager thread — syncs LSA→guest table, connects tunnels.

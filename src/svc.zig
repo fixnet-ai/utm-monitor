@@ -790,10 +790,17 @@ pub fn ensure(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_arg
 // macOS retry counter — prevents infinite restart loops
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Check restart count on macOS. If we've restarted >= 3 times,
-/// exit(0) so launchd stops restarting us.
-/// Uses a simple counter file — resetRetryCounter() clears it after
-/// the service runs successfully.
+/// Check restart count on macOS. If we've restarted >= 3 times within a
+/// short window, exit(0) so launchd stops restarting us.
+///
+/// Purpose: prevent infinite crash loops (service crashes on start →
+/// launchd restarts → crashes again → …). The counter is scoped to a time
+/// window: if the counter file is older than 120 seconds, the service
+/// ran successfully for a while (or was killed intentionally — e.g.
+/// upgrade, kickstart), so the counter resets to 1.
+///
+/// Call resetRetryCounter() after the service fully initializes (mesh up,
+/// HTTP serving) to clear hot-restart state.
 pub fn checkRetryLimit(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) void {
     if (builtin.os.tag != .macos) return;
 
@@ -801,12 +808,29 @@ pub fn checkRetryLimit(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) 
     defer alloc.free(retry_path);
 
     var count: u32 = 0;
+    var should_reset: bool = false;
 
-    // Read existing counter
-    if (std.Io.Dir.cwd().readFileAlloc(io, retry_path, alloc, std.Io.Limit.limited(1024))) |content| {
-        defer alloc.free(content);
-        count = std.fmt.parseInt(u32, std.mem.trim(u8, content, " \n\r"), 10) catch 0;
+    // Read existing counter with time-window check
+    if (std.Io.Dir.cwd().statFile(io, retry_path, .{})) |st| {
+        // If the counter file is older than 120 seconds, the previous run
+        // ran successfully for a meaningful interval — this isn't a crash
+        // loop. Reset the count so intentional restarts (upgrade, testing)
+        // aren't penalized.
+        const now = std.Io.Timestamp.now(io, .awake);
+        const age_ns: i96 = now.nanoseconds - st.mtime.nanoseconds;
+        if (age_ns > 120 * std.time.ns_per_s) {
+            should_reset = true;
+        }
+        if (std.Io.Dir.cwd().readFileAlloc(io, retry_path, alloc, std.Io.Limit.limited(1024))) |content| {
+            defer alloc.free(content);
+            count = std.fmt.parseInt(u32, std.mem.trim(u8, content, " \n\r"), 10) catch 0;
+        } else |_| {}
     } else |_| {}
+
+    if (should_reset) {
+        count = 0;
+        std.log.info("[svc] retry counter stale (>{d}s), resetting", .{120});
+    }
 
     count += 1;
 

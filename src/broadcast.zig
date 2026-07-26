@@ -9,6 +9,7 @@ const protocol = @import("protocol.zig");
 const tunnel_mod = @import("tunnel.zig");
 const tunproto = @import("tunproto.zig");
 const mesh_mod = @import("mesh.zig");
+const svc = @import("svc.zig");
 
 /// Shared signal between udpDiscoveryListener (background thread) and
 /// wsAnnounceLoop (main thread). When the UDP listener detects a version
@@ -1076,6 +1077,7 @@ pub fn meshSessionLoop(
         };
 
         std.log.info("[guest-mesh] Mesh networking started (LSA on UDP :{d})", .{mesh_port});
+        svc.resetRetryCounter(io, allocator, .guest);
     }
 
     defer {
