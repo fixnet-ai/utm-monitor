@@ -13,6 +13,7 @@ const host_mod = @import("host.zig");
 const broadcast = @import("broadcast.zig");
 const svc = @import("svc.zig");
 const fail = @import("fail.zig");
+const mcp = @import("mcp.zig");
 
 comptime {
     _ = @import("hosts_file.zig");
@@ -21,6 +22,8 @@ comptime {
     _ = @import("mesh.zig");
     _ = @import("tunnel.zig");
     _ = @import("tunproto.zig");
+    _ = @import("lock.zig");
+    _ = @import("mcp.zig");
     _ = svc;
     _ = fail;
 }
@@ -331,7 +334,7 @@ pub fn main(init: std.process.Init) !void {
     // Auto-start it if not running so users and AI agents can go directly
     // from "utmm --exec vm cmd" without a separate "utmm --host" step.
     const needs_host = cli.is_host or cli.cmd_status or cli.cmd_exec
-        or cli.cmd_upload or cli.cmd_download;
+        or cli.cmd_upload or cli.cmd_download or cli.is_mcp;
     if (needs_host) {
         const was_running = svc.isRunning(init.io, init.gpa, .host);
         var extra_args = try buildServiceArgs(init.gpa, cli);
@@ -340,7 +343,7 @@ pub fn main(init: std.process.Init) !void {
         // --host alone (no management command): ensure + exit
         if (cli.is_host and !cli.cmd_status and !cli.cmd_exec
             and !cli.cmd_upload and !cli.cmd_download
-            and !cli.cmd_gen_init and !cli.save_config) {
+            and !cli.cmd_gen_init and !cli.save_config and !cli.is_mcp) {
             return;
         }
         // If the service was just started, give it time to bind the HTTP port
@@ -358,9 +361,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // ── 9. --mcp alone: redirect ──
+    // ── 9. --mcp: stdio MCP server (Host service already ensured above) ──
     if (cli.is_mcp) {
-        std.log.info("[main] --mcp deprecated; MCP available via --host on port 2121", .{});
+        try mcp.run(init.io, init.gpa, cli.port);
         return;
     }
 

@@ -11,6 +11,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const fail = @import("fail.zig");
+const lock = @import("lock.zig");
 
 /// POSIX canonical install path.
 pub const CANONICAL_PATH_POSIX = "/opt/utmm/utmm";
@@ -450,8 +451,13 @@ fn uninstallServiceConfig(io: std.Io, alloc: std.mem.Allocator, role: ServiceRol
     }
 }
 
-/// Uninstall service: stop, remove config, delete binary.
+/// Uninstall service: acquire lock, stop, remove config, delete binary.
 pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
+    lock.acquire(io, alloc) catch |err| {
+        fail.err("uninstall/lock", err);
+    };
+    defer lock.release(io);
+
     // Stop and remove all service names (current + legacy)
     switch (builtin.os.tag) {
         .macos => {
@@ -705,7 +711,18 @@ fn copyFile(io: std.Io, alloc: std.mem.Allocator, src_path: []const u8, dst_path
 /// Stops any running service, kills all utmm processes, copies self to
 /// canonical path, registers service config, and starts the service.
 /// Fail-fast: any unexpected error calls fail() and does not return.
+/// Force-install the service (public entry point, acquires singleton lock).
+/// Called from main.zig --install path.
 pub fn forceInstall(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) void {
+    lock.acquire(io, alloc) catch |err| {
+        fail.err("forceInstall/lock", err);
+    };
+    defer lock.release(io);
+    forceInstallInternal(io, alloc, role, extra_args);
+}
+
+/// Force-install without acquiring the lock (caller must hold it).
+fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) void {
     const name = svcName(role);
     const dest_path = canonicalPath();
     std.log.info("[svc] force installing {s}...", .{name});
@@ -753,7 +770,7 @@ pub fn forceInstall(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, ext
 
 /// Ensure the service is installed and running.
 /// If already running: log and return.
-/// If not running: call forceInstall.
+/// If not running: acquire singleton lock, then call forceInstallInternal.
 pub fn ensure(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) void {
     const name = svcName(role);
     if (isRunning(io, alloc, role)) {
@@ -761,8 +778,12 @@ pub fn ensure(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_arg
         std.debug.print("utmm {s} service is running.\n", .{if (role == .host) "host" else "guest"});
         return;
     }
-    std.log.info("[svc] {s} service not running — force installing...", .{name});
-    forceInstall(io, alloc, role, extra_args);
+    std.log.info("[svc] {s} service not running — acquiring lock...", .{name});
+    lock.acquire(io, alloc) catch |err| {
+        fail.err("ensure/lock", err);
+    };
+    defer lock.release(io);
+    forceInstallInternal(io, alloc, role, extra_args);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

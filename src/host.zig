@@ -1,6 +1,6 @@
 //! Host mode — unified HTTP server on port 2121.
 //!
-//! Single std.http.Server replaces UDP broadcast + TCP binary frames + MCP :2121.
+//! Single std.http.Server replaces UDP broadcast + TCP binary frames on port 2121.
 //! Management commands (--status/--exec/--upload/--download) are HTTP clients.
 
 const std = @import("std");
@@ -12,6 +12,7 @@ const httpd = @import("httpd.zig");
 const broadcast = @import("broadcast.zig");
 const mesh_mod = @import("mesh.zig");
 const tunnel_mod = @import("tunnel.zig");
+const tunproto = @import("tunproto.zig");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     return runWithIo(init.io, init.gpa, cli, null);
@@ -467,7 +468,6 @@ fn startHttpHost(
     // Guest discovery now via mesh LSA — /announce and /ws removed
     try router.add(gpa, .GET, "/bin/", httpd.handleBin);
     try router.add(gpa, .GET, "/version", httpd.handleVersion);
-    try router.add(gpa, .POST, "/mcp", httpd.handleMcp);
     try router.add(gpa, .GET, "/", httpd.handleRoot);
 
     // Initialize shared state (guest table + pending commands)
@@ -543,7 +543,7 @@ fn startHttpHost(
             break :start_mesh;
         };
 
-        // Build node_info for LSA
+        // Build node_info for LSA (Mesh.init() appends epoch internally)
         const node_info = std.fmt.allocPrint(gpa,
             "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:host\nstatus:serving",
             .{ host_info.hostname, host_info.ip, host_info.target, protocol.VERSION, host_info.shell },
@@ -554,7 +554,7 @@ fn startHttpHost(
             break :start_mesh;
         };
 
-        // Create mesh instance
+        // Create mesh instance (epoch is auto-appended to node_info by init())
         mesh_opt = mesh_mod.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, &upgrade_signal.needed, bc_addrs, "") catch |err| {
             std.log.err("[host] Mesh init failed: {}", .{err});
             gpa.free(node_info);
@@ -743,60 +743,70 @@ fn tunnelManager(
                     break :blk found;
                 } else false;
 
-                if (tun_dead or status_just_changed or guest_session_available) {
+                // Note: guest_session_available is intentionally NOT a trigger
+                // for tunnel replacement during normal operation. When the Host
+                // restarts and creates a fresh session via m.connect(), the
+                // Guest's old keepalive session (different conv) is harmless and
+                // will expire via KCP keepalive timeout. Including it here causes
+                // an infinite tunnel-recreate loop: m.connect() → detect old
+                // keepalive → replace → m.connect() again → ...
+                if (tun_dead or status_just_changed) {
                     if (!tun_dead) {
                         std.log.info("[tun-mgr] {s} tunnel replace (dead={}, upgrading={}, guestSession={})", .{ hostname, tun_dead, status_just_changed, guest_session_available });
                         state.removeGuestTunnel(hostname);
                     }
 
-                    // Always prefer a Guest-initiated session to avoid the
-                    // dual-session mismatch that causes exec hangs.
+                    // For upgrading guests: search for a Guest-initiated session
+                    // with upgrade_req data pending. This is the only case where
+                    // we need the Guest's session — the Guest creates it during
+                    // the upgrade handshake with a conv that differs from the
+                    // Host's m.connect() conv.
                     //
-                    // Host and Guest each call m.connect() with their own
-                    // nonce+connect_counter, producing different conv IDs.
-                    // If handleMeshGuest uses the Host-created session but
-                    // the Guest sends data on its own session, output never
-                    // reaches the Host — the two sessions operate independently.
-                    //
-                    // Solution: search sessions table for one whose `remote`
-                    // matches this Guest. This is the session created by
-                    // handleKcpData when the Guest's first KCP packet arrived.
-                    //
-                    // For upgrading guests: only accept sessions with pending
-                    // data (upgrade_req). Stale sessions from the previous
-                    // Guest instance have no data and are skipped.
+                    // For normal (re)connection — including after Host restart —
+                    // always use m.connect() to create a fresh Host-initiated
+                    // session. The Guest will respond on this same conv, so
+                    // there is no dual-session mismatch. Old keepalive-probe
+                    // sessions from the previous Host epoch have different convs
+                    // and are harmless — they are never selected by tunnelManager
+                    // and expire via KCP keepalive timeout (~15 s).
                     var sess: ?*mesh_mod.MeshSession = null;
-                    {
-                        m.sessions_mutex.lock(m.io) catch continue;
-                        defer m.sessions_mutex.unlock(m.io);
+                    if (upgrading) {
+                        {
+                            m.sessions_mutex.lock(m.io) catch continue;
+                            defer m.sessions_mutex.unlock(m.io);
 
-                        var s_it = m.sessions.iterator();
-                        while (s_it.next()) |s_entry| {
-                            if (std.mem.eql(u8, &s_entry.value_ptr.*.remote, &saved_node_id)) {
-                                if (upgrading and s_entry.value_ptr.*.kcp_inst.peekSize() < 0) {
-                                    std.log.info("[tun-mgr] {s} skipping stale session conv={d} (no data)", .{ hostname, s_entry.key_ptr.* });
-                                    continue;
+                            var s_it = m.sessions.iterator();
+                            while (s_it.next()) |s_entry| {
+                                if (std.mem.eql(u8, &s_entry.value_ptr.*.remote, &saved_node_id)) {
+                                    if (s_entry.value_ptr.*.kcp_inst.peekSize() < 0) {
+                                        std.log.info("[tun-mgr] {s} skipping stale session conv={d} (no data)", .{ hostname, s_entry.key_ptr.* });
+                                        continue;
+                                    }
+                                    sess = s_entry.value_ptr.*;
+                                    std.log.info("[tun-mgr] {s} using guest-initiated session conv={d}", .{ hostname, s_entry.key_ptr.* });
+                                    break;
                                 }
-                                sess = s_entry.value_ptr.*;
-                                std.log.info("[tun-mgr] {s} using guest-initiated session conv={d}", .{ hostname, s_entry.key_ptr.* });
-                                break;
                             }
                         }
-                    }
-
-                    if (sess == null) {
-                        if (upgrading) {
-                            // Upgrading Guest hasn't sent upgrade_req yet — wait
-                            continue;
-                        }
-                        // No Guest-initiated session yet — create Host-initiated
-                        // session as fallback. The Guest may still connect later;
-                        // when it does, the next tunnelManager scan will replace
-                        // this session with the Guest-initiated one.
+                    } else {
+                        // Normal reconnect — create fresh Host-initiated session.
+                        // This avoids the dual-session mismatch (Finding 93) that
+                        // occurs when tunnelManager picks an old keepalive session
+                        // instead of a session the Guest actually listens on.
                         sess = m.connect(saved_node_id) catch |err| {
                             std.log.err("[tun-mgr] connect to {s} failed: {} (will retry)", .{ hostname, err });
                             continue;
                         };
+                    }
+
+                    if (sess == null) {
+                        if (upgrading) {
+                            // Upgrading Guest hasn't sent upgrade_req yet — wait.
+                            continue;
+                        }
+                        // Should not reach here: non-upgrading always has a
+                        // session from m.connect() above.
+                        continue;
                     }
                     const tun_ptr = allocator.create(tunnel_mod.Tunnel) catch continue;
                     tun_ptr.* = tunnel_mod.Tunnel.init(allocator, m.io, sess.?);
@@ -808,6 +818,18 @@ fn tunnelManager(
                         allocator.destroy(tun_ptr);
                         continue;
                     };
+
+                    // Send pty_spawn to trigger the Guest's pty shell creation.
+                    // Without this, the Guest waits for the first pty_exec_input
+                    // as an implicit spawn trigger — but keepalive probes (0xFF)
+                    // may arrive first, delaying the spawn detection.
+                    const spawn_frame = tunproto.buildPtySpawn(allocator) catch null;
+                    if (spawn_frame) |sf| {
+                        defer allocator.free(sf);
+                        _ = tun_ptr.send(sf) catch {};
+                        tun_ptr.flush(m.clock_ms);
+                        std.log.info("[tun-mgr] pty_spawn sent to {s}", .{hostname});
+                    }
 
                     // Spawn per-guest handler thread
                     const hostname_dup = allocator.dupe(u8, hostname) catch {

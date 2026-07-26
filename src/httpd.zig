@@ -187,7 +187,7 @@ pub const HostState = struct {
     /// Used for upload/download singleton deduplication.
     transfers: std.StringHashMap(TransferState),
     /// Wake event: set when any OpState completes (marker found or completeOpState called).
-    /// HTTP/MCP handlers wait on this instead of busy-polling takeOpResult.
+    /// HTTP handlers wait on this instead of busy-polling takeOpResult.
     wake_event: std.Io.Event = .unset,
     allocator: std.mem.Allocator,
     /// I/O instance for network operations (shared across threads).
@@ -486,7 +486,7 @@ pub const HostState = struct {
 
         op.exit_code = ec;
         op.done = true;
-        // Wake HTTP/MCP handlers waiting on takeOpResult
+        // Wake HTTP handlers waiting on takeOpResult
         self.wake_event.set(self.io.?);
     }
 
@@ -644,7 +644,7 @@ pub const HostState = struct {
     }
 
     /// Fail all pending operations (called on guest disconnect).
-    /// Wakes all HTTP/MCP handlers waiting on wake_event so they
+    /// Wakes all HTTP handlers waiting on wake_event so they
     /// can return errors instead of blocking forever.
     pub fn failAllPendingOps(self: *HostState) void {
         self.mutex.lock(self.io.?) catch return;
@@ -677,7 +677,7 @@ pub const HandlerFn = *const fn (
 
 const Route = struct {
     method: http.Method,
-    /// Path prefix match (e.g. "/mcp", "/announce", "/bin/")
+    /// Path prefix match (e.g. "/exec", "/bin/", "/api/guests")
     path: []const u8,
     handler: HandlerFn,
 };
@@ -844,232 +844,6 @@ fn handleConnection(ctx: *ConnCtx) void {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MCP JSON-RPC (曾 mcp.zig)
-// ═══════════════════════════════════════════════════════════════════════════
-
-const SERVER_INFO =
-    \\{"protocolVersion":"2024-11-05",
-    \\"serverInfo":{"name":"utmm","version":"__VERSION__"},
-    \\"capabilities":{"tools":{}}}
-;
-
-const TOOLS_JSON =
-    \\[{"name":"vm_status","description":"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check vm_status first to see each VM's shell type, then write compatible commands.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)"}},"required":["vm","command"]}}]
-;
-
-/// Build vm_status result from HostState guest table.
-fn mcpHandleVmStatus(allocator: std.mem.Allocator, state: *HostState) ![]const u8 {
-    state.mutex.lock(state.io.?) catch |e| return e;
-    defer state.mutex.unlock(state.io.?);
-
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(allocator);
-
-    if (state.guests.items.len == 0) {
-        return try allocator.dupe(u8, "{\"text\":\"No VMs currently online.\"}");
-    }
-
-    try text.appendSlice(allocator, "**UTM Virtual Machines:**\\n");
-
-    for (state.guests.items) |g| {
-        try text.print(allocator,
-            "- **{s}** — {s} | IP: {s} | MAC: {s} | v{s} | shell: {s}\\n",
-            .{ g.hostname, g.target, g.ip, g.mac, g.version, if (g.shell.len > 0) g.shell else "unknown" },
-        );
-    }
-
-    const text_json = try jsonEscape(allocator, text.items);
-    defer allocator.free(text_json);
-
-    var result: std.ArrayList(u8) = .empty;
-    try result.print(allocator, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{text_json});
-    return result.toOwnedSlice(allocator);
-}
-
-/// Handle vm_exec via pty model: build pty_input, enqueue frame, poll for marker.
-fn mcpHandleVmExec(allocator: std.mem.Allocator, state: *HostState, vm: []const u8, command: []const u8) ![]const u8 {
-    // Check guest exists and get shell type (block-scoped lock to avoid
-    // self-deadlock with internal locking in createOpState/getGuestTunnel).
-    const guest_shell = blk: {
-        state.mutex.lock(state.io.?) catch |e| return e;
-        defer state.mutex.unlock(state.io.?);
-        for (state.guests.items) |g| {
-            if (std.mem.eql(u8, g.hostname, vm)) break :blk try allocator.dupe(u8, g.shell);
-        }
-        return error.GuestNotFound;
-    };
-    defer allocator.free(guest_shell);
-
-    // Generate unique cmd_id
-    const cmd_id = blk: {
-        const ts = std.Io.Timestamp.now(state.io.?, .real).nanoseconds;
-        break :blk try std.fmt.allocPrint(allocator, "mcp_{d}", .{ts});
-    };
-    defer allocator.free(cmd_id);
-
-    // Build pty_input frame with shell-appropriate marker
-    const cmd_with_marker = try buildCmdWithMarker(allocator, guest_shell, command);
-    defer allocator.free(cmd_with_marker);
-
-    const frame = try tunproto.buildPtyExecInput(allocator, cmd_id, cmd_with_marker);
-    defer allocator.free(frame);
-
-    try state.createOpState(cmd_id);
-
-    const tun = state.getGuestTunnel(vm) orelse {
-        return error.GuestNotConnected;
-    };
-    _ = tun.send(frame) catch {
-        return error.TunnelSendFailed;
-    };
-
-    // Wait for result — woken by mesh handler thread via wake_event
-    while (true) {
-        if (state.takeOpResult(cmd_id)) |result| {
-            defer allocator.free(result.stdout);
-
-            const trimmed = std.mem.trim(u8, result.stdout, " \n\r");
-            const esc_vm = try jsonEscape(allocator, vm);
-            defer allocator.free(esc_vm);
-            const esc_cmd = try jsonEscape(allocator, command);
-            defer allocator.free(esc_cmd);
-            const esc_out = try jsonEscape(allocator, trimmed);
-            defer allocator.free(esc_out);
-
-            var buf: std.ArrayList(u8) = .empty;
-            try buf.print(allocator,
-                "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** `$ {s}`:\\n```\\n{s}\\n```\"}}]}}",
-                .{ esc_vm, esc_cmd, esc_out },
-            );
-            return buf.toOwnedSlice(allocator);
-        }
-        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(30), .clock = .awake } }) catch {
-            return error.ExecTimeout;
-        };
-        state.wake_event.reset();
-    }
-}
-
-/// Process a raw JSON-RPC request string using HostState, return JSON-RPC response.
-/// Called from the unified HTTP server's /mcp endpoint.
-pub fn processJsonRpcWithState(
-    allocator: std.mem.Allocator,
-    state: *HostState,
-    json_str: []const u8,
-) ![]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{ .allocate = .alloc_always }) catch |err| {
-        return jsonBuildError(allocator, .{ .null = {} }, -32700, @errorName(err));
-    };
-    defer parsed.deinit();
-
-    const root = parsed.value;
-    const obj = switch (root) {
-        .object => |o| o,
-        else => return jsonBuildError(allocator, .{ .null = {} }, -32600, "Invalid Request"),
-    };
-
-    const method_raw = jsonGetString(obj, "method") orelse
-        return jsonBuildError(allocator, .{ .null = {} }, -32600, "Missing method");
-
-    const id_val = if (obj.get("id")) |v| v else std.json.Value{ .null = {} };
-    const is_notification = switch (id_val) {
-        .null => true,
-        else => false,
-    };
-
-    const method = try allocator.dupe(u8, method_raw);
-    defer allocator.free(method);
-
-    if (std.mem.eql(u8, method, "initialize")) {
-        var info: std.ArrayList(u8) = .empty;
-        defer info.deinit(allocator);
-        var iter = std.mem.splitSequence(u8, SERVER_INFO, "__VERSION__");
-        var first = true;
-        while (iter.next()) |part| {
-            if (!first) try info.appendSlice(allocator, protocol.VERSION);
-            try info.appendSlice(allocator, part);
-            first = false;
-        }
-        return jsonBuildResponse(allocator, id_val, info.items);
-    }
-
-    if (std.mem.eql(u8, method, "notifications/initialized")) {
-        if (is_notification) return allocator.dupe(u8, "");
-        return jsonBuildResponse(allocator, id_val, "{}");
-    }
-
-    if (std.mem.eql(u8, method, "ping")) {
-        return jsonBuildResponse(allocator, id_val, "{}");
-    }
-
-    if (std.mem.eql(u8, method, "tools/list")) {
-        var tools: std.ArrayList(u8) = .empty;
-        defer tools.deinit(allocator);
-        try tools.appendSlice(allocator, "{\"tools\":");
-        var iter = std.mem.splitSequence(u8, TOOLS_JSON, "__VERSION__");
-        var first = true;
-        while (iter.next()) |part| {
-            if (!first) try tools.appendSlice(allocator, protocol.VERSION);
-            try tools.appendSlice(allocator, part);
-            first = false;
-        }
-        try tools.appendSlice(allocator, "}");
-        return jsonBuildResponse(allocator, id_val, tools.items);
-    }
-
-    if (std.mem.eql(u8, method, "tools/call")) {
-        const params = jsonGetNestedObject(obj, "params") orelse {
-            if (is_notification) return allocator.dupe(u8, "");
-            return jsonBuildError(allocator, id_val, -32602, "Missing params");
-        };
-
-        const tool_name = jsonGetString(params, "name") orelse {
-            if (is_notification) return allocator.dupe(u8, "");
-            return jsonBuildError(allocator, id_val, -32602, "Missing tool name");
-        };
-
-        const args = jsonGetNestedObject(params, "arguments");
-
-        if (std.mem.eql(u8, tool_name, "vm_status")) {
-            const result = mcpHandleVmStatus(allocator, state) catch |err| {
-                if (is_notification) return allocator.dupe(u8, "");
-                return jsonBuildError(allocator, id_val, -32603, @errorName(err));
-            };
-            defer allocator.free(result);
-            return jsonBuildResponse(allocator, id_val, result);
-        }
-
-        if (std.mem.eql(u8, tool_name, "vm_exec")) {
-            if (args == null) {
-                if (is_notification) return allocator.dupe(u8, "");
-                return jsonBuildError(allocator, id_val, -32602, "Missing arguments: vm, command");
-            }
-            const vm = jsonGetString(args.?, "vm") orelse {
-                if (is_notification) return allocator.dupe(u8, "");
-                return jsonBuildError(allocator, id_val, -32602, "Missing argument: vm");
-            };
-            const command = jsonGetString(args.?, "command") orelse {
-                if (is_notification) return allocator.dupe(u8, "");
-                return jsonBuildError(allocator, id_val, -32602, "Missing argument: command");
-            };
-            const result = mcpHandleVmExec(allocator, state, vm, command) catch |err| {
-                if (is_notification) return allocator.dupe(u8, "");
-                return jsonBuildError(allocator, id_val, -32603, @errorName(err));
-            };
-            defer allocator.free(result);
-            return jsonBuildResponse(allocator, id_val, result);
-        }
-
-        if (is_notification) return allocator.dupe(u8, "");
-        return jsonBuildError(allocator, id_val, -32601, "Unknown tool");
-    }
-
-    if (is_notification) return allocator.dupe(u8, "");
-    return jsonBuildError(allocator, id_val, -32601, "Method not found");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // HTTP endpoint handlers
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1123,11 +897,42 @@ fn respondJson(request: *http.Server.Request, json: []const u8) !void {
 }
 
 /// Respond with a simple text error.
+/// Safely handles both pre-body-read (reader in .received_head) and post-body-read
+/// states. In the pre-body-read case, uses a direct write to avoid discardBody's
+/// assert on missing Content-Length for POST requests.
 fn respondError(request: *http.Server.Request, status: http.Status, message: []const u8) !void {
+    // If the reader is still in .received_head state and this is a POST request
+    // without transfer-encoding or content-length, request.respond() would call
+    // discardBody() which asserts → unreachable panic. Use the direct path instead.
+    if (request.server.reader.state == .received_head and
+        request.head.method.requestHasBody() and
+        request.head.transfer_encoding == .none and
+        request.head.content_length == null)
+    {
+        return respondErrorDirect(request, status, message);
+    }
     try request.respond(message, .{
         .status = status,
         .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain" }},
     });
+}
+
+/// Respond with an HTTP error bypassing request.respond()'s discardBody assert.
+/// Use this ONLY when the request body could not be read (e.g. missing Content-Length),
+/// because calling request.respond() would trigger discardBody() → assert → unreachable panic.
+/// Writes directly to the server output and sets reader state to .closing to prevent
+/// subsequent response attempts.
+fn respondErrorDirect(request: *http.Server.Request, status: http.Status, message: []const u8) !void {
+    const phrase = status.phrase() orelse "";
+    const out = request.server.out;
+    try out.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(status), phrase });
+    try out.writeAll("connection: close\r\n");
+    try out.print("content-length: {d}\r\n", .{message.len});
+    try out.writeAll("Content-Type: text/plain\r\n\r\n");
+    try out.writeAll(message);
+    try out.flush();
+    // Prevent further response attempts on this connection.
+    request.server.reader.state = .closing;
 }
 
 // ── POST /exec ────────────────────────────────────────────────────────────
@@ -1136,7 +941,7 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *HostState, request: *htt
     _ = body;
     const body_str = readBody(allocator, request) catch |err| {
         std.log.err("[exec] readBody failed: {}", .{err});
-        try respondError(request, .bad_request, "Missing body");
+        try respondErrorDirect(request, .bad_request, "Missing body");
         return;
     };
     defer allocator.free(body_str);
@@ -1276,7 +1081,7 @@ pub fn handleExec(allocator: std.mem.Allocator, state: *HostState, request: *htt
         if (done) break;
 
         // Wait for more data
-        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(5), .clock = .awake } }) catch break;
+        state.wake_event.waitTimeout(state.io.?, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(10), .clock = .awake } }) catch break;
         state.wake_event.reset();
     }
 
@@ -1644,23 +1449,6 @@ pub fn handleRoot(allocator: std.mem.Allocator, state: *HostState, request: *htt
         .status = .ok,
         .extra_headers = &.{.{ .name = "Content-Type", .value = "text/html; charset=utf-8" }},
     });
-}
-
-// ── POST /mcp ──────────────────────────────────────────────────────────────
-
-pub fn handleMcp(allocator: std.mem.Allocator, state: *HostState, request: *http.Server.Request, body: ?[]const u8) !void {
-    _ = body;
-    const body_str = readRawBody(allocator, request, 65536) catch |err| {
-        std.log.err("[mcp] readBody failed: {}", .{err});
-        try respondError(request, .bad_request, "Missing body");
-        return;
-    };
-    defer allocator.free(body_str);
-
-    const result = try processJsonRpcWithState(allocator, state, body_str);
-    defer allocator.free(result);
-
-    try respondJson(request, result);
 }
 
 // ── Mesh guest handler (tunnel per guest) ───────────────────────────────────
@@ -2412,65 +2200,3 @@ test "DEFAULT_PORT is 2121" {
     try std.testing.expectEqual(@as(u16, 2121), DEFAULT_PORT);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// MCP tests (曾 mcp.zig)
-// ═══════════════════════════════════════════════════════════════════════════
-
-test "mcp jsonAppendId - null" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try jsonAppendId(&list, std.testing.allocator, .{ .null = {} });
-    try std.testing.expectEqualStrings("null", list.items);
-}
-
-test "mcp jsonAppendId - integer" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try jsonAppendId(&list, std.testing.allocator, .{ .integer = 42 });
-    try std.testing.expectEqualStrings("42", list.items);
-}
-
-test "mcp jsonAppendId - string" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try jsonAppendId(&list, std.testing.allocator, .{ .string = "abc" });
-    try std.testing.expectEqualStrings("\"abc\"", list.items);
-}
-
-test "mcp jsonAppendId - bool true" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try jsonAppendId(&list, std.testing.allocator, .{ .bool = true });
-    try std.testing.expectEqualStrings("true", list.items);
-}
-
-test "mcp jsonAppendId - bool false" {
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(std.testing.allocator);
-    try jsonAppendId(&list, std.testing.allocator, .{ .bool = false });
-    try std.testing.expectEqualStrings("false", list.items);
-}
-
-test "mcp jsonGetString - present" {
-    var map: std.json.ObjectMap = .empty;
-    defer map.deinit(std.testing.allocator);
-    try map.put(std.testing.allocator, "key", .{ .string = "value" });
-    const result = jsonGetString(map, "key");
-    try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("value", result.?);
-}
-
-test "mcp jsonGetString - missing" {
-    var map: std.json.ObjectMap = .empty;
-    defer map.deinit(std.testing.allocator);
-    const result = jsonGetString(map, "nope");
-    try std.testing.expect(result == null);
-}
-
-test "mcp jsonGetString - wrong type" {
-    var map: std.json.ObjectMap = .empty;
-    defer map.deinit(std.testing.allocator);
-    try map.put(std.testing.allocator, "key", .{ .integer = 42 });
-    const result = jsonGetString(map, "key");
-    try std.testing.expect(result == null);
-}

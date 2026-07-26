@@ -149,7 +149,7 @@ httpd.zig:1265 → wake_event.waitTimeout()
 httpd.zig:699 → dispatch → handleExec
 ```
 
-**修复**：从 `handleMeshGuest` 的 4 处 `set()+reset()` 中移除 `reset()`。`reset()` 仅在等待线程（`handleExec`/`handleDownload`/`mcpHandleVmExec`）的 `waitTimeout()` 返回后调用。
+**修复**：从 `handleMeshGuest` 的 4 处 `set()+reset()` 中移除 `reset()`。`reset()` 仅在等待线程（`handleExec`/`handleDownload`/`mcpHandleVmExec`[已移除，Phase 53]）的 `waitTimeout()` 返回后调用。
 
 ### Finding 77: `cleanupOpState` 自死锁（Critical）
 

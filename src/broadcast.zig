@@ -866,6 +866,15 @@ fn ptyReadLoop(
     var buf: [4096]u8 = undefined;
 
     while (true) {
+        // Check for shutdown signal from main thread (e.g. tunnel died).
+        // Without this, the main thread's pty_dead.store(true) + close(fd)
+        // has a race with sendAndFlush: if the pty output thread is stalled
+        // in sendAndFlush (waiting on sessions_mutex), closing the fd won't
+        // wake it. The signaled flag provides a guaranteed exit path.
+        if (pty_dead.load(.acquire)) {
+            std.log.info("[guest-pty] pty_dead signaled, exiting", .{});
+            break;
+        }
         // POSIX: poll master_fd with 100ms timeout to check pty_dead
         if (builtin.os.tag != .windows) {
             var fds: [1]std.posix.pollfd = .{
@@ -1102,6 +1111,7 @@ pub fn meshSessionLoop(
         }
 
         // Wait for Host to establish a KCP tunnel and send pty_spawn
+        std.log.info("[guest-mesh] Entering waitForHostTunnel...", .{});
         var tunnel = waitForHostTunnel(io, allocator, &mesh_opt) catch |err| {
             std.log.err("[guest-mesh] waitForHostTunnel failed: {}", .{err});
             continue;
@@ -1136,20 +1146,21 @@ pub fn meshSessionLoop(
                     continue;
                 }
                 if (n > 0 and rbuf[0] == @intFromEnum(tunproto.MsgType.pty_spawn)) {
+                    std.log.info("[guest-spawn] got pty_spawn on conv={d}", .{tunnel.session.conv});
                     break :blk true;
                 }
                 // Host restart race: old command loop consumed pty_spawn,
                 // next frame is pty_exec_input. Accept as implicit spawn
                 // and buffer the command for delivery after pty is ready.
                 if (n > 0 and rbuf[0] == @intFromEnum(tunproto.MsgType.pty_exec_input)) {
-                    std.log.info("[guest-mesh] pty exec before spawn (reconnect race), buffering", .{});
+                    std.log.info("[guest-spawn] pty exec before spawn (reconnect race), buffering on conv={d}", .{tunnel.session.conv});
                     if (tunproto.parsePtyExecInput(rbuf[1..n])) |input| {
                         pending_cmd_id = allocator.dupe(u8, input.cmd_id) catch &.{};
                         pending_cmd_data = allocator.dupe(u8, input.command) catch &.{};
                     }
                     break :blk true;
                 }
-                std.log.debug("[guest-mesh] Ignoring pre-spawn frame type={d}", .{rbuf[0]});
+                std.log.info("[guest-spawn] Ignoring pre-spawn frame type={d} len={d} conv={d}", .{ rbuf[0], n, tunnel.session.conv });
             }
         };
         if (!spawn_ok) {
@@ -1324,24 +1335,61 @@ pub fn meshSessionLoop(
         }
 
         tunnel.deinit();
+        std.log.info("[guest-mesh] Cleanup done, looping back to waitForHostTunnel", .{});
     }
 }
 
 /// Wait for Host to establish a KCP tunnel via mesh.
+/// Wait for a KCP tunnel from the Host with data ready to read.
+///
+/// When multiple sessions have pending data (e.g. after Host restart —
+/// stale sessions from the old Host epoch alongside a fresh session from
+/// the new Host), picks the one with the most recent `last_recv_ms`.
+/// After Host restart, new sessions are fed by the new Host's KCP data
+/// and have a near-current timestamp, while old sessions were last fed
+/// before the crash — so the fresh session wins. This resolves the
+/// dual-session mismatch that caused exec to return empty output
+/// (Finding 93) without relying on KCP keepalive timeout (~15s).
 fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_mod.Mesh) !tunnel_mod.Tunnel {
     while (true) {
         if (mesh_opt.*) |*m| {
-            m.sessions_mutex.lock(m.io) catch continue;
+            m.sessions_mutex.lock(m.io) catch |err| {
+                // Lock failure (e.g. Io canceled) — back off instead of
+                // spinning. Skipping the sleep at the bottom of the loop
+                // would turn this into a 100% CPU busy-loop.
+                std.log.err("[guest-wait] sessions_mutex lock failed: {}", .{err});
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+                continue;
+            };
             const count = m.sessions.count();
+            // Log on each scan to trace waitForHostTunnel liveness
+            std.log.debug("[guest-wait] scan: sessions={d}", .{count});
             if (count > 0) {
+                var best: ?*mesh_mod.MeshSession = null;
+                var best_ms: u32 = 0;
+                var total_dead: u32 = 0;
+                var total_with_data: u32 = 0;
                 var it = m.sessions.iterator();
                 while (it.next()) |entry| {
                     const sess = entry.value_ptr.*;
+                    if (sess.dead) {
+                        total_dead += 1;
+                        continue;
+                    }
                     const peek = sess.kcp_inst.peekSize();
                     if (peek > 0) {
-                        m.sessions_mutex.unlock(m.io);
-                        return tunnel_mod.Tunnel.init(allocator, m.io, sess);
+                        total_with_data += 1;
+                        if (best == null or sess.last_recv_ms > best_ms) {
+                            best = sess;
+                            best_ms = sess.last_recv_ms;
+                        }
                     }
+                }
+                std.log.info("[guest-wait] sessions={d} dead={d} data={d}", .{ count, total_dead, total_with_data });
+                if (best) |sess| {
+                    std.log.info("[guest-wait] selected conv={d} peek={d}", .{ sess.conv, sess.kcp_inst.peekSize() });
+                    m.sessions_mutex.unlock(m.io);
+                    return tunnel_mod.Tunnel.init(allocator, m.io, sess);
                 }
             }
             m.sessions_mutex.unlock(m.io);

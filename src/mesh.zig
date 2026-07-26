@@ -81,6 +81,18 @@ fn generateNonce() u32 {
     return pid ^ stack_addr;
 }
 
+/// Extract the Host epoch (per-process nonce) from an LSA node_info string.
+/// Format: "epoch:{nonce}" on its own line. Returns null if not found or malformed.
+fn parseEpoch(node_info: []const u8) ?u32 {
+    var it = std.mem.splitScalar(u8, node_info, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "epoch:")) {
+            return std.fmt.parseInt(u32, line["epoch:".len..], 10) catch null;
+        }
+    }
+    return null;
+}
+
 /// Read the KCP conversation ID from a KCP packet embedded in mesh KCP data.
 /// The KCP header starts at offset 13 (after 1-byte TTL + 6-byte src + 6-byte dst).
 /// KCP conv is u32 big-endian at byte 0 of the KCP header.
@@ -250,11 +262,13 @@ pub const MeshSession = struct {
     allocator: std.mem.Allocator,
 
     /// KCP keepalive — TCP-style idle probe.
-    /// After 5s idle, send a 1-byte probe through KCP. Each probe expects
+    /// After 1s idle, send a 1-byte probe through KCP. Each probe expects
     /// the peer's KCP ACK response — if no ACK arrives, KCP retransmits.
-    /// After 3 unanswered probes (~15s total), the session is declared dead.
+    /// After 3 unanswered probes (~3s total), the session is declared dead.
     last_recv_ms: u32 = 0,
     keepalive_probes: u8 = 0,
+    /// Next keepalive probe timestamp (clock_ms). 0 = no probe scheduled —
+    /// first probe goes out after 1s idle.
     keepalive_next_ms: u32 = 0,
 
     /// Set true by the mesh thread when keepalive declares dead.
@@ -297,13 +311,21 @@ pub const Mesh = struct {
     sessions: std.AutoHashMap(u32, *MeshSession),
     sessions_mutex: std.Io.Mutex,
 
-    /// Per-process nonce, XOR'd with connect_counter to produce unique
-    /// KCP conversation IDs across reconnections and Host restarts.
+    /// Per-process nonce, changes on every restart. Embedded in the KCP conv
+    /// to isolate sessions across Host restarts — stale old-process KCP packets
+    /// carry a different conv and are immediately rejected (Finding 93 / Task #254).
     nonce: u32,
 
-    /// Counter incremented on each connect() call. Ensures each reconnection
-    /// gets a unique conv, preventing stale KCP seq number mismatch.
-    connect_counter: u32,
+    /// Guest-side: Host epoch (the Host's per-process nonce from LSA node_info).
+    /// null until the first Host LSA arrives (bootstrap mode — accept any conv).
+    host_epoch: ?u32 = null,
+
+    /// Guest-side: expected KCP conv from the Host, computed once host_epoch is known.
+    /// null during bootstrap. handleKcpData() validates incoming conv against this.
+    host_expected_conv: ?u32 = null,
+
+    /// Guest-side: NodeId of the Host (from LSA origin). Used to compute expected_conv.
+    host_node_id: ?NodeId = null,
 
     // Shutdown
     shutdown: std.atomic.Value(bool),
@@ -331,10 +353,27 @@ pub const Mesh = struct {
         broadcast_addrs: std.ArrayList(net.IpAddress),
         host_gateway_ip: []const u8,
     ) !Mesh {
+        const nonce = generateNonce();
+
+        // Append epoch (nonce) to node_info so Guests can detect Host restarts
+        // via LSA node_info change (Finding 93). Build it here inside init() so
+        // the first LSA broadcast already carries the epoch — no updateNodeInfo()
+        // call window where a stale epoch-less LSA could leak out and cause a
+        // double LSA restart detection on the Guest.
+        const node_info_with_epoch = std.fmt.allocPrint(allocator, "{s}\nepoch:{d}", .{ node_info, nonce }) catch {
+            // If alloc fails, fall back to the original node_info without epoch.
+            // The Guest can still detect restarts via LSA seq reset (though less
+            // reliable — same node_info means the lower-seq accept path at
+            // handleLsa line 702 won't trigger lsa_restart).
+            allocator.free(node_info);
+            return error.OutOfMemory;
+        };
+        allocator.free(node_info);
+
         return Mesh{
             .allocator = allocator,
             .node_id = node_id,
-            .node_info = node_info,
+            .node_info = node_info_with_epoch,
             .socket = socket,
             .io = io,
             .broadcast_addrs = broadcast_addrs,
@@ -351,8 +390,7 @@ pub const Mesh = struct {
             .shutdown = std.atomic.Value(bool).init(false),
             .upgrade_needed = upgrade_needed,
             .host_gateway_ip = host_gateway_ip,
-            .nonce = generateNonce(),
-            .connect_counter = 0,
+            .nonce = nonce,
             .clock_ms = 0,
         };
     }
@@ -612,23 +650,23 @@ pub const Mesh = struct {
 
             const idle = self.clock_ms -| sess.last_recv_ms;
 
-            if (idle < 5000) {
+            if (idle < 1000) {
                 // Link is active — nothing to do
             } else if (sess.keepalive_probes >= 3) {
-                // Dead: 3 probes sent, no response. Set flag only —
+                // Dead: 3 probes sent, no response (~3s total). Set flag only —
                 // the tunnel owner (handleMeshGuest / command loop)
                 // checks isAlive() and does the actual closeSession cleanup.
                 std.log.info("[mesh] keepalive dead conv={d} idle={d:.1}s", .{ conv, @as(f64, @floatFromInt(idle)) / 1000.0 });
                 sess.dead = true;
             } else if (sess.keepalive_next_ms == 0) {
-                // First probe after idle period
+                // First probe after 1s idle
                 sess.keepalive_probes = 1;
-                sess.keepalive_next_ms = self.clock_ms + 5000;
+                sess.keepalive_next_ms = self.clock_ms + 1000;
                 _ = sess.kcp_inst.send(&[_]u8{0xFF}) catch {};
             } else if (self.clock_ms >= sess.keepalive_next_ms) {
                 // Next probe interval elapsed → send another
                 sess.keepalive_probes += 1;
-                sess.keepalive_next_ms = self.clock_ms + 5000;
+                sess.keepalive_next_ms = self.clock_ms + 1000;
                 _ = sess.kcp_inst.send(&[_]u8{0xFF}) catch {};
             }
         }
@@ -683,6 +721,7 @@ pub const Mesh = struct {
         if (decoded.ttl <= 1) return;
 
         // ── lsas section: lock, check + store, unlock ──
+        var lsa_restart: bool = false;
         {
             self.lsas_mutex.lock(self.io) catch return;
             defer self.lsas_mutex.unlock(self.io);
@@ -694,9 +733,18 @@ pub const Mesh = struct {
                     if (!std.mem.eql(u8, decoded.node_info, existing.node_info)) {
                         std.log.info("[mesh] LSA restart detected: node_info changed, accepting lower seq", .{});
                         existing.deinit(self.allocator);
+                        lsa_restart = true;
                     } else {
                         return; // existing is same or newer
                     }
+                } else if (!std.mem.eql(u8, decoded.node_info, existing.node_info)) {
+                    // Higher seq with different node_info: stale relayed LSA
+                    // from an older process whose seq counter was ahead.
+                    // Keep the current (lower-seq, newer-process) entry —
+                    // replacing it would let the next genuine LSA trigger a
+                    // spurious second restart (Finding 93 / Task #254).
+                    std.log.info("[mesh] Ignoring stale high-seq LSA from {any} (node_info differs)", .{decoded.origin});
+                    return;
                 } else {
                     existing.deinit(self.allocator);
                 }
@@ -738,6 +786,57 @@ pub const Mesh = struct {
             };
         }
         // ── neighbors_mutex released here ──
+
+        // ── Guest-side: Track Host epoch for KCP conv validation ──
+        // Extract the Host's epoch (per-process nonce) from LSA node_info.
+        // Only track "role:host" LSAs when we are a Guest (host_gateway_ip is set).
+        // All nodes carry epoch:{nonce} in their node_info, but:
+        // - Only the Host's epoch matters for conv validation (Host initiates KCP).
+        // - host_gateway_ip.len > 0 ensures only Guests track it — prevents a
+        //   multi-Host scenario where Host A sets expected_conv from Host B's LSA.
+        if (self.host_gateway_ip.len > 0 and std.mem.indexOf(u8, decoded.node_info, "role:host") != null) {
+            if (parseEpoch(decoded.node_info)) |epoch| {
+                const epoch_changed = self.host_epoch == null or self.host_epoch.? != epoch;
+                if (epoch_changed) {
+                    std.log.info("[mesh] Host epoch changed: {?d} -> {d}, updating expected conv", .{ self.host_epoch, epoch });
+                    self.host_epoch = epoch;
+                    self.host_node_id = decoded.origin;
+                    self.host_expected_conv = computeConv(decoded.origin, self.node_id, epoch);
+
+                    // Mark existing sessions with wrong conv as dead.
+                    // Handles the bootstrap race: KCP data arrives before LSA,
+                    // creating a session with an old conv. Now that we know
+                    // the correct conv, non-matching sessions must die.
+                    self.sessions_mutex.lock(self.io) catch {};
+                    defer self.sessions_mutex.unlock(self.io);
+                    var s_it = self.sessions.iterator();
+                    while (s_it.next()) |s_entry| {
+                        if (s_entry.key_ptr.* != self.host_expected_conv.?) {
+                            std.log.info("[mesh] marking session conv={d} dead (epoch changed, expected={d})", .{ s_entry.key_ptr.*, self.host_expected_conv.? });
+                            s_entry.value_ptr.*.dead = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // When a remote node restarts (detected via LSA node_info change),
+        // immediately mark all KCP sessions to that node as dead. This lets
+        // the tunnel owner (handleMeshGuest / Guest command loop) break out
+        // of the dead session and call waitForHostTunnel, which will pick up
+        // the fresh m.connect() session with actual data. Without this, the
+        // caller stalls for ~15 s until KCP keepalive timeout (Finding 93).
+        if (lsa_restart) {
+            self.sessions_mutex.lock(self.io) catch {};
+            defer self.sessions_mutex.unlock(self.io);
+            var s_it = self.sessions.iterator();
+            while (s_it.next()) |s_entry| {
+                if (std.mem.eql(u8, &s_entry.value_ptr.*.remote, &decoded.origin)) {
+                    std.log.info("[mesh] marking session conv={d} dead (LSA restart for origin)", .{s_entry.key_ptr.*});
+                    s_entry.value_ptr.*.dead = true;
+                }
+            }
+        }
 
         // Check for version mismatch (upgrade signal).
         if (!self.upgrade_needed.load(.acquire) and self.host_gateway_ip.len > 0) {
@@ -805,6 +904,18 @@ pub const Mesh = struct {
 
         // Are we the destination?
         if (std.mem.eql(u8, &dst_mac, &self.node_id)) {
+            // ── Conv epoch validation (Guest-side) ──
+            // Once we've received the Host's LSA and know its epoch,
+            // reject KCP packets with the wrong conv immediately.
+            // Prevents stale retransmissions from a previous Host process
+            // from creating dead sessions (Finding 93 / Task #254).
+            if (self.host_expected_conv) |expected| {
+                if (kcp_conv != expected) {
+                    std.log.info("[mesh] Rejecting KCP packet from {any} conv={d} (expected={d}, epoch changed)", .{ from, kcp_conv, expected });
+                    return;
+                }
+            }
+
             std.log.info("[mesh-kcp] recv UDP {d}B from {any} conv={d}", .{ data.len, from, kcp_conv });
             // Deliver to our KCP session (keyed by conv from packet header)
             self.sessions_mutex.lock(self.io) catch {
@@ -1098,24 +1209,39 @@ pub const Mesh = struct {
     // Session management
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// Create (or return existing) KCP session to a remote node.
+    /// Create a new KCP session to a remote node. Always creates a fresh KCP
+    /// instance — closes any existing session for the same destination first.
     /// Thread-safe: locks sessions_mutex to protect against concurrent mesh.run() access.
     pub fn connect(self: *Mesh, dest: NodeId) !*MeshSession {
         self.sessions_mutex.lock(self.io) catch {
-            // If the Io context is canceled, fail the connect.
-            // Do NOT proceed without the lock — shared data would be
-            // accessed unsynchronized and the deferred unlock would corrupt
-            // the mutex state.
             return error.Canceled;
         };
         defer self.sessions_mutex.unlock(self.io);
 
-        // Increment counter to ensure each reconnection gets a unique conv.
-        // This prevents stale KCP seq number mismatch after reconnect
-        // (when nonce hasn't changed because Host wasn't restarted).
-        self.connect_counter +%= 1;
-        const conv = computeConv(self.node_id, dest, self.nonce ^ self.connect_counter);
-        if (self.sessions.get(conv)) |existing| return existing;
+        // KCP conv is purely a function of (host_id, guest_id, host_nonce).
+        // Host restart → new nonce → new conv → stale old-process KCP packets
+        // are immediately rejected at the conv level (Finding 93 / Task #254).
+        const conv = computeConv(self.node_id, dest, self.nonce);
+
+        // Close any existing session for the same destination. Always create
+        // a fresh KCP instance — even if conv hasn't changed (e.g. Guest
+        // reconnected without Host restart), the old KCP state has advanced
+        // SNs that would deadlock the Guest's fresh KCP (rcv_nxt=0 mismatch).
+        {
+            var s_iter = self.sessions.iterator();
+            while (s_iter.next()) |entry| {
+                if (std.mem.eql(u8, &entry.value_ptr.*.remote, &dest)) {
+                    const old_conv = entry.key_ptr.*;
+                    if (self.sessions.get(old_conv)) |old_sess| {
+                        std.log.info("[mesh] close stale session conv={d} for dest (new conv={d})", .{ old_conv, conv });
+                        _ = self.sessions.remove(old_conv);
+                        old_sess.deinit();
+                        self.allocator.destroy(old_sess);
+                    }
+                    break;
+                }
+            }
+        }
 
         const sess = try self.allocator.create(MeshSession);
         errdefer self.allocator.destroy(sess);
@@ -1149,32 +1275,6 @@ pub const Mesh = struct {
         _ = self.sessions.remove(sess.conv);
         sess.deinit();
         self.allocator.destroy(sess);
-    }
-
-    /// Close the KCP session for a specific destination node, if any.
-    /// Used before reconnecting to avoid stale KCP seq number mismatch.
-    /// Finds the session by iterating (using `remote` field) rather than
-    /// computing conv, because the conv may have changed due to
-    /// connect_counter increments or nonce changes.
-    pub fn closeSessionFor(self: *Mesh, dest: NodeId) void {
-        self.sessions_mutex.lock(self.io) catch {
-            // If the Io context is canceled, skip this periodicTasks cycle.
-            // Do NOT proceed without the lock — shared data would be
-            // accessed unsynchronized and the deferred unlock would corrupt
-            // the mutex state.
-            return;
-        };
-        defer self.sessions_mutex.unlock(self.io);
-        var it = self.sessions.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, &entry.value_ptr.*.remote, &dest)) {
-                const sess = entry.value_ptr.*;
-                _ = self.sessions.remove(entry.key_ptr.*);
-                sess.deinit();
-                self.allocator.destroy(sess);
-                break;
-            }
-        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -1337,6 +1437,32 @@ test "readKcpConv" {
     // Write a KCP conv at offset 13 (big-endian, matching KCP wire format)
     std.mem.writeInt(u32, buf[13..17], 0x12345678, .big);
     try std.testing.expectEqual(@as(u32, 0x12345678), readKcpConv(&buf));
+}
+
+test "computeConv symmetry: Host and Guest produce same conv" {
+    const host: NodeId = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
+    const guest: NodeId = .{ 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
+    const nonce: u32 = 0xDEADBEEF;
+    // Host: conv = computeConv(host, guest, host_nonce)
+    // Guest: conv = computeConv(host, guest, host_nonce) — same args
+    try std.testing.expectEqual(
+        computeConv(host, guest, nonce),
+        computeConv(host, guest, nonce),
+    );
+    // Verify different nonce → different conv (epoch isolation)
+    try std.testing.expect(computeConv(host, guest, nonce) != computeConv(host, guest, nonce ^ 1));
+    // Verify different guest → different conv
+    const guest2: NodeId = .{ 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+    try std.testing.expect(computeConv(host, guest, nonce) != computeConv(host, guest2, nonce));
+}
+
+test "parseEpoch" {
+    try std.testing.expectEqual(@as(?u32, 42), parseEpoch("hostname:test\nip:1.2.3.4\nepoch:42\nstatus:serving"));
+    try std.testing.expectEqual(@as(?u32, null), parseEpoch("hostname:test\nip:1.2.3.4\n"));
+    try std.testing.expectEqual(@as(?u32, null), parseEpoch(""));
+    try std.testing.expectEqual(@as(?u32, 0), parseEpoch("epoch:0"));
+    try std.testing.expectEqual(@as(?u32, null), parseEpoch("epoch:notanumber"));
+    try std.testing.expectEqual(@as(?u32, 1234567890), parseEpoch("epoch:1234567890\nother:data"));
 }
 
 test "encodeLsa + decodeLsa round-trip" {

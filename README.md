@@ -6,8 +6,9 @@ Check processes, read logs, attach debuggers, profile performance on any machine
 running the Guest agent. Virtual or bare-metal — Linux, macOS, Windows. No SSH,
 no IP tracking, no context switching. Just `utmm --exec linuxvm "..."` and you're in.
 
-**MCP integration** lets AI coding agents do the same — debug across platforms through
-natural language.
+**MCP integration** (`utmm --mcp`) lets AI coding agents do the same — debug across
+platforms through natural language. No daemon required — auto-ensure boots the Host
+if needed.
 
 **Mesh network & Zero config** ties everything together under the hood. Guests
 auto-discover the Host over the local network — no fixed IPs, no DNS, no manual
@@ -16,7 +17,8 @@ Ethernet — they all show up in one flat `utmm --status`.
 
 ## AI Agent Experience
 
-Same capabilities, natural language. Two MCP tools for Claude Code and other agents:
+Same capabilities, natural language. `utmm --mcp` provides two MCP tools over stdio
+for Claude Code and other agents:
 
 | Tool | Description |
 |------|-------------|
@@ -89,13 +91,15 @@ Add to your MCP config (`~/.claude/mcp.json` or `.mcp.json` in project):
 ```json
 {
   "mcpServers": {
-    "utm-monitor": {
-      "type": "streamableHttp",
-      "url": "http://127.0.0.1:2121/mcp"
+    "utmm": {
+      "command": "sudo",
+      "args": ["/opt/utmm/utmm", "--mcp"]
     }
   }
 }
 ```
+
+Or use the CLI: `claude mcp add utmm -- sudo /opt/utmm/utmm --mcp`
 
 ## CLI Reference
 
@@ -119,10 +123,12 @@ results back — HTTP handlers send frames through KCP tunnels, pty sessions exe
 
 ```
 Guest (linuxvm)      ──KCP/Mesh──┐
-Guest (macvm)        ──KCP/Mesh──┤──→ Host HTTP :2121 ── MCP /mcp (AI agents)
-Guest (windowsvm)    ──KCP/Mesh──┤                      ── CLI (--status, --exec)
-Guest (raspigw, LAN) ──KCP/Mesh──┘                      ── Static files (/bin/)
+Guest (macvm)        ──KCP/Mesh──┤──→ Host HTTP :2121 ── CLI (--status, --exec)
+Guest (windowsvm)    ──KCP/Mesh──┤                      ── Static files (/bin/)
+Guest (raspigw, LAN) ──KCP/Mesh──┘
                          ┌── LSA broadcast discovery ───┘   (topology + version detection)
+                         │
+AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → HTTP 127.0.0.1:2121
 ```
 
 - **Streaming exec**: output flows in real time via HTTP chunked encoding with
@@ -132,7 +138,8 @@ Guest (raspigw, LAN) ──KCP/Mesh──┘                      ── Static 
   `C:\opt\utmm\utmm.exe` (Windows). `--install` = unconditional force overwrite.
   Upgrade = scp new binary + `--install`. Zero shell commands.
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
-- **Single port**: 2121 for MCP + CLI + static file serving (TCP) and mesh networking (UDP)
+- **Single port**: 2121 for CLI + static file serving (TCP) and mesh networking (UDP)
+  MCP uses stdio (utmm --mcp), not HTTP — no port needed
 - **Auto IP tracking**: Host syncs Guest IPs to `/etc/hosts` — hostnames always resolve
 - **Cross-platform**: macOS, Linux, Windows — both Host and Guest (aarch64, x86_64, x86)
 - **Persistent shell session**: shell state survives across `--exec` calls (pty model)

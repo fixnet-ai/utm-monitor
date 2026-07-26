@@ -7,6 +7,10 @@ const std = @import("std");
 const kcp = @import("kcp.zig");
 const mesh = @import("mesh.zig");
 
+/// Single-byte 0xFF keepalive probe sent by mesh.periodicTasks through KCP data
+/// channel. Filtered at the tunnel layer so applications never see it.
+const KEEPALIVE_PROBE: u8 = 0xFF;
+
 /// Tunnel wraps a MeshSession for stream I/O.
 pub const Tunnel = struct {
     allocator: std.mem.Allocator,
@@ -100,13 +104,21 @@ pub const Tunnel = struct {
 
     /// Receive data from the tunnel. Returns immediately — does NOT poll or block.
     /// Returns 0 if no data is available (not an error — caller should sleep and retry).
+    /// Filters out 0xFF keepalive probes — they are consumed silently and the next
+    /// available real message is returned.
     /// NOTE: Does NOT call kcp.update() — only mesh.run() thread updates KCP state.
     /// Locks sessions_mutex to synchronize with mesh thread's kcp.input().
     pub fn recv(self: *Tunnel, buf: []u8) !usize {
         self.assertAlive();
         try self.session.mesh.sessions_mutex.lock(self.io);
         defer self.session.mesh.sessions_mutex.unlock(self.io);
-        return try self.session.kcp_inst.recv(buf);
+        while (true) {
+            const n = try self.session.kcp_inst.recv(buf);
+            // Filter out 0xFF keepalive probes — they are mesh-level control
+            // messages that should not reach the application layer.
+            if (n == 1 and buf[0] == KEEPALIVE_PROBE) continue;
+            return n;
+        }
     }
 
     /// Check if the tunnel is still alive (KCP retransmit + keepalive).
@@ -125,12 +137,27 @@ pub const Tunnel = struct {
     /// or -1 if no complete message is available. In message mode (non-stream),
     /// this is the exact size needed for the next recv() call. Callers can
     /// use this to allocate the correct buffer size before calling recv().
+    /// Filters out 0xFF keepalive probes — consumes them silently and returns
+    /// the size of the next real message. This is critical because callers
+    /// size their receive buffer from peekSize; a 1-byte keepalive would
+    /// cause a BufferTooSmall error on the subsequent recv() when the real
+    /// tunproto message is larger.
     /// Locks sessions_mutex to synchronize with mesh thread.
     pub fn peekSize(self: *Tunnel) i32 {
         self.assertAlive();
         self.session.mesh.sessions_mutex.lock(self.io) catch return -1;
         defer self.session.mesh.sessions_mutex.unlock(self.io);
-        return self.session.kcp_inst.peekSize();
+        while (true) {
+            const ps = self.session.kcp_inst.peekSize();
+            // 1-byte messages are always 0xFF keepalive probes — consume
+            // them silently so callers see the next real tunproto message.
+            if (ps == 1) {
+                var dummy: [1]u8 = undefined;
+                const n = self.session.kcp_inst.recv(&dummy) catch return ps;
+                if (n == 1 and dummy[0] == KEEPALIVE_PROBE) continue;
+            }
+            return ps;
+        }
     }
 
     /// Force immediate KCP flush. Normally the mesh thread's periodic update

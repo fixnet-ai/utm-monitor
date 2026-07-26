@@ -1,20 +1,24 @@
 # MCP Server Configuration for UTM Monitor
 # =============================================================================
 # This file lets Claude Code (or any MCP client) control UTM VMs via the utmm
-# Host daemon.  Copy this file and the Host handles the rest.
+# stdio MCP interface.  utmm --mcp handles auto-ensure (starts Host service if
+# not running), so no separate daemon management is needed.
 #
 # PREREQUISITES
 # -----------------------------------------------------------------------------
-# 1. The utmm Host daemon MUST be running on the local machine:
-#       sudo utmm --host
+# 1. utmm binary must be installed and executable:
+#       which utmm   # should print /opt/utmm/utmm (or C:\opt\utmm\utmm.exe)
 #
-# 2. Verify it's reachable (should return version):
-#       curl http://127.0.0.1:2121/version
+# 2. Root/Administrator access for the auto-ensure flow:
+#       sudo utmm --version   # verify it works
 #
 # QUICK INSTALL (Claude Code / Claude Desktop)
 # -----------------------------------------------------------------------------
 # Option A — claude CLI (recommended):
-#   claude mcp add utmm --url http://127.0.0.1:2121/mcp
+#   claude mcp add utmm -- sudo /opt/utmm/utmm --mcp
+#
+#   Or with custom port:
+#   claude mcp add utmm -- sudo /opt/utmm/utmm --mcp --port 2122
 #
 # Option B — manual, copy this file:
 #   cp mcp.json.example ~/.claude/mcp.json
@@ -33,25 +37,37 @@
 #   "Run vm_status to check which VMs are online"
 #
 # If Claude says the tool is not available, check:
-#   - Host daemon is running: sudo utmm --host
-#   - Port 2121 is not blocked by firewall
-#   - curl http://127.0.0.1:2121/version returns a version string
+#   - utmm binary is at /opt/utmm/utmm and executable
+#   - sudo /opt/utmm/utmm --version works
+#   - Try manually: echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | sudo /opt/utmm/utmm --mcp
+#
+# HOW IT WORKS
+# -----------------------------------------------------------------------------
+# utmm --mcp starts a stdio MCP server. On first use:
+#   1. Checks if Host service is running → if not, auto-installs + auto-starts
+#   2. Reads JSON-RPC from stdin, writes responses to stdout
+#   3. Tool calls (vm_status, vm_exec) talk to Host service at 127.0.0.1:2121
+#
+# Key benefit over old HTTP MCP: if the Host service is down, the AI agent can
+# still complete the critical auto-install/recovery flow because utmm --mcp
+# benefits from Phase 52 auto-ensure just like utmm --exec does.
 #
 # TROUBLESHOOTING
 # -----------------------------------------------------------------------------
 # | Symptom                              | Fix                                |
 # |--------------------------------------|------------------------------------|
 # | "No VMs online"                      | Boot the VMs, start utmm inside each |
-# | "Connection refused"                 | sudo utmm --host                    |
+# | "Connection refused"                 | Host auto-ensure may have failed;   |
+# |                                      | try sudo utmm --host first          |
 # | MCP tools not showing in Claude      | Reload MCP config (restart Claude)  |
-# | curl works but MCP fails             | Check URL ends with /mcp            |
+# | utmm --mcp hangs                     | Ensure stdin is not a TTY (piped)   |
 # =============================================================================
 
 {
   "mcpServers": {
     "utmm": {
-      "type": "streamableHttp",
-      "url": "http://127.0.0.1:2121/mcp"
+      "command": "sudo",
+      "args": ["/opt/utmm/utmm", "--mcp"]
     }
   }
 }

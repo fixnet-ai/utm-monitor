@@ -18,8 +18,11 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
 - **Persistent pty per connection**: `posix_openpt` (POSIX) / `CreatePipe` (Windows).
   Commands share one shell session — `cd`, `export`, shell history survive across calls.
   `MDELIM:$?\n` exit-code markers embedded in pty output.
-- **MCP JSON-RPC**: AI agents control machines through `vm_status` / `vm_exec` tools.
-- **Single port**: HTTP + MCP + static file serving all on 2121 (mesh on UDP same port).
+- **MCP stdio**: AI agents control machines via `utmm --mcp` (stdio JSON-RPC).
+  `vm_status` / `vm_exec` tools. Benefits from auto-ensure — if Host service is
+  down, `--mcp` auto-starts it, so the recovery flow is never broken.
+- **Single port**: HTTP + static file serving all on 2121 (mesh on UDP same port).
+  MCP uses stdio (not HTTP) — see `mcp.json.example`.
 - **8 cross-compilation targets**: aarch64/x86_64/x86 × linux-musl/macos/windows.
 - **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
 
@@ -66,18 +69,19 @@ UDP port 2121 first-byte dispatch:
   `--version`: print version. No foreground mode — service model only.
 - **Host mode (`--host`)**: Unified HTTP server on port 2121 — guest registration
   via mesh LSA, management commands (exec/upload/download),
-  MCP JSON-RPC, static file serving (/bin/), /etc/hosts sync, and periodic LSA
+  static file serving (/bin/), /etc/hosts sync, and periodic LSA
   version broadcast. All on one port.
+- **MCP mode (`--mcp`)**: stdio JSON-RPC server for AI agents. Talks to Host
+  service at 127.0.0.1:2121 for tool implementation. Benefits from auto-ensure.
 
 ### Complete Data Flow
 
 ```
-                         ┌── MCP HTTP /mcp (JSON-RPC) ← AI Agent
+                         ┌── MCP stdio ← AI Agent (utmm --mcp → auto-ensure → HTTP 127.0.0.1:2121)
 Guest (macvm)    ──KCP/Mesh──┐
 Guest (linuxvm)  ──KCP/Mesh──┤──→ Host HTTP :2121 ──┼── GET /bin/ (static files)
 Guest (windows)  ──KCP/Mesh──┘                      ├── POST /exec, /upload, /download
-                         │   (LSA discovery)         ├── GET /mcp (MCP JSON-RPC)
-                         │                            └── /etc/hosts sync
+                         │   (LSA discovery)         └── /etc/hosts sync
                          │
 Guest ←── LSA broadcast (UDP) ──┘  (topology discovery + version detection)
 ```
@@ -209,7 +213,7 @@ stop→kill→copy→install→start. No KCP download, no utmm-old process.
 - **Self-copy install model** (v0.12.0) — replaces utmm-old 10+ step KCP download
   upgrade (fork→mesh→connect→download→verify→replace→restart) with 4 steps
   (stop→kill→copy→start). Network-independent. No bat scripts for Windows.
-- Single port 2121 for HTTP, MCP JSON-RPC, static file serving, and mesh UDP
+- Single port 2121 for HTTP, static file serving, and mesh UDP
 - **Persistent pty per mesh session**: POSIX `posix_openpt` + fork + setsid + execve,
   Windows `CreatePipe` + `CreateProcessW("cmd.exe /k chcp 65001 ...")` + `SetConsoleOutputCP(65001)` — UTF-8 forced
 - **MDELIM markers**: `; echo MDELIM:$?\n` appended to each command. Host-side
@@ -362,7 +366,9 @@ src/
 ├── kcp.zig            # KCP reliable ARQ protocol (matches C reference skywind3000/kcp)
 ├── mesh.zig           # LSA mesh networking: UDP broadcast, KCP session mgmt, relay
 ├── tunnel.zig         # TCP-like stream wrapper over KCP sessions (send/recv/flush)
-├── httpd.zig          # HTTP server + endpoint handlers + MCP JSON-RPC (+ host_http.zig + mcp.zig)
+├── httpd.zig          # HTTP server + endpoint handlers (+ host_http.zig)
+├── mcp.zig            # MCP stdio server: JSON-RPC stdin/stdout, HTTP client to Host
+├── lock.zig           # Process singleton lock (utmm.lock PID file)
 ├── host.zig           # Host orchestration: cmd dispatch + HTTP server + mesh start (+ install.zig Platform/genInit)
 ├── broadcast.zig      # Guest core: system info, ptySpawn, ptyReadLoop, meshSessionLoop (+ guest.zig)
 ├── svc.zig            # Unified cross-platform service management (+ install.zig detectServiceEnv)
@@ -371,10 +377,9 @@ src/
 └── fail.zig           # Fast-fail helpers (err, msg — noreturn)
 ```
 
-> v0.11.10 consolidated from 19 to 13 source files. Merged: ver.zig→protocol.zig,
-> priv.zig→main.zig, install.zig→svc.zig+host.zig, guest.zig→broadcast.zig,
-> mcp.zig+host_http.zig→httpd.zig. Each deleted file's functionality lives on
-> in its merge target.
+> v0.11.10 consolidated from 19 to 13 source files; Phase 53 added mcp.zig + lock.zig = 14 files.
+> Merged: ver.zig→protocol.zig, priv.zig→main.zig, install.zig→svc.zig+host.zig,
+> guest.zig→broadcast.zig, host_http.zig→httpd.zig.
 
 ## Code of Conduct / Guidelines
 

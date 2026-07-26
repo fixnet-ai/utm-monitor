@@ -168,6 +168,38 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 
 **已知遗留**: KCP 隧道 Host 重启后 exec 空输出（F93，预存在）、selfCopy 未重新签名（F91）、DebugAllocator CLI 短生命周期泄漏（4 处）
 
+### Phase 53: MCP stdio + utmm.lock 单例改造 ✅ (2026-07-26)
+
+**Part 1 — MCP stdio**: 从 HTTP MCP 换为标准 stdio JSON-RPC 接口。
+
+- **新建 `src/mcp.zig`**（~330 行）：stdio 循环读取 stdin → 处理 JSON-RPC → 写入 stdout。工具（`vm_status`、`vm_exec`）通过 HTTP client 调 Host `127.0.0.1:2121`。
+- **修改 `src/main.zig`**：`--mcp` 从废弃打印改为：加入 `needs_host` auto-ensure + 调用 `mcp.run()`。
+- **删除 HTTP MCP**：从 `httpd.zig` 移除 `handleMcp`、`processJsonRpcWithState`、`SERVER_INFO`、`TOOLS_JSON`（~240 行），从 `host.zig` 移除 `/mcp` 路由。
+- **MCP 测试**：`src/mcp.zig` 新增 14 个测试（jsonEscape、jsonBuildResponse、jsonBuildError、jsonGetString、jsonAppendId、jsonGetNestedObject）。
+- **配置文件**：`mcp.json.example` 从 `streamableHttp` 改为 stdio 命令格式。
+- **文档更新**：CLAUDE.md、README.md、SKILL.md、MANUAL.md 全部更新为 stdio MCP。
+
+**Part 2 — utmm.lock 单例锁**：
+
+- **新建 `src/lock.zig`**（~260 行）：`acquire()` / `release()`，PID 文件锁，原子创建（POSIX `O_CREAT|O_EXCL` / Windows `CREATE_NEW`），崩溃残留检测（>20s 抢夺），3×5s 重试。
+- **集成 `src/svc.zig`**：`ensure()` 和 `forceInstall()` 加锁包裹，`uninstall()` 入口加锁。`forceInstall` 拆分为 public 包装 + internal 实现，避免 ensure→forceInstall 双重锁。
+- **5 个锁测试**：acquire/release、PID 内容、PID 匹配、自进程存活检测、死 PID 检测。
+
+**Part 3 — MCP 端到端验证**：
+- `echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | sudo utmm --mcp` → 返回 SERVER_INFO ✅
+- `tools/list` → 返回 vm_status + vm_exec 工具定义 ✅
+- `vm_status` → 返回 4 台 VM 状态（winx64、macvm、windowsvm、linuxvm 离线）✅
+- `ping` → 返回 `{}` ✅
+
+**验证**: `zig build test` 147/147 通过，`zig build` 合成无错误，8 目标交叉编译验证通过。
+
+**设计决策**：
+- MCP stdio 享受 Phase 52 auto-ensure，AI Agent 子进程自动启动 Host 服务 — 破除了 HTTP MCP "Host 没启动就无法操作"的死锁。
+- `--mcp` 要求 root（因为 auto-ensure 需要 admin 权限）— 在 `mcp.json.example` 中用 `sudo` 命令。
+- `src/mcp.zig` 完全独立于 HostState — 通过 HTTP client 通信，不依赖 Host 内部状态。
+- httpd.zig 中的 JSON 辅助函数（`jsonEscape`、`jsonGetString` 等）保留，因为 `host.zig` 的 CLI 管理命令仍在使用。
+- mcp.zig 有自己的 JSON 辅助函数副本 — 避免 stdio MCP 进程依赖 httpd.zig 中的 HostState 线程变量。
+
 ## 待办
 
 - [ ] F91: `selfCopy()` copy+delete 回退路径添加 macOS codesign 重新签名
