@@ -1,52 +1,19 @@
 //! UTM Monitor — Automatic VM IP sync tool
 //!
-//! Guest mode (default): UDP broadcast local IP + HTTP server
-//! Host mode (--host): UDP listener + update /etc/hosts + management commands
+//! Guest mode (default): mesh LSA + KCP tunnel to Host
+//! Host mode (--host): ensures Host service is running
+//!
+//! Self-copy model: binary copies itself to canonical path /opt/utmm/utmm[.exe].
+//! All operations (except --version/--help) require root/Administrator.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const guest = @import("guest.zig");
 const host_mod = @import("host.zig");
-const httpd = @import("httpd.zig");
-const host_http = @import("host_http.zig");
 const priv = @import("priv.zig");
-
-// ── Windows Service integration types and externs (only compiled on Windows) ──
-const windows = if (builtin.os.tag == .windows) std.os.windows else struct {
-    pub const DWORD = u32;
-    pub const BOOL = u32;
-};
-
-const SERVICE_WIN32_OWN_PROCESS = 0x00000010;
-const SERVICE_RUNNING = 0x00000004;
-const SERVICE_STOPPED = 0x00000001;
-const SERVICE_STOP_PENDING = 0x00000003;
-const SERVICE_ACCEPT_STOP = 0x00000001;
-const SERVICE_CONTROL_STOP = 0x00000001;
-
-const SERVICE_STATUS = extern struct {
-    dwServiceType: u32,
-    dwCurrentState: u32,
-    dwControlsAccepted: u32,
-    dwWin32ExitCode: u32,
-    dwServiceSpecificExitCode: u32,
-    dwCheckPoint: u32,
-    dwWaitHint: u32,
-};
-
-const SERVICE_STATUS_HANDLE = *anyopaque;
-
-const SvcMainFn = *const fn (dwNumServiceArgs: u32, lpServiceArgVectors: [*]?[*:0]const u16) callconv(.winapi) void;
-
-const SERVICE_TABLE_ENTRYW = extern struct {
-    lpServiceName: ?[*:0]const u16,
-    lpServiceProc: ?SvcMainFn,
-};
-
-extern "advapi32" fn StartServiceCtrlDispatcherW(lpServiceStartTable: [*]const SERVICE_TABLE_ENTRYW) callconv(.winapi) u32;
-extern "advapi32" fn RegisterServiceCtrlHandlerExW(lpServiceName: [*:0]const u16, lpHandlerProc: ?*const fn (dwControl: u32, dwEventType: u32, lpEventData: ?*anyopaque, lpContext: ?*anyopaque) callconv(.winapi) u32, lpContext: ?*anyopaque) callconv(.winapi) ?SERVICE_STATUS_HANDLE;
-extern "advapi32" fn SetServiceStatus(hServiceStatus: ?SERVICE_STATUS_HANDLE, lpServiceStatus: *SERVICE_STATUS) callconv(.winapi) u32;
+const svc = @import("svc.zig");
+const fail = @import("fail.zig");
 
 comptime {
     _ = @import("hosts_file.zig");
@@ -54,13 +21,13 @@ comptime {
     _ = @import("install.zig");
     _ = @import("config.zig");
     _ = @import("mcp.zig");
-    _ = @import("agent.zig");
     _ = @import("kcp.zig");
     _ = @import("mesh.zig");
     _ = @import("tunnel.zig");
     _ = @import("tunproto.zig");
     _ = @import("priv.zig");
-    _ = @import("upgrade.zig");
+    _ = svc;
+    _ = fail;
 }
 
 /// CLI parse result
@@ -69,12 +36,11 @@ pub const CliArgs = struct {
     is_host: bool = false,
     /// HTTP server port (Host mode)
     port: u16 = protocol.DEFAULT_PORT,
-    /// Mesh UDP port for LSA + KCP (default: same as port, configurable for local testing)
+    /// Mesh UDP port for LSA + KCP
     mesh_port: u16 = protocol.DEFAULT_PORT,
-    /// Direct peer mesh address for local testing (e.g. "127.0.0.1:2122").
-    /// Added to LSA broadcast list so peers on different mesh ports can discover each other.
+    /// Direct peer mesh address for local testing
     peer_mesh: ?[]const u8 = null,
-    /// Guest hostname (default: auto-detect hostname)
+    /// Guest hostname (default: auto-detect)
     hostname: ?[]const u8 = null,
     /// Host IP for Guest HTTP client (default: auto-detect via default gateway)
     host_ip: ?[]const u8 = null,
@@ -93,11 +59,8 @@ pub const CliArgs = struct {
     serve_dir: ?[]const u8 = null,
     /// Whether to save config
     save_config: bool = false,
-    /// Run as daemon via service manager (--svc, set by --install service configs)
+    /// Run as daemon via service manager (--svc, set by service configs)
     is_svc: bool = false,
-    /// Run as foreground guest (stop service, run, restart on exit).
-    /// When false and no management commands: run as daemon (pure guest, no service mgmt).
-    /// This is the default mode when no flags are provided.
 
     // Management commands
     cmd_status: bool = false,
@@ -106,14 +69,12 @@ pub const CliArgs = struct {
     cmd_gen_init: bool = false,
     cmd_install: bool = false,
     cmd_uninstall: bool = false,
-    /// Install as user-level service (LaunchAgent / user systemd) — for --agent
-    is_user: bool = false,
     is_mcp: bool = false,
     exec_target: ?[]const u8 = null,
     exec_cmd: ?[]const u8 = null,
     gen_init_platform: ?[]const u8 = null,
 
-    // Upload/download commands (Host mode, no external curl needed)
+    // Upload/download commands
     cmd_upload: bool = false,
     upload_file: ?[]const u8 = null,
     upload_target: ?[]const u8 = null,
@@ -121,16 +82,12 @@ pub const CliArgs = struct {
     download_target: ?[]const u8 = null,
     download_remote: ?[]const u8 = null,
     download_local: ?[]const u8 = null,
-
-    // Internal: auto-upgrade bootstrap (spawned by Guest when version mismatch detected)
-    cmd_upgrade: bool = false,
-    upgrade_target: ?[]const u8 = null,
 };
 
 /// Parse command-line arguments
 pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
     var cli = CliArgs{};
-    var i: usize = 1; // Skip program name
+    var i: usize = 1;
 
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -139,11 +96,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             cli.is_host = true;
         } else if (std.mem.eql(u8, arg, "--status")) {
             cli.cmd_status = true;
-        } else if (std.mem.eql(u8, arg, "--upgrade")) {
-            cli.cmd_upgrade = true;
-        } else if (std.mem.eql(u8, arg, "--target")) {
-            i += 1;
-            if (i < args.len) cli.upgrade_target = args[i];
         } else if (std.mem.eql(u8, arg, "--version")) {
             cli.cmd_version = true;
         } else if (std.mem.eql(u8, arg, "--gen-init")) {
@@ -154,8 +106,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             }
         } else if (std.mem.eql(u8, arg, "--install")) {
             cli.cmd_install = true;
-        } else if (std.mem.eql(u8, arg, "--user")) {
-            cli.is_user = true;
         } else if (std.mem.eql(u8, arg, "--svc")) {
             cli.is_svc = true;
         } else if (std.mem.eql(u8, arg, "--uninstall")) {
@@ -241,235 +191,147 @@ pub fn printHelp() void {
     const help =
         \\Usage: utmm [options]
         \\
+        \\Service management:
+        \\  --install           Force install as system auto-start service (guest or host)
+        \\  --uninstall         Remove system service and binary
+        \\
         \\Mode selection:
-        \\  --host              Run in Host mode (UDP listener + hosts management)
-        \\  (no args)           Default Guest mode (stop service, foreground, restart on exit)
-        \\  --svc               Run as daemon (launched by service manager, no service mgmt)
+        \\  --host              Ensure Host service is running (auto-installs if needed)
+        \\  (no args)           Ensure Guest service is running (auto-installs if needed)
+        \\  --svc               Internal: run as daemon (set by service manager)
         \\
         \\Guest options:
         \\  --hostname NAME     Local hostname (auto-detect by default)
         \\  --host-ip IP        Host IP to connect to (auto-detect via gateway by default)
-        \\  --port PORT         UDP broadcast + TCP server port (default 2121)
+        \\  --port PORT         Service port (default 2121)
+        \\  --mesh-port PORT    Mesh UDP port (default 2121)
+        \\  --peer-mesh ADDR    Direct peer mesh address for local testing
         \\  --log-file PATH     Log file path
         \\
         \\Host options:
-        \\  --port PORT         UDP listen port (default 2121)
+        \\  --port PORT         Service port (default 2121)
         \\  --hosts-file PATH   hosts file path (default /etc/hosts)
         \\  --serve-dir PATH    HTTP serve directory (default: exe directory)
         \\  --marker TAG        Marker comment text (default "UTM-MONITOR")
-        \\  --config PATH       Config file path (default ./utmm.conf)
+        \\  --config PATH       Config file path
         \\  --log-file PATH     Log file path
         \\  --save-config       Save current parameters to config file
         \\
-        \\Management commands (connect to persistent Host via IPC, no --host needed):
-        \\  --status            Query all online guest status (with target/arch/os)
-        \\  --exec TARGET CMD   Execute command on target guest (TARGET=hostname or FQDN)
-        \\  --upload FILE VM    Upload a file to Guest VM (via HTTP, no curl needed)
-        \\  --download VM REMOTE LOCAL  Download REMOTE from Guest VM → LOCAL file
-        \\  --gen-init PLATFORM  Generate auto-start script (linux/macos/windows)
-        \\  --install           Install as system service (daemon: utmm --host --install)
-        \\  --install --user    Create desktop shortcut for foreground guest launcher
-        \\  --uninstall         Remove system service (utmm --uninstall)
-        \\  --uninstall --user  Remove desktop shortcut (utmm --uninstall --user)
-        \\  --mcp               Deprecated; MCP now on --host HTTP :2121/mcp
+        \\Management commands (require Host service running):
+        \\  --status            Query all online guest status
+        \\  --exec TARGET CMD   Execute command on target guest
+        \\  --upload FILE VM    Upload a file to Guest VM
+        \\  --download VM REMOTE LOCAL  Download file from Guest VM
+        \\  --gen-init PLATFORM Generate auto-start script (linux/macos/windows)
         \\  --version           Show version info
         \\
-        \\NOTE: --exec/--status/--upload/--download require a running Host background
-        \\process (sudo utmm --host). Do NOT add --host to these commands — they
-        \\talk to the Host via IPC, not by starting a new listener.
+        \\NOTE: All operations require root/Administrator privileges.
+        \\  POSIX: sudo utmm ...
+        \\  Windows: Run as Administrator
         \\
-        \\Foreground Guest mode (default when no flags):
-        \\  utmm                 Stop background service, run Guest in foreground,
-        \\                       restart service on exit (Ctrl+C or close window)
-        \\  utmm --hostname X    Override auto-detected hostname
-        \\  utmm --install --user  Create desktop shortcut for foreground launcher
+        \\Install paths:
+        \\  POSIX:   /opt/utmm/utmm
+        \\  Windows: C:\\opt\\utmm\\utmm.exe
         \\
     ;
     std.debug.print("{s}", .{help});
-}
-
-/// Windows service globals — shared between service handler and service main
-const SvcGlobals = struct {
-    var status_handle: ?SERVICE_STATUS_HANDLE = null;
-    var io_ptr: ?std.Io = null;
-    var gpa_ptr: ?std.mem.Allocator = null;
-    var cli_ptr: ?CliArgs = null;
-    var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-};
-
-fn svcCtrlHandler(dwControl: u32, _: u32, _: ?*anyopaque, _: ?*anyopaque) callconv(.winapi) u32 {
-    if (dwControl == SERVICE_CONTROL_STOP) {
-        // Report STOP_PENDING — the main service loop will stop cleanly
-        // and report STOPPED after runWithIo returns.
-        if (SvcGlobals.status_handle) |h| {
-            var status = SERVICE_STATUS{
-                .dwServiceType = SERVICE_WIN32_OWN_PROCESS,
-                .dwCurrentState = SERVICE_STOP_PENDING,
-                .dwControlsAccepted = 0,
-                .dwWin32ExitCode = 0,
-                .dwServiceSpecificExitCode = 0,
-                .dwCheckPoint = 1,
-                .dwWaitHint = 30000, // 30s for graceful shutdown
-            };
-            _ = SetServiceStatus(h, &status);
-        }
-        SvcGlobals.shutdown_flag.store(true, .release);
-    }
-    return 1;
-}
-
-fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
-    const svc_name_utf16 = [_:0]u16{ 'U', 'T', 'M', '-', 'M', 'o', 'n', 'i', 't', 'o', 'r', 0 };
-    const h = RegisterServiceCtrlHandlerExW(&svc_name_utf16, svcCtrlHandler, null);
-    SvcGlobals.status_handle = h;
-
-    if (h) |handle| {
-        var status = SERVICE_STATUS{
-            .dwServiceType = SERVICE_WIN32_OWN_PROCESS,
-            .dwCurrentState = SERVICE_RUNNING,
-            .dwControlsAccepted = SERVICE_ACCEPT_STOP,
-            .dwWin32ExitCode = 0,
-            .dwServiceSpecificExitCode = 0,
-            .dwCheckPoint = 0,
-            .dwWaitHint = 0,
-        };
-        _ = SetServiceStatus(handle, &status);
-    }
-
-    const svc_io = SvcGlobals.io_ptr orelse @panic("io_ptr not set");
-    const svc_gpa = SvcGlobals.gpa_ptr orelse @panic("gpa_ptr not set");
-    const svc_cli = SvcGlobals.cli_ptr orelse @panic("cli_ptr not set");
-
-    if (svc_cli.is_host) {
-        host_mod.runWithIo(svc_io, svc_gpa, svc_cli, &SvcGlobals.shutdown_flag) catch |err| {
-            std.debug.print("[svc] host run failed: {}\n", .{err});
-        };
-    } else {
-        guest.runWithIo(svc_io, svc_gpa, svc_cli, &SvcGlobals.shutdown_flag) catch |err| {
-            std.debug.print("[svc] guest run failed: {}\n", .{err});
-        };
-    }
-
-    if (h) |handle| {
-        var status = SERVICE_STATUS{
-            .dwServiceType = SERVICE_WIN32_OWN_PROCESS,
-            .dwCurrentState = SERVICE_STOPPED,
-            .dwControlsAccepted = 0,
-            .dwWin32ExitCode = 0,
-            .dwServiceSpecificExitCode = 0,
-            .dwCheckPoint = 0,
-            .dwWaitHint = 0,
-        };
-        _ = SetServiceStatus(handle, &status);
-    }
-}
-
-/// Windows service entry point — runs Guest/Host loop as a proper Windows service.
-/// Called when binary is started with --svc flag (added by sc create on --install).
-fn winServiceRun(io: std.Io, gpa: std.mem.Allocator, cli: CliArgs) !void {
-    SvcGlobals.io_ptr = io;
-    SvcGlobals.gpa_ptr = gpa;
-    SvcGlobals.cli_ptr = cli;
-
-    const svc_name_utf16 = [_:0]u16{ 'U', 'T', 'M', '-', 'M', 'o', 'n', 'i', 't', 'o', 'r', 0 };
-    var svc_table = [2]SERVICE_TABLE_ENTRYW{
-        .{ .lpServiceName = &svc_name_utf16, .lpServiceProc = svcMain },
-        .{ .lpServiceName = null, .lpServiceProc = null },
-    };
-
-    const ok = StartServiceCtrlDispatcherW(&svc_table);
-    if (ok == 0) {
-        std.debug.print("[svc] StartServiceCtrlDispatcher failed (error: {})\n", .{std.os.windows.GetLastError()});
-        return error.ServiceStartFailed;
-    }
 }
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var cli = try parseArgs(args);
 
-    // --version: no admin needed, just print version and exit.
+    // ── 1. --version: print and exit (no admin needed) ──
     if (cli.cmd_version) {
         std.debug.print("utmm v{s}\n", .{protocol.VERSION});
         return;
     }
 
-    // --help: no admin needed, just print help and exit.
+    // ── 2. --help: print and exit (no admin needed) ──
     if (args.len > 1 and std.mem.eql(u8, args[1], "--help")) {
         printHelp();
         return;
     }
 
-    // --upgrade: auto-upgrade bootstrap (utmm-old). Spawned by Guest when
-    // version mismatch detected via mesh LSA. Must run before ensureAdmin
-    // because it inherits admin privileges from the parent service process.
-    if (cli.cmd_upgrade) {
-        const upgrade = @import("upgrade.zig");
-        try upgrade.runUpgrade(init.io, init.gpa, cli.upgrade_target orelse {
-            std.debug.print("--upgrade requires --target <arch>\n", .{});
-            return;
-        }, cli.mesh_port, cli.peer_mesh);
-        return;
-    }
-
-    // ── Management commands: HTTP client only, no admin needed ──
-    // --exec/--status/--upload/--download talk to Host HTTP at 127.0.0.1:2121.
-    // --gen-init prints a script to stdout. --save-config writes a local file.
-    // Dispatch these BEFORE ensureAdmin() to avoid unnecessary sudo re-exec
-    // that hangs in non-interactive contexts.
-    if (cli.cmd_status or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config) {
-        // Fault tolerance: --host is meaningless with management commands
-        cli.is_host = false;
-        try host_mod.run(init, cli);
-        return;
-    }
-
-    // --mcp alone (no --host): MCP now integrated into Host HTTP server.
-    // Redirect to --host which always serves /mcp on port 2121.
-    if (cli.is_mcp and !cli.is_host and !cli.cmd_install and !cli.cmd_uninstall) {
-        std.log.info("[main] --mcp deprecated; MCP available via --host on port 2121. Use 'utmm --host' instead.", .{});
-        return;
-    }
-
-    // ── Admin privilege check — required for everything below ──
-    // Checks if running as root (POSIX) or Administrator/SYSTEM (Windows).
-    // If not, attempts self-elevation (sudo / ShellExecuteW runas).
-    // On success the new elevated process takes over; on failure prints
-    // a clear error and exits.
-    try priv.ensureAdmin(init.io, args, init.arena.allocator());
-
-    // --svc (internal): run as system daemon — no service stop/restart.
-    // On Windows this registers with SCM; on POSIX it just runs guest directly.
-    // Admin check above ensures we're running with proper privileges.
-    if (cli.is_svc) {
+    // ── 3. Admin privilege check — required for everything below ──
+    if (!priv.isAdmin()) {
         if (builtin.os.tag == .windows) {
-            return winServiceRun(init.io, init.gpa, cli);
+            std.debug.print(
+                \\[ERROR] Administrator privileges required.
+                \\Please run this program as Administrator (right-click → "Run as Administrator").
+                \\
+            , .{});
+        } else {
+            std.debug.print(
+                \\[ERROR] Root privileges required.
+                \\Please run with: sudo utmm ...
+                \\
+            , .{});
         }
-        // POSIX: service manager launched us — just run guest directly
-        try guest.run(init, cli);
+        std.process.exit(1);
+    }
+
+    // ── 4. --svc: run as daemon (internal flag set by service manager) ──
+    if (cli.is_svc) {
+        if (builtin.os.tag == .macos) {
+            const role: svc.ServiceRole = if (cli.is_host) .host else .guest;
+            svc.checkRetryLimit(init.io, init.gpa, role);
+        }
+        if (builtin.os.tag == .windows) {
+            return svc.winServiceRun(
+                init.io,
+                init.gpa,
+                cli.is_host,
+                cli.hostname,
+                cli.port,
+                cli.mesh_port,
+                cli.peer_mesh,
+                cli.host_ip,
+            );
+        }
+        // POSIX (non-macOS): run directly — service manager launched us
+        if (cli.is_host) {
+            try host_mod.runWithIo(init.io, init.gpa, cli, null);
+        } else {
+            try guest.runWithIo(init.io, init.gpa, cli, null);
+        }
         return;
     }
 
-    // --install/--uninstall work in both host and guest mode (install.zig uses cli.is_host)
-    if (cli.cmd_install or cli.cmd_uninstall) {
-        try host_mod.run(init, cli);
+    // ── 5. --install: force install service ──
+    if (cli.cmd_install) {
+        const role: svc.ServiceRole = if (cli.is_host) .host else .guest;
+        svc.forceInstall(init.io, init.gpa, role, &.{});
         return;
     }
 
-    // --host: start HTTP server (requires admin for port binding)
+    // ── 6. --uninstall: remove service ──
+    if (cli.cmd_uninstall) {
+        try svc.uninstall(init.io, init.gpa);
+        return;
+    }
+
+    // ── 7. --host: ensure Host service is running ──
     if (cli.is_host) {
+        svc.ensure(init.io, init.gpa, .host, &.{});
+        return;
+    }
+
+    // ── 8. Management commands ──
+    if (cli.cmd_status or cli.cmd_exec or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config) {
+        cli.is_host = false; // management commands don't need --host
         try host_mod.run(init, cli);
         return;
     }
 
-    // Default Guest mode (foreground): stop background service, run Guest in
-    // foreground with visible terminal, restart service on exit (Ctrl+C / close).
-    // This gives the user GUI-aware exec access (runs in user session, not daemon).
-    // System daemons use --svc to skip the stop/restart logic.
-    {
-        const agent = @import("agent.zig");
-        try agent.run(init.io, init.gpa, cli.hostname, cli.port, cli.mesh_port, cli.peer_mesh, cli.host_ip);
+    // ── 9. --mcp alone: redirect ──
+    if (cli.is_mcp) {
+        std.log.info("[main] --mcp deprecated; MCP available via --host on port 2121", .{});
+        return;
     }
+
+    // ── 10. Default: ensure Guest service is running ──
+    svc.ensure(init.io, init.gpa, .guest, &.{});
 }
 
 test "parseArgs - default guest mode" {

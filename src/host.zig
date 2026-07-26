@@ -19,17 +19,12 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
 }
 
 pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
-    // --install / --uninstall: delegate to install module
-    if (cli.cmd_install) {
-        const install_mod = @import("install.zig");
-        return install_mod.installSelf(block_io, gpa, cli.is_host, cli.hostname, cli.is_user);
-    }
-    if (cli.cmd_uninstall) {
-        const install_mod = @import("install.zig");
-        return install_mod.uninstallSelf(block_io, gpa, cli.is_user);
-    }
-
-    // --gen-init: generate init script
+    // Management commands: stateless, no Host daemon needed
+    if (cli.cmd_status) return cmdStatus(block_io, gpa, cli.port);
+    if (cli.cmd_exec) return cmdExec(block_io, gpa, cli.port, cli.exec_target.?, cli.exec_cmd.?);
+    if (cli.cmd_upload) return cmdUpload(block_io, gpa, cli.port, cli.upload_target.?, cli.upload_file.?);
+    if (cli.cmd_download) return cmdDownload(block_io, gpa, cli.port, cli.download_target.?, cli.download_remote.?, cli.download_local.?);
+    // --gen-init
     if (cli.cmd_gen_init) {
         const install_mod = @import("install.zig");
         const platform_str = cli.gen_init_platform orelse "linux";
@@ -43,12 +38,6 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
         std.debug.print("{s}", .{script});
         return;
     }
-
-    // Management commands: stateless, no Host daemon needed
-    if (cli.cmd_status) return cmdStatus(block_io, gpa, cli.port);
-    if (cli.cmd_exec) return cmdExec(block_io, gpa, cli.port, cli.exec_target.?, cli.exec_cmd.?);
-    if (cli.cmd_upload) return cmdUpload(block_io, gpa, cli.port, cli.upload_target.?, cli.upload_file.?);
-    if (cli.cmd_download) return cmdDownload(block_io, gpa, cli.port, cli.download_target.?, cli.download_remote.?, cli.download_local.?);
     // --save-config
     if (cli.save_config) {
         const config_mod = @import("config.zig");
@@ -61,7 +50,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
         return config_mod.saveConfig(block_io, gpa, cfg, cli.config_path orelse "utmm.conf");
     }
 
-    // Default serve_dir to exe directory if not specified (needed for auto-upgrade)
+    // Default serve_dir to exe directory if not specified
     const serve_dir = if (cli.serve_dir) |sd| sd else blk: {
         const exe_path = try std.process.executablePathAlloc(block_io, gpa);
         defer gpa.free(exe_path);
@@ -70,15 +59,9 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
     };
     defer if (cli.serve_dir == null) gpa.free(serve_dir);
 
-    // --host: start HTTP server (v0.3.0 unified architecture)
+    // --host (via --svc): start HTTP server
     if (cli.is_host) {
         try startHttpHost(block_io, gpa, cli.port, cli.mesh_port, cli.hosts_file, serve_dir, cli.peer_mesh, shutdown);
-        return;
-    }
-
-    // --mcp alone: deprecated; MCP available via --host HTTP on port 2121
-    if (cli.is_mcp) {
-        std.log.info("[host] --mcp deprecated; use --host for MCP on port 2121", .{});
         return;
     }
 }
