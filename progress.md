@@ -2,20 +2,21 @@
 
 ## 当前状态
 
-- **分支**: `main`
-- **最新提交**: Phase 50 加固优化（20 项修复，128/128 测试通过）
-- **8 目标交叉编译**: 全部通过，x86_64-macos Rosetta 测试 128/128
+- **分支**: `main`（领先 origin/main 2 个提交）
+- **最新提交**: `e444d46` — macOS 重试计数器永久累积修复
+- **测试**: 149/149 通过
+- **部署**: macOS Host ✅ | linuxvm ✅ | macvm 📋 | windowsvm 📋 | winx64 📋
 
 ## 最近提交
 
 ```
+e444d46 fix: macOS retry counter accumulates permanently, blocking restart tests
+1ff46ad fix: Host restart exec returning empty (0xFF keepalive pollution + stale session races)
+ed7985b v0.11.10: Phase 50-52 hardening, consolidation, auto-ensure + deployment fixes
 717d6e1 refactor: consolidate 19 source files into 13 by merging thin wrappers
 52aa0c3 test: add 66 unit tests, coverage from 127 to 193 (+52%)
 1484e5e fix: correct MCP tool descriptions and port references
 1aa5de0 refactor: unified install/upgrade self-copy model + doc consolidation (#1)
-3fa0b5e fix: add IP detection retry for all platforms including Windows
-fba0a9f fix: add IP detection retry for DHCP race on Guest startup
-adffa15 fix: KCP tunnel session matching and reconnect race conditions
 ```
 
 ## Phase 50: 加固优化全面审计 ✅ (2026-07-26)
@@ -211,3 +212,43 @@ adffa15 fix: KCP tunnel session matching and reconnect race conditions
 - KCP 隧道在 Host 重启后 exec 返回空输出（dual-session mismatch，F93）
 - `selfCopy()` 的 copy+delete 路径未重新签名（F91）
 - 4 个 DebugAllocator 内存泄漏（`buildServiceArgs` CLI 短生命周期，OS 回收）
+
+## Phase 54: Task #254 — Host 重启 exec 空输出修复 ✅ (2026-07-26)
+
+**目标**: 修复 Host 重启后 exec 返回 HTTP 200 空 body + x-exit-code: -1 的长期 bug。
+
+**根因**（6 个协同问题）:
+1. 0xFF keepalive 污染 KCP 数据通道 — 1 字节探针作为应用消息传递，触发 BufferTooSmall
+2. Host 不发送 pty_spawn — Guest 依赖隐式触发
+3. waitForHostTunnel 忙等 — lock 失败跳过 sleep，CPU 100%
+4. ptyReadLoop 不检查 pty_dead — 资源泄漏
+5. tunnelManager 选过期 session — 有 keepalive 的旧 session 被优先选中
+6. macOS launchd 重试计数器不重置 — 测试重启被拒绝
+
+**提交**:
+
+| 提交 | 内容 | 文件 |
+|------|------|------|
+| `1ff46ad` | Fix 1-5: 0xFF 过滤 + pty_spawn + 忙等修复 + pty_dead + session 选择 | `tunnel.zig`, `broadcast.zig`, `host.zig` |
+| `e444d46` | Fix 6: 重试计数器 120s 时间窗重置 + mesh 启动后 resetRetryCounter | `svc.zig`, `host.zig`, `broadcast.zig` |
+
+**验证**:
+| 项目 | 结果 |
+|------|------|
+| `zig build test` | 149/149 通过 |
+| `zig build` (aarch64-macos) | ✅ 无错误 |
+| Host 重启循环（轮询模式） | 10/10 通过 |
+| 0xFF 错误（日志） | 0 出现 |
+| 重试计数器 | 10 次快速重启未触发 |
+
+**部署**:
+| 目标 | 状态 |
+|------|------|
+| macOS Host | ✅ 已部署，PID 75841 |
+| linuxvm Guest | ✅ 已部署，服务 active |
+| macvm、windowsvm、winx64 | 📋 待部署（用户指示：本机测试完善后） |
+
+**遗留**:
+- 待推送到 origin/main
+- debug 日志过于冗长（`scan: sessions=X`）
+- `selfCopy()` copy+delete 路径未重新签名（F91）

@@ -200,7 +200,41 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 - httpd.zig 中的 JSON 辅助函数（`jsonEscape`、`jsonGetString` 等）保留，因为 `host.zig` 的 CLI 管理命令仍在使用。
 - mcp.zig 有自己的 JSON 辅助函数副本 — 避免 stdio MCP 进程依赖 httpd.zig 中的 HostState 线程变量。
 
+### Phase 54: Task #254 — Host 重启后 exec 空输出修复 ✅ (2026-07-26)
+
+**目标**: 修复 Host 重启后 exec 返回 HTTP 200 空 body + x-exit-code: -1 的长期 bug。
+
+**根因链**（6 个协同问题）：
+
+1. **0xFF Keepalive 污染 KCP 数据通道** — `mesh.zig` 定期 keepalive 通过 `kcp.send(&[_]u8{0xFF})` 发送 1 字节探针，作为 KCP 消息到达应用层。`tunnel.peekSize()` 返回 1 → `handleMeshGuest` 分配 1 字节缓冲区 → real message >1 字节 → KCP BufferTooSmall → handler crash
+2. **Host 不发送 pty_spawn** — Guest 依赖隐式触发，Host 重启后新 session 无 exec 请求时 Guest 状态不确定
+3. **waitForHostTunnel 忙等** — lock 失败 `continue` 跳过 500ms sleep，CPU 100%
+4. **ptyReadLoop 不检查 pty_dead** — pty 被杀后 loop 继续运行
+5. **tunnelManager 选过期 session** — 有 keepalive 数据的旧 session 被优先选中
+6. **macOS launchd 重试计数器不重置** — `resetRetryCounter()` 定义但从未调用，测试反复重启触发 >3 次限制
+
+**修复清单**:
+
+| 编号 | 文件 | 修改 | 提交 |
+|------|------|------|------|
+| F1 | `tunnel.zig` | `recv()` + `peekSize()` 过滤 0xFF keepalive | `1ff46ad` |
+| F2 | `broadcast.zig` | lock 失败退避 500ms，不跳过 sleep | `1ff46ad` |
+| F3 | `host.zig` | tunnelManager 创建 tunnel 后发送 pty_spawn | `1ff46ad` |
+| F4 | `broadcast.zig` | ptyReadLoop pty_dead 检查提前退出 | `1ff46ad` |
+| F5 | `broadcast.zig` | waitForHostTunnel 按 `last_recv_ms` 选最新 session | `1ff46ad` |
+| F6 | `svc.zig` + `host.zig` + `broadcast.zig` | 重试计数器 120s 时间窗重置 + mesh 启动后调用 `resetRetryCounter()` | `e444d46` |
+
+**测试方法改进**: 固定 `sleep 20` → 轮询模式（每 2s 尝试 exec，就绪即进入下一轮）。典型就绪时间 ~8s，比固定等待快 60%。
+
+**验证**: `zig build test` 149/149 通过，Host 重启循环 10/10 通过，0xFF 错误 0 出现，10 次快速重启未触发重试限制。
+
+**部署状态**: macOS Host ✅ | linuxvm ✅ | macvm 📋 | windowsvm 📋 | winx64 📋
+（用户指示：本机测试完善后再部署到其他 VM）
+
 ## 待办
 
+- [ ] 部署到 macvm、windowsvm、winx64（本机测试完善后）
+- [ ] 推送 2 个本地提交到 origin/main（`git push`）
 - [ ] F91: `selfCopy()` copy+delete 回退路径添加 macOS codesign 重新签名
-- [ ] F93: KCP 隧道 Host 重启后 exec 空输出（dual-session mismatch）
+- [ ] 清理 debug 日志（`waitForHostTunnel` 的 `scan: sessions=X` 消息）
+- [ ] 改进 `waitForHostTunnel` 对仅含 keepalive 数据的过期 session 的过滤

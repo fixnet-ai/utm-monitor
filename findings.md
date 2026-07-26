@@ -279,3 +279,43 @@ Host 重启后，所有 VM 重新连接（LSA 正常，status 显示在线），
 **原因分析**：Host 和 Guest 各自调用 `m.connect()` 创建 KCP 会话，conv ID 不同。Host 重启后 tunnelManager 创建新会话，但 Guest 仍用旧会话。数据在不同会话间无法互通——"dual-session mismatch"。
 
 tunnelManager 有检测逻辑（搜索 Guest-initiated session），但在 Host 重启后 Guest 的 session 可能还未重建。此问题早于 Phase 52，属于 KCP 隧道管理的设计 bug。
+
+**更新 (2026-07-26)**: 此问题的根因分析不完整。真正根因是 6 个协同问题（详见 Phase 54）：0xFF keepalive 污染数据通道 + 缺少 pty_spawn + tunnel 层 peekSize/recv 过滤不对称 + waitForHostTunnel 选过期 session + ptyReadLoop 不检查 pty_dead + macOS 重试计数器不重置。已在提交 `1ff46ad` 和 `e444d46` 中全部修复。
+
+---
+
+## Phase 54: Task #254 — Host 重启 exec 空输出修复 (2026-07-26)
+
+### Finding 94: 0xFF Keepalive 通过 KCP 数据通道污染应用层（Critical）
+
+`mesh.zig:periodicTasks` 每 1s 通过 `kcp.send(&[_]u8{0xFF})` 发送 keepalive 探针。`0xFF` 作为完整的 KCP 消息（1 字节，type=255）传递到对端应用层，与 tunproto 消息（pty_exec_input=0x10、file_chunk=0x1c 等）混在同一通道。
+
+**影响链**：
+- `tunnel.peekSize()` 返回 1 → `handleMeshGuest` 分配 1 字节缓冲区
+- `tunnel.recv()` 有过滤但 `peekSize()` 没有 → 不对称
+- 下次 real message（>1 字节）被读到 1 字节缓冲区 → KCP BufferTooSmall → handler crash
+- `waitForHostTunnel` 选中有 0xFF 数据的 session → 读到 type=255 → 忽略 → 永远处理不了 exec 数据
+
+**修复** (`tunnel.zig`): `recv()` 和 `peekSize()` 同时过滤 `0xFF`。keepalive 检测仍通过 `kcp_inst.peekSize()` 直接访问，不受 tunnel 层过滤影响。
+
+### Finding 95: peekSize/recv 过滤不对称导致 BufferTooSmall 级联
+
+`tunnel.recv()` 在 while 循环中过滤 0xFF，但 `tunnel.peekSize()` 是 `kcp_inst.peekSize()` 的简单透传。`handleMeshGuest` 的模式是 `peekSize()` → 分配缓冲区 → `recv()`：peekSize 返回 1（0xFF）→ 分配 1 字节 buf → recv() 过滤 0xFF 后尝试读 real message → KCP 内部缓冲区足够但用户 buf 不够 → BufferTooSmall。
+
+**教训**：成对的 peek/read 方法必须保持过滤逻辑一致。peek 应消费被过滤的消息，而非仅报告其大小。
+
+### Finding 96: macOS launchd 重试计数器永久累积
+
+`svc.zig:checkRetryLimit()` 每次服务启动时读取 `/var/run/utmm-host.retry`，递增计数器，>3 则 exit。`resetRetryCounter()` 定义但从未调用。每次重启都累积计数，测试时快速重启 4 次即被 launchd 拒绝。
+
+**修复**：
+1. 在 `host.zig` 和 `broadcast.zig` 的 mesh 启动成功后调用 `resetRetryCounter()`
+2. 在 `checkRetryLimit()` 中添加 120s 时间窗口：如果计数器文件 mtime > 120s 前，说明上次运行成功持续了有意义的时间，重置计数
+
+### Finding 97: 轮询测试模式替代固定等待
+
+固定 `sleep 20` 等待 Host 就绪 → 不可靠（有时未就绪）、慢（8s 就绪也要等 20s）。轮询模式：每 2s 尝试 exec，HTTP 200 即进入下一轮。典型就绪 ~8s，可靠性从 ~70% 提升到 100%。
+
+### Finding 98: Zig 0.16.0 `zig build test` 管道模式 EndOfStream
+
+`zig build test` 使用内部 `--listen=-` 管道模式与测试 runner 通信时，偶尔报 `error.EndOfStream`。绕过方案：直接运行测试二进制 `./.zig-cache/o/<hash>/test --seed=0x1`。
