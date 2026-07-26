@@ -1200,17 +1200,6 @@ pub fn meshSessionLoop(
                 break;
             }
 
-            // Check auto-upgrade signal before blocking recv.
-            // When peer_mesh is set, also check version mismatch (local dual-port testing).
-            if (upgrade.needed.load(.acquire)) {
-                std.log.info("[upgrade] Version mismatch, initiating utmm-old upgrade", .{});
-                performUpgrade(io, allocator, &tunnel, info.target, mesh_port, peer_mesh) catch |err| {
-                    std.log.err("[upgrade] performUpgrade failed: {}", .{err});
-                    upgrade.needed.store(false, .release);
-                };
-                break;
-            }
-
             if (!tunnel.isAlive()) {
                 std.log.info("[guest-mesh] Tunnel dead (keepalive), reconnecting", .{});
                 break;
@@ -1490,25 +1479,5 @@ fn sendChunkedFile(
         std.log.err("[guest-mesh] file_eof send failed: {}", .{e});
     };
 }
-
-/// Auto-upgrade via utmm-old detached bootstrap.
-/// Spawns a detached child process (utmm-old) that stops the service,
-/// downloads the new binary via mesh KCP tunnel, replaces it, and restarts.
-/// After spawning, this process exits — the child outlives it.
-fn performUpgrade(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    tun: *tunnel_mod.Tunnel,
-    target: []const u8,
-    mesh_port: u16,
-    peer_mesh: ?[]const u8,
-) !void {
-    _ = tun;
-    const upgrade = @import("upgrade.zig");
-    try upgrade.spawnDetachedUpgrader(io, allocator, target, mesh_port, peer_mesh);
-    std.log.info("[upgrade] utmm-old spawned — exiting for upgrade", .{});
-    std.process.exit(0);
-}
-
 
 test "getSubnetBroadcasts - signature" { _ = getSubnetBroadcasts; }
