@@ -301,7 +301,9 @@ pub fn main(init: std.process.Init) !void {
     // ── 5. --install: force install service ──
     if (cli.cmd_install) {
         const role: svc.ServiceRole = if (cli.is_host) .host else .guest;
-        svc.forceInstall(init.io, init.gpa, role, &.{});
+        var extra_args = try buildServiceArgs(init.gpa, cli);
+        defer extra_args.deinit(init.gpa);
+        svc.forceInstall(init.io, init.gpa, role, extra_args.items);
         return;
     }
 
@@ -313,7 +315,9 @@ pub fn main(init: std.process.Init) !void {
 
     // ── 7. --host: ensure Host service is running ──
     if (cli.is_host) {
-        svc.ensure(init.io, init.gpa, .host, &.{});
+        var extra_args = try buildServiceArgs(init.gpa, cli);
+        defer extra_args.deinit(init.gpa);
+        svc.ensure(init.io, init.gpa, .host, extra_args.items);
         return;
     }
 
@@ -331,7 +335,58 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── 10. Default: ensure Guest service is running ──
-    svc.ensure(init.io, init.gpa, .guest, &.{});
+    var extra_args_guest = try buildServiceArgs(init.gpa, cli);
+    defer extra_args_guest.deinit(init.gpa);
+    svc.ensure(init.io, init.gpa, .guest, extra_args_guest.items);
+}
+
+/// Build extra CLI arguments to embed in service config (--hostname, --port, etc.)
+fn buildServiceArgs(alloc: std.mem.Allocator, cli: CliArgs) !std.ArrayListAligned([]const u8, null) {
+    var args: std.ArrayListAligned([]const u8, null) = .empty;
+    errdefer args.deinit(alloc);
+
+    if (cli.hostname) |h| {
+        const arg = try alloc.dupe(u8, "--hostname");
+        errdefer alloc.free(arg);
+        try args.append(alloc, arg);
+        const val = try alloc.dupe(u8, h);
+        errdefer alloc.free(val);
+        try args.append(alloc, val);
+    }
+    if (cli.host_ip) |h| {
+        const arg = try alloc.dupe(u8, "--host-ip");
+        errdefer alloc.free(arg);
+        try args.append(alloc, arg);
+        const val = try alloc.dupe(u8, h);
+        errdefer alloc.free(val);
+        try args.append(alloc, val);
+    }
+    if (cli.port != protocol.DEFAULT_PORT) {
+        const arg = try alloc.dupe(u8, "--port");
+        errdefer alloc.free(arg);
+        try args.append(alloc, arg);
+        const port_str = try std.fmt.allocPrint(alloc, "{d}", .{cli.port});
+        errdefer alloc.free(port_str);
+        try args.append(alloc, port_str);
+    }
+    if (cli.mesh_port != protocol.DEFAULT_PORT) {
+        const arg = try alloc.dupe(u8, "--mesh-port");
+        errdefer alloc.free(arg);
+        try args.append(alloc, arg);
+        const port_str = try std.fmt.allocPrint(alloc, "{d}", .{cli.mesh_port});
+        errdefer alloc.free(port_str);
+        try args.append(alloc, port_str);
+    }
+    if (cli.peer_mesh) |p| {
+        const arg = try alloc.dupe(u8, "--peer-mesh");
+        errdefer alloc.free(arg);
+        try args.append(alloc, arg);
+        const val = try alloc.dupe(u8, p);
+        errdefer alloc.free(val);
+        try args.append(alloc, val);
+    }
+
+    return args;
 }
 
 test "parseArgs - default guest mode" {

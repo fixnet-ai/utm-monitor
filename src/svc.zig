@@ -501,7 +501,7 @@ pub fn stop(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
 fn killAllUtmm(io: std.Io, alloc: std.mem.Allocator) !void {
     switch (builtin.os.tag) {
         .macos, .linux => {
-            _ = runCmd(alloc, io, &[_][]const u8{ "pkill", "-9", "utmm" });
+            _ = runCmd(alloc, io, &[_][]const u8{ "pkill", "-9", "-x", "utmm" });
         },
         .windows => {
             _ = runCmd(alloc, io, &[_][]const u8{ "taskkill", "/f", "/im", "utmm.exe" });
