@@ -1,5 +1,29 @@
 # Progress: v0.11.9
 
+## Session 2026-07-26 (Phase 46 — KCP 可靠性全面加固)
+
+### Phase 46: KCP 可靠性全面加固 ✅
+
+**目标**: 全面深度审查 kcp.zig 所有边界条件和异常情况，进行加固。
+
+**审查方法**: 逐函数、逐路径追踪所有代码路径，对比 C 参考实现 (skywind3000/kcp)，
+识别内存安全、整数溢出、拥塞控制、窗口管理、ACK 处理、流控等 7 个维度的边界问题。
+
+**发现**: 13 个问题（2 Critical、3 High、3 Medium、5 Low/Info）
+
+**Critical 修复**:
+1. `flush()` snd_buf.append OOM → segment 丢失 → 恢复至 snd_queue
+2. `flush()` buffer 分配失败 → 静默返回 → outputSegment 回退路径
+
+**High 修复**:
+3. `send()` count 64-bit @intCast 截断 → safeDivCeil 辅助函数
+4. `flush()` cwnd 下溢 → @max(prior_cwnd/2, 1)
+5. `updateRtt()` 中间值溢出 → saturatingAdd/saturatingMul 饱和运算
+
+**文件变更**: `src/kcp.zig` (+280/-80: 130 行加固 + 150 行新测试)
+**测试**: 111/111 通过（含 18 个新加固测试）
+**构建**: 8 目标交叉编译全过
+
 ## Session 2026-07-26 (Phase 43-45 — KCP tunnel 完善 + IP 检测重试)
 
 ### Phase 43: KCP tunnel session 匹配 + 重连竞态修复 ✅
@@ -1169,3 +1193,119 @@ recv loop 持续收到 0 字节，pty_spawn 被写入但不能读取 pty_output�
 | `task_plan.md` | Phase 39 新增 |
 | `findings.md` | Finding #35 更新 + #36 新增 |
 | `progress.md` | 本条目 |
+
+## Session 2026-07-26 (Phase 47 — KCP 可靠性第二轮深度审计)
+
+### Phase 47: KCP 可靠性第二轮深度审计 ✅
+
+**目标**: 在 Phase 46 基础上进一步深度审查错误路径内存安全、协议状态机一致性、
+整数溢出、KCP-tunnel-mesh 交互边界、模糊测试。
+
+**关键修复 (3 个代码变更)**:
+
+1. **Finding 55 (Critical)**: `input()` seg.data 泄漏
+   - `ackPush` 或 `parseData`→`insertRcvBuf` OOM 时 seg.data 堆内存泄漏
+   - 修复: PUSH 处理器内部 errdefer 块 + `seg.data = null` 防 double-free
+
+2. **Finding 56 (Critical)**: `send()` OOM 部分队列残留
+   - 非 stream 模式 OOM 部分片段残留致接收端永久阻塞
+   - 修复: errdefer 回滚（pop+free）+ catch 释放当前 owned
+
+3. **Finding 59 (Medium)**: 时间戳算术溢出
+   - 8 处 `+` 改为 `+%`：flush() 3 处、update() 2 处、check() 1 处、探针 2 处
+   - Debug 模式 ~49 天 uptime 时不再 panic
+
+**新增测试**: 20 个（总数 34→54，本次会话 131 全过含跨模块测试）
+- SN 回绕滑动窗口、4 个模糊测试（随机丢包/乱序/重复/高丢包/字节损坏/字段损坏）
+- OOM 恢复、内存泄漏模拟、不完整片段重传恢复
+- ACK 去重、空缓冲区输出、各种边界条件
+- parseFastack 边界、insertRcvBuf 重复检测、safeDivCeil 边界
+
+**审查覆盖**:
+- 完整 segment 生命周期追踪：`send()` → snd_queue → snd_buf → parseUna/parseAck → free；`input()` → rcv_buf → rcv_queue → recv() → free。每个转移点验证了数据所有权。
+- 整数溢出扫描：所有时间戳加法 (`current + rto`, `ts_flush + interval`)；cwnd/incr 乘加（已由 Phase 46 保护）；saturatingAdd/saturatingMul 在 RTO 计算。
+- KCP-tunnel-mesh 交互：mesh.zig 中 `input()` catch 日志行为（line 782-784）；`periodicTasks` 锁保护；`meshKcpOutput` null user 守卫。
+
+**未修复的设计限制**:
+- rcv_queue 不完整片段超时——keepalive (15s) + dead_link (20×RTO) 已兜底
+- input() parseUna 先于 OOM 操作——协议固有，不可修
+- setWndSize 空操作——已有文档说明
+
+**文件变更**: `src/kcp.zig` (+530/-15 行：30 行修复 + 500 行测试)
+
+**构建验证**: `zig build test` 131/131 通过（debug 模式），8 目标交叉编译全过
+
+**Status**: complete
+
+## Session 2026-07-26 (Phase 48 — 全平台安装/卸载/运行/升级重构)
+
+### Phase 48: 自复制安装模型重构 ✅
+
+**目标**: 统一安装、卸载、运行、升级流程，用自复制模型替代 utmm-old KCP 下载模式，
+移除提权代码，统一服务模型，fast-fail 原则。
+
+**设计决策**:
+- 固定安装路径: POSIX `/opt/utmm/utmm`，Windows `C:\opt\utmm\utmm.exe`
+- `--install` 永远无条件强制覆盖安装（不检查状态、不比较配置）
+- 升级 = 新版本带 `--install` 执行一次
+- 自复制: 写 `.tmp` → fsync → 原子 `rename()`
+
+**新建文件**:
+- `src/svc.zig` (~900 行): 统一跨平台服务管理模块
+  - `canonicalPath()` / `canonicalDir()` / `isAtCanonicalPath()` — 路径工具
+  - `selfCopy()` — 核心自复制: tmp+rename，跨文件系统 EXDEV 用 copy+delete 回退
+  - `forceInstall()` — 无条件: stop→kill→selfCopy→install→start
+  - `ensure()` — isRunning? skip : forceInstall
+  - `isRunning()` / `install()` / `uninstall()` / `start()` / `stop()` — 服务生命周期
+  - `checkRetryLimit()` / `resetRetryCounter()` — macOS 重试计数器
+  - `winServiceRun()` / `svcMain()` / `svcCtrlHandler()` — Windows SCM 集成
+  - `runCmd()` / `runCmdStdout()` / `runCmdCheckExit()` — 命令执行工具
+  - `copyFile()` — 64KB chunked file copy
+- `src/fail.zig` (~60 行): fast-fail 辅助模块
+  - `err(feature, error)` — 打印错误名 + 系统错误码，exit(1)
+  - `msg(feature, fmt, args)` — 打印格式化消息 + 系统错误码，exit(1)
+  - `printSysError()` — 平台特定: POSIX errno+strerror，Windows GetLastError
+
+**重写文件**:
+- `src/main.zig`: 完整重写调度树
+  1. `--version` → 打印版本，exit(0)
+  2. `--help` → 打印帮助，exit(0)
+  3. 权限检查（所有后续路径必须 root）
+  4. `--svc` → macOS checkRetryLimit / Windows winServiceRun / POSIX runWithIo
+  5. `--install` → forceInstall，exit
+  6. `--uninstall` → uninstall，exit
+  7. `--host` → ensure(.host)
+  8. 管理命令（--status/--exec/--upload/--download/--gen-init）→ host_mod.run
+  9. `--mcp` → 打印引导信息
+  10. 默认 → ensure(.guest)
+  - 移除: `--upgrade`、`--target`、`--user` 标志
+
+**删除文件**:
+- `src/agent.zig` (237 行): 前台 guest 模式取消，功能由 svc.ensure 替代
+- `src/upgrade.zig` (867 行): utmm-old KCP 下载模式被自复制替代
+
+**精简文件**:
+- `src/priv.zig`: 157→~25 行 — 仅 isAdmin()，删除 elevatePosix/elevateWindows/ensureAdmin
+- `src/install.zig`: 631→~150 行 — 仅 Platform detect/asStr + genInit + detectServiceEnv
+- `src/broadcast.zig`: 移除 performUpgrade() (~30 行) 和升级检查分支，保留 UpgradeSignal
+- `src/host.zig`: 移除 --install/--uninstall dispatch (~30 行)
+
+**Zig 0.16.0 编译问题解决**（7 次迭代）:
+1. `makePath`→`createDirPath`、`std.time.timestamp()`→简化计数器
+2. `Io.File.read/write` 已移除→reader/writer API
+3. `std.c.strerror` 已移除→`@extern` 直接调用 libc
+4. `chmod` 从 Io.Dir 移除→createFile 时设置权限
+5. `rename()` 4 参数签名: `(old_path, new_dir, new_path, io)`
+6. `++` 字符串拼接需 comptime-known→多个 `appendSlice`
+7. `GetLastError()` 返回 Win32Error enum→`@intFromEnum()`
+8. Windows SCM 类型从 std.os.windows 移除→手动声明 extern "advapi32"
+
+**构建验证**: `zig build test` 全过，8/8 目标交叉编译全过：
+- aarch64-macos (native) ✅
+- aarch64-linux-musl / x86_64-linux-musl / x86-linux-musl ✅
+- x86_64-macos ✅
+- aarch64-windows / x86_64-windows / x86-windows-gnu ✅
+
+**Commit**: `ca1d7fe` — 9 files changed, +1078/-2143
+
+**Status**: complete

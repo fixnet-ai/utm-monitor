@@ -674,3 +674,325 @@ powershell -Command "Move-Item -Force C:\opt\utmm\utmm.next.exe C:\opt\utmm\utmm
 
 **教训**: Windows .exe 替换与 POSIX `rename()` 语义不同。始终先终止进程再用
 临时文件 + Move-Item。
+
+---
+
+## Phase 46: KCP 可靠性全面审计 (2026-07-26)
+
+### Finding 42: `flush()` buffer 分配失败静默丢弃数据
+
+**严重级别**: Critical
+
+`flush()` line 644-646 中 buffer 分配失败（`catch null`）后，line 647 `orelse return`
+静默返回。此时所有待发送 ACK、数据和窗口探测全部丢失，但 `acklist` 尚未清空（line 679
+在 ACK 处理分支内），所以下次 flush 会重试。然而，`snd_queue` → `snd_buf` 的移动在
+buffer 检查之后（line 737-754），不受影响。
+
+**结论**: 当前实现中，buffer 分配失败时 acklist 未被清空（在 ACK 处理分支内清空），
+所以数据不会丢失。但 `setMtu()` 分配失败可能导致 buffer 为 null。如果用户从未调用
+`setMtu()`，则 buffer 在首次 flush 时延迟分配，失败后每次都尝试分配。
+
+**加固方案**: 在 buffer 分配失败时跳过 ACK 编码和数据发送，但仍处理窗口探测（使用
+`outputSegment` 回退）和 snd_queue→snd_buf 移动。acklist 不清空，下次 flush 重试。
+
+### Finding 43: `snd_buf.append` OOM 导致 segment 丢失
+
+**严重级别**: Critical
+
+`flush()` line 753: `self.snd_buf.append(self.allocator, newseg) catch break;` —
+segment 已从 `snd_queue.orderedRemove(0)` 取出，如果 `append` 到 `snd_buf` 失败，
+segment 及其数据（堆分配）泄漏且永久丢失。调用者无感知。
+
+**加固方案**: OOM 时将 segment 放回 snd_queue（`insert(0)`），然后 break。
+
+### Finding 44: `send()` count 计算 64-bit 截断
+
+**严重级别**: High
+
+`send()` line 522: `@intCast((remaining.len + self.mss - 1) / self.mss)` — 在 64-bit
+平台上，`remaining.len` 为 usize (64-bit)，除法结果可能超过 u32::MAX（约 4B 段）。
+`@intCast` 在溢出时触发 panic。
+
+**加固方案**: 在除法前检查 `remaining.len / self.mss > IKCP_WND_RCV`，提早返回错误。
+
+### Finding 45: `flush()` 超时路径 cwnd 下溢
+
+**严重级别**: High
+
+`flush()` line 846: `self.ssthresh = prior_cwnd / 2;` 当 `prior_cwnd == 1` 时结果为 0，
+随后 line 847-849 夹紧 `ssthresh = IKCP_THRESH_MIN (2)`，line 850 `cwnd = 1`。
+最终 cwnd=1、ssthresh=2，状态正确。但 line 846 本身产生了值为 0 的中间状态。
+
+**加固方案**: 使用 `@max(prior_cwnd / 2, 1)` 避免中间零值，防御后续代码变更引入的 bug。
+
+### Finding 46: `check()` xmit==0 segment 的 resendts 处理
+
+**严重级别**: Medium
+
+`check()` line 616: `if (seg.xmit == 0) continue;` — 跳过尚未首次发送的 segment。
+但新 segment 在 `flush()` step 3 中设置了 `resendts = current`，且 xmit 在 step 4
+首次发送时才从 0 变为 1。如果 flush 在 step 3 之后、step 4 之前因 buffer 不足而
+跳过发送，则 segment 在 snd_buf 中 xmit=0 但 resendts=current。下次 `check()` 因
+`xmit == 0` 跳过，不会因 `resendts` 到期而返回 immediate。这是正确的——依赖
+ts_flush timer 来驱动下次 flush。
+
+### Finding 47: `rcv_queue` 无限累积风险
+
+**严重级别**: Medium
+
+消息模式下，如果 `rcv_queue` 首个 segment 的 `frg != 0`（多片段消息的首段），且后续
+片段永不抵达（网络丢包），则 `recv()` 永远返回 0，`peekSize()` 永远返回 -1。
+`rcv_queue` 无限增长，无超时淘汰机制。
+
+**加固方案**: 为 rcv_queue 中不完整消息添加超时淘汰（例如 30 秒）。或至少在诊断接口
+暴露此状态，让上层通过重建 KCP session 恢复。
+
+### Finding 48: `moveRcvBuf` reconnect 检测误判风险
+
+**严重级别**: Medium
+
+`moveRcvBuf()` line 981: `if (sn_lt(seg.sn, self.rcv_nxt) and self.rcv_nxt > 10)`
+— reconnect 检测：远程重启后 SN 回绕，旧 rcv_buf 中的高 SN 段在新 rcv_nxt 之后。
+但条件 `rcv_nxt > 10` 是启发式阈值——如果 rcv_nxt ≤ 10（连接刚开始），即使 seg.sn
+< rcv_nxt 也跳过检测。这意味着在连接早期收到旧 session 的残留段时，可能被错误当作
+有效段插入 rcv_buf。
+
+**当前影响**: 低。因为 nonce 机制确保新旧 session 的 conv 不同，旧 session 的段
+不会到达新 KCP 实例。但防御性编程应记录此假设。
+
+### Finding 49: `updateRtt` 整数溢出
+
+**严重级别**: Low
+
+`updateRtt()` line 1113: `3 * self.rx_rttval + delta` — rttval 最大约 60000
+（来自 IKCP_RTO_MAX），3*60000+60000 = 240000，远小于 i32::MAX。但若未来修改
+常量使其增大，存在溢出风险。line 1116: `7 * self.rx_srtt + rtt` 同理。
+
+**加固方案**: 使用饱和运算或 `@mulWithOverflow`，或将中间变量提升为 i64。
+
+### Finding 50: `flush()` 死链检测双路径不一致
+
+**严重级别**: Low
+
+Line 822-824: `if (segment.xmit >= self.dead_link) { self.state = 0xFFFFFFFF; }`
+— 设置 `state` 字段。但 `isDead()` 检查 `seg.xmit >= self.dead_link`，不检查
+`state`。这意味着两个死链检测路径可能不同步：
+- `state = 0xFFFFFFFF` 被设置后，如果 segment 被 ACK 移除，`state` 不清零
+- `isDead()` 依赖 snd_buf 中 segment 的 xmit，如果所有 segment 被 ACK，则返回 false
+
+**加固方案**: 统一使用 `isDead()` 或 `state`，不混用。
+
+### Finding 51: `recv()` 零长度缓冲区返回歧义
+
+**严重级别**: Low
+
+`recv(buf)` 当 `buf.len == 0` 且队列有数据时，返回 `error.BufferTooSmall`。
+当队列无数据时，返回 0。调用者可能用 `recv(&empty_buf)` 探测是否有数据，
+返回 0 表示无数据（正确），返回 `BufferTooSmall` 表示有数据（也正确）。
+无歧义——调用者区分了两种情况。但若调用者不检查错误，可能将 `BufferTooSmall`
+视为无数据。
+
+### Finding 52: `setWndSize` 是空操作
+
+**严重级别**: Low
+
+Line 302: `pub fn setWndSize(_: *Kcp, _: u32, _: u32) void {}` — 公开 API 但无实现。
+C 参考中对应函数有实现：重置 snd_wnd/rcv_wnd 常量。
+
+**加固方案**: 实现该函数或添加 `@compileError` 提示未实现。
+
+### Finding 53: Segment data null 安全
+
+**严重级别**: Low
+
+`flush()` line 815-819: 检查 `segment.len > 0` 后再检查 `segment.data`。
+如果 `segment.len > 0` 但 `data == null`（状态不一致），跳过 memcpy 是安全的
+（不会崩溃），但会发送带有错误长度的段。应在创建 segment 时断言 `len > 0 → data != null`。
+
+### Finding 54: `send()` stream 模式部分发送状态不一致
+
+**严重级别**: Info
+
+`send()` line 496-517: stream 模式下先修改 snd_queue 最后一个 segment（扩展其 data），
+然后检查剩余数据是否超过 segment 数量限制。如果限制触发 `return error.MessageTooLarge`，
+已扩展的 segment 保持被修改状态。这是 C 参考的预期行为（stream 模式允许部分发送），
+但调用者无法得知实际发送了多少字节。
+
+## Phase 47: KCP 可靠性第二轮深度审计 (2026-07-26)
+
+在 Phase 46 基础上进行了更深入的边界条件审查，重点关注错误路径内存安全、
+协议状态机一致性、整数溢出全面扫描、KCP-tunnel-mesh 交互边界、模糊测试。
+
+### Finding 55: `input()` — seg.data 泄漏在 ackPush/insertRcvBuf OOM 路径
+
+**严重级别**: Critical
+
+`input()` 中 PUSH segment 的数据在 line 357-359 通过 `allocator.alloc` 堆分配后，
+若后续 `ackPush` (line 401) 或 `parseData` → `insertRcvBuf` (line 1037/1039) OOM，
+错误向上传播，`seg`（栈变量）出作用域，`seg.data` 永久泄漏。
+
+**根因**: Segment 的所有权模型不清晰——堆分配在 `input()` 中完成，但释放依赖于
+深层函数（parseData/insertRcvBuf）的成功或显式 drop 路径。错误路径未覆盖。
+
+**加固方案**: PUSH 处理器内部使用 `errdefer` 块保护。`ackPush` 或 `parseData`
+失败时 `errdefer` 自动释放 `seg.data`。`parseData` 成功后（数据所有权转移至
+`rcv_buf`），将 `seg.data = null` 防止 double-free。
+
+### Finding 56: `send()` 非 stream 模式 OOM 部分队列残留
+
+**严重级别**: Critical
+
+`send()` 在非 stream 模式下将多片段消息逐个加入 `snd_queue`。若某段分配或
+`append` 失败，已入队的片段留在队列中，其 `frg` 字段指示属于一个未完成的大消息。
+接收端 `peekSize()` 检查 `rcv_queue.items.len < frg + 1` → 返回 -1，`recv()` 返回 0。
+**rcv_queue 永久阻塞**——新消息的片段排在后面，无法被消费。
+
+**根因**: 发送端在部分失败后没有回滚机制。已入队片段无论后续是否成功都留在队列中。
+
+**加固方案**:
+1. 循环前保存 `initial_count`，用 `errdefer` 在非 stream 模式或 stream 无部分发送
+   时回滚所有新增 segment（pop + free data）。
+2. `snd_queue.append` 失败时用 `catch |err|` 显式释放当前 `owned` 数据，防止
+   当前 segment 数据泄漏。
+
+### Finding 57: `input()` — 协议状态部分修改后 OOM 回滚
+
+**严重级别**: High (设计限制)
+
+`input()` 对每个 segment 先调用 `parseUna` + `shrinkBuf`（可修改 `snd_buf`
+并释放已 ACK 的 segment 数据），再进入 command 分发。如果后续 PUSH 的
+`ackPush` 或 `parseData` OOM，已从 `snd_buf` 移除的 segment 永久丢失——
+发送端认为已 ACK，接收端未能成功处理数据。
+
+**分析**: 这是 KCP 协议固有行为——UNA 是 piggyback ACK，应尽早处理。
+目前 mesh 层（mesh.zig:782-784）catch 错误后仅记录日志并继续使用 session，
+状态可能不一致。但 keepalive 机制（15s 超时）最终会杀死异常 session 并重建。
+
+**加固方案**: 未修改协议逻辑，但增强了 mesh 层的错误处理意识。
+`input()` 返回错误后 session 继续运行，状态不一致由 keepalive 兜底。
+
+### Finding 58: `parseData` → `insertRcvBuf` OOM 时 seg.data 未释放
+
+**严重级别**: High
+
+`parseData()` 在窗口外/重复检查后调用 `insertRcvBuf(seg)`（按值传递）。
+若 `insertRcvBuf` 的 `append`/`insert` OOM，seg.data 未释放，且错误传播至
+`input()` → mesh 层。Finding 55 的修复通过在调用侧添加 errdefer 覆盖了此路径。
+
+### Finding 59: 时间戳算术溢出 — ~49 天 uptime 时 debug panic
+
+**严重级别**: Medium
+
+`flush()` / `update()` / `check()` 中共 8 处时间戳加法使用普通 `+` 运算符：
+- `segment.resendts = current + segment.rto + rtomin`（首次发送）
+- `segment.resendts = current + segment.rto`（超时重传、快速重传）
+- `self.ts_probe = current + self.probe_wait`（窗口探测）
+- `self.ts_flush += self.interval` / `= self.current + self.interval`（更新计时）
+- `return current_ms + minimal`（检查计时）
+
+当 `current` 接近 `u32::MAX`（约 49 天运行时间）且加数为正时，结果溢出 u32。
+Debug 模式 panic，Release 模式 wrapping（恰好正确）。
+
+**根因**: 所有时间戳比较使用 `-%`（wrapping sub），但加法使用普通 `+`，不一致。
+
+**加固方案**: 全部 8 处改为 `+%`（wrapping add），与现有的 `-%` 一致。
+长会话可安全跨越 u32 回绕点。
+
+### Finding 60: `flush()` buffer OOM 时数据段静默延迟
+
+**严重级别**: Low (已文档化)
+
+`flush()` line 885-893: buffer 为 null 时数据段延迟到下次 flush，无警告。
+若 buffer 分配永不成功（内存极度不足），数据永远不发，上层无感知。
+
+**分析**: `check()` 返回值仍正确（基于 ts_flush），mesh 循环继续调用 update。
+死链检测（dead_link）最终触发。不可恢复但不会静默挂起——dead_link 杀死连接。
+
+### Finding 61: `send()` stream 模式 `last.data == null` 但 `last.len > 0`
+
+**严重级别**: Info
+
+`send()` stream 模式 line 522-529: 检查 `last.len < self.mss` 后计算 `capacity`，
+假设 `last.data != null`（通过 `if (last.data) |ld|` 守卫 memcpy）。
+若 `last.data == null` 且 `last.len > 0`（状态不一致——正常操作下不应发生），
+合并后的 segment 前半部分是未初始化内存。
+
+**分析**: 当前代码中所有创建 segment 的路径都确保 `len > 0 → data != null`。
+此状态仅在内存损坏或未来代码变更未维护此不变式时才可能出现。
+
+## Phase 48: 安装/升级自复制模型重构 Discoveries (2026-07-26)
+
+### Finding 62: Zig 0.16.0 `std.os.windows` 移除 SCM 类型
+
+**严重级别**: Critical (Windows 构建阻断)
+
+Zig 0.16.0 从 `std.os.windows` 移除了 Windows SCM（Service Control Manager）相关类型：
+- `SERVICE_TABLE_ENTRYW` struct
+- `SetServiceStatus` 函数
+- `RegisterServiceCtrlHandlerExW` 函数
+- `StartServiceCtrlDispatcherW` 函数
+
+这些类型和函数在旧版 Zig 中位于 `std.os.windows`，但 0.16.0 已清除。必须手动声明
+`extern "advapi32"` 函数和自定义 struct。
+
+**修复**: 在 `src/svc.zig` 中手动声明：
+```zig
+const SERVICE_TABLE_ENTRYW = extern struct {
+    lpServiceName: ?[*:0]const u16,
+    lpServiceProc: ?SvcMainFn,
+};
+extern "advapi32" fn StartServiceCtrlDispatcherW(...) callconv(.winapi) u32;
+extern "advapi32" fn RegisterServiceCtrlHandlerExW(...) callconv(.winapi) ?SERVICE_STATUS_HANDLE;
+extern "advapi32" fn SetServiceStatus(...) callconv(.winapi) u32;
+```
+
+### Finding 63: `GetLastError()` 返回 enum 而非整数
+
+**严重级别**: High (Windows 构建阻断)
+
+Zig 0.16.0 中 `std.os.windows.GetLastError()` 返回 `Win32Error` enum，不再是原始整数。
+比较 `if (gle != 0)` 和格式化 `{gle}` 在 enum 上失败。
+
+**修复**: 使用 `@intFromEnum(gle)` 转换为整数后再比较和格式化。
+`if (@intFromEnum(gle) != 0)` 和 `{@intFromEnum(gle)}`。
+
+### Finding 64: `std.c.strerror` 在 Zig 0.16.0 已移除
+
+**严重级别**: High (POSIX 构建阻断)
+
+Zig 0.16.0 从 `std.c` 移除了 `strerror` 函数。必须通过 `@extern` 直接调用 libc：
+```zig
+const strerror = @extern(*const fn (c_int) callconv(.c) [*:0]const u8, .{ .name = "strerror" });
+```
+注意 calling convention 为 `callconv(.c)`（小写c），Zig 0.16.0 将 `.C` 改为 `.c`。
+
+### Finding 65: `rename()` 签名变更 — 4 参数
+
+**严重级别**: Medium
+
+Zig 0.16.0 `Dir.rename()` 签名从 `(io, old_path, new_path)` 变为
+`(old_path, new_dir, new_path, io)`。目标目录和目标文件名需要分开传入。
+跨文件系统 rename 返回 `error.RenameAcrossMountPoints`，需用 copy+delete 回退。
+
+### Finding 66: `++` 字符串拼接需 comptime-known
+
+**严重级别**: Medium
+
+Zig 0.16.0 中 `++` 运算符左操作数必须 comptime-known。运行时拼接需改为多个
+`appendSlice` 调用：
+```zig
+// ❌ 0.15.x: buf.appendSlice(prefix ++ name ++ suffix)
+// ✅ 0.16.0:
+try buf.appendSlice(prefix);
+try buf.appendSlice(name);
+try buf.appendSlice(suffix);
+```
+
+### Finding 67: 自复制跨文件系统 rename 回退
+
+**严重级别**: Low (设计决策)
+
+`selfCopy()` 使用 tmp + rename 实现原子替换。当 tmp 文件和目标路径在不同文件系统时
+（`/tmp` → `/opt/utmm/`），rename 返回 `error.RenameAcrossMountPoints`。回退方案是
+copy+delete（非原子但可接受，因为此时服务已停止，无并发访问）。
+

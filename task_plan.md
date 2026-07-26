@@ -911,3 +911,132 @@ while (attempt < MAX_IP_RETRIES) : (attempt += 1) {
 **Commit**: `67fc113`
 
 **Status:** complete
+
+### Phase 46: KCP 可靠性全面加固 ✅ (2026-07-26)
+
+**背景**: v0.11.9 部署后 KCP 隧道稳定运行，但代码审查发现 13 个边界条件问题，
+按严重级别分类：Critical 2、High 3、Medium 3、Low 4、Info 1。
+
+**修复清单**:
+
+| # | 严重级 | 问题 | 修复 | 位置 |
+|---|--------|------|------|------|
+| 1 | Critical | `snd_buf.append` OOM → segment 丢失 | OOM 时恢复 segment 到 snd_queue；二次 OOM 时释放数据 | `flush()` step 3 |
+| 2 | Critical | `flush()` buffer 分配失败 → 静默返回 | buffer 为 null 时 ACK/探针走 `outputSegment()` 单独发送，数据段延后 | `flush()` 重构 |
+| 3 | High | `send()` count 64-bit 截断 panic | `safeDivCeil()` 辅助函数 + 提前检查 | `send()` |
+| 4 | High | `flush()` timeout 路径 cwnd 下溢 | `@max(prior_cwnd / 2, 1)` | `flush()` step 7 |
+| 5 | High | `updateRtt()` 中间值溢出 | `saturatingAdd()`/`saturatingMul()` 饱和运算 | `updateRtt()` |
+| 6 | Medium | `parseUna` ackedlen 溢出 | `+|` 饱和加法 | `parseUna()` |
+| 7 | Medium | `isDead()` 与 `state` 不一致 | `isDead()` 同时检查 `state == 0xFFFFFFFF` | `isDead()` |
+| 8 | Medium | `moveRcvBuf` reconnect 检测阈值 | `rcv_nxt > 10` → `rcv_nxt > IKCP_WND_RCV` | `moveRcvBuf()` |
+| 9 | Low | `recv()` 窗口恢复通知未启用 | `was_full` 后设置 `probe \|= 0x2` (IKCP_ASK_TELL) | `recv()` |
+| 10 | Low | `setWndSize` 空操作 | 文档化已知限制 | `setWndSize()` |
+| 11 | Low | `input()` 无段数据长度上限 | PUSH 段数据长度 ≤ MSS 校验 | `input()` |
+| 12 | Low | 未知命令静默忽略 | 保持 C 参考行为（兼容未来协议扩展） | `input()` |
+| 13 | Low | 部分发送状态不一致 | 已通过注释文档化 stream 模式语义 | `send()` |
+
+**新增辅助函数**:
+- `safeDivCeil(num, denom)` — 防截断除法
+- `saturatingAdd(a, b)` — i32 饱和加法
+- `saturatingMul(a, b)` — i32 饱和乘法
+
+**新增测试**: 18 个加固专项测试（边界条件、OOM 路径、时间跳变、窗口溢出、重传恢复等）
+
+**文件变更**: `src/kcp.zig` (+280/-80 行：130 行加固逻辑 + 150 行新测试)
+
+**构建验证**: `zig build test` 111/111 通过，8 目标交叉编译全过
+
+**Status:** complete
+
+### Phase 47: KCP 可靠性第二轮深度审计 ✅ (2026-07-26)
+
+**背景**: Phase 46 覆盖了基础边界条件，本轮在以下维度进一步深度审查：
+1. 错误路径内存安全（OOM 泄漏）
+2. 协议状态机一致性（部分修改后回滚）
+3. 整数溢出全面扫描（时间戳回绕）
+4. KCP-tunnel-mesh 交互边界（错误传播）
+5. 模糊测试（随机丢包/乱序/重复/损坏）
+
+**修复清单**:
+
+| # | Finding | 严重级 | 问题 | 修复 |
+|---|---------|--------|------|------|
+| 1 | 55 | Critical | `input()` seg.data 泄漏在 ackPush/insertRcvBuf OOM | errdefer 块保护 + seg.data=null 防 double-free |
+| 2 | 56 | Critical | `send()` 非 stream OOM → 部分片段残留致接收端永久阻塞 | errdefer 回滚 + catch 释放当前段数据 |
+| 3 | 57 | High | `input()` parseUna 先执行，OOM 后无法回滚 | 设计限制文档化；keepalive 兜底 |
+| 4 | 58 | High | `parseData`→`insertRcvBuf` OOM 时 seg.data 未释放 | Finding 55 修复覆盖此路径 |
+| 5 | 59 | Medium | 时间戳算术溢出 — 8 处 `+` 改为 `+%` | `flush()` 3处、`update()` 2处、`check()` 1处、`flush()` 探针 2处 |
+| 6 | 60 | Low | `flush()` buffer OOM 数据段静默延迟 | 已文档化；dead_link 兜底 |
+| 7 | 61 | Info | `send()` stream `last.data==null` 状态不一致 | 不变式文档化 |
+
+**新增测试**: 20 个测试：
+- SN 回绕滑动窗口
+- 4 个模糊测试（随机丢包/乱序/重复、高丢包率 70%、字节损坏、字段损坏）
+- OOM 恢复（非 stream 回滚、stream 部分发送）
+- 内存泄漏模拟
+- 不完整片段重传恢复
+- ACK 去重、空缓冲区输出、空 parseUna、越界 parseAck
+- check() 多段 resendts、窗口探测标志、dead_link 阈值设置
+- setNoDelay resend 负值、parseFastack 边界、insertRcvBuf 重复检测
+- safeDivCeil 边界
+
+**文件变更**: `src/kcp.zig` (+550/-20 行：30 行核心修复 + 520 行测试)
+
+**构建验证**: `zig build test` 131/131 通过，8 目标交叉编译全过
+
+**Status:** complete
+
+### Phase 48: v0.12.0 — 全平台安装/卸载/运行/升级重构 ✅ (2026-07-26)
+
+**背景**: 旧安装/升级模型存在多重复杂性问题：三套安装路径（agent.zig foreground、
+install.zig service、upgrade.zig utmm-old）、软连接引入的符号链接解析问题（自升级后
+运行旧版本）、Windows 升级需 bat 脚本不可靠、提权代码过于复杂、升级需 KCP 隧道下载。
+
+**方案**: 自复制模型 — 二进制从任意路径运行，强制覆盖安装到固定路径 `/opt/utmm/utmm`
+（POSIX）/ `C:\opt\utmm\utmm.exe`（Windows）。升级 = 新版本带 `--install` 执行一次。
+
+**四项核心要求**:
+
+1. **统一服务模型**: Host 和 Guest 均安装为系统自动启动服务。运行时若服务未启动则
+   自动安装（保持 3 次重试）。安装或启动失败打印错误并退出。
+
+2. **移除提权代码**: 删除所有 elevatePosix/elevateWindows/ensureAdmin。运行时检查
+   管理员权限，若无则打印明确错误信息并退出。除 `--version`/`--help` 外所有执行路径
+   必须 root/Administrator。
+
+3. **简化升级（自复制模型）**: 废弃多步骤 utmm-old KCP 下载模式。二进制自复制到固定
+   路径，升级 = 运行新二进制带 `--install`。
+
+4. **Fast fail 原则**: 不继续执行出错操作。打印函数名 + 系统错误码 + 错误信息，退出。
+
+**文件变更**:
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `src/svc.zig` | **新建** | 统一跨平台服务管理：selfCopy()、forceInstall()、ensure()、isRunning()、install()、uninstall()、start()、stop()、checkRetryLimit()、winServiceRun() |
+| `src/fail.zig` | **新建** | fast-fail 工具：err(feature, error) 和 msg(feature, fmt, args)，均 noreturn |
+| `src/main.zig` | **重写** | 新调度树：--version→exit(0)、--help→exit(0)、权限检查、--svc→服务模式、--install→forceInstall、--uninstall→uninstall、--host→ensure(.host)、管理命令→host_mod、默认→ensure(.guest) |
+| `src/priv.zig` | **精简** | 仅 isAdmin()，删除所有提权函数 |
+| `src/install.zig` | **精简** | 仅 Platform + genInit() + detectServiceEnv() |
+| `src/broadcast.zig` | **修改** | 移除 performUpgrade() 和升级检查分支，保留 UpgradeSignal 类型 |
+| `src/host.zig` | **修改** | 移除 --install/--uninstall dispatch |
+| `src/agent.zig` | **删除** | 前台 guest 模式取消 |
+| `src/upgrade.zig` | **删除** | utmm-old KCP 下载被自复制模型替代 |
+
+**自复制流程**: 写 `.tmp` → fsync → 原子 `rename()`。跨文件系统 EXDEV → copy+delete 回退。
+
+**3 次重试**: Linux `StartLimitBurst=3`、Windows `sc failure` 3 次重启、macOS 二进制侧计数器。
+
+**Windows SCM 适配（Zig 0.16.0）**: `std.os.windows.SERVICE_TABLE_ENTRYW` 及 SCM 函数
+（RegisterServiceCtrlHandlerExW、SetServiceStatus、StartServiceCtrlDispatcherW）已从
+Zig 0.16.0 移除。手动声明类型和 `extern "advapi32"` 函数。
+
+**Zig 0.16.0 API 适配**: `std.c.strerror`→`@extern`、`GetLastError()`→`@intFromEnum()`、
+`makePath`→`createDirPath`、`Io.File.read/write`→reader/writer API、`chmod`→createFile
+权限设置、`rename()` 4 参数签名、`std.time.timestamp()`→简化计数器。
+
+**构建验证**: `zig build test` 全过，8/8 目标交叉编译全过。
+
+**Commit**: `ca1d7fe` — 9 files changed, +1078/-2143
+
+**Status:** complete
