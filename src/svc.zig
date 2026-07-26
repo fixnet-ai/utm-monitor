@@ -921,15 +921,18 @@ const SvcGlobals = struct {
 
 fn svcCtrlHandler(dwControl: u32, _: u32, _: ?*anyopaque, _: ?*anyopaque) callconv(.winapi) u32 {
     if (dwControl == SERVICE_CONTROL_STOP) {
+        // Immediate hard-stop: report STOPPED to SCM and exit the process.
+        // Graceful shutdown via shutdown_flag + thread join is unreliable on
+        // Windows — the ptyReadLoop blocks in ReadFile which ARM64 AFD
+        // cannot cancel, and the mesh timer self-wake has timing races.
+        // Tracked as deferred: graceful Windows service shutdown (Finding 103).
         var status = std.mem.zeroes(SERVICE_STATUS);
         status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-        status.dwCurrentState = SERVICE_STOP_PENDING;
+        status.dwCurrentState = SERVICE_STOPPED;
         status.dwControlsAccepted = 0;
-        status.dwWaitHint = 30000;
         _ = SetServiceStatus(SvcGlobals.status_handle, &status);
 
-        SvcGlobals.shutdown_flag.store(true, .release);
-        return 0;
+        std.process.exit(0);
     }
     return 0;
 }

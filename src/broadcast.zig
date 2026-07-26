@@ -1159,7 +1159,8 @@ pub fn meshSessionLoop(
 
         // Wait for Host to establish a KCP tunnel and send pty_spawn
         std.log.info("[guest-mesh] Entering waitForHostTunnel...", .{});
-        var tunnel = waitForHostTunnel(io, allocator, &mesh_opt) catch |err| {
+        var tunnel = waitForHostTunnel(io, allocator, &mesh_opt, shutdown) catch |err| {
+            if (err == error.ShutdownRequested) break;
             std.log.err("[guest-mesh] waitForHostTunnel failed: {}", .{err});
             continue;
         };
@@ -1397,8 +1398,15 @@ pub fn meshSessionLoop(
 /// before the crash — so the fresh session wins. This resolves the
 /// dual-session mismatch that caused exec to return empty output
 /// (Finding 93) without relying on KCP keepalive timeout (~15s).
-fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_mod.Mesh) !tunnel_mod.Tunnel {
+fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_mod.Mesh, shutdown: ?*std.atomic.Value(bool)) !tunnel_mod.Tunnel {
     while (true) {
+        // Check for service shutdown signal before blocking on tunnel
+        // availability. Without this, sc stop hangs forever (STOP_PENDING)
+        // when the main loop is in reconnect-wait rather than the command
+        // loop — the outer while's checkShutdown is never reached.
+        if (shutdown) |s| {
+            if (s.load(.acquire)) return error.ShutdownRequested;
+        }
         if (mesh_opt.*) |*m| {
             m.sessions_mutex.lock(m.io) catch |err| {
                 // Lock failure (e.g. Io canceled) — back off instead of
