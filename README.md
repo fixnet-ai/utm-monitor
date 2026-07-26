@@ -17,13 +17,14 @@ Ethernet — they all show up in one flat `utmm --status`.
 
 ## AI Agent Experience
 
-Same capabilities, natural language. `utmm --mcp` provides two MCP tools over stdio
+Same capabilities, natural language. `utmm --mcp` provides three MCP tools over stdio
 for Claude Code and other agents:
 
 | Tool | Description |
 |------|-------------|
 | `vm_status` | List all machines: hostname, IP, OS/arch, version, shell type |
 | `vm_exec` | Execute commands. Shell session persists — cd, export survive across calls |
+| `vm_ping` | Ping a guest over the mesh — test connectivity and measure RTT |
 
 Example prompts your AI agent can handle:
 - "Check the status of all my machines"
