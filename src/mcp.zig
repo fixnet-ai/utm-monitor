@@ -306,14 +306,16 @@ fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
             else => continue,
         };
         const hostname = jsonGetString(g, "hostname") orelse "?";
+        const role = jsonGetString(g, "role") orelse "?";
         const target = jsonGetString(g, "target") orelse "?";
         const ip = jsonGetString(g, "ip") orelse "?";
         const mac = jsonGetString(g, "mac") orelse "?";
         const version = jsonGetString(g, "version") orelse "?";
         const shell = jsonGetString(g, "shell") orelse "?";
+        const status = jsonGetString(g, "status") orelse "?";
         try text.print(gpa,
-            "- **{s}** — {s} | IP: {s} | MAC: {s} | v{s} | shell: {s}\\n",
-            .{ hostname, target, ip, mac, version, if (shell.len > 0) shell else "unknown" },
+            "- **{s}** ({s}) — {s} | IP: {s} | MAC: {s} | v{s} | shell: {s} | status: {s}\\n",
+            .{ hostname, role, target, ip, mac, version, if (shell.len > 0) shell else "unknown", if (status.len > 0) status else "?" },
         );
     }
 

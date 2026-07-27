@@ -122,6 +122,7 @@ pub fn jsonBuildError(allocator: std.mem.Allocator, id: std.json.Value, code: i6
 
 pub const GuestEntry = struct {
     hostname: []const u8,
+    role: []const u8, // "host" | "guest"
     ip: []const u8,
     target: []const u8,
     mac: []const u8,
@@ -212,6 +213,8 @@ pub const HostState = struct {
             self.allocator.free(entry.mac);
             self.allocator.free(entry.version);
             if (entry.shell.len > 0) self.allocator.free(entry.shell);
+            if (entry.status.len > 0) self.allocator.free(entry.status);
+            if (entry.role.len > 0) self.allocator.free(entry.role);
         }
         self.guests.deinit(self.allocator);
 
@@ -261,7 +264,7 @@ pub const HostState = struct {
 
     /// Upsert a guest from announce data (caller must own the strings — they are duplicated).
     /// Returns true if this is a new guest or IP/target/version/shell changed.
-    pub fn upsertGuest(self: *HostState, hostname: []const u8, ip: []const u8, target: []const u8, mac: []const u8, version: []const u8, shell: []const u8, status: []const u8) bool {
+    pub fn upsertGuest(self: *HostState, hostname: []const u8, ip: []const u8, target: []const u8, mac: []const u8, version: []const u8, shell: []const u8, status: []const u8, role: []const u8) bool {
         self.mutex.lock(self.io.?) catch return false;
         defer self.mutex.unlock(self.io.?);
 
@@ -275,6 +278,7 @@ pub const HostState = struct {
             if (!std.mem.eql(u8, existing.version, version)) changed = true;
             if (!std.mem.eql(u8, existing.shell, shell)) changed = true;
             if (!std.mem.eql(u8, existing.status, status)) changed = true;
+            if (!std.mem.eql(u8, existing.role, role)) changed = true;
 
             // Update fields (free old strings)
             if (!std.mem.eql(u8, existing.ip, ip)) {
@@ -297,6 +301,10 @@ pub const HostState = struct {
                 if (existing.status.len > 0) self.allocator.free(existing.status);
                 existing.status = self.allocator.dupe(u8, status) catch existing.status;
             }
+            if (!std.mem.eql(u8, existing.role, role)) {
+                if (existing.role.len > 0) self.allocator.free(existing.role);
+                existing.role = self.allocator.dupe(u8, role) catch existing.role;
+            }
             existing.last_seen = now_ms;
             return changed;
         }
@@ -310,6 +318,7 @@ pub const HostState = struct {
             .version = self.allocator.dupe(u8, version) catch version,
             .shell = if (shell.len > 0) self.allocator.dupe(u8, shell) catch shell else "",
             .status = if (status.len > 0) self.allocator.dupe(u8, status) catch status else "",
+            .role = if (role.len > 0) self.allocator.dupe(u8, role) catch role else "guest",
             .last_seen = now_ms,
         }) catch return false;
         return true;
@@ -329,6 +338,7 @@ pub const HostState = struct {
         self.allocator.free(entry.version);
         if (entry.shell.len > 0) self.allocator.free(entry.shell);
         if (entry.status.len > 0) self.allocator.free(entry.status);
+        if (entry.role.len > 0) self.allocator.free(entry.role);
     }
 
     /// Set the parsed mesh MAC for a guest (v0.10.0+ mesh support).

@@ -27,7 +27,7 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 
 - **版本**: v0.11.18（`src/protocol.zig`、`build.zig.zon`）
 - **源文件**: 16 个（`src/*.zig`）+ 2 skills（`zig`、`deploy`）
-- **测试**: 159/159 通过
+- **测试**: 149/149 通过
 - **部署**: macOS Host v0.11.18 ✅ | linuxvm v0.11.18 ✅ | macvm v0.11.18 ✅ | windowsvm v0.11.18 ✅ | winx64 v0.11.18 ✅
 - **健康检查**: 4/4 全部通过（status ✓ ping ✓ exec ✓）
 - **8 交叉编译目标**: aarch64/x86_64/x86 × linux-musl/macos/windows
@@ -56,6 +56,7 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 67 | 2026-07-27 | v0.11.17：修复 `serveUpgradeFile` `@memcpy alias` crash + 自动升级全流程测试 |
 | 68 | 2026-07-27 | v0.11.18：修复 LSA restart 误判 — nonce 比较替代全 node_info 字符串比较 |
 | 69 | 2026-07-27 | ✅ 开发效率提升：二进制类型校验 + 一键部署 + 健康检查 + deploy skill |
+| 70 | 2026-07-27 | `--status` 增强：全部字段 + Host 显示 + role 字段区分 host/guest |
 
 ## 待修复
 
@@ -73,6 +74,39 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 327 | `--verify` 健康检查 | 对所有 Guest 执行 status + ping + exec echo，ANSI 彩色矩阵输出 | ✅ |
 | 328 | `--deploy` 一键部署 | 读取 VM 配置，自动交叉编译→SCP→install→验证全流程，使用 sshpass | ✅ |
 | 329 | `deploy` skill | Claude Code skill 封装部署流程，含 VM 表、常见问题、安全注意事项 | ✅ |
+
+## Phase 70: `--status` 增强 ✅ (2026-07-27)
+
+| # | 任务 | 描述 | 状态 |
+|---|------|------|------|
+| 330 | GuestEntry 加 role 字段 | httpd.zig: struct + upsertGuest + deinit + removeGuest | ✅ |
+| 331 | handleStatus 完整字段 | ipc.zig: JSON 输出 +role/+status/+last_seen（6→9 字段） | ✅ |
+| 332 | host.zig 四改 | tunnelManager 移除 role:host 过滤 + 传递 role；Host 自注册；cmdStatus 表格；cmdVerify 跳过 Host | ✅ |
+| 333 | formatStatusMCP 更新 | mcp.zig: markdown 加 role/status 字段 | ✅ |
+
+### 变更摘要
+
+- **`GuestEntry` 加 `role` 字段**：`"host"` | `"guest"`，标识节点类型
+- **`handleStatus` JSON 输出全部 9 字段**：hostname, role, target, ip, mac, version, shell, status, last_seen
+- **Host 自注册到 guest table**：`startHost()` 中 mesh 初始化成功后 `upsertGuest(..., "host")`，MAC 全零
+- **tunnelManager 移除 `role:host` 过滤**：Host 和 Guest 平等出现在状态列表中
+- **`cmdStatus` 表格加 3 列**：Role, Status, Last（相对时间：now/Ns/Nm/Nh/Nd）
+- **`cmdVerify` 跳过 Host**：Host 无自身隧道，ping/exec 会失败
+- **`formatStatusMCP` 更新**：每行显示 `(role)` + `status:` 字段
+
+### 验证
+
+- 149/149 测试通过
+- `--status`：Host + 4 Guest 全部显示，role/status/last 正确
+- `--verify`：4 Guest 全绿 ✓，Host 正确跳过
+- MCP `vm_status`：role 标签 + status 字段正确
+
+## 待修复
+
+| Finding | 严重度 | 描述 |
+|---------|--------|------|
+| 123 | 🔴 CRITICAL | macOS 自动升级后 `exit(0)` + `KeepAlive SuccessfulExit=false` → 服务永久停止 |
+| 129 | 🔴 | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
 | 125 | 📋 | `nowMs()` RTT 直连正确、中继异常（uptime 级别数值） |
 | 127 | 📋 | linuxvm Journal 停止 + 升级下载无声失败 |
 | 128 | 📋 | macOS `launchctl bootstrap` errno=5 在 bootout 后 |

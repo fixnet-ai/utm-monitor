@@ -4,9 +4,44 @@
 
 - **分支**: `main`
 - **版本**: v0.11.18（`src/protocol.zig` VERSION、`build.zig.zon`）
-- **测试**: 159/159 通过
+- **测试**: 149/149 通过
 - **部署**: macOS Host v0.11.18 ✅ | linuxvm v0.11.18 ✅ | macvm v0.11.18 ✅ | windowsvm v0.11.18 ✅ | winx64 v0.11.18 ✅
 - **健康检查**: 4/4 全部通过（`--verify` 全绿 ✓）
+
+## Phase 70: `--status` 增强 (2026-07-27)
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 330 | GuestEntry 加 role 字段：struct + upsertGuest + deinit + removeGuest | ✅ |
+| 331 | handleStatus JSON 输出全部 9 字段（+role/+status/+last_seen） | ✅ |
+| 332 | host.zig：tunnelManager 移除 role:host 过滤 + Host 自注册 + cmdStatus 表格 + cmdVerify 跳过 Host | ✅ |
+| 333 | formatStatusMCP markdown 加 role/status | ✅ |
+
+### 变更摘要
+
+**GuestEntry 加 role 字段** (`src/httpd.zig`):
+- `role: []const u8` — "host" | "guest" 标识节点类型
+- `upsertGuest()` 签名加 `role` 参数，update/insert 路径均处理
+- `deinit()` / `removeGuest()` 释放 role 内存
+
+**handleStatus 完整字段** (`src/ipc.zig`):
+- JSON 从 6 字段扩展到 9 字段：hostname, role, target, ip, mac, version, shell, status, last_seen
+
+**Host 自注册 + 过滤移除** (`src/host.zig`):
+- `startHost()`：mesh 初始化后 upsertGuest 写入 Host 自身（role=host, MAC=全零）
+- `tunnelManager`：移除 `role == "host" continue` 过滤
+- `upsertGuest` 调用传递 role 参数
+
+**cmdStatus 表格更新** (`src/host.zig`):
+- 加 Role、Status、Last 三列（8 列紧凑单行）
+- last_seen 使用相对时间格式化（now/Ns/Nm/Nh/Nd）
+
+**cmdVerify 跳过 Host** (`src/host.zig`):
+- Host 无自身 KCP 隧道，ping/exec 必然失败 → 跳过 role=host 的条目
+
+**formatStatusMCP 更新** (`src/mcp.zig`):
+- 每个节点显示 role 标签：`**hostname** (role) — ...`
+- 加 status 字段：`| status: serving`
 
 ## Phase 69: 开发效率提升 (2026-07-27)
 

@@ -519,8 +519,8 @@ fn handleStatus(io: std.Io, gpa: std.mem.Allocator, state_ptr: *anyopaque, conn:
     for (state.guests.items) |g| {
         if (!first) json.appendSlice(gpa, ",") catch return;
         first = false;
-        json.print(gpa, "{{\"hostname\":\"{s}\",\"target\":\"{s}\",\"ip\":\"{s}\",\"mac\":\"{s}\",\"version\":\"{s}\",\"shell\":\"{s}\"}}", .{
-            g.hostname, g.target, g.ip, g.mac, g.version, g.shell,
+        json.print(gpa, "{{\"hostname\":\"{s}\",\"role\":\"{s}\",\"target\":\"{s}\",\"ip\":\"{s}\",\"mac\":\"{s}\",\"version\":\"{s}\",\"shell\":\"{s}\",\"status\":\"{s}\",\"last_seen\":{d}}}", .{
+            g.hostname, g.role, g.target, g.ip, g.mac, g.version, g.shell, g.status, g.last_seen,
         }) catch return;
     }
     json.appendSlice(gpa, "]") catch return;

@@ -111,20 +111,57 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         return;
     }
 
-    std.debug.print("\n{s: <16} {s: <18} {s: <16} {s: <18} {s: <10} {s}\n", .{ "Hostname", "Target", "IP", "MAC", "Version", "Shell" });
-    std.debug.print("{s:-<85}\n", .{""});
+    // Format relative time for last_seen display
+    const now_ns = std.Io.Timestamp.now(block_io, .real).nanoseconds;
+    const now_ms = @as(i64, @intCast(@divFloor(now_ns, std.time.ns_per_ms)));
+    const relTime = struct {
+        fn fmt(ms: i64, now: i64) []const u8 {
+            const diff = now - ms;
+            if (diff < 1000) return "now";
+            if (diff < 60_000) return "s"; // printed inline below
+            if (diff < 3600_000) return "m";
+            if (diff < 86400_000) return "h";
+            return "d";
+        }
+    }.fmt;
+
+    std.debug.print("\n{s: <6} {s: <16} {s: <18} {s: <16} {s: <18} {s: <10} {s: <10} {s: <8} {s}\n", .{ "Role", "Hostname", "Target", "IP", "MAC", "Version", "Status", "Shell", "Last" });
+    std.debug.print("{s:-<120}\n", .{""});
     for (guests.items) |guest_val| {
         const g = switch (guest_val) {
             .object => |o| o,
             else => continue,
         };
         const hostname = httpd.jsonGetString(g, "hostname") orelse "?";
+        const role = httpd.jsonGetString(g, "role") orelse "?";
         const target = httpd.jsonGetString(g, "target") orelse "?";
         const ip = httpd.jsonGetString(g, "ip") orelse "?";
         const mac = httpd.jsonGetString(g, "mac") orelse "?";
         const version = httpd.jsonGetString(g, "version") orelse "?";
+        const status = httpd.jsonGetString(g, "status") orelse "?";
         const shell = httpd.jsonGetString(g, "shell") orelse "?";
-        std.debug.print("{s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s}\n", .{ hostname, target, ip, mac, version, shell });
+        // Parse last_seen from JSON integer
+        var last_seen: i64 = 0;
+        if (g.get("last_seen")) |v| {
+            if (v == .integer) last_seen = @intCast(v.integer);
+        }
+        const rel = relTime(last_seen, now_ms);
+        const rel_val = if (std.mem.eql(u8, rel, "s"))
+            @as(i64, @intCast(@divTrunc(now_ms - last_seen, 1000)))
+        else if (std.mem.eql(u8, rel, "m"))
+            @as(i64, @intCast(@divTrunc(now_ms - last_seen, 60_000)))
+        else if (std.mem.eql(u8, rel, "h"))
+            @as(i64, @intCast(@divTrunc(now_ms - last_seen, 3600_000)))
+        else if (std.mem.eql(u8, rel, "d"))
+            @as(i64, @intCast(@divTrunc(now_ms - last_seen, 86400_000)))
+        else
+            @as(i64, 0);
+        std.debug.print("{s: <6} {s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s: <10} {s: <8}", .{ role, hostname, target, ip, mac, version, status, shell });
+        if (rel_val > 0) {
+            std.debug.print(" {d}{s}\n", .{ rel_val, rel });
+        } else {
+            std.debug.print(" {s}\n", .{rel});
+        }
     }
     std.debug.print("\n", .{});
 }
@@ -183,13 +220,17 @@ fn cmdVerify(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         return;
     }
 
-    // Collect hostnames
+    // Collect hostnames (skip Host itself — no tunnel for ping/exec)
     var hostnames: std.ArrayListAligned([]const u8, null) = .empty;
     for (guests.items) |guest_val| {
         const g = switch (guest_val) {
             .object => |o| o,
             else => continue,
         };
+        // Skip Host — no KCP tunnel to itself, ping/exec would fail
+        if (httpd.jsonGetString(g, "role")) |r| {
+            if (std.mem.eql(u8, r, "host")) continue;
+        }
         if (httpd.jsonGetString(g, "hostname")) |h| {
             try hostnames.append(aa, try aa.dupe(u8, h));
         }
@@ -727,6 +768,14 @@ fn startHost(
         state.mesh = @ptrCast(@alignCast(&mesh_opt.?));
 
         std.log.info("[host] Mesh networking started (LSA on UDP :{d})", .{mesh_port});
+
+        // Register Host itself in the guest table so --status shows it alongside guests
+        _ = state.upsertGuest(
+            host_info.hostname, host_info.ip, host_info.target,
+            "00:00:00:00:00:00", protocol.VERSION, host_info.shell,
+            "serving", "host",
+        );
+
         svc.resetRetryCounter(block_io, gpa, .host);
     }
 
@@ -838,9 +887,6 @@ fn tunnelManager(
                     if (parseNodeInfoLine(line, "role")) |v| role = v;
                 }
 
-                // Only process Guest nodes (skip other Host instances)
-                if (std.mem.eql(u8, role, "host")) continue;
-
                 if (hostname.len == 0 or ip.len == 0) continue;
 
                 // Convert mesh NodeId to MAC string
@@ -851,7 +897,7 @@ fn tunnelManager(
                 defer allocator.free(mac_str);
 
                 // Upsert to guest table
-                const changed = state.upsertGuest(hostname, ip, target, mac_str, version, shell, status);
+                const changed = state.upsertGuest(hostname, ip, target, mac_str, version, shell, status, role);
                 if (changed and hostname.len > 0) {
                     httpd.syncHostsFromState(state, allocator);
                 }
