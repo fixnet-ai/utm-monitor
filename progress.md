@@ -95,9 +95,10 @@ SKILL.md + MANUAL.md 全面更新至 v0.11.14 代码现状。发布 v0.11.15 后
 ## 最近提交
 
 ```
+14896a9 v0.11.17: fix serveUpgradeFile @memcpy alias crash, deployment test findings
+54c3376 docs: fix outdated architecture references and clean up planning files
 3c6d7d4 feat: RTT real ms, macOS codesign re-sign, multi-NIC broadcast refresh
 b5bc849 docs: mark Phase 66 complete, update planning files
 3006806 fix: replace host_gateway_ip with self-role check in epoch tracking
 a94b6a7 v0.11.16: install.sh + install.bat, fix auto-upgrade IP gating bug
-a001fa3 v0.11.15: rewrite SKILL.md and MANUAL.md for v0.11.14+ architecture
 ```

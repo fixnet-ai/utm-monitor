@@ -25,10 +25,10 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 
 ## 当前状态
 
-- **版本**: v0.11.16（`src/protocol.zig`）
+- **版本**: v0.11.17（`src/protocol.zig`、`build.zig.zon`）
 - **源文件**: 16 个（`src/*.zig`）
 - **测试**: 149/149 通过
-- **部署**: macOS Host + 4 Guest 全部 v0.11.16
+- **部署**: macOS Host v0.11.17 + 4 Guest 全部 v0.11.17（手动升级，自动升级全部失败）
 - **8 交叉编译目标**: aarch64/x86_64/x86 × linux-musl/macos/windows
 
 ## 已完成阶段
@@ -52,7 +52,14 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 64 | 2026-07-27 | 文档重写（SKILL.md + MANUAL.md）+ v0.11.15 发布 |
 | 65 | 2026-07-27 | install.sh + install.bat + v0.11.16 发布 + IP gating bug 修复 |
 | 66 | 2026-07-27 | RTT 真实毫秒 (`nowMs()`)、macOS codesign 重签、多网卡广播刷新 |
+| 67 | 2026-07-27 | v0.11.17：修复 `serveUpgradeFile` `@memcpy alias` crash + 自动升级全流程测试 |
 
-## 待办
+## 待修复
 
-（清空 — 所有已知待办已完成或取消）
+| Finding | 严重度 | 描述 |
+|---------|--------|------|
+| 123 | 🔴 CRITICAL | macOS 自动升级后 `exit(0)` + `KeepAlive SuccessfulExit=false` → 服务永久停止 |
+| 124 | 🔴 | 非 Linux Guest 隧道不稳定，频繁重连，exec 返回 exit=-1 |
+| 125 | 📋 | `nowMs()` RTT 直连正确、中继异常（uptime 级别数值） |
+| 127 | 📋 | linuxvm Journal 停止 + 升级下载无声失败 |
+| 128 | 📋 | macOS `launchctl bootstrap` errno=5 在 bootout 后 |
