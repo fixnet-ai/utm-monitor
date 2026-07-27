@@ -362,30 +362,31 @@ src/
 | 359 | 修改 `src/broadcast.zig` | 升级流程改为 shm 驱动：写 cmd_data(路径) + cmd=UPGRADE → exit(0)，移除 applyUpgradeAndRestart | 355 | ✅ |
 | 360 | 修改 `build.zig` | 两步构建：utmmd 先编译 → 复制到 src/embed/utmmd.bin → utmm @embedFile + .gitignore embed/ | 356 | ✅ |
 | 361 | 编译 + 测试 | zig build + zig build test 全部通过 | 355-360 | ✅ |
-| 362 | 部署验证 | Host + linuxvm + macvm 部署测试，验证 3a/3b 两条安装路径 | 361 | 📋 待部署 |
+| 376 | 安装优化 3b 路径 + config 持久化 | hash 比对 + utmm.conf 读写 + 3a/3b 双路径 + SHA256 构建期预计算 | 361 | ✅ |
+| 362 | 部署验证 | Host + linuxvm + macvm 部署测试，验证 3a/3b 两条安装路径 | 376 | 📋 待部署 |
 
 ### 实现总结
 
-**完成时间**: 2026-07-28，四个阶段（Tasks 355-361）全部完成。
+**完成时间**: 2026-07-28，Tasks 355-361 + 376 全部完成。
 
 **代码变更量**:
 | 文件 | 变更类型 | 行数 |
 |------|---------|------|
 | `src/shm.zig` | 新建 | ~400 行 |
 | `src/utmmd.zig` | 新建 | ~600 行 |
-| `src/svc.zig` | 重构 | -440/+200 行（净减 ~240） |
-| `src/main.zig` | 修改 | +200/-30 行 |
+| `src/svc.zig` | 重构 | -440/+340 行（净减 ~100） |
+| `src/main.zig` | 修改 | +210/-50 行 |
 | `src/broadcast.zig` | 修改 | +50/-90 行 |
 | `src/host.zig` | 清理 | -1 行 |
-| `build.zig` | 修改 | +25 行 |
+| `build.zig` | 修改 | +30 行 |
 
 **关键实现细节**:
 - **shm.zig**: Zig 0.16.0 移除了 `posix.O`/`posix.mmap`/`posix.munmap` 的跨平台封装，改用原始 `extern "c"` 函数 + POSIX 常量绕过平台差异。`shm.open()` 返回 `*volatile ShmLayout`（mmap 映射的内存）。
 - **utmmd.zig**: macOS 信号处理用自定义 `c_sigaction` extern struct（`SIG_IGN` sentinel 需 `*align(1)` 类型）。`init.gpa` 替代已移除的 `GeneralPurposeAllocator`。Windows SCM `SERVICE_TABLE_ENTRYW` 手动声明。
-- **svc.zig**: 服务名统一为 `utmmd`（`com.utmmd`/`utmmd`/`UTM-MonitorD`），plist 移除 `KeepAlive`，systemd 移除 `Restart=`，Windows 移除 `sc failure`。存根函数（`checkRetryLimit` 等）在 Task 373 完成后已清理。
-- **main.zig**: `@embedFile("embed/utmmd.bin")` 编译期嵌入 ~2.1MB utmmd 二进制。`extractUtmmd` 在 `--install` 时强制写入，`extractUtmmdIfMissing` 在 `ensure` 时按需写入。`--svc` 路径：打开 shm → 设置 PID/状态 → 心跳线程(1s) → 运行主循环 → 清理。
+- **svc.zig**: 服务名统一为 `utmmd`（`com.utmmd`/`utmmd`/`UTM-MonitorD`），plist 移除 `KeepAlive`，systemd 移除 `Restart=`，Windows 移除 `sc failure`。存根函数（`checkRetryLimit` 等）在 Task 373 完成后已清理。Task 376 新增：`shouldUpdateUtmmd`、`saveUtmmdMeta`、`readConfigValue`、`writeConfigValue`、`fileSha256Hex`、`buildArgsString`。
+- **main.zig**: `@embedFile("embed/utmmd.bin")` + `@embedFile("embed/utmmd.sha256")` 编译期嵌入 ~2.1MB utmmd 二进制及其 SHA256 哈希。`extractUtmmd` 在 `--install` 时强制写入，`extractUtmmdIfMissing` 在 `ensure` 时按需写入。`--svc` 路径：打开 shm → 设置 PID/状态 → 心跳线程(1s) → 运行主循环 → 清理。Task 376 优化：3a（全量 forceInstall + saveMeta）/ 3b（仅 start() 跳过重装）双路径。
 - **broadcast.zig**: `doAutoUpgrade` 下载新二进制后不再执行 `--install`，改为写 shm（`cmd=UPGRADE, cmd_data=临时路径`）后返回 `true`，外层循环检测后 `break` 退出。utmmd 接管重命名+重启。
-- **build.zig**: `addSystemCommand(&.{ "cp", "-f" })` 替代 `addInstallBinFile`（后者写入 zig-out/ 而非源码树）。
+- **build.zig**: `addSystemCommand("cp -f")` 替代 `addInstallBinFile`（后者写入 zig-out/ 而非源码树）。Task 376 新增 `shasum -a 256` 构建步骤预计算 utmmd SHA256，避免 comptime 哈希 >20M eval branch quota 问题。
 
 **测试**: 全部 166 个测试通过，构建无警告。
 

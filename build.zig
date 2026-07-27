@@ -75,7 +75,16 @@ pub fn build(b: *std.Build) void {
     copy_utmmd.addArg(embed_path);
     copy_utmmd.step.dependOn(&utmmd.step);
 
-    // ── Step 2: Build utmm (main binary, embeds utmmd) ──
+    // Pre-compute SHA256 hash of utmmd.bin so main.zig can embed it at compile
+    // time without expensive comptime hashing (>20M eval branches for ~2MB binary).
+    const hash_utmmd = b.addSystemCommand(&.{ "sh", "-c" });
+    hash_utmmd.addArg(b.fmt(
+        "shasum -a 256 {s} | cut -d' ' -f1 | tr -d '\\n' > {s}/utmmd.sha256",
+        .{ embed_path, embed_dir },
+    ));
+    hash_utmmd.step.dependOn(&copy_utmmd.step);
+
+    // ── Step 2: Build utmm (main binary, embeds utmmd + sha256) ──
     const exe = b.addExecutable(.{
         .name = "utmm",
         .root_module = b.createModule(.{
@@ -85,7 +94,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    exe.step.dependOn(&copy_utmmd.step);
+    exe.step.dependOn(&hash_utmmd.step);
 
     // Windows: link ws2_32 (may be needed by Zig runtime for socket operations)
     if (target.result.os.tag == .windows) {

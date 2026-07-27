@@ -1076,6 +1076,197 @@ pub fn ensure(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_arg
 }
 
 
+// ═══════════════════════════════════════════════════════════════════════════
+// utmmd 安装优化：hash 比对 + config 持久化
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Config file path — stored alongside the canonical binary.
+fn configFilePath() []const u8 {
+    if (builtin.os.tag == .windows) return "C:\\opt\\utmm\\utmm.conf";
+    return "/opt/utmm/utmm.conf";
+}
+
+/// Read a single key=value from the config file. Returns null if not found.
+fn readConfigValue(io: std.Io, alloc: std.mem.Allocator, key: []const u8) ?[]const u8 {
+    const path = configFilePath();
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, path, .{ .mode = .read_only }) catch return null;
+    defer file.close(io);
+
+    var rbuf: [4096]u8 = undefined;
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    const n = reader.interface.readSliceShort(&rbuf) catch return null;
+    const content = rbuf[0..n];
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
+            const k = trimmed[0..eq_pos];
+            const v = trimmed[eq_pos + 1 ..];
+            if (std.mem.eql(u8, k, key)) {
+                return alloc.dupe(u8, v) catch null;
+            }
+        }
+    }
+    return null;
+}
+
+/// Write/update a key=value pair in the config file. Creates the file if missing.
+/// Preserves existing entries; replaces the key if already present.
+fn writeConfigValue(io: std.Io, alloc: std.mem.Allocator, key: []const u8, value: []const u8) !void {
+    const path = configFilePath();
+    const cwd = std.Io.Dir.cwd();
+
+    // Ensure directory exists
+    const dirname = canonicalDir();
+    cwd.createDirPath(io, dirname) catch {};
+
+    // Read existing content
+    const existing = readFullFile(io, alloc, path) orelse &.{};
+    defer if (existing.len > 0) alloc.free(existing);
+
+    // Write back with updated key
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}/utmm.conf.tmp", .{dirname});
+    defer alloc.free(tmp_path);
+
+    const dst = try cwd.createFile(io, tmp_path, .{ .truncate = true, .permissions = @enumFromInt(0o644) });
+    defer dst.close(io);
+    var wb: [4096]u8 = undefined;
+    var writer = dst.writer(io, &wb);
+
+    var found = false;
+    var lines = std.mem.splitScalar(u8, existing, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') {
+            try writer.interface.print("{s}\n", .{line});
+            continue;
+        }
+        if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
+            const k = trimmed[0..eq_pos];
+            if (std.mem.eql(u8, k, key)) {
+                try writer.interface.print("{s}={s}\n", .{ key, value });
+                found = true;
+                continue;
+            }
+        }
+        try writer.interface.print("{s}\n", .{line});
+    }
+    if (!found) {
+        try writer.interface.print("{s}={s}\n", .{ key, value });
+    }
+    writer.interface.flush() catch {};
+    dst.sync(io) catch {};
+
+    // Atomic rename
+    cwd.rename(tmp_path, cwd, path, io) catch |err| {
+        cwd.deleteFile(io, tmp_path) catch {};
+        return err;
+    };
+}
+
+/// Read entire file content, or null if not found.
+fn readFullFile(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, path, .{ .mode = .read_only }) catch return null;
+    defer file.close(io);
+
+    var rbuf: [4096]u8 = undefined;
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    const n = reader.interface.readSliceShort(&rbuf) catch return null;
+    return alloc.dupe(u8, rbuf[0..n]) catch null;
+}
+
+/// Compute SHA256 of a file at the given path. Returns hex string or null on error.
+fn fileSha256Hex(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    const file = cwd.openFile(io, path, .{ .mode = .read_only }) catch return null;
+    defer file.close(io);
+
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var buf: [65536]u8 = undefined;
+    var read_buf: [65536]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    while (true) {
+        const n = reader.interface.readSliceShort(&buf) catch return null;
+        if (n == 0) break;
+        sha.update(buf[0..n]);
+    }
+
+    var hash: [32]u8 = undefined;
+    sha.final(&hash);
+
+    var hex: [64]u8 = undefined;
+    for (hash, 0..) |b, j| {
+        hex[j * 2] = "0123456789abcdef"[b >> 4];
+        hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    return alloc.dupe(u8, &hex) catch null;
+}
+
+/// Build the args string that was used to install utmmd.
+/// This is the canonical form stored in config for comparison.
+fn buildArgsString(alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) ![]const u8 {
+    var buf: std.ArrayListAligned(u8, null) = .empty;
+    try buf.appendSlice(alloc, if (role == .host) "--role host" else "--role guest");
+    for (extra_args) |arg| {
+        try buf.append(alloc, ' ');
+        try buf.appendSlice(alloc, arg);
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+/// Check whether the installed utmmd needs updating.
+/// Returns true if utmmd should be reinstalled (binary missing, hash differs, or args changed).
+pub fn shouldUpdateUtmmd(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8, comptime embedded_sha256_hex: []const u8) bool {
+    const svc_path = canonicalSvcPath();
+
+    // Check 1: binary must exist
+    const installed_hash = fileSha256Hex(io, alloc, svc_path) orelse {
+        std.log.debug("[svc] utmmd binary missing at {s}, needs install", .{svc_path});
+        return true;
+    };
+    defer alloc.free(installed_hash);
+
+    // Check 2: hash must match embedded
+    if (!std.mem.eql(u8, installed_hash, embedded_sha256_hex)) {
+        std.log.debug("[svc] utmmd hash differs (installed={s}, embedded={s}), needs update", .{ installed_hash[0..@min(installed_hash.len, 16)], embedded_sha256_hex[0..@min(embedded_sha256_hex.len, 16)] });
+        return true;
+    }
+
+    // Check 3: args must match stored config
+    const current_args = buildArgsString(alloc, role, extra_args) catch return true;
+    defer alloc.free(current_args);
+
+    if (readConfigValue(io, alloc, "utmmd_args")) |stored_args| {
+        defer alloc.free(stored_args);
+        if (!std.mem.eql(u8, stored_args, current_args)) {
+            std.log.debug("[svc] utmmd args changed (stored=''{s}'' current=''{s}''), needs reinstall", .{ stored_args, current_args });
+            return true;
+        }
+    }
+    // If no stored args entry but utmmd exists and hash matches, assume OK
+
+    return false;
+}
+
+/// Save utmmd metadata to config file after successful install.
+pub fn saveUtmmdMeta(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8, comptime embedded_sha256_hex: []const u8) void {
+    writeConfigValue(io, alloc, "utmmd_sha256", embedded_sha256_hex) catch |err| {
+        std.log.warn("[svc] failed to save utmmd_sha256: {}", .{err});
+    };
+    const args_str = buildArgsString(alloc, role, extra_args) catch return;
+    defer alloc.free(args_str);
+    writeConfigValue(io, alloc, "utmmd_args", args_str) catch |err| {
+        std.log.warn("[svc] failed to save utmmd_args: {}", .{err});
+    };
+}
+
+
 // ========== Tests ==========
 
 test "describeBinary - ELF" {

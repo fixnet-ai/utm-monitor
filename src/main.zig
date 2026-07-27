@@ -19,6 +19,10 @@ const shm = @import("shm.zig");
 /// Embedded utmmd binary — compiled at build time, extracted at install time.
 const utmmd_bin = @embedFile("embed/utmmd.bin");
 
+/// SHA256 hex string of the embedded utmmd binary (64 chars, pre-computed by build.zig).
+/// Used to determine whether the installed utmmd needs updating.
+const utmmd_sha256_hex: [:0]const u8 = @embedFile("embed/utmmd.sha256");
+
 comptime {
     _ = @import("hosts_file.zig");
     _ = @import("config.zig");
@@ -366,6 +370,7 @@ pub fn main(init: std.process.Init) !void {
         var extra_args = try buildServiceArgs(init.gpa, cli);
         defer extra_args.deinit(init.gpa);
         svc.forceInstall(init.io, init.gpa, role, extra_args.items);
+        svc.saveUtmmdMeta(init.io, init.gpa, role, extra_args.items, utmmd_sha256_hex);
         return;
     }
 
@@ -384,15 +389,25 @@ pub fn main(init: std.process.Init) !void {
         or cli.cmd_deploy;
     if (needs_host) {
         const was_running = svc.isRunning(init.io, init.gpa, .host);
-        // Ensure utmmd binary exists at canonical path before starting service.
-        // Only extract if missing (not running = fresh install likely needed).
-        // --install always force-overwrites; ensure only fills in if missing.
-        extractUtmmdIfMissing(init.io, init.gpa) catch |err| {
-            std.log.warn("[main] extractUtmmdIfMissing: {} (continuing)", .{err});
-        };
         var extra_args = try buildServiceArgs(init.gpa, cli);
         defer extra_args.deinit(init.gpa);
-        svc.ensure(init.io, init.gpa, .host, extra_args.items);
+
+        if (svc.shouldUpdateUtmmd(init.io, init.gpa, .host, extra_args.items, utmmd_sha256_hex)) {
+            // 3a path: utmmd needs update — extract + full forceInstall
+            try extractUtmmd(init.io, init.gpa);
+            svc.forceInstall(init.io, init.gpa, .host, extra_args.items);
+            svc.saveUtmmdMeta(init.io, init.gpa, .host, extra_args.items, utmmd_sha256_hex);
+        } else if (!was_running) {
+            // 3b path: utmmd unchanged, just start the service (skip reinstall)
+            std.log.info("[main] utmmd unchanged, starting service directly", .{});
+            svc.start(init.io, init.gpa, .host) catch |err| {
+                std.log.err("[main] start failed: {} — falling back to ensure", .{err});
+                extractUtmmdIfMissing(init.io, init.gpa) catch {};
+                svc.ensure(init.io, init.gpa, .host, extra_args.items);
+            };
+        }
+        // else: utmmd fine and service already running; management cmds can proceed
+
         // --host alone (no management command): ensure + exit
         if (cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_ping
             and !cli.cmd_upload and !cli.cmd_download
@@ -422,13 +437,26 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── 10. Default: ensure Guest service is running ──
-    // Extract utmmd if missing (same logic as Host path above).
-    extractUtmmdIfMissing(init.io, init.gpa) catch |err| {
-        std.log.warn("[main] extractUtmmdIfMissing: {} (continuing)", .{err});
-    };
-    var extra_args_guest = try buildServiceArgs(init.gpa, cli);
-    defer extra_args_guest.deinit(init.gpa);
-    svc.ensure(init.io, init.gpa, .guest, extra_args_guest.items);
+    {
+        const was_running = svc.isRunning(init.io, init.gpa, .guest);
+        var extra_args_guest = try buildServiceArgs(init.gpa, cli);
+        defer extra_args_guest.deinit(init.gpa);
+
+        if (svc.shouldUpdateUtmmd(init.io, init.gpa, .guest, extra_args_guest.items, utmmd_sha256_hex)) {
+            // 3a path: utmmd needs update — extract + full forceInstall
+            try extractUtmmd(init.io, init.gpa);
+            svc.forceInstall(init.io, init.gpa, .guest, extra_args_guest.items);
+            svc.saveUtmmdMeta(init.io, init.gpa, .guest, extra_args_guest.items, utmmd_sha256_hex);
+        } else if (!was_running) {
+            // 3b path: utmmd unchanged, just start the service (skip reinstall)
+            std.log.info("[main] utmmd unchanged, starting guest service directly", .{});
+            svc.start(init.io, init.gpa, .guest) catch |err| {
+                std.log.err("[main] start failed: {} — falling back to ensure", .{err});
+                extractUtmmdIfMissing(init.io, init.gpa) catch {};
+                svc.ensure(init.io, init.gpa, .guest, extra_args_guest.items);
+            };
+        }
+    }
 }
 
 /// Write the embedded utmmd binary to the canonical service path.

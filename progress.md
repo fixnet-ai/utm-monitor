@@ -95,6 +95,55 @@ Phase 75 引入 utmmd 监督进程，将生命周期管理从系统服务管理�
 - `zig build test`: 166/166 全部通过
 - macOS aarch64 原生构建验证通过
 
+## Task 376: 安装优化 — hash 比对 + config 持久化 + 3b 仅重启路径 ✅ (2026-07-28)
+
+### 背景
+
+完成 Phase 75 核心实现后，识别出安装流程可进一步优化：每次 `ensure` 都走完整 forceInstall
+（stop→kill→selfCopy→installService→start），即使 utmmd 未变化。引入 hash 比对和 3b 路径跳过
+不必要的重装步骤。
+
+### 变更摘要
+
+**build.zig**:
+- 新增 `hash_utmmd` 构建步骤：`shasum -a 256 utmmd.bin → src/embed/utmmd.sha256`
+- utmm 编译依赖 hash 步骤（替代直接依赖 copy 步骤）
+- 避免 comptime SHA256（2MB 二进制需要 >20M eval branch quota）
+
+**`src/main.zig`**:
+- `utmmd_sha256_hex`: `@embedFile("embed/utmmd.sha256")` — 构建期预计算，64 字符 hex
+- `--install`: forceInstall 后调用 `svc.saveUtmmdMeta()` 持久化 hash + args
+- Host ensure: 新增 `shouldUpdateUtmmd` 分支
+  - 3a 路径: utmmd 需更新 → extractUtmmd + forceInstall + saveMeta
+  - 3b 路径: utmmd 未变但服务未运行 → `svc.start()`（跳过重装）
+  - 均未命中: 服务已在运行，无需操作
+- Guest ensure: 同 Host ensure 优化逻辑
+
+**`src/svc.zig`** (~140 行新增):
+- `configFilePath()` — utmm.conf 路径
+- `readConfigValue(io, alloc, key)` — 读取 key=value
+- `writeConfigValue(io, alloc, key, value)` — 写入 key=value（tmp+rename 原子写）
+- `readFullFile(io, alloc, path)` — 读取完整文件内容
+- `fileSha256Hex(io, alloc, path)` — 运行时计算文件 SHA256 hex
+- `buildArgsString(alloc, role, extra_args)` — 序列化参数用于比对
+- `shouldUpdateUtmmd(io, alloc, role, extra_args, comptime hex) bool` — 三检查点:
+  1. utmmd 二进制是否存在
+  2. SHA256 hash 是否匹配嵌入值
+  3. 存储的 args 是否匹配当前参数
+- `saveUtmmdMeta(io, alloc, role, extra_args, comptime hex)` — 保存 hash+args 到 utmm.conf
+
+### 设计决策
+
+- SHA256 在构建期预计算（`build.zig` shasum 步骤），避免 comptime 哈希的 eval branch quota 问题
+- utmm.conf 使用 key=value 纯文本格式，简单可靠
+- 文件写入使用 tmp+rename 原子模式
+- `shouldUpdateUtmmd` 三检查点中任一项不匹配即触发全量重装
+
+### 验证
+
+- `zig build`: 编译成功（utmmd + hash + utmm 三步构建）
+- `zig build test`: 166/166 全部通过
+
 ## Phase 74: 自动升级 forceInstall 修复 (2026-07-28)
 
 | # | 任务 | 状态 |
