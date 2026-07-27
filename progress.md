@@ -1,11 +1,55 @@
-# Progress: v0.11.17
+# Progress: v0.11.18
 
 ## 当前状态
 
 - **分支**: `main`
-- **版本**: v0.11.17（`src/protocol.zig` VERSION、`build.zig.zon`）
-- **测试**: 149/149 通过
-- **部署**: macOS Host v0.11.17 ✅ | linuxvm v0.11.17 ✅ (手动) | macvm v0.11.17 ✅ (手动) | windowsvm v0.11.17 ✅ (手动) | winx64 v0.11.17 ✅ (手动)
+- **版本**: v0.11.18（`src/protocol.zig` VERSION、`build.zig.zon`）
+- **测试**: 159/159 通过
+- **部署**: 待部署
+
+## Phase 69: 开发效率提升 (2026-07-27)
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 326 | 二进制类型校验 — selfCopy 前检查文件魔数 | ✅ |
+| 327 | `--verify` 健康检查命令 | ✅ |
+| 328 | `--deploy` 一键部署命令 | ✅ |
+| 329 | `deploy` Claude Code skill | ✅ |
+
+### 变更摘要
+
+**Task 326 — 二进制类型校验** (`src/svc.zig`):
+- 新增 `validateBinaryType()` 函数：读二进制前 4 字节，比较平台魔数
+- 新增 `describeBinary()` 辅助函数：魔数 → 可读格式名称
+- 在 `selfCopy()` 中调用，复制前验证平台匹配
+- 魔数常量：ELF `\x7fELF`、Mach-O `\xcf\xfa\xed\xfe`、PE `MZ`
+- 10 个新测试（describeBinary 7 + magic constants 3）
+- 防止 ELF-on-macOS 类部署错误
+
+**Task 327 — `--verify` 健康检查** (`src/main.zig`、`src/host.zig`):
+- 新增 `--verify` CLI 命令
+- 对全部在线 Guest 执行三重检查：Status（LSA 在线）+ Ping（mesh 可达）+ Exec echo（隧道+shell 正常）
+- ANSI 彩色矩阵输出（绿✓/红✗/黄−）
+- 任一检查失败 → exit(1)；全部通过 → exit(0)
+
+**Task 328 — `--deploy` 一键部署** (`src/main.zig`、`src/host.zig`):
+- 新增 `--deploy [TARGET]` CLI 命令
+- 硬编码 4 VM 配置表（linuxvm/macvm/windowsvm/winx64）
+- 自动交叉编译 → sshpass+scp 上传 → sshpass+ssh 安装
+- Windows 目标跳过 SCP/SSH（提示手动步骤）
+- 成功/失败计数摘要输出
+- 依赖 `sshpass`（检查并提示安装）
+
+**Task 329 — deploy skill** (`.claude/skills/deploy/SKILL.md`):
+- VM 配置表 + 部署流程文档
+- macOS bootstrap 常见问题处理（errno=5/2、codesign）
+- 手动/自动部署两种方式
+- 安全注意事项
+
+### 性能影响
+- 无运行时开销（所有新增代码仅在 CLI 管理命令中执行）
+- `validateBinaryType` 仅在 `selfCopy` 时调用，读 4 字节
+- `--verify` 串行检查每台 Guest（ping + exec echo），~5s/台
 
 ## Phase 68: 修复 LSA restart 误判 (Finding 124) (2026-07-27)
 

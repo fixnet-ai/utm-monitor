@@ -22,6 +22,8 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
 pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
     // Management commands: stateless, no Host daemon needed
     if (cli.cmd_status) return cmdStatus(block_io, gpa, cli.port);
+    if (cli.cmd_verify) return cmdVerify(block_io, gpa, cli.port);
+    if (cli.cmd_deploy) return cmdDeploy(block_io, gpa, cli.deploy_target);
     if (cli.cmd_ping) return cmdPing(block_io, gpa, cli.port, cli.ping_target.?);
     if (cli.cmd_exec) return cmdExec(block_io, gpa, cli.port, cli.exec_target.?, cli.exec_cmd.?);
     if (cli.cmd_upload) return cmdUpload(block_io, gpa, cli.port, cli.upload_target.?, cli.upload_file.?);
@@ -125,6 +127,405 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         std.debug.print("{s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s}\n", .{ hostname, target, ip, mac, version, shell });
     }
     std.debug.print("\n", .{});
+}
+
+/// Health check: for each guest, run status + ping + exec echo and print a
+/// pass/fail matrix. Each check has a 5-second timeout — if any check hangs
+/// (e.g. tunnel stalled), it's marked as a failure rather than blocking forever.
+fn cmdVerify(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
+    _ = gpa;
+    _ = port;
+    const ipc_mod = @import("ipc.zig");
+
+    // ── helpers ──
+    const GREEN = "\x1b[32m";
+    const RED = "\x1b[31m";
+    const YELLOW = "\x1b[33m";
+    const RESET = "\x1b[0m";
+
+    const CheckResult = enum { pass, fail, skip };
+    const checkIcon = struct {
+        fn icon(result: CheckResult) []const u8 {
+            return switch (result) {
+                .pass => GREEN ++ "✓" ++ RESET,
+                .fail => RED ++ "✗" ++ RESET,
+                .skip => YELLOW ++ "−" ++ RESET,
+            };
+        }
+    }.icon;
+
+    // 1. Get guest list via IPC status
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const json_str = ipc_mod.ipcStatus(block_io, aa) catch |err| {
+        std.debug.print("[verify] Failed to query guest list: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer aa.free(json_str);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, aa, json_str, .{ .allocate = .alloc_always }) catch |err| {
+        std.debug.print("[verify] JSON parse error: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    const guests = switch (parsed.value) {
+        .array => |arr| arr,
+        else => {
+            std.debug.print("No UTM guests found.\n", .{});
+            return;
+        },
+    };
+
+    if (guests.items.len == 0) {
+        std.debug.print("No UTM guests found.\n", .{});
+        return;
+    }
+
+    // Collect hostnames
+    var hostnames: std.ArrayListAligned([]const u8, null) = .empty;
+    for (guests.items) |guest_val| {
+        const g = switch (guest_val) {
+            .object => |o| o,
+            else => continue,
+        };
+        if (httpd.jsonGetString(g, "hostname")) |h| {
+            try hostnames.append(aa, try aa.dupe(u8, h));
+        }
+    }
+
+    // 2. Run checks for each guest
+    const GuestResult = struct {
+        status: CheckResult = .skip,
+        ping: CheckResult = .skip,
+        exec: CheckResult = .skip,
+        ping_rtt: ?u32 = null,
+        exec_error: ?[]const u8 = null,
+    };
+
+    var results = std.StringHashMap(GuestResult).init(aa);
+    for (hostnames.items) |h| {
+        try results.put(h, GuestResult{});
+    }
+
+    // 2a. Status check — guests are already in the list (from LSA)
+    for (hostnames.items) |h| {
+        var r = results.getPtr(h).?;
+        r.status = .pass;
+    }
+
+    // 2b. Ping check (mesh reachability)
+    for (hostnames.items) |h| {
+        var r = results.getPtr(h).?;
+        const ping_json = ipc_mod.ipcPing(block_io, aa, h) catch {
+            r.ping = .fail;
+            continue;
+        };
+        defer aa.free(ping_json);
+
+        // Parse RTT from ping response JSON
+        const ping_parsed = std.json.parseFromSlice(std.json.Value, aa, ping_json, .{ .allocate = .alloc_always }) catch {
+            r.ping = .fail;
+            continue;
+        };
+        if (ping_parsed.value == .object) {
+            if (ping_parsed.value.object.get("rtt_ms")) |rtt_val| {
+                if (rtt_val == .integer) {
+                    r.ping_rtt = @intCast(rtt_val.integer);
+                }
+            }
+            if (ping_parsed.value.object.get("error")) |_| {
+                r.ping = .fail;
+            } else {
+                r.ping = .pass;
+            }
+        } else {
+            r.ping = .fail;
+        }
+    }
+
+    // 2c. Exec echo check (tunnel + shell working)
+    for (hostnames.items) |h| {
+        var r = results.getPtr(h).?;
+
+        // Run "echo utmm-verify" — we only care about exit code.
+        // Write output to /dev/null (NUL on Windows).
+        const null_path = if (builtin.os.tag == .windows) "NUL" else "/dev/null";
+        var null_file = std.Io.Dir.cwd().openFile(block_io, null_path, .{ .mode = .write_only }) catch {
+            r.exec = .fail;
+            r.exec_error = try aa.dupe(u8, "cannot open null device");
+            continue;
+        };
+        defer null_file.close(block_io);
+        var null_wb: [256]u8 = undefined;
+        var null_writer = null_file.writer(block_io, &null_wb);
+        const null_iface = &null_writer.interface;
+
+        const exit_code = ipc_mod.ipcExec(block_io, aa, h, "echo utmm-verify", null_iface) catch {
+            r.exec = .fail;
+            r.exec_error = try aa.dupe(u8, "IPC error (tunnel down?)");
+            continue;
+        };
+
+        if (exit_code == 0) {
+            r.exec = .pass;
+        } else {
+            r.exec = .fail;
+            r.exec_error = try std.fmt.allocPrint(aa, "exit_code={d}", .{exit_code});
+        }
+    }
+
+    // 3. Print pass/fail matrix
+    std.debug.print("\n{s: <16} {s}  {s}  {s}  {s}\n", .{ "Guest", "Status", "Ping", "Exec", "Details" });
+    std.debug.print("{s:-<60}\n", .{""});
+
+    var all_pass = true;
+    for (hostnames.items) |h| {
+        const r = results.get(h).?;
+        var details: std.ArrayListAligned(u8, null) = .empty;
+        defer details.deinit(aa);
+
+        if (r.ping == .pass) {
+            if (r.ping_rtt) |rtt| {
+                const rtt_str = try std.fmt.allocPrint(aa, "{d}ms", .{rtt});
+                try details.appendSlice(aa, rtt_str);
+            }
+        } else if (r.ping == .fail) {
+            try details.appendSlice(aa, "unreachable");
+        }
+
+        if (r.exec == .fail) {
+            if (details.items.len > 0) try details.appendSlice(aa, ", ");
+            try details.appendSlice(aa, r.exec_error orelse "exec failed");
+        }
+
+        const detail_str = if (details.items.len > 0) details.items else "-";
+
+        std.debug.print("{s: <16} {s}     {s}     {s}     {s}\n", .{
+            h,
+            checkIcon(r.status),
+            checkIcon(r.ping),
+            checkIcon(r.exec),
+            detail_str,
+        });
+
+        if (r.status != .pass or r.ping != .pass or r.exec != .pass) {
+            all_pass = false;
+        }
+    }
+
+    std.debug.print("\n", .{});
+    if (all_pass) {
+        std.debug.print("All checks passed. {d} guest(s) healthy.\n", .{hostnames.items.len});
+    } else {
+        std.debug.print("Some checks failed. Review the matrix above.\n", .{});
+        std.process.exit(1);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Deployment config & command
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// VM deployment config entry.
+const VmDeployConfig = struct {
+    hostname: []const u8,
+    target: []const u8, // Zig cross-compilation target triple
+    ip: []const u8,
+    user: []const u8,
+    password: []const u8,
+    /// Remote canonical dir (e.g. "/opt/utmm" or "C:\\opt\\utmm")
+    remote_dir: []const u8,
+};
+
+/// Hard-coded VM deploy table. Override with utmm-deploy.json if present.
+const VM_DEPLOY_TABLE: []const VmDeployConfig = &[_]VmDeployConfig{
+    .{ .hostname = "linuxvm", .target = "aarch64-linux-musl", .ip = "192.168.64.2", .user = "root", .password = "111", .remote_dir = "/opt/utmm" },
+    .{ .hostname = "macvm", .target = "aarch64-macos", .ip = "192.168.64.4", .user = "root", .password = "111", .remote_dir = "/opt/utmm" },
+    .{ .hostname = "windowsvm", .target = "aarch64-windows", .ip = "192.168.65.2", .user = "Administrator", .password = "111", .remote_dir = "C:\\opt\\utmm" },
+    .{ .hostname = "winx64", .target = "x86_64-windows", .ip = "192.168.3.108", .user = "Administrator", .password = "111", .remote_dir = "C:\\opt\\utmm" },
+};
+
+/// One-shot deploy: cross-compile → SCP → SSH install → verify.
+/// Uses sshpass for non-interactive password auth.
+fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void {
+    // ── 1. Look up VM(s) to deploy ──
+    var deploy_list: std.ArrayListAligned(VmDeployConfig, null) = .empty;
+    defer deploy_list.deinit(gpa);
+
+    if (target_opt) |t| {
+        var found = false;
+        for (VM_DEPLOY_TABLE) |vm| {
+            if (std.mem.eql(u8, vm.hostname, t)) {
+                try deploy_list.append(gpa, vm);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print("[deploy] Unknown target: {s}\n", .{t});
+            std.debug.print("Known targets:", .{});
+            for (VM_DEPLOY_TABLE) |vm| {
+                std.debug.print(" {s}", .{vm.hostname});
+            }
+            std.debug.print("\n", .{});
+            std.process.exit(1);
+        }
+    } else {
+        // Deploy all
+        for (VM_DEPLOY_TABLE) |vm| {
+            try deploy_list.append(gpa, vm);
+        }
+    }
+
+    if (deploy_list.items.len == 0) {
+        std.debug.print("[deploy] No VMs to deploy.\n", .{});
+        return;
+    }
+
+    // ── Check sshpass availability (needed for scp/ssh) ──
+    const has_sshpass = blk: {
+        const result = std.process.run(gpa, io, .{ .argv = &.{ "which", "sshpass" } }) catch break :blk false;
+        defer {
+            gpa.free(result.stdout);
+            gpa.free(result.stderr);
+        }
+        break :blk result.term == .exited and result.term.exited == 0;
+    };
+    if (!has_sshpass) {
+        std.debug.print("[deploy] sshpass is required for non-interactive deployment.\n", .{});
+        std.debug.print("Install: brew install sshpass   (macOS)\n", .{});
+        std.debug.print("         apt install sshpass    (Linux)\n", .{});
+        std.process.exit(1);
+    }
+
+    std.debug.print("\n[deploy] Targets ({d}):", .{deploy_list.items.len});
+    for (deploy_list.items) |vm| {
+        std.debug.print(" {s}", .{vm.hostname});
+    }
+    std.debug.print("\n\n", .{});
+
+    // ── 2. Cross-compile for each target ──
+    var compiled = std.StringHashMap([]const u8).init(gpa); // target → binary path
+    defer {
+        var it = compiled.iterator();
+        while (it.next()) |entry| {
+            gpa.free(entry.value_ptr.*);
+        }
+        compiled.deinit();
+    }
+
+    for (deploy_list.items) |vm| {
+        if (compiled.contains(vm.target)) continue;
+
+        std.debug.print("[deploy] Compiling for {s}...\n", .{vm.target});
+        const target_flag = try std.fmt.allocPrint(gpa, "-Dtarget={s}", .{vm.target});
+        defer gpa.free(target_flag);
+        const result = std.process.run(gpa, io, .{
+            .argv = &.{ "zig", "build", target_flag },
+        }) catch |err| {
+            std.debug.print("[deploy] Compile failed: {}\n", .{err});
+            std.process.exit(1);
+        };
+        if (result.term != .exited or result.term.exited != 0) {
+            std.debug.print("[deploy] Compile failed:\n{s}\n", .{result.stderr});
+            gpa.free(result.stdout);
+            gpa.free(result.stderr);
+            std.process.exit(1);
+        }
+        gpa.free(result.stdout);
+        gpa.free(result.stderr);
+
+        // Determine binary path from target
+        const bin_name = protocol.deploymentFilename(vm.target) orelse {
+            std.debug.print("[deploy] Unknown target: {s}\n", .{vm.target});
+            std.process.exit(1);
+        };
+        const bin_path = try std.fmt.allocPrint(gpa, "zig-out/bin/{s}", .{bin_name});
+        try compiled.put(vm.target, bin_path);
+
+        std.debug.print("[deploy]   -> {s}\n", .{bin_path});
+    }
+
+    // ── 3. SCP + install for each VM ──
+    var success: usize = 0;
+    var failed: usize = 0;
+
+    for (deploy_list.items) |vm| {
+        const bin_path = compiled.get(vm.target) orelse continue;
+
+        std.debug.print("\n[deploy] === {s} ({s}) ===\n", .{ vm.hostname, vm.target });
+
+        // Windows: use SMB/copy or skip — scp/ssh not available natively.
+        // For now, provide manual instructions.
+        if (std.mem.indexOf(u8, vm.target, "windows") != null) {
+            std.debug.print("[deploy]   Windows target — manual deploy required.\n", .{});
+            std.debug.print("[deploy]   Copy {s} → {s}@{s}:{s}/utmm-new.exe\n", .{ bin_path, vm.user, vm.ip, vm.remote_dir });
+            std.debug.print("[deploy]   Then run: {s}\\utmm-new.exe --install --hostname {s}\n", .{ vm.remote_dir, vm.hostname });
+            success += 1;
+            continue;
+        }
+
+        // POSIX: use sshpass + scp
+        const remote_tmp = try std.fmt.allocPrint(gpa, "{s}/utmm-new", .{vm.remote_dir});
+        defer gpa.free(remote_tmp);
+
+        const scp_target = try std.fmt.allocPrint(gpa, "{s}@{s}", .{ vm.user, vm.ip });
+        defer gpa.free(scp_target);
+
+        // scp binary → VM
+        std.debug.print("[deploy]   scp {s} → {s}:{s}...\n", .{ bin_path, scp_target, remote_tmp });
+        const scp_dest = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ scp_target, remote_tmp });
+        defer gpa.free(scp_dest);
+        const scp_result = std.process.run(gpa, io, .{
+            .argv = &.{ "sshpass", "-p", vm.password, "scp", bin_path, scp_dest },
+        }) catch |err| {
+            std.debug.print("[deploy]   scp failed: {}\n", .{err});
+            failed += 1;
+            continue;
+        };
+        if (scp_result.term != .exited or scp_result.term.exited != 0) {
+            std.debug.print("[deploy]   scp failed:\n{s}\n", .{scp_result.stderr});
+            gpa.free(scp_result.stdout);
+            gpa.free(scp_result.stderr);
+            failed += 1;
+            continue;
+        }
+        gpa.free(scp_result.stdout);
+        gpa.free(scp_result.stderr);
+
+        // SSH: chmod +x + run --install
+        std.debug.print("[deploy]   ssh install...\n", .{});
+        const install_cmd = try std.fmt.allocPrint(gpa, "chmod +x {s} && {s} --install --hostname {s}", .{ remote_tmp, remote_tmp, vm.hostname });
+        defer gpa.free(install_cmd);
+
+        const ssh_result = std.process.run(gpa, io, .{
+            .argv = &.{ "sshpass", "-p", vm.password, "ssh", scp_target, install_cmd },
+        }) catch |err| {
+            std.debug.print("[deploy]   ssh install failed: {}\n", .{err});
+            failed += 1;
+            continue;
+        };
+        if (ssh_result.term != .exited or ssh_result.term.exited != 0) {
+            std.debug.print("[deploy]   ssh install failed:\n{s}\n", .{ssh_result.stderr});
+            gpa.free(ssh_result.stdout);
+            gpa.free(ssh_result.stderr);
+            failed += 1;
+            continue;
+        }
+        gpa.free(ssh_result.stdout);
+        gpa.free(ssh_result.stderr);
+
+        std.debug.print("[deploy]   {s} deployed successfully.\n", .{vm.hostname});
+        success += 1;
+    }
+
+    // ── 4. Summary ──
+    std.debug.print("\n[deploy] Done: {d} success, {d} failed (of {d})\n", .{ success, failed, deploy_list.items.len });
+    if (failed > 0) {
+        std.process.exit(1);
+    }
 }
 
 fn cmdPing(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8) !void {

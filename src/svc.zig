@@ -603,11 +603,74 @@ fn killAllUtmm(io: std.Io, alloc: std.mem.Allocator) !void {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Binary type validation — prevent cross-platform binary overwrite
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Binary magic numbers for platform detection.
+const MAGIC_ELF = [4]u8{ 0x7f, 'E', 'L', 'F' };
+const MAGIC_MACHO64 = [4]u8{ 0xcf, 0xfa, 0xed, 0xfe }; // 64-bit LE
+const MAGIC_MACHO32 = [4]u8{ 0xce, 0xfa, 0xed, 0xfe }; // 32-bit LE
+const MAGIC_PE = [2]u8{ 'M', 'Z' };
+
+/// Return a human-readable description of the binary format detected in `head`.
+fn describeBinary(head: []const u8) []const u8 {
+    if (head.len >= 2 and std.mem.eql(u8, head[0..2], &MAGIC_PE)) return "PE (Windows)";
+    if (head.len >= 4 and std.mem.eql(u8, head[0..4], &MAGIC_ELF)) return "ELF (Linux)";
+    if (head.len >= 4 and (std.mem.eql(u8, head[0..4], &MAGIC_MACHO64) or
+        std.mem.eql(u8, head[0..4], &MAGIC_MACHO32))) return "Mach-O (macOS)";
+    return "unknown format";
+}
+
+/// Read first 4 bytes of a binary and verify the magic matches the current platform.
+/// Call before selfCopy to prevent accidental cross-platform binary overwrite
+/// (e.g. deploying an ELF binary to a macOS host).
+fn validateBinaryType(io: std.Io, path: []const u8) !void {
+    const cwd = std.Io.Dir.cwd();
+    const f = cwd.openFile(io, path, .{ .mode = .read_only }) catch |err| {
+        fail.err("validateBinary/open", err);
+    };
+    defer f.close(io);
+
+    var head: [4]u8 = [_]u8{0} ** 4;
+    var read_buf: [256]u8 = undefined;
+    var reader = f.reader(io, &read_buf);
+    const n = reader.interface.readSliceShort(&head) catch |err| {
+        fail.err("validateBinary/read", err);
+    };
+
+    if (n < 4) {
+        fail.msg("validateBinary", "file too small ({d} bytes) to be a valid binary", .{n});
+    }
+
+    switch (builtin.os.tag) {
+        .linux => {
+            if (!std.mem.eql(u8, &head, &MAGIC_ELF)) {
+                fail.msg("validateBinary", "expected ELF (Linux) binary but detected {s} — wrong platform binary?", .{describeBinary(&head)});
+            }
+        },
+        .macos => {
+            if (!std.mem.eql(u8, &head, &MAGIC_MACHO64) and
+                !std.mem.eql(u8, &head, &MAGIC_MACHO32))
+            {
+                fail.msg("validateBinary", "expected Mach-O (macOS) binary but detected {s} — wrong platform binary?", .{describeBinary(&head)});
+            }
+        },
+        .windows => {
+            if (!std.mem.eql(u8, head[0..2], &MAGIC_PE)) {
+                fail.msg("validateBinary", "expected PE (Windows) binary but detected {s} — wrong platform binary?", .{describeBinary(&head)});
+            }
+        },
+        else => {}, // Unknown platform — skip check
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Self-copy: copy current binary to canonical path
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Copy the current process binary to the canonical install path.
 /// Uses tmp file + rename for atomic replacement.
+/// Validates binary magic before copying to prevent cross-platform mistakes.
 pub fn selfCopy(io: std.Io, alloc: std.mem.Allocator) !void {
     const dest = canonicalPath();
 
@@ -623,6 +686,11 @@ pub fn selfCopy(io: std.Io, alloc: std.mem.Allocator) !void {
         std.log.info("[svc] already at canonical path", .{});
         return;
     }
+
+    // Validate binary matches current platform before copying
+    validateBinaryType(io, self_path) catch |err| {
+        fail.err("selfCopy/binary-check", err);
+    };
 
     // Ensure canonical directory exists
     const dest_dir = canonicalDir();
@@ -1068,4 +1136,61 @@ pub fn winServiceRun(
         std.debug.print("[svc] StartServiceCtrlDispatcher failed (error: {})\n", .{windows.GetLastError()});
         return error.ServiceDispatchFailed;
     }
+}
+
+// ========== Tests ==========
+
+test "describeBinary - ELF" {
+    const head = [_]u8{ 0x7f, 'E', 'L', 'F' };
+    try std.testing.expectEqualStrings("ELF (Linux)", describeBinary(&head));
+}
+
+test "describeBinary - Mach-O 64-bit" {
+    const head = [_]u8{ 0xcf, 0xfa, 0xed, 0xfe };
+    try std.testing.expectEqualStrings("Mach-O (macOS)", describeBinary(&head));
+}
+
+test "describeBinary - Mach-O 32-bit" {
+    const head = [_]u8{ 0xce, 0xfa, 0xed, 0xfe };
+    try std.testing.expectEqualStrings("Mach-O (macOS)", describeBinary(&head));
+}
+
+test "describeBinary - PE" {
+    const head = [_]u8{ 'M', 'Z', 0, 0 };
+    try std.testing.expectEqualStrings("PE (Windows)", describeBinary(&head));
+}
+
+test "describeBinary - unknown" {
+    const head = [_]u8{ 0x00, 0x00, 0x00, 0x00 };
+    try std.testing.expectEqualStrings("unknown format", describeBinary(&head));
+}
+
+test "describeBinary - short slice" {
+    const head = [_]u8{'M'};
+    try std.testing.expectEqualStrings("unknown format", describeBinary(&head));
+}
+
+test "describeBinary - empty slice" {
+    const head = [_]u8{};
+    try std.testing.expectEqualStrings("unknown format", describeBinary(&head));
+}
+
+test "magic constants - ELF" {
+    try std.testing.expectEqual(@as(u8, 0x7f), MAGIC_ELF[0]);
+    try std.testing.expectEqual(@as(u8, 'E'), MAGIC_ELF[1]);
+    try std.testing.expectEqual(@as(u8, 'L'), MAGIC_ELF[2]);
+    try std.testing.expectEqual(@as(u8, 'F'), MAGIC_ELF[3]);
+}
+
+test "magic constants - Mach-O 64 LE" {
+    // 0xFEEDFACF in little-endian
+    try std.testing.expectEqual(@as(u8, 0xcf), MAGIC_MACHO64[0]);
+    try std.testing.expectEqual(@as(u8, 0xfa), MAGIC_MACHO64[1]);
+    try std.testing.expectEqual(@as(u8, 0xed), MAGIC_MACHO64[2]);
+    try std.testing.expectEqual(@as(u8, 0xfe), MAGIC_MACHO64[3]);
+}
+
+test "magic constants - PE" {
+    try std.testing.expectEqual(@as(u8, 'M'), MAGIC_PE[0]);
+    try std.testing.expectEqual(@as(u8, 'Z'), MAGIC_PE[1]);
 }
