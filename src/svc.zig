@@ -867,13 +867,16 @@ pub fn resetRetryCounter(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole
 /// auto-upgrade attempt. If found, replace the running binary and restart.
 /// Returns true if upgrade was applied (caller should exit), false otherwise.
 pub fn checkPendingUpgradeWindows(io: std.Io, alloc: std.mem.Allocator) bool {
-    _ = alloc;
     if (builtin.os.tag != .windows) return false;
 
     const exe_path = canonicalPath();
-    const new_path = exe_path ++ ".new";
+    const new_path = std.fmt.allocPrint(alloc, "{s}.new", .{exe_path}) catch {
+        std.log.err("[svc] allocPrint for upgrade path failed", .{});
+        return false;
+    };
+    defer alloc.free(new_path);
 
-    if (std.Io.Dir.cwd().stat(io, new_path, .{})) |_| {
+    if (std.Io.Dir.cwd().statFile(io, new_path, .{})) |_| {
         std.log.info("[svc] pending upgrade found at {s}", .{new_path});
     } else |_| {
         return false;
