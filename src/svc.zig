@@ -535,15 +535,36 @@ pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
                 return;
             }
             if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "kickstart", "-k", "system", name })) {
-                // kickstart failed — service may not be loaded. Try bootstrap.
+                // kickstart failed — service may not be loaded.
+                // Add a short delay to let launchd finish processing a prior
+                // bootout before trying bootstrap (avoids errno=2/5, Finding 128).
+                std.log.info("[svc] kickstart failed, waiting 500ms before bootstrap...", .{});
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+
                 const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name});
                 defer alloc.free(plist_path);
                 _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
-                if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path })) {
-                    fail.msg("start/launchctl-bootstrap", "failed to bootstrap {s}", .{name});
+
+                // Retry bootstrap up to 3 times with 1-second delays.
+                // launchd may still be processing a prior bootout; retries
+                // resolve transient errno=2/5 failures (Finding 123 + 128).
+                var bootstrapped = false;
+                for (0..3) |attempt| {
+                    if (runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path })) {
+                        bootstrapped = true;
+                        std.log.info("[svc] bootstrap succeeded on attempt {d}", .{attempt + 1});
+                        break;
+                    }
+                    std.log.warn("[svc] bootstrap attempt {d}/3 failed, retrying in 1s...", .{attempt + 1});
+                    std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch break;
+                }
+
+                if (!bootstrapped) {
+                    fail.msg("start/launchctl-bootstrap", "failed to bootstrap {s} after 3 attempts", .{name});
                 }
             }
-            // Verify
+            // Verify — give launchd a moment to register the service
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
             const list_out = runCmdStdout(alloc, io, &[_][]const u8{ "launchctl", "list" });
             if (list_out) |stdout| {
                 defer alloc.free(stdout);
@@ -590,17 +611,148 @@ pub fn stop(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
     }
 }
 
+/// Get our own process ID, cross-platform.
+fn getOwnPid() u32 {
+    if (builtin.os.tag == .windows) {
+        return @intCast(std.os.windows.GetCurrentProcessId());
+    }
+    return @intCast(std.posix.system.getpid());
+}
+
 /// Kill all utmm processes (except self) — best-effort, never fails.
+/// Uses pgrep/tasklist to enumerate PIDs, filtering out our own PID
+/// so the installer doesn't kill itself (Finding 139).
 fn killAllUtmm(io: std.Io, alloc: std.mem.Allocator) !void {
+    const my_pid = getOwnPid();
     switch (builtin.os.tag) {
         .macos, .linux => {
-            runCmdQuiet(alloc, io, &[_][]const u8{ "pkill", "-9", "-x", "utmm" });
+            // Enumerate PIDs with pgrep; fall back to pkill if unavailable.
+            const out = runCmdStdout(alloc, io, &[_][]const u8{ "pgrep", "-x", "utmm" }) orelse {
+                std.log.warn("[svc] pgrep -x utmm failed, falling back to pkill", .{});
+                runCmdQuiet(alloc, io, &[_][]const u8{ "pkill", "-9", "-x", "utmm" });
+                return;
+            };
+            defer alloc.free(out);
+            var killed: usize = 0;
+            var iter = std.mem.tokenizeScalar(u8, out, '\n');
+            while (iter.next()) |pid_str| {
+                const pid = std.fmt.parseInt(u32, std.mem.trim(u8, pid_str, " \r"), 10) catch continue;
+                if (pid == my_pid) {
+                    std.log.debug("[svc] killAllUtmm: skipping own PID {d}", .{pid});
+                    continue;
+                }
+                std.log.info("[svc] killAllUtmm: killing PID {d}", .{pid});
+                _ = runCmdQuiet(alloc, io, &[_][]const u8{ "kill", "-9", pid_str });
+                killed += 1;
+            }
+            if (killed > 0) {
+                std.log.info("[svc] killAllUtmm: killed {d} process(es)", .{killed});
+            }
         },
         .windows => {
-            runCmdQuiet(alloc, io, &[_][]const u8{ "taskkill", "/f", "/im", "utmm.exe" });
+            // Enumerate PIDs with tasklist; fall back to taskkill /im if unavailable.
+            const out = runCmdStdout(alloc, io, &[_][]const u8{
+                "tasklist", "/fi", "imagename eq utmm.exe", "/fo", "csv", "/nh",
+            }) orelse {
+                std.log.warn("[svc] tasklist failed, falling back to taskkill /im", .{});
+                runCmdQuiet(alloc, io, &[_][]const u8{ "taskkill", "/f", "/im", "utmm.exe" });
+                return;
+            };
+            defer alloc.free(out);
+            var killed: usize = 0;
+            var iter = std.mem.tokenizeScalar(u8, out, '\n');
+            while (iter.next()) |line| {
+                const trimmed = std.mem.trim(u8, line, " \r");
+                if (trimmed.len < 2) continue;
+                // CSV format: "utmm.exe","1234","Console","1","12,345 K"
+                var csv_iter = std.mem.splitScalar(u8, trimmed, ',');
+                _ = csv_iter.next(); // skip image name
+                const pid_field = csv_iter.next() orelse continue;
+                const pid_str = std.mem.trim(u8, pid_field, " \"\r");
+                const pid = std.fmt.parseInt(u32, pid_str, 10) catch continue;
+                if (pid == my_pid) {
+                    std.log.debug("[svc] killAllUtmm: skipping own PID {d}", .{pid});
+                    continue;
+                }
+                std.log.info("[svc] killAllUtmm: killing PID {d}", .{pid});
+                _ = runCmdQuiet(alloc, io, &[_][]const u8{ "taskkill", "/f", "/pid", pid_str });
+                killed += 1;
+            }
+            if (killed > 0) {
+                std.log.info("[svc] killAllUtmm: killed {d} process(es)", .{killed});
+            }
         },
         else => {},
     }
+}
+
+/// Count utmm processes other than our own PID.
+/// Returns 0 if no other utmm processes are running.
+fn countOtherUtmmProcesses(alloc: std.mem.Allocator, io: std.Io, my_pid: u32) !usize {
+    switch (builtin.os.tag) {
+        .macos, .linux => {
+            const out = runCmdStdout(alloc, io, &[_][]const u8{ "pgrep", "-x", "utmm" }) orelse return 0;
+            defer alloc.free(out);
+            var count: usize = 0;
+            var iter = std.mem.tokenizeScalar(u8, out, '\n');
+            while (iter.next()) |pid_str| {
+                const pid = std.fmt.parseInt(u32, std.mem.trim(u8, pid_str, " \r"), 10) catch continue;
+                if (pid != my_pid) count += 1;
+            }
+            return count;
+        },
+        .windows => {
+            const out = runCmdStdout(alloc, io, &[_][]const u8{
+                "tasklist", "/fi", "imagename eq utmm.exe", "/fo", "csv", "/nh",
+            }) orelse return 0;
+            defer alloc.free(out);
+            var count: usize = 0;
+            var iter = std.mem.tokenizeScalar(u8, out, '\n');
+            while (iter.next()) |line| {
+                const trimmed = std.mem.trim(u8, line, " \r");
+                if (trimmed.len < 2) continue;
+                var csv_iter = std.mem.splitScalar(u8, trimmed, ',');
+                _ = csv_iter.next(); // skip image name
+                const pid_field = csv_iter.next() orelse continue;
+                const pid_str = std.mem.trim(u8, pid_field, " \"\r");
+                const pid = std.fmt.parseInt(u32, pid_str, 10) catch continue;
+                if (pid != my_pid) count += 1;
+            }
+            return count;
+        },
+        else => return 0,
+    }
+}
+
+/// Wait up to `timeout_ms` for all other utmm processes to exit.
+/// Returns true if no other utmm processes remain, false on timeout.
+/// Placed between stop() and killAllUtmm() so selfCopy has a clean
+/// filesystem — prevents "Text file busy" on Linux (Finding 135).
+fn waitForProcessExit(io: std.Io, alloc: std.mem.Allocator, timeout_ms: u64) bool {
+    const my_pid = getOwnPid();
+    const poll_interval_ms: u64 = 100;
+    var elapsed: u64 = 0;
+
+    while (elapsed < timeout_ms) {
+        const remaining = countOtherUtmmProcesses(alloc, io, my_pid) catch |err| {
+            std.log.debug("[svc] countOtherUtmmProcesses error: {} (continuing wait)", .{err});
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(poll_interval_ms), .awake) catch return false;
+            elapsed += poll_interval_ms;
+            continue;
+        };
+
+        if (remaining == 0) {
+            std.log.info("[svc] all other utmm processes exited after {d}ms", .{elapsed});
+            return true;
+        }
+
+        std.log.info("[svc] waiting for {d} other utmm process(es) to exit... ({d}ms elapsed)", .{ remaining, elapsed });
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(poll_interval_ms), .awake) catch return false;
+        elapsed += poll_interval_ms;
+    }
+
+    std.log.warn("[svc] timeout after {d}ms — proceeding with killAllUtmm", .{elapsed});
+    return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -868,7 +1020,13 @@ fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole,
         std.log.warn("[svc] stop before install: {} (continuing)", .{err});
     };
 
-    // 2. Kill any lingering utmm processes
+    // 1.5. Wait for old processes to fully exit before touching the binary.
+    // On Linux, systemctl stop may return before the process has released
+    // its file descriptors, causing selfCopy to fail with "Text file busy".
+    // 5-second timeout covers the typical case; killAllUtmm handles stragglers.
+    _ = waitForProcessExit(io, alloc, 5000);
+
+    // 2. Kill any lingering utmm processes (now PID-aware; excludes self)
     killAllUtmm(io, alloc) catch |err| {
         std.log.warn("[svc] forceInstall killAllUtmm failed: {}", .{err});
     };

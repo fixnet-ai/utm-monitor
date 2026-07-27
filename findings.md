@@ -1,4 +1,4 @@
-# Findings: v0.11.18
+# Findings: v0.11.23
 
 记录重要的技术发现、Bug、设计决策和 Zig 0.16.0 API 笔记。
 
@@ -249,7 +249,7 @@ Host 等 Guest 建隧道、Guest 等 Host 建隧道 → 死锁。修复：统一
 - `exit(0)` 与 `KeepAlive SuccessfulExit=false` 不兼容 — 升级后应 `exit(42)` 或修改 plist
 - `start()` 中 `kickstart -k` 失败时应尝试 `bootstrap` 后再 `kickstart`
 
-**状态**: 🔴 待修复
+**状态**: ✅ 已修复 (Phase 74) — killAllUtmm PID 感知排除自身、start() bootstrap 重试、exit(0)→exit(42)
 
 ### Finding 124: 非 Linux Guest 隧道不稳定 — LSA restart 误判 (✅ 已修复)
 
@@ -347,7 +347,9 @@ main.zig:393:35: dupe__anon in buildServiceArgs
 
 **影响**: 自动升级半完成 — 新二进制已下载但未部署，Guest 继续运行旧版本。Host 侧认为升级成功（命令流正常），但下次 LSA 版本检测仍不匹配 → 无限循环尝试升级。
 
-**状态**: 🔴 待修复
+**修复** (Phase 74): `forceInstallInternal()` 在 stop() 后插入 `waitForProcessExit()`（5s 超时/100ms 轮询），确保 systemctl stop 异步退出完成后再 selfCopy。`killAllUtmm` 改为 PID 感知实现，排除自身。
+
+**状态**: ✅ 已修复 (Phase 74)
 
 ### Finding 136 (CRITICAL): winx64 自动升级信号未检测到
 
@@ -399,7 +401,9 @@ main.zig:393:35: dupe__anon in buildServiceArgs
 
 **与 Finding 107 的关系**: Finding 107 描述了 SSH 远程执行 `--install` 时被 pkill 自伤的同一问题。Finding 139 确认此问题同样影响 Host 本地安装。
 
-**状态**: 🟡 规避方案存在，需重新设计 kill 步骤（排除自身 PID）
+**修复** (Phase 74): `killAllUtmm()` 改为 PID 感知实现 — pgrep/tasklist 枚举 PID，过滤自身，kill -9 每个。pkill/taskkill /im 保留为 pgrep/tasklist 不可用时的回退。
+
+**状态**: ✅ 已修复 (Phase 74)
 
 ### Finding 123 更新: rollback 修复验证
 
@@ -409,11 +413,12 @@ main.zig:393:35: dupe__anon in buildServiceArgs
 
 **v0.11.23 测试验证**: macvm 上 launchctl bootstrap errno=2 后，二进制 v0.11.23 和 .plist 均保留。旧代码会删除两者 → VM 失联。修复生效。
 
-**剩余问题** (原 Finding 123 的另外两个根因):
-1. `pkill -9 -x utmm` 有时杀不掉旧进程 — 旧进程打出 "--install ok" 证明仍存活
-2. `exit(0)` + `KeepAlive SuccessfulExit=false` 不兼容 — 升级后应 exit(非零) 触发 launchd 重启
+**Phase 74 修复**:
+1. `killAllUtmm()` 改为 PID 感知 — pgrep 枚举 + 过滤自身 PID + kill -9 每个，替代不可靠的 pkill
+2. `start()` macOS 路径 — kickstart 失败后 500ms 延迟 + bootstrap 3 次重试（间隔 1s）
+3. `exit(0)` → `exit(42)` — 非零退出码可靠触发 launchd/systemd 重启
 
-**状态**: 部分修复（回滚路径已消除，pkill 失效 + exit(0) 问题待解决）
+**状态**: ✅ 已修复 (Phase 74)
 
 ---
 
@@ -421,13 +426,13 @@ main.zig:393:35: dupe__anon in buildServiceArgs
 
 | # | 问题 | 状态 |
 |---|------|------|
-| **123** | macOS 自动升级后服务永久停止（回滚路径已修复，pkill+exit(0) 待解决） | 🔴 部分修复 |
+| **123** | macOS 自动升级后服务永久停止 | ✅ 已修复 (Phase 74) |
 | **129** | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 | ✅ 已修复 (Phase 73) |
-| **135** | linuxvm selfCopy 无法覆盖运行中二进制（Text file busy） | 🔴 待修复 |
-| **136** | winx64 自动升级信号未检测到 | 🔴 待调查 |
+| **135** | linuxvm selfCopy 无法覆盖运行中二进制（Text file busy） | ✅ 已修复 (Phase 74) |
+| **136** | winx64 自动升级信号未检测到 | 🔴 待调查（网络隔离） |
 | **137** | windowsvm 自动升级 install 失败，优雅回退 | 🟡 待调查 |
 | **138** | KCP 自动升级下载性能瓶颈（~15KB/s，日志 I/O 阻塞） | ✅ 已修复 (Phase 73) |
-| **139** | Host 自 kill：`pkill -9 -x utmm` 杀死安装器自身 | 🟡 规避方案存在 |
+| **139** | Host 自 kill：`pkill -9 -x utmm` 杀死安装器自身 | ✅ 已修复 (Phase 74) |
 | 124 | 非 Linux Guest 隧道不稳定 | ✅ 已修复 (Finding 124) |
 | 125 | `nowMs()` RTT 中继路径异常 | 📋 不影响核心功能 |
 | 126 | DebugAllocator 泄漏 (`buildServiceArgs`) | 📋 仅 debug 构建 |

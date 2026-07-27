@@ -9,6 +9,28 @@
 - **健康检查**: 4/4 全部通过（`--verify` 全绿 ✓）
 - **自动升级 rollback 修复**: `forceInstallInternal()` 步骤 5 不再回滚删除二进制+配置 ✅
 - **KCP Tunnel 稳定性修复**: session_gen 唯一 conv + epoch 范围验证 + 日志降级 ✅
+- **自动升级 forceInstall 修复**: killAllUtmm PID 感知 + waitForProcessExit + start() 重试 ✅
+
+## Phase 74: 自动升级 forceInstall 修复 (2026-07-28)
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 350 | killAllUtmm PID 感知 — pgrep/tasklist 枚举 + 排除自身（Finding 139） | ✅ |
+| 351 | waitForProcessExit — stop 后轮询等待进程退出（Finding 135） | ✅ |
+| 352 | macOS start() 重试 — 500ms 延迟 + bootstrap 3 次重试（Finding 123） | ✅ |
+| 353 | exit(0) → exit(42) — applyUpgradeAndRestart 非零退出码 | ✅ |
+| 354 | zig build + 166/166 测试通过 | ✅ |
+
+### 变更摘要
+
+- **`src/svc.zig`**: `getOwnPid()` + `killAllUtmm()` 重写（PID 感知）+ `countOtherUtmmProcesses()` + `waitForProcessExit()` + `forceInstallInternal()` 步骤 1.5 等待 + `start()` macOS bootstrap 重试
+- **`src/broadcast.zig`**: `applyUpgradeAndRestart()` — `exit(0)` → `exit(42)`
+
+### 验证结果
+
+- 166/166 测试通过
+- zig build 编译成功
+- 待部署验证: macvm (Finding 123), linuxvm (Finding 135), Host (Finding 139)
 
 ## Phase 73: KCP Tunnel 稳定性 + 下载性能修复 (2026-07-28)
 

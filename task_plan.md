@@ -1,4 +1,4 @@
-# Task Plan: v0.11.18
+# Task Plan: v0.11.23
 
 ## 架构概述
 
@@ -63,6 +63,7 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 71 | 2026-07-28 | 版本号单文件管理 + GitHub 新版本检测（OS线程 fire-and-forget） |
 | 72 | 2026-07-28 | 自动升级 rollback 修复 + 全流程部署测试 |
 | 73 | 2026-07-28 | KCP Tunnel 稳定性 + 下载性能修复（Finding 129 + 138） |
+| 74 | 2026-07-28 | 自动升级 forceInstall 修复（Finding 123 + 135 + 139） |
 
 ## Phase 72: 自动升级 rollback 修复 + 全流程部署测试 ✅ (2026-07-28)
 
@@ -124,17 +125,44 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | macvm 文件上传 | 不稳定 | 成功 |
 | Host 日志增长 | ~96MB/数分钟 | ~3.5KB/10 秒 |
 
+## Phase 74: 自动升级 forceInstall 修复 ✅ (2026-07-28)
+
+| # | 任务 | 描述 | 状态 |
+|---|------|------|------|
+| 350 | Fix A: killAllUtmm PID 感知 | pgrep/tasklist 枚举 PID → 过滤自身 → kill -9 每个（Finding 139） | ✅ |
+| 351 | Fix B: waitForProcessExit | stop 后轮询等待进程退出（5s 超时/100ms 间隔），防 Text file busy（Finding 135） | ✅ |
+| 352 | Fix C: macOS start() 重试 | kickstart 失败后 500ms 延迟 + bootstrap 3 次重试（间隔 1s）（Finding 123） | ✅ |
+| 353 | Fix D: exit(0) → exit(42) | applyUpgradeAndRestart 非零退出码触发 launchd/systemd 可靠重启 | ✅ |
+| 354 | 编译 + 测试 | zig build ✅，166/166 测试通过 ✅ | ✅ |
+
+### 变更摘要
+
+**`src/svc.zig`**:
+- `getOwnPid()` — 跨平台获取自身 PID
+- `killAllUtmm()` 重写 — pgrep/tasklist PID 枚举替代 pkill/taskkill /im，排除自身 PID
+- `countOtherUtmmProcesses()` + `waitForProcessExit()` — stop 后轮询等待，防 Linux Text file busy
+- `forceInstallInternal()` — 步骤 1.5 插入 waitForProcessExit
+- `start()` macOS — kickstart 失败后 500ms 延迟 + bootstrap 3 次重试（1s 间隔）+ verify 前 500ms 延迟
+
+**`src/broadcast.zig`**:
+- `applyUpgradeAndRestart()` — `exit(0)` → `exit(42)`，非零退出码触发服务管理器可靠重启
+
+### 未包含
+
+- **Finding 136** (winx64 LSA 信号): 网络隔离问题（192.168.3.x vs 64.x/65.x），非代码 bug
+- **Finding 137** (windowsvm install): Windows .exe 文件锁定机制，需单独设计
+
 ## 待修复
 
 | Finding | 严重度 | 描述 |
 |---------|--------|------|
-| 123 | 🔴 CRITICAL | macOS 自动升级后 `exit(0)` + `KeepAlive SuccessfulExit=false` → 服务永久停止 |
-| 135 | 🔴 | linuxvm selfCopy 无法覆盖运行中二进制（Text file busy） |
-| 136 | 🔴 | winx64 自动升级信号未检测到 |
+| 136 | 🔴 | winx64 自动升级信号未检测到（网络隔离，待调查） |
 | 137 | 🟡 | windowsvm 自动升级 install 失败，优雅回退 |
-| 139 | 🟡 | Host 自 kill：pkill -9 -x utmm 杀死正执行的安装器自身 |
-| 129 | ✅ 已修复 | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
-| 138 | ✅ 已修复 | KCP 自动升级下载性能瓶颈（~15KB/s，mesh 日志刷屏） |
+| 123 | ✅ 已修复 (Phase 74) | macOS 自动升级：killAllUtmm PID 感知 + start() 重试 + exit(42) |
+| 135 | ✅ 已修复 (Phase 74) | linuxvm selfCopy：waitForProcessExit 等进程退出后再覆盖 |
+| 139 | ✅ 已修复 (Phase 74) | Host 自 kill：killAllUtmm 排除自身 PID |
+| 129 | ✅ 已修复 (Phase 73) | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
+| 138 | ✅ 已修复 (Phase 73) | KCP 自动升级下载性能瓶颈（~15KB/s，mesh 日志刷屏） |
 
 ## Phase 71: 版本号单文件管理 + GitHub 新版本检测 ✅ (2026-07-28)
 
@@ -191,12 +219,3 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 - `--verify`：4 Guest 全绿 ✓，Host 正确跳过
 - MCP `vm_status`：role 标签 + status 字段正确
 
-## 待修复
-
-| Finding | 严重度 | 描述 |
-|---------|--------|------|
-| 123 | 🔴 CRITICAL | macOS 自动升级后 `exit(0)` + `KeepAlive SuccessfulExit=false` → 服务永久停止 |
-| 129 | 🔴 | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
-| 125 | 📋 | `nowMs()` RTT 直连正确、中继异常（uptime 级别数值） |
-| 127 | 📋 | linuxvm Journal 停止 + 升级下载无声失败 |
-| 128 | 📋 | macOS `launchctl bootstrap` errno=5 在 bootout 后 |

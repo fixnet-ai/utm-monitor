@@ -1774,8 +1774,11 @@ fn applyUpgradeAndRestart(
     // Exit so the service manager restarts with the new binary.
     allocator.free(result.stdout);
     allocator.free(result.stderr);
-    std.log.info("[upgrade] --install ok, exiting for restart...", .{});
-    std.process.exit(0);
+    // Exit with non-zero code so the service manager (launchd KeepAlive,
+    // systemd Restart=on-failure) reliably restarts the service with the
+    // new binary. 42 is a recognizable sentinel for "upgrade completed".
+    std.log.info("[upgrade] --install ok, exiting with code 42 to trigger restart...", .{});
+    std.process.exit(42);
 }
 
 /// Perform auto-upgrade: connect to Host via KCP, download new binary,
