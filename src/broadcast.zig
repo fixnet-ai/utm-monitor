@@ -1313,6 +1313,13 @@ pub fn meshSessionLoop(
                 break;
             }
 
+            // Check for pending auto-upgrade (version mismatch detected via LSA).
+            // Exit the command loop to let the outer loop handle the upgrade.
+            if (upgrade.needed.load(.acquire)) {
+                std.log.info("[guest-mesh] Upgrade signal detected, exiting command loop", .{});
+                break;
+            }
+
             if (!tunnel.isAlive()) {
                 std.log.info("[guest-mesh] Tunnel dead (keepalive), reconnecting", .{});
                 break;
