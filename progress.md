@@ -1,12 +1,27 @@
-# Progress: v0.11.16-dev
+# Progress: v0.11.16 → v0.11.17
 
 ## 当前状态
 
 - **分支**: `main`
-- **版本**: 0.11.15 tagged; 代码已修改（自动升级修复）待 bump
+- **版本**: v0.11.16（`src/protocol.zig` VERSION、`build.zig.zon`）
 - **测试**: 149/149 通过
-- **部署**: macOS Host v0.11.15 ✅ | linuxvm v0.11.15 ✅ | macvm v0.11.15 ✅ | windowsvm v0.11.15 ✅ | winx64 v0.11.15 ✅
-- **未提交修改**: 自动升级 IP gating 修复（mesh.zig + broadcast.zig + host.zig）
+- **部署**: macOS Host v0.11.16 ✅ | linuxvm v0.11.16 ✅ | macvm v0.11.16 ✅ | windowsvm v0.11.16 ✅ | winx64 v0.11.16 ✅
+- **最新提交**: `3006806` fix: replace host_gateway_ip with self-role check in epoch tracking
+- **GitHub Release**: https://github.com/fixnet-ai/utm-monitor/releases/tag/v0.11.16
+- **当前阶段**: Phase 66 — 小修复收尾
+
+## Phase 66 计划 (2026-07-27)
+
+**目标**: 清理已知小问题，消除日志噪音，完善跨平台细节。
+
+| # | 任务 | 难度 | 依赖 | 预计影响 |
+|---|------|------|------|---------|
+| 1 | `upload_result` (0x17) handler | ★☆☆ | 无 | httpd.zig switch +1 分支 |
+| 2 | RTT → 真实毫秒 | ★★☆ | 无 | mesh.zig ping/pong 时间戳 |
+| 3 | F91: macOS codesign | ★★☆ | 无 | svc.zig selfCopy EXDEV 路径 |
+| 4 | 多网卡 LSA 广播可达性 | ★★★ | 无 | mesh.zig 广播策略 |
+
+**已取消**: httpd.zig 测试编译（httpd 已废弃）、Windows 优雅退出 Finding 103（永久延迟）
 
 ## Phase 64: 文档重写 + v0.11.15 发布 (2026-07-27)
 
@@ -55,7 +70,7 @@
 **版本检查现在直接执行**：`remote_version != protocol.VERSION` — 无需 IP 匹配。
 版本不匹配即触发升级。其他 Guest 都运行相同 VERSION，无虚假触发风险。
 
-## Phase 65: 一键安装脚本 (install.sh + install.bat) ← 当前
+## Phase 65: 一键安装脚本 (install.sh + install.bat) ✅ (2026-07-27)
 
 **目标**: 创建跨平台交互式安装脚本，一行命令即可完成首次安装/升级。
 
@@ -68,29 +83,42 @@
 - 支持离线安装：zip 自带 `install.sh`/`install.bat`
 - README/SKILL.md/MANUAL.md 去除 UTM 限定描述，适用所有 VM + 真机
 
-**涉及文件**：
+**已完成**：
 
-| 文件 | 操作 | 说明 |
-|------|------|------|
-| `install.sh` | 新建 | POSIX 安装脚本，~180行 |
-| `install.bat` | 新建 | Windows 安装脚本，~150行，Win7+ 兼容 |
-| `.gitattributes` | 更新 | `install.sh text eol=lf` / `install.bat text eol=crlf` |
-| `release.sh` | 修改 | zip 打包时追加 `install.sh install.bat` |
-| `README.md` | 修改 | One-Time Setup 重写；去除 SCP/UTM 限定描述 |
-| `SKILL.md` | 修改 | 安装指引同步为一键脚本 |
-| `MANUAL.md` | 修改 | 安装章节重写；去除 UTM 限定描述 |
-| `task_plan.md` | 更新 | Phase 65 计划 |
-| `progress.md` | 更新 | 进度跟踪 |
+| 文件 | 说明 |
+|------|------|
+| `install.sh` | POSIX 安装脚本，272 行。root check → platform detect → 交互 → download (curl→wget) → extract → --install |
+| `install.bat` | Windows 安装脚本，332 行。Admin check → arch detect → 交互 → download (powershell→curl→certutil→bitsadmin) → extract (Expand-Archive→tar→COM) → --install |
+| `.gitattributes` | `install.sh text eol=lf` / `install.bat text eol=crlf` |
+| `release.sh` | zip 追加 install.sh + install.bat |
+| `README.md` | One-Time Setup 改为一键 curl\|sh 命令 + 离线安装 |
+| `SKILL.md` | Deploy/Upgrade 改为一键脚本 |
+| `MANUAL.md` | §2 Quick Deployment + §4 Upgrade 全面重写 |
+| `src/protocol.zig` | VERSION = "0.11.16" |
+| `build.zig.zon` | .version = "0.11.16" |
 
-**实现步骤**：
-1. 创建 `install.sh`（POSIX：curl/wget download + unzip + 交互 + --install）
-2. 创建 `install.bat`（Windows：curl/certutil download + tar/COM unzip + 交互 + --install）
-3. 更新 `.gitattributes` 强制 LF/CRLF 行尾
-4. 修改 `release.sh`，zip 追加 install 脚本
-5. 更新 `README.md` One-Time Setup 为一键命令
-6. 更新 `SKILL.md` / `MANUAL.md` 安装章节
-7. 更新 `build.zig.zon` + `src/protocol.zig` VERSION bump
-8. 构建 → 测试 → 发布 v0.11.16 → 部署观察自动升级
+**v0.11.16 发布**:
+- 构建 8 目标全部通过，`utmm.zip` 8.3MB（含 install 脚本）
+- GitHub Release: https://github.com/fixnet-ai/utm-monitor/releases/tag/v0.11.16
+
+**自动升级 Bug 修复总结**:
+
+| Bug | 文件 | 根因 | 修复 |
+|-----|------|------|------|
+| IP gating 阻止升级 | `mesh.zig:901` | `remote_ip != host_gateway_ip` 多网卡 Host 永不匹配 | 移除 IP gating，仅检查版本号 |
+| epoch tracking 依赖 host_gateway_ip | `mesh.zig:848` | 检查 `host_gateway_ip.len > 0` 判断是否 Guest | 改为检查自身 `node_info` 中是否有 `role:host` |
+
+**自动升级观察结果**:
+
+v0.11.15→v0.11.16 自动升级未触发。原因分析：
+1. **主要根因**: Guests (v0.11.15) 仍包含旧的 IP gating bug——修复代码只在 Host v0.11.16 中
+2. 这是 **bootstrap 问题**：自动升级修复需要手动部署一次才能生效
+3. 下次升级 (v0.11.16→v0.11.17) 自动升级应正常工作，因为修复已在所有节点上
+
+**手动升级完成**: 全部 4 台 Guest 通过 SCP + `--install` 升级到 v0.11.16，功能验证通过。
+
+**发现的潜在问题 — 多网卡 LSA 广播**:
+Host 的 `detectUnixIp()` 选取 WiFi `en0`，LSA 广播只覆盖 WiFi 子网，不覆盖 bridge 子网（192.168.64.0/24、192.168.65.0/24）。`getSubnetBroadcasts()` 已遍历所有接口并计算子网广播地址，但 Host socket 绑定的 IP 可能导致 bridge 子网广播走错误接口发出。此问题不影响 KCP 数据通信（Guest→Host LSA 可达），但影响 Host→Guest 的 LSA 广播可达性。需后续调查和修复。
 
 ## Phase 63: Guest 自主升级方案 ✅ (2026-07-27)
 

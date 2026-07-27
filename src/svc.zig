@@ -654,6 +654,13 @@ pub fn selfCopy(io: std.Io, alloc: std.mem.Allocator) !void {
             copyFile(io, alloc, tmp_path, dest, builtin.os.tag != .windows) catch |err2| {
                 fail.err("selfCopy/copy-fallback", err2);
             };
+            // macOS: copyFile destroys the ad-hoc code signature.
+            // Re-sign so launchd doesn't kill the process on next bootstrap.
+            if (builtin.os.tag == .macos) {
+                if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dest })) {
+                    std.log.warn("[svc] selfCopy: codesign re-sign failed — ad-hoc signature may be missing", .{});
+                }
+            }
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         } else {
             fail.err("selfCopy/rename", err);

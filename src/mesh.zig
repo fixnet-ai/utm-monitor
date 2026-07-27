@@ -302,6 +302,10 @@ pub const Mesh = struct {
 
     // Broadcast addresses for LSA (subnet-directed + 255.255.255.255)
     broadcast_addrs: std.ArrayList(net.IpAddress),
+    // Optional callback to refresh broadcast_addrs when interfaces change.
+    // Called by periodicTasks every ~30s. Set by Host/Guest init code.
+    // Takes allocator, returns new ArrayList (caller takes ownership).
+    broadcast_refresh_fn: ?*const fn (std.mem.Allocator) anyerror!std.ArrayList(net.IpAddress) = null,
 
     // LSA state
     lsa_seq: u32,
@@ -350,15 +354,21 @@ pub const Mesh = struct {
     // Clock (monotonic ms, advanced in run loop)
     clock_ms: u32,
 
+    // Broadcast address refresh counter (seconds since last refresh)
+    broadcast_refresh_tick: u32 = 0,
+    broadcast_refresh_next_ms: u32 = 30_000, // first refresh after ~30s
+
     // Last pong received (for --ping command). Set by handlePong.
     last_pong_src: NodeId = [_]u8{0} ** 6,
     last_pong_rtt: u32 = 0,
-    last_pong_time: u32 = 0, // clock_ms when received
+    last_pong_time: u64 = 0, // real monotonic ms from nowMs() when received
     last_pong_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     /// Create a new Mesh instance. Takes ownership of node_info (will free on deinit).
     /// socket should be a UDP socket already bound to :2121 with broadcast enabled.
     /// broadcast_addrs should contain subnet-directed broadcast + 255.255.255.255.
+    /// broadcast_refresh_fn is an optional callback for periodicTasks to refresh the
+    /// broadcast address list (picks up new interfaces like bridge100 created after startup).
     pub fn init(
         allocator: std.mem.Allocator,
         node_id: NodeId,
@@ -367,6 +377,7 @@ pub const Mesh = struct {
         io: std.Io,
         upgrade_needed: *std.atomic.Value(bool),
         broadcast_addrs: std.ArrayList(net.IpAddress),
+        broadcast_refresh_fn: ?*const fn (std.mem.Allocator) anyerror!std.ArrayList(net.IpAddress),
     ) !Mesh {
         const nonce = generateNonce();
 
@@ -392,6 +403,7 @@ pub const Mesh = struct {
             .socket = socket,
             .io = io,
             .broadcast_addrs = broadcast_addrs,
+            .broadcast_refresh_fn = broadcast_refresh_fn,
             .lsa_seq = 0,
             .last_lsa_broadcast_ms = 0,
             .neighbors = std.AutoHashMap(NodeId, Neighbor).init(allocator),
@@ -407,6 +419,15 @@ pub const Mesh = struct {
             .nonce = nonce,
             .clock_ms = 0,
         };
+    }
+
+    /// Real monotonic millisecond timestamp for ping/pong RTT measurement.
+    /// Separate from clock_ms — clock_ms is a coarse event counter (stepped by
+    /// 10 or 1000 per event) used by KCP update, keepalive timers, and LSA
+    /// expiry, where 10ms/1000ms granularity is acceptable.  Ping/pong RTT
+    /// needs sub-ms precision, so we read the system monotonic clock directly.
+    fn nowMs(self: *Mesh) u32 {
+        return @truncate(@as(u64, @intCast(std.Io.Timestamp.now(self.io, .awake).toMilliseconds())));
     }
 
     /// Release all resources.
@@ -633,6 +654,23 @@ pub const Mesh = struct {
         if (self.clock_ms - self.last_lsa_broadcast_ms >= protocol.MESH_LSA_INTERVAL_MS) {
             self.broadcastOwnLsa();
             self.last_lsa_broadcast_ms = self.clock_ms;
+        }
+
+        // Refresh broadcast address list every ~30s to pick up new
+        // interfaces (e.g. bridge100 created after Host startup by UTM).
+        // Multi-NIC Hosts otherwise miss bridge subnet Guests in LSA.
+        if (self.broadcast_refresh_fn) |refresh_fn| {
+            if (self.clock_ms >= self.broadcast_refresh_next_ms) {
+                self.broadcast_refresh_next_ms = self.clock_ms + 30_000;
+                const new_addrs = refresh_fn(self.allocator) catch |err| {
+                    std.log.err("[mesh] broadcast address refresh failed: {}", .{err});
+                    self.broadcast_refresh_next_ms = self.clock_ms + 30_000;
+                    return;
+                };
+                var old = self.broadcast_addrs;
+                self.broadcast_addrs = new_addrs;
+                old.deinit(self.allocator);
+            }
         }
 
         // Periodic ping of all known nodes (every ~60 periodicTasks calls,
@@ -1131,7 +1169,7 @@ pub const Mesh = struct {
                 var pong: [11]u8 = undefined;
                 pong[0] = protocol.MESH_TYPE_PONG;
                 @memcpy(pong[1..7], &self.node_id);
-                std.mem.writeInt(u32, pong[7..11], self.clock_ms, .big);
+                std.mem.writeInt(u32, pong[7..11], self.nowMs(), .big);
                 self.socket.send(self.io, &from, &pong) catch {};
                 return;
             }
@@ -1179,7 +1217,7 @@ pub const Mesh = struct {
         var src_mac: NodeId = undefined;
         @memcpy(&src_mac, data[0..6]);
         const send_ts = std.mem.readInt(u32, data[6..10], .big);
-        const rtt = self.clock_ms -% send_ts;
+        const rtt = self.nowMs() -% send_ts;
         var mac_buf: [18]u8 = undefined;
         std.log.info("[mesh] pong from {s} rtt={d}ms", .{ formatNodeIdBuf(src_mac, &mac_buf), rtt });
 
@@ -1188,7 +1226,7 @@ pub const Mesh = struct {
         defer self.last_pong_mutex.unlock(self.io);
         self.last_pong_src = src_mac;
         self.last_pong_rtt = rtt;
-        self.last_pong_time = self.clock_ms;
+        self.last_pong_time = self.nowMs();
     }
 
     /// Send a ping and wait for the pong from the specific target.
@@ -1207,7 +1245,7 @@ pub const Mesh = struct {
         var iterations: u32 = 0;
         while (iterations < 200) : (iterations += 1) {
             self.last_pong_mutex.lock(self.io) catch return null;
-            const fresh = (self.last_pong_time -% prev_time < 0x80000000) and self.last_pong_time != prev_time;
+            const fresh = self.last_pong_time != prev_time;
             const matches = std.mem.eql(u8, &self.last_pong_src, &dest_id);
             const rtt = self.last_pong_rtt;
             self.last_pong_mutex.unlock(self.io);
@@ -1237,7 +1275,7 @@ pub const Mesh = struct {
                 var ping: [11]u8 = undefined;
                 ping[0] = protocol.MESH_TYPE_PING;
                 @memcpy(ping[1..7], &self.node_id);
-                std.mem.writeInt(u32, ping[7..11], self.clock_ms, .big);
+                std.mem.writeInt(u32, ping[7..11], self.nowMs(), .big);
                 self.socket.send(self.io, &neighbor.addr, &ping) catch {};
                 var dst_buf: [18]u8 = undefined;
                 std.log.info("[mesh] ping direct: → {s} addr={any}", .{ formatNodeIdBuf(dest_id, &dst_buf), neighbor.addr });
@@ -1254,7 +1292,7 @@ pub const Mesh = struct {
             @memcpy(ping[1..7], &self.node_id);     // src_mac
             @memcpy(ping[7..13], &dest_id);          // dst_mac
             ping[13] = protocol.MESH_MAX_TTL;        // ttl
-            std.mem.writeInt(u32, ping[14..18], self.clock_ms, .big); // timestamp
+            std.mem.writeInt(u32, ping[14..18], self.nowMs(), .big); // timestamp
             self.socket.send(self.io, &nb.addr, &ping) catch {};
             var src_buf: [18]u8 = undefined;
             var dst_buf: [18]u8 = undefined;

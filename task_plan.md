@@ -231,48 +231,61 @@ if (upgrade.needed.load(.acquire)) {
 
 **自动升级 Bug 发现**: Guest 全部未自动升级。根因：`mesh.zig:901` — IP gating 条件在多网卡 Host 上永远不匹配（Host LSA `ip:`=主IP, Guest `host_gateway_ip`=网关IP ≠ 主IP）。修复：移除 IP gating，版本检查不依赖 IP 匹配。已编码，待 bump 到 v0.11.16。
 
-### Phase 65: 一键安装脚本 (install.sh + install.bat) 🔴 当前
+### Phase 65: 一键安装脚本 (install.sh + install.bat) ✅ (2026-07-27)
 
 **目标**: 一行命令完成 utmm 安装/升级，覆盖 POSIX + Windows (Win7+)，交互式 + 离线安装。
 
-**设计原则**:
-- 全平台强制 root/Administrator 权限检查
-- 脚本交互提问 hostname（默认系统 hostname）/ mode（Host/Guest）/ Host IP（仅 Guest，默认自动检测）
-- `utmm` 二进制绝不交互 — MCP/AI/CI/自动升级无人值守
-- 纯 `.bat`（Win7+）— curl→certutil fallback，tar→COM fallback
-- 安装 = 升级，不做区分
-- Host 保留全部 8 平台二进制（Guest 自动升级依赖 serve-dir）；Guest 仅保留当前平台
-- zip 自带 install 脚本支持离线安装
-- README/SKILL.md/MANUAL.md 全面去除 UTM 限定，适用所有 VM + 真机
+**已完成**:
+
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `install.sh` | 272 | POSIX: root check → platform detect → 交互 → download (curl→wget, 3 retries) → extract (unzip) → --install |
+| `install.bat` | 332 | Windows: Admin check (`net session`) → arch detect → 交互 → download (powershell→curl→certutil→bitsadmin) → extract (Expand-Archive→tar→COM) → --install |
+| `.gitattributes` | 4 | `install.sh text eol=lf` / `install.bat text eol=crlf` |
+| `release.sh` | +2 | zip 追加 `install.sh install.bat` |
+| `README.md` | 重写 | One-Time Setup → 一键 curl\|sh；去除 SCP/UTM 限定 |
+| `SKILL.md` | 修改 | Deploy/Upgrade → 一键脚本 |
+| `MANUAL.md` | 重写 §2+§4 | Quick Deployment + Upgrade 全部更新 |
+| `src/protocol.zig` | VERSION | "0.11.15" → "0.11.16" |
+| `build.zig.zon` | .version | "0.11.15" → "0.11.16" |
 
 **下载/解压链路**:
 
-| | 方案 1 | 方案 2 | 方案 3 |
-|---|--------|--------|--------|
-| POSIX 下载 | curl -fsSLo | wget -qO | 退出 |
-| Win10 1803+ 下载 | curl.exe -fsSLo | — | — |
-| Win7/8 下载 | certutil -urlcache -split -f | bitsadmin /transfer | — |
-| POSIX 解压 | unzip -o | — | — |
-| Win10 1803+ 解压 | tar -xf | — | — |
-| Win7/8 解压 | ps Expand-Archive | COM Shell.Application | — |
+| | 方案 1 | 方案 2 | 方案 3 | 方案 4 |
+|---|--------|--------|--------|--------|
+| POSIX 下载 | curl -fsSLo | wget -qO | — | — |
+| Windows 下载 | powershell IWR | curl.exe | certutil | bitsadmin |
+| POSIX 解压 | unzip -o | — | — | — |
+| Windows 解压 | powershell Expand-Archive | tar -xf | COM Shell.Application | — |
 
-**实现步骤**:
-1. 创建 `install.sh`（~180行：权限检查 → 平台检测 → 交互 → 下载/离线 → 解压 → --install）
-2. 创建 `install.bat`（~150行：Admin 检查 → 平台检测 → 交互 → 下载/离线 → 解压 → --install）
-3. 更新 `.gitattributes` — `install.sh text eol=lf` / `install.bat text eol=crlf`
-4. 修改 `release.sh` — zip 追加 `install.sh install.bat`
-5. 更新 `README.md` One-Time Setup → 一键命令 + 离线安装 + 脚本注释手动步骤
-6. 更新 `SKILL.md` / `MANUAL.md` 安装章节 → 一键脚本
-7. VERSION bump（`src/protocol.zig` + `build.zig.zon`）0.11.15 → 0.11.16
-8. `zig build test` → 全绿 → 构建 8 目标 → `./release.sh` → GitHub Release
-9. 本机 Host 部署 → 观察 Guest 自动升级
+**v0.11.16 发布**: 构建 8 目标全部通过，`utmm.zip` 8.3MB（含 install 脚本），149/149 测试通过。
 
-**涉及文件**: `install.sh`(新)、`install.bat`(新)、`.gitattributes`(改)、`release.sh`(改)、`README.md`(改)、`SKILL.md`(改)、`MANUAL.md`(改)、`task_plan.md`(改)、`progress.md`(改)、`src/protocol.zig`(改)、`build.zig.zon`(改)
+**自动升级 Bug 修复**（本版本附带）:
+
+| Bug | 文件 | 根因 | 修复 |
+|-----|------|------|------|
+| IP gating 阻止升级 | `mesh.zig:901` | `remote_ip != host_gateway_ip` 多网卡 Host 永不匹配 | 移除 IP gating，仅检查版本号 |
+| epoch tracking 依赖 host_gateway_ip | `mesh.zig:848` | 检查 `host_gateway_ip.len > 0` 判断是否 Guest | 改为检查自身 `node_info` 中是否有 `role:host` |
+
+**Bootstrap 观察**: v0.11.15→v0.11.16 自动升级未触发（Guest 旧代码仍含 IP gating bug）。全部 4 台 Guest 手动升级至 v0.11.16，功能验证通过。下次升级 (v0.11.16→v0.11.17) 自动升级应正常工作。
+
+**多网卡 LSA 广播**（发现未修复）: Host `detectUnixIp()` 选主 NIC IP，LSA 广播可能不到达 bridge 子网 Guest。不影响 KCP 数据通信，但影响 Host→Guest LSA 可达性。
+
+### Phase 66: 小修复收尾 ✅ (2026-07-27)
+
+**目标**: 清理已知小问题，消除日志噪音，完善跨平台细节。
+
+| # | 任务 | 难度 | 状态 |
+|---|------|------|------|
+| 1 | `upload_result` (0x17) handler | ★☆☆ | 待开始 |
+| 2 | RTT → 真实毫秒 | ★★☆ | 待开始 |
+| 3 | F91: macOS codesign | ★★☆ | 待开始 |
+| 4 | 多网卡 LSA 广播可达性 | ★★★ | 待开始 |
+
+**已取消**:
+- ~~httpd.zig 测试未编译~~ → httpd 已废弃，自动取消
+- ~~Windows 优雅退出 (Finding 103)~~ → 永久延迟
 
 ## 待办
 
-- [ ] F91: `selfCopy()` copy+delete 回退路径添加 macOS codesign 重新签名
-- [ ] Windows 优雅退出方案延后（Finding 103）：ARM64 AFD 不中断 ReadFile + 多线程协调竞态
-- [ ] RTT 改为真实毫秒：`clock_ms` 事件计数器不适合测量时间，需用 `std.Io.Timestamp.awake`
-- [ ] `handleMeshGuest` 缺少 `upload_result` (0x17) 处理分支 — 虽不影响功能（当前 upload 走 fire-and-forget），但会在日志刷 `unknown msg type 0x17`
-- [ ] httpd.zig 测试未被编译到测试套件中（~31 个测试遗漏）— 需排查
+（清空 — 所有已知待办已纳入 Phase 66 或取消）

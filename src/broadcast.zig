@@ -1086,7 +1086,7 @@ pub fn meshSessionLoop(
         };
 
         // Create mesh instance (mesh takes ownership of node_info and broadcast_addrs)
-        mesh_opt = mesh_mod.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs) catch |err| {
+        mesh_opt = mesh_mod.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs, getSubnetBroadcasts) catch |err| {
             std.log.err("[guest-mesh] Mesh init failed: {}", .{err});
             allocator.free(node_info);
             mesh_socket.close(mesh_io);

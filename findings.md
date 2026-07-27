@@ -379,6 +379,8 @@ Phase 55 部署后 windowsvm 和 winx64 的 `sc stop` 仍卡 STOP_PENDING。两�
 
 **修复提交**: `3cc95ab`
 
+**状态**: ⛔ **永久延迟** (2026-07-27) — Windows ARM64 多线程协调退出受 AFD 行为限制，硬停止方案工作稳定，不值得投入更多精力追求优雅退出。
+
 **教训**: Windows ARM64 上多线程协调退出的可靠性受 AFD 行为限制，某些场景下"硬停止"比"优雅退出"更可靠。此方案同时适用于 Guest 和 Host（Host 同理在停止时直接 exit，让 SCM 或 watchdog 自动重启）。
 
 ---
@@ -487,7 +489,7 @@ Host 日志周期性出现 `error: [tun-hdl] unknown msg type 0x17 for macvm`。
 
 **影响**: 不影响功能 — upload 走 fire-and-forget（Host 发送完 chunks+eof 后立即返回 OK，不等待 Guest 的 upload_result）。但日志刷屏干扰排查。
 
-**待修**: 添加 `upload_result` 处理分支（至少静默消费）。
+**状态**: 🔴 Phase 66 待修 — 添加 `upload_result` 处理分支（至少静默消费）。
 
 ### Finding 114: httpd.zig 测试未被编译入测试套件
 
@@ -495,9 +497,7 @@ httpd.zig 包含约 31 个测试（jsonEscape、jsonGetString、jsonGetInt、bui
 
 **可能原因**: httpd.zig 被 `@import` 但 Zig 编译器可能因某些原因未收集其 test 块。`mcp.zig` 有自己的 `jsonEscape` 副本（含独立测试）。
 
-**影响**: httpd.zig 的 `jsonEscape`（与 mcp.zig 重复实现）和 `buildCmdWithMarker`、`scanForMarker` 等关键函数缺少测试覆盖。
-
-**待排查**。
+**状态**: ❌ **已取消** (2026-07-27) — httpd 已在 Phase 61 废弃（HTTP 协议全面删除），httpd.zig 仅保留 HostState + handleMeshGuest 等 KCP 侧功能，Router/jsonEscape 等 HTTP 代码已删除。此任务自动取消。
 
 ---
 
