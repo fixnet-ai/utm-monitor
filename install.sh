@@ -16,6 +16,10 @@
 #   2. mkdir -p /opt/utmm && cp <binary> /opt/utmm/utmm && chmod +x /opt/utmm/utmm
 #   3. sudo /opt/utmm/utmm --host --install              (Host)
 #      sudo /opt/utmm/utmm --install --hostname mybox    (Guest)
+#
+# Deploy to existing Host network (v0.11.18+):
+#   sudo utmm --deploy                # Build + SCP + SSH deploy to all guests
+#   sudo utmm --verify                # Health check: status + ping + exec per guest
 # ==============================================================================
 
 set -e
@@ -23,7 +27,7 @@ set -e
 CANONICAL_DIR="/opt/utmm"
 BINARY_NAME="utmm"
 DOWNLOAD_URL="https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.zip"
-VERSION="0.11.16"
+VERSION="0.11.18"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -257,7 +261,9 @@ if "${CANONICAL_DIR}/${BINARY_NAME}" ${INSTALL_ARGS}; then
     green "Done."
     if [ "${MODE}" = "host" ]; then
         echo "  Host service is running on UDP :2121"
-        echo "  Check: sudo ${CANONICAL_DIR}/${BINARY_NAME} --status"
+        echo "  Status:  sudo ${CANONICAL_DIR}/${BINARY_NAME} --status"
+        echo "  Verify:  sudo ${CANONICAL_DIR}/${BINARY_NAME} --verify"
+        echo "  Deploy:  sudo ${CANONICAL_DIR}/${BINARY_NAME} --deploy [<vm>]"
     else
         echo "  Guest service is running - auto-starts on boot."
         echo "  Check: run 'utmm --status' on the Host machine."

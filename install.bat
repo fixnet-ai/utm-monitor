@@ -17,12 +17,16 @@ setlocal enabledelayedexpansion
 ::   2. mkdir C:\opt\utmm && copy <binary>.exe C:\opt\utmm\utmm.exe
 ::   3. C:\opt\utmm\utmm.exe --host --install                  (Host)
 ::      C:\opt\utmm\utmm.exe --install --hostname mybox        (Guest)
+::
+:: Deploy to existing Host network (v0.11.18+):
+::   utmm --deploy                (Build + SCP + SSH deploy to all guests)
+::   utmm --verify                (Health check: status + ping + exec per guest)
 :: =============================================================================
 
 set "CANONICAL_DIR=C:\opt\utmm"
 set "BINARY_NAME=utmm.exe"
 set "DOWNLOAD_URL=https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.zip"
-set "VERSION=0.11.16"
+set "VERSION=0.11.18"
 
 :: ── admin check ─────────────────────────────────────────────────────────────
 
@@ -296,7 +300,9 @@ echo.
 echo Done.
 if /i "%MODE%"=="host" (
     echo   Host service is running on UDP :2121
-    echo   Check: %CANONICAL_DIR%\%BINARY_NAME% --status
+    echo   Status:  %CANONICAL_DIR%\%BINARY_NAME% --status
+    echo   Verify:  %CANONICAL_DIR%\%BINARY_NAME% --verify
+    echo   Deploy:  %CANONICAL_DIR%\%BINARY_NAME% --deploy [^<vm^>]
 ) else (
     echo   Guest service is running - auto-starts on boot.
     echo   Check: run 'utmm --status' on the Host machine.
