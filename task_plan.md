@@ -54,6 +54,7 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 66 | 2026-07-27 | RTT 真实毫秒 (`nowMs()`)、macOS codesign 重签、多网卡广播刷新 |
 | 67 | 2026-07-27 | v0.11.17：修复 `serveUpgradeFile` `@memcpy alias` crash + 自动升级全流程测试 |
 | 68 | 2026-07-27 | v0.11.18：修复 LSA restart 误判 — nonce 比较替代全 node_info 字符串比较 |
+| 69 | 2026-07-27 | 开发效率提升：二进制类型校验 + 一键部署 + 健康检查 + deploy skill |
 
 ## 待修复
 
@@ -62,6 +63,15 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 123 | 🔴 CRITICAL | macOS 自动升级后 `exit(0)` + `KeepAlive SuccessfulExit=false` → 服务永久停止 |
 | 124 | ✅ 已修复 | LSA restart 用全 node_info 比较 → 动态字段(status:)触发误判 → nonce 比较 |
 | 129 | 🔴 | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
+
+## Phase 69: 开发效率提升
+
+| # | 任务 | 描述 |
+|---|------|------|
+| 326 | 二进制类型校验 | `selfCopy` 前检查文件魔数（Mach-O .feebface / ELF .ELF / PE MZ），拒绝错误平台 |
+| 327 | `--verify` 健康检查 | 对所有 Guest 执行 status + ping + exec echo，输出通过/失败矩阵 |
+| 328 | `--deploy` 一键部署 | 读取 VM 配置，自动交叉编译→SCP→install→验证全流程 |
+| 329 | `deploy` skill | Claude Code skill 封装部署流程，并行部署多台 Guest |
 | 125 | 📋 | `nowMs()` RTT 直连正确、中继异常（uptime 级别数值） |
 | 127 | 📋 | linuxvm Journal 停止 + 升级下载无声失败 |
 | 128 | 📋 | macOS `launchctl bootstrap` errno=5 在 bootout 后 |
