@@ -2,17 +2,17 @@
 
 ## 架构概述
 
-UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 隧道为唯一 Guest-Host 传输层。自复制安装模型：二进制从任意路径运行，强制覆盖安装到固定路径。
+UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 隧道为唯一 Guest-Host 传输层。
+自复制安装模型：二进制从任意路径运行，强制覆盖安装到 `/opt/utmm/utmm`（POSIX）/ `C:\opt\utmm\utmm.exe`（Windows）。
 
 **关键设计决策：**
-- 删除 WebSocket，KCP Tunnel 为唯一传输层（v0.11.0）
-- 统一服务模型：Host 和 Guest 均为系统自动启动服务（v0.12.0）
-- 自复制模型：升级 = 新版本 `--install`，取消 utmm-old + agent.zig（v0.12.0）
-- **Guest 自主升级**（v0.11.14）：Guest 检测 LSA 版本不匹配 → KCP 下载新二进制 → `--install --hostname <name>` 自安装。Host 永不推送升级。
-- **一键安装脚本**（v0.11.16）：`install.sh`/`install.bat` 交互式跨平台安装/升级，一行命令
-- Fast-fail：不继续执行出错操作，打印错误退出
-- 所有操作要求 root/Administrator（除 `--version`/`--help`）
-- 支持所有 VM 超虚拟化 + 物理真机，不限于 UTM
+- KCP Tunnel 为唯一 Guest-Host 传输层（v0.11.0 删除 WebSocket）
+- Host 和 Guest 均为系统自动启动服务
+- 自复制模型：升级 = 新版本 `--install`（v0.12.0）
+- **Guest 自主升级**（v0.11.14）：Guest 检测 LSA 版本不匹配 → KCP 下载 → `--install`。Host 永不推送
+- **一键安装脚本**（v0.11.16）：`install.sh`/`install.bat` 交互式跨平台安装/升级
+- 端口 2121 UDP only（mesh LSA + KCP tunnel），CLI/MCP 走本地 IPC socket
+- Fast-fail 错误处理，所有操作要求 root/Administrator
 
 ## 活跃 VM
 
@@ -23,274 +23,36 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | Windows | windowsvm | aarch64-windows | 192.168.65.2 | Administrator / 111 | C:\opt\utmm\ |
 | Windows | winx64 | x86_64-windows | 192.168.3.108 | Administrator / 111 | C:\opt\utmm\ |
 
+## 当前状态
+
+- **版本**: v0.11.16（`src/protocol.zig`）
+- **源文件**: 16 个（`src/*.zig`）
+- **测试**: 149/149 通过
+- **部署**: macOS Host + 4 Guest 全部 v0.11.16
+- **8 交叉编译目标**: aarch64/x86_64/x86 × linux-musl/macos/windows
+
 ## 已完成阶段
 
-### Phase 57: `--ping` 命令实现与自动升级测试 ✅ (2026-07-27)
-
-**目标**: 实现 `utmm --ping <hostname>` CLI 命令，通过 mesh 对指定 Guest 发起 ping，并验证自动升级端到端流程。
-
-**核心实现**:
-
-| 组件 | 文件 | 说明 |
-|------|------|------|
-| CLI 参数 + 调度 + 帮助 | `src/main.zig` | `--ping <hostname>` 解析、`needs_host` 集成、dispatch |
-| `cmdPing()` HTTP 客户端 | `src/host.zig` | POST `/ping` + `x-vm` header，显示 JSON 响应 |
-| `/ping` 路由注册 | `src/host.zig:524` | `router.add(gpa, .POST, "/ping", httpd.handlePing)` |
-| `handlePing()` HTTP 处理器 | `src/httpd.zig:1369` | 查找 Guest MAC → mesh.pingAndWait → 返回 JSON |
-| `pingAndWait()` + `sendPing()` | `src/mesh.zig` | 发送 MESH_TYPE_PING，200×50ms=10s 真实时间轮询等 pong |
-| `handlePing()` mesh 层 | `src/mesh.zig:1119` | 直接 ping（10 字节）/ 中继 ping（17 字节含 dst_mac+TTL） |
-| `handlePong()` mesh 层 | `src/mesh.zig:1181` | 更新 `last_pong_*` 跟踪字段供 `pingAndWait` 检测 |
-| `setGuestMeshMac()` 调用 | `src/host.zig:873` | 在 tunnelManager 注册 tunnel 后设置 mesh_mac |
-
-**修复的 Bug**:
-
-| # | 问题 | 根因 | 修复 |
-|---|------|------|------|
-| 1 | `/ping` 返回 "guest not found" | `setGuestMeshMac()` 定义但从未调用 → `mesh_mac` 永远为 null | 在 tunnelManager `registerGuestTunnel` 后调用 |
-| 2 | `pingAndWait` 超时不准确 | 使用 `clock_ms`（事件计数器，~1000-2000/秒）做 5s 超时，实际周期 ping 每 ~60s 一次 | 改为 200×50ms=10s 真实时间轮询 |
-| 3 | `fromMillis` / `readHeader` 编译错误 | Zig 0.16.0 API 变更 | `fromMilliseconds` / `getRequestHeader` |
-| 4 | `Writer.Discarding.init()` 需要 buffer 参数 | Zig 0.16.0 API | 改用 `Writer.fixed()` |
-
-**Ping 协议**:
-- **直接 ping** (Host→Guest 或同一子网): `[0x03][src_mac:6][timestamp:4]` = 11 字节
-- **中继 ping** (跨跳，如 Guest→Guest 经 Host): `[0x03][src_mac:6][dst_mac:6][ttl:1][timestamp:4]` = 18 字节
-- **Pong 响应**（统一格式）: `[0x04][responder_mac:6][timestamp:4]` = 11 字节
-- **RTT 单位**: mesh `clock_ms` 事件计数（非真实毫秒），~10 表示 sub-ms 实际延迟
-
-**自动升级验证** (v0.11.10→v0.11.11):
-
-| Guest | 升级方式 | 结果 |
-|-------|---------|------|
-| linuxvm | SSH scp + `--install` | ✅ 服务重启，LSA 重连 |
-| macvm | SSH scp + `--install` + 手动 bootstrap | ✅ (launchd bootstrap 间歇失败) |
-| windowsvm | SSH scp + `--install` | ✅ |
-| winx64 | SSH scp + `--install` | ✅ |
-
-**部署期发现**:
-- `--install` 通过 SSH 执行不可靠：`pkill`/`taskkill` 会杀掉 SSH 会话，导致服务配置未完成
-- macOS `launchctl bootstrap` 间歇返回 errno=2，需手动重试
-- 升级后 Guest 丢失 `--hostname` 参数 → 自动检测主机名 → 需手动重配服务
-
-**验证**: `zig build test` 193/193 通过（EXIT=0），`--ping` 4/4 Guest 全部返回正确 MAC 和 RTT。
-
-### Phase 58: 关键代码注释 + file_chunk MSS 对齐优化 ✅ (2026-07-27)
-
-**目标**: 在关键位置添加技术细节注释，防止误读代码；将 file_chunk 数据大小从 8KB 改为与 KCP MSS 对齐，消除 KCP 层二次分片。
-
-**注释添加**:
-
-| 文件 | 位置 | 内容 |
-|------|------|------|
-| `src/tunproto.zig` | Parse functions 前 | **CRITICAL CONVENTION**: 所有 `parse*()` 从 `pos=0` 开始，调用者必须传 `data[1..]`（Finding 109 教训） |
-| `src/kcp.zig` | 常量区后 | MTU/MSS/frg 关系、message vs stream 模式、MSS-aligned 设计意图 |
-| `src/httpd.zig` | `handleMeshGuest` dispatch | `msg_type = data[0]` 被 switch 消费，分支必须传 `data[1..]` |
-| `src/broadcast.zig` | `sendChunkedFile` + dispatch | MSS-aligned chunk 设计理由；`payload = rbuf[1..]` 注释 |
-
-**file_chunk MSS 对齐重构**:
-
-- `tunproto.zig`: 新增 `FILE_CHUNK_DATA_MAX = 1200`（MSS 1242 - 帧开销 ~42）
-- `broadcast.zig`: `chunk_buf[1200]` + `file_read_buf[4096]`（分离磁盘读缓冲）
-- `httpd.zig`/`ipc.zig`: 所有上传 chunk buffer 改用新常量
-
-**设计理由**:
-- 旧方案：8KB chunk → KCP 拆 7 segment (frg 6→0) → 无谓二次分片 → 丢一段阻塞整 chunk
-- 新方案：1200B chunk → frame ≈ 1229B < MSS 1242 → **恰好 1 KCP segment** → 无 frg 重组
-- 代价：~7x 的 `sendAndFlush()` 调用，但文件通常 < 100MB，可接受
-
-### Phase 59: StandardErrorPath plist 回归修复 ✅ (2026-07-27)
-
-**问题**: `--install` 重写 macOS plist 时未包含 `StandardErrorPath`（Finding 110 回归）。
-每次 `--install` 都会丢失之前手动添加的 stderr 日志路径，所有 `std.log` 输出进入 ASL 而非文件。
-
-**修复**: `svc.zig:installMacOS()` 的 plist 模板中新增 `StandardErrorPath` 键，生成同 stdout 的 `-err.log` 路径。
-
-### Phase 50-56（历史）
-
-Phase 50（加固审计）、Phase 51（文件合并）、Phase 52（auto-ensure）、Phase 53（MCP stdio + lock）、Phase 54（Host 重启 exec 空输出）、Phase 55（Windows 服务停止）、Phase 56（回归测试 + 硬停止）— 详见 [progress.md](progress.md)。
-
-### Phase 60: HTTP 废弃端点清理 ✅ (2026-07-27)
-
-**目标**: 移除 CLI→IPC 迁移后的 HTTP 死代码（POST 端点 + HTTP fallback 函数）。
-
-**httpd.zig 移除**:
-- `parseJson()` — 未使用，mcp.zig 有自己的 JSON 解析
-- `readBody()` / `readRawBody()` — POST body 读取辅助
-- `getRequestHeader()` — 自定义 header 读取
-- `handlePing()` / `handleExec()` / `handleUpload()` / `handleDownload()` — POST 端点
-- `parseJson` 测试 (2 个)
-
-**httpd.zig 保留**: `respondError()` / `respondErrorDirect()` — `handleBin()` 仍在使用。
-
-**host.zig 移除**:
-- 4 条 POST 路由注册 (`/download`, `/upload`, `/exec`, `/ping`)
-- 5 个 HTTP fallback 函数: `cmdStatusHttp()`, `cmdPingHttp()`, `cmdExecHttp()`, `cmdUploadHttp()`, `cmdDownloadHttp()`
-
-**验证**: `zig build test` 149/149 通过（与 git HEAD 一致）。
-
-### Phase 61: 彻底删除 HTTP 协议，全面转向 KCP+IPC ✅ (2026-07-27)
-
-**目标**: HTTP 服务器所有 GET 端点均无活跃消费者（升级走 scp，GUEST 列表走 IPC），删除整个 HTTP 服务栈。
-
-**httpd.zig** (净保留 ~680 行):
-- 删除: HTTP 路由器（`Router`、`HandlerFn`、`Route`）、`serve()` accept 循环、`respondJson/Error/Direct`、`handleBin/Version/ApiGuests/Root`
-- 保留: `HostState` + 所有状态管理方法、`buildCmdWithMarker`、`handleMeshGuest`、`serveUpgradeFile`（KCP 文件分发，非 HTTP）、`syncHostsFromState`、JSON 辅助函数、测试
-
-**host.zig** (净删除 ~170 行):
-- 移除 HTTP 路由注册和 `httpd.serve()` 阻塞调用
-- `startHttpHost` → `startHost`，端口 2121 不再用于 HTTP
-- 替换阻塞机制：shutdown flag 轮询循环
-- 清理 MCP HTTP fallback 函数: `handleVmStatusHttp` (72 行)、`handleVmExecHttp` (93 行)
-
-**端口 2121 仅保留 UDP** (mesh LSA + KCP tunnel)
-
-**验证**: `zig build test` 149/149 通过。HTTP 代码从 `httpd.zig` ~1750 行减至 ~680 行（-61%）。
-
-### Phase 62: Windows IPC 编译修复 + 全量部署测试 ✅ (2026-07-27)
-
-**目标**: 修复 Phase 61 HTTP 删除后 Windows 交叉编译问题，构建所有 8 目标并部署到全部 VM 验证。
-
-**Windows IPC 编译修复** (`src/ipc.zig`):
-
-Zig 0.16.0 移除了大量 `std.os.windows` API（CreateNamedPipeA、ConnectNamedPipe、CreateFileA、ReadFile、WriteFile、SetNamedPipeHandleState），需在 `ipc.zig` 中手动 `extern "kernel32"` 声明。
-
-| 修复 | 问题 | 方案 |
-|------|------|------|
-| `callconv(.winapi)` | x86-windows-gnu (32-bit MinGW) 缺少此约定导致 `_CreateFileA` 等 6 个符号未定义 | 全部 extern 添加 `callconv(.winapi)` |
-| `hTemplateFile: ?HANDLE` | Zig 0.16.0 中 `null` 无类型，不能隐式转换为 `*anyopaque` | 参数改为可空类型 `?HANDLE` |
-| `socketPathZ()` 返回 `[*:0]const u8` | `@ptrCast([]const u8)` 无法转为 C API 所需的 null-terminated 指针 | 独立函数返回字符串字面量（直接强制转换） |
-
-**构建验证**: 8 目标全部通过。
-
-**全量部署测试** (2026-07-27):
-
-| VM | --status | --ping | --exec | --upload | --download |
-|----|----------|--------|--------|----------|------------|
-| linuxvm | ✅ | ✅ RTT=10 | ✅ uname | ✅ 30B MATCH | ✅ 30B MATCH |
-| macvm | ✅ | ✅ RTT=10 | ✅ uname | ✅ 30B MATCH | ✅ 30B MATCH |
-| windowsvm | ✅ | ✅ RTT=10 | ✅ ver | ✅ 30B MATCH | ✅ 30B MATCH |
-| winx64 | ✅ | ✅ RTT=10 | ✅ ver | ✅ 30B MATCH | ✅ 30B MATCH |
-
-macOS `launchctl bootstrap` 间歇性 errno=2/5（已知问题，Phase 57）：`--install` 最后一步失败，但 launchd 自动重启服务（二进制已复制到位）。
-
-### Phase 63: Guest 自主升级方案 ✅ (2026-07-27)
-
-**目标**: 将升级从 Host 推送模式简化为 Guest 自主完成，实现原子化自升级。
-
-**v0.11.12 — Guest 自动升级 (commit `6ee2155`)**:
-
-初始实现 Guest 自主升级：LSA 检测版本不匹配 → `doAutoUpgrade()` → KCP `upgrade_req` → Host `serveUpgradeFile` → `receiveUpgradeFile()` → `applyUpgradeAndRestart()` → `--install --hostname <name>`。
-
-**v0.11.13 — 简化 Host 侧 (commit `98409c4`)**:
-
-彻底移除 Host 推送升级的所有代码：
-- `host.zig`: 删除 `pushUpgradeToGuest()` 函数（~183 行）、`upgrade_cooldown` 状态、推送触发逻辑
-- `host.zig`: tunnelManager "Phase 2" 简化 — 移除 upgrading 特殊逻辑，统一使用 `m.connect()`
-- 升级完全由 Guest 发起，Host 仅响应 `upgrade_req`
-
-**v0.11.14 — 修复命令循环死锁 (commit `7178fb2`)**:
-
-**Critical Bug**: Guest `meshSessionLoop` 的升级检查只在**外层循环**（`waitForHostTunnel` 之前），但 Guest 在 `waitForHostTunnel` 之后进入**内层命令循环**（`while (!pty_dead.load(.acquire))`）永不退出。`upgrade.needed` 被设置后永远不会被检查 → 升级信号死锁。
-
-**修复**: 在内层命令循环中添加升级检查：
-```zig
-if (upgrade.needed.load(.acquire)) {
-    std.log.info("[guest-mesh] Upgrade signal detected, exiting command loop", .{});
-    break;
-}
-```
-
-**Bootstrap 部署**: v0.11.11/v0.11.12 Guest 由于上述 bug 无法自动升级。SSH 手动部署 v0.11.14 到 linuxvm/macvm/windowsvm（winx64 离线）。升级后所有 Guest 的 `--exec`、`--upload`、`--download` 验证通过。
-
-**最终升级流程**:
-```
-1. Guest LSA handler 检测 Host version != protocol.VERSION → upgrade.needed = true
-2. Guest 命令循环检测到 upgrade.needed → break 退出内层循环
-3. 外层循环: doAutoUpgrade()
-   a. waitForHostTunnel() 获取 KCP 隧道
-   b. 发送 upgrade_req(0x19) → Host serveUpgradeFile()
-   c. 接收 file_chunk × N + file_eof (SHA256 校验)
-   d. 保存到临时目录 → chmod +x
-   e. 运行 --install --hostname <name> → forceInstall 完整部署
-4. Host 永不推送升级 — Guest 完全自主
-```
-
-**Host 侧保留**: `serveUpgradeFile()` 响应 Guest 的 `upgrade_req`，通过 `deploymentFilename()` 查找匹配目标平台的二进制。
-
-### Phase 64: 文档重写 + v0.11.15 发布 ✅ (2026-07-27)
-
-**目标**: 重写 `skills/utmm/SKILL.md` 和 `skills/utmm/MANUAL.md`，使其与 v0.11.14 代码现状一致；发布 v0.11.15 验证文档更新后的完整发布流程。
-
-**文档修正**:
-
-| 文件 | 关键修正 |
-|------|---------|
-| `SKILL.md` | 架构描述（UDP+IPC 替代 HTTP）、MCP 工具 2→5（新增 vm_ping/vm_upload/vm_download）、IPC socket 路径、文件传输工作流、Auto-Upgrade 节 |
-| `MANUAL.md` | 版本号 0.11.10→0.11.14、端口 2121 TCP HTTP→UDP only、CLI 通信 HTTP→IPC socket、MCP 通信 HTTP→IPC socket、MCP 工具 2→5、升级"无自动升级"→Guest 自主升级、源文件 13→15（新增 ipc.zig） |
-
-**v0.11.15 发布**: 构建 8 目标 → `./release.sh` → GitHub Release → 本机 Host 安装 → 观察 VM 自动升级。
-
-**自动升级 Bug 发现**: Guest 全部未自动升级。根因：`mesh.zig:901` — IP gating 条件在多网卡 Host 上永远不匹配（Host LSA `ip:`=主IP, Guest `host_gateway_ip`=网关IP ≠ 主IP）。修复：移除 IP gating，版本检查不依赖 IP 匹配。已编码，待 bump 到 v0.11.16。
-
-### Phase 65: 一键安装脚本 (install.sh + install.bat) ✅ (2026-07-27)
-
-**目标**: 一行命令完成 utmm 安装/升级，覆盖 POSIX + Windows (Win7+)，交互式 + 离线安装。
-
-**已完成**:
-
-| 文件 | 行数 | 说明 |
-|------|------|------|
-| `install.sh` | 272 | POSIX: root check → platform detect → 交互 → download (curl→wget, 3 retries) → extract (unzip) → --install |
-| `install.bat` | 332 | Windows: Admin check (`net session`) → arch detect → 交互 → download (powershell→curl→certutil→bitsadmin) → extract (Expand-Archive→tar→COM) → --install |
-| `.gitattributes` | 4 | `install.sh text eol=lf` / `install.bat text eol=crlf` |
-| `release.sh` | +2 | zip 追加 `install.sh install.bat` |
-| `README.md` | 重写 | One-Time Setup → 一键 curl\|sh；去除 SCP/UTM 限定 |
-| `SKILL.md` | 修改 | Deploy/Upgrade → 一键脚本 |
-| `MANUAL.md` | 重写 §2+§4 | Quick Deployment + Upgrade 全部更新 |
-| `src/protocol.zig` | VERSION | "0.11.15" → "0.11.16" |
-| `build.zig.zon` | .version | "0.11.15" → "0.11.16" |
-
-**下载/解压链路**:
-
-| | 方案 1 | 方案 2 | 方案 3 | 方案 4 |
-|---|--------|--------|--------|--------|
-| POSIX 下载 | curl -fsSLo | wget -qO | — | — |
-| Windows 下载 | powershell IWR | curl.exe | certutil | bitsadmin |
-| POSIX 解压 | unzip -o | — | — | — |
-| Windows 解压 | powershell Expand-Archive | tar -xf | COM Shell.Application | — |
-
-**v0.11.16 发布**: 构建 8 目标全部通过，`utmm.zip` 8.3MB（含 install 脚本），149/149 测试通过。
-
-**自动升级 Bug 修复**（本版本附带）:
-
-| Bug | 文件 | 根因 | 修复 |
-|-----|------|------|------|
-| IP gating 阻止升级 | `mesh.zig:901` | `remote_ip != host_gateway_ip` 多网卡 Host 永不匹配 | 移除 IP gating，仅检查版本号 |
-| epoch tracking 依赖 host_gateway_ip | `mesh.zig:848` | 检查 `host_gateway_ip.len > 0` 判断是否 Guest | 改为检查自身 `node_info` 中是否有 `role:host` |
-
-**Bootstrap 观察**: v0.11.15→v0.11.16 自动升级未触发（Guest 旧代码仍含 IP gating bug）。全部 4 台 Guest 手动升级至 v0.11.16，功能验证通过。下次升级 (v0.11.16→v0.11.17) 自动升级应正常工作。
-
-**多网卡 LSA 广播**（发现未修复）: Host `detectUnixIp()` 选主 NIC IP，LSA 广播可能不到达 bridge 子网 Guest。不影响 KCP 数据通信，但影响 Host→Guest LSA 可达性。
-
-### Phase 66: 小修复收尾 ✅ (2026-07-27)
-
-**目标**: 清理已知小问题，消除日志噪音，完善跨平台细节。
-
-| # | 任务 | 难度 | 状态 |
-|---|------|------|------|
-| 1 | `upload_result` (0x17) handler | ★☆☆ | ✅ 已完成（commit `98409c4`）|
-| 2 | RTT → 真实毫秒 | ★★☆ | ✅ `nowMs()` 替代 ping/pong 时钟 |
-| 3 | F91: macOS codesign | ★★☆ | ✅ EXDEV 路径 codesign 重新签名 |
-| 4 | 多网卡 LSA 广播可达性 | ★★★ | ✅ 回调刷新广播地址列表 |
-
-**关键变更** (commit `3c6d7d4`):
-- `mesh.zig`: `nowMs()` 真实单调时钟用于 ping/pong RTT；广播地址每 30s 回调刷新
-- `svc.zig`: copyFile 破坏签名后 `codesign --force --sign -` 修复
-- `host.zig` + `broadcast.zig`: Mesh.init() 传入 `getSubnetBroadcasts` 回调
-
-**已取消**:
-- ~~httpd.zig 测试未编译~~ → httpd 已废弃，自动取消
-- ~~Windows 优雅退出 (Finding 103)~~ → 永久延迟
+| Phase | 日期 | 内容 |
+|-------|------|------|
+| 50 | 2026-07-26 | 加固优化全面审计（20 个修复） |
+| 51 | 2026-07-26 | 19→13 文件合并，127→193 测试 (+52%) |
+| 52 | 2026-07-26 | CLI auto-ensure + 管理命令行为矩阵 |
+| 53 | 2026-07-26 | MCP stdio + utmm.lock 进程单例锁 |
+| 54 | 2026-07-26 | Host 重启 exec 空输出修复（6 协同 bug：0xFF keepalive 污染等） |
+| 55 | 2026-07-27 | Windows 服务停止卡死修复（3 断裂点） |
+| 56 | 2026-07-27 | 回归测试 + Windows 硬停止（放弃优雅退出，Finding 103 永久延迟） |
+| 57 | 2026-07-27 | `--ping` 命令 + ping/pong mesh 协议（11B direct / 18B relayed） |
+| 58 | 2026-07-27 | file_chunk MSS 对齐（8KB→1200B），消除 KCP 二次分片 |
+| 59 | 2026-07-27 | macOS plist StandardErrorPath 回归修复 |
+| 60 | 2026-07-27 | 清理 HTTP POST 端点死代码 |
+| 61 | 2026-07-27 | **彻底删除 HTTP 协议**，全面转向 KCP+IPC |
+| 62 | 2026-07-27 | Windows IPC 编译修复 + 全量部署测试（8 目标全通过） |
+| 63 | 2026-07-27 | Guest 自主升级（v0.11.12→v0.11.14，修复命令循环死锁） |
+| 64 | 2026-07-27 | 文档重写（SKILL.md + MANUAL.md）+ v0.11.15 发布 |
+| 65 | 2026-07-27 | install.sh + install.bat + v0.11.16 发布 + IP gating bug 修复 |
+| 66 | 2026-07-27 | RTT 真实毫秒 (`nowMs()`)、macOS codesign 重签、多网卡广播刷新 |
 
 ## 待办
 
-（清空 — 所有已知待办已纳入 Phase 66 或取消）
+（清空 — 所有已知待办已完成或取消）

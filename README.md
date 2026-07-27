@@ -140,8 +140,8 @@ AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
 ```
 
 - **Streaming exec**: output flows in real time through KCP tunnel with `x-exit-code`
-  trailer. No JSON wrapping, no timeout. Upload/download use chunked stream (8KB
-  blocks over MSS-aligned KCP segments).
+  trailer. No JSON wrapping, no timeout. Upload/download use chunked stream
+  (1200B MSS-aligned blocks, one per KCP segment — no fragmentation).
 - **Self-copy install**: binary copies itself to `/opt/utmm/utmm` (POSIX) or
   `C:\opt\utmm\utmm.exe` (Windows). `--install` = unconditional force overwrite.
   Upgrade = scp new binary + `--install`. Zero shell commands.

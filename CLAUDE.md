@@ -21,8 +21,9 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
 - **MCP stdio**: AI agents control machines via `utmm --mcp` (stdio JSON-RPC).
   `vm_status` / `vm_exec` tools. Benefits from auto-ensure — if Host service is
   down, `--mcp` auto-starts it, so the recovery flow is never broken.
-- **Single port**: HTTP + static file serving all on 2121 (mesh on UDP same port).
-  MCP uses stdio (not HTTP) — see `mcp.json.example`.
+- **Single port**: 2121 for mesh networking (UDP only — LSA + KCP tunnel).
+  CLI and MCP use local IPC socket — no TCP or HTTP on any port.
+  MCP uses stdio — see `mcp.json.example`.
 - **8 cross-compilation targets**: aarch64/x86_64/x86 × linux-musl/macos/windows.
 - **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
 
@@ -67,20 +68,20 @@ UDP port 2121 first-byte dispatch:
 - **Guest mode (default)**: `--svc`: daemon mode (mesh LSA broadcast + KCP tunnel + pty shell).
   `--install --hostname <name>`: force install as system auto-start service.
   `--version`: print version. No foreground mode — service model only.
-- **Host mode (`--host`)**: Unified HTTP server on port 2121 — guest registration
-  via mesh LSA, management commands (exec/upload/download),
-  static file serving (/bin/), /etc/hosts sync, and periodic LSA
-  version broadcast. All on one port.
+- **Host mode (`--host`)**: Mesh networking on UDP port 2121 — guest registration
+  via LSA broadcast, KCP tunnel management, /etc/hosts sync, and IPC socket
+  for CLI/MCP communication. Guest auto-upgrade binary serving via KCP
+  (`serveUpgradeFile`). All on one port.
 - **MCP mode (`--mcp`)**: stdio JSON-RPC server for AI agents. Talks to Host
-  service at 127.0.0.1:2121 for tool implementation. Benefits from auto-ensure.
+  daemon via IPC socket (`/var/run/utmm.sock`); auto-ensures Host on first use.
 
 ### Complete Data Flow
 
 ```
-                         ┌── MCP stdio ← AI Agent (utmm --mcp → auto-ensure → HTTP 127.0.0.1:2121)
+                         ┌── MCP stdio ← AI Agent (utmm --mcp → auto-ensure → IPC socket)
 Guest (macvm)    ──KCP/Mesh──┐
-Guest (linuxvm)  ──KCP/Mesh──┤──→ Host HTTP :2121 ──┼── GET /bin/ (static files)
-Guest (windows)  ──KCP/Mesh──┘                      ├── POST /exec, /upload, /download
+Guest (linuxvm)  ──KCP/Mesh──┤──→ Host UDP :2121 ──┼── IPC socket (CLI/MCP)
+Guest (windows)  ──KCP/Mesh──┘                      ├── KCP upgrade_req (binary serve)
                          │   (LSA discovery)         └── /etc/hosts sync
                          │
 Guest ←── LSA broadcast (UDP) ──┘  (topology discovery + version detection)
@@ -90,14 +91,14 @@ Guest ←── LSA broadcast (UDP) ──┘  (topology discovery + version det
 
 ```
 1. CLI: utmm --exec linuxvm "ls -la"
-2. Host HTTP /exec → looks up guest tunnel → builds pty_exec_input frame
+2. Host IPC /exec → looks up guest tunnel → builds pty_exec_input frame
    with "ls -la; echo MDELIM:$?\n" appended
 3. Host sends pty_exec_input via KCP tunnel (tunproto message)
 4. Guest meshSessionLoop: reads pty_exec_input from KCP → writes to pty master fd
 5. Shell executes → output flows through pty → ptyReadLoop sends
    pty_output frames back to Host via KCP
 6. Host handleMeshGuest: appendOpOutput + scanForMarker
-7. Host HTTP: respondStreaming() sends output as it arrives (chunked)
+7. Host IPC: respondStreaming() sends output as it arrives (chunked)
 8. When MDELIM:N\n found: strip marker, set exit_code=N, send x-exit-code trailer
 ```
 
@@ -106,19 +107,19 @@ Guest ←── LSA broadcast (UDP) ──┘  (topology discovery + version det
 ```
 Upload (Host→Guest):
 1. CLI: utmm --upload file.txt linuxvm
-2. HTTP POST /upload with headers: x-vm: linuxvm, x-path: file.txt
+2. IPC /upload with headers: x-vm: linuxvm, x-path: file.txt
    Body: raw file bytes (application/octet-stream)
-3. handleUpload: stream-read body 8KB chunks → tunproto file_chunk × N → file_eof
+3. handleUpload: stream-read body → tunproto file_chunk × N → file_eof
 4. Guest receiveChunkedFile: temp file → sha256 per chunk → verify → rename
-5. HTTP response: plain text "OK" or error
+5. IPC response: plain text "OK" or error
 
 Download (Guest→Host):
 1. CLI: utmm --download linuxvm file.txt ./local.txt
-2. HTTP POST /download with headers: x-vm: linuxvm, x-path: file.txt
+2. IPC /download with headers: x-vm: linuxvm, x-path: file.txt
 3. handleDownload: tunproto download_cmd → Guest sendChunkedFile
-4. Guest: read file 8KB chunks → file_chunk × N → file_eof (sha256)
+4. Guest: read file → file_chunk × N → file_eof (sha256)
 5. Host: appendOpOutput per chunk → file_eof marks completion
-6. HTTP response: respondStreaming() chunked file bytes + x-exit-code trailer
+6. IPC response: respondStreaming() chunked file bytes + x-exit-code trailer
 7. CLI: body_reader.stream(file_iface) → write to local file
 ```
 
@@ -137,7 +138,7 @@ File transfers use chunked protocol: command → file_chunk × N → file_eof.
 | download_cmd | 0x14 | host→guest | Download request (cmd_id + path) |
 | upload_cmd | 0x1b | host→guest | Upload request (cmd_id + path + file_size + hash) |
 | upload_result | 0x17 | guest→host | Upload result (cmd_id + exit_code) |
-| file_chunk | 0x1c | bidirectional | 8KB file chunk (cmd_id + data) |
+| file_chunk | 0x1c | bidirectional | 1200B file chunk (cmd_id + data, MSS-aligned) |
 | file_eof | 0x1d | bidirectional | End of file (cmd_id + exit_code + size + hash) |
 | upgrade_req | 0x19 | guest→host | Request upgrade binary (cmd_id + target) |
 
@@ -166,7 +167,7 @@ All handlers share one `HostState` instance, mutex-protected:
 - `guest_tunnels`: StringHashMap of per-guest `*Tunnel` (KCP tunnel for exec/upload/download)
 - `op_states`: StringHashMap of `OpState` by cmd_id (output buffer, exit_code, done flag)
 - `transfers`: StringHashMap of `TransferState` (file transfer progress tracking)
-- `wake_event`: Io.Event signaled on op completion (wakes polling HTTP handlers)
+- `wake_event`: Io.Event signaled on op completion (wakes polling IPC handlers)
 - `serve_dir`: static file serve directory (default: `/opt/utmm`)
 - `mesh`: opaque pointer to `*mesh.Mesh` instance
 
@@ -227,7 +228,7 @@ Host never pushes upgrades — the Guest is fully self-upgrading.
   upgrades — fully atomic on Guest side. Upgrade check runs in both the outer
   mesh session loop and the inner command loop to ensure idle Guests detect the
   signal promptly.
-- Single port 2121 for HTTP, static file serving, and mesh UDP
+- Single port 2121 for mesh UDP (LSA + KCP tunnel)
 - **Persistent pty per mesh session**: POSIX `posix_openpt` + fork + setsid + execve,
   Windows `CreatePipe` + `CreateProcessW("cmd.exe /k chcp 65001 ...")` + `SetConsoleOutputCP(65001)` — UTF-8 forced
 - **MDELIM markers**: `; echo MDELIM:$?\n` appended to each command. Host-side
@@ -236,15 +237,13 @@ Host never pushes upgrades — the Guest is fully self-upgrading.
 - Connection = Shell Session: mesh disconnect → pty killed → guest reconnects
   with fresh shell
 - **Chunked file transfer**: upload/download use `cmd → file_chunk × N → file_eof`
-  protocol instead of blob-in-message. 8KB chunks, incremental SHA256, 256KB fixed buffer.
-  Supports >1GB files with constant memory.
+  protocol instead of blob-in-message. 1200B MSS-aligned chunks (one per KCP segment),
+  incremental SHA256, 256KB fixed buffer. Supports >1GB files with constant memory.
 - **LSA version broadcast**: Host broadcasts version in LSA every 2s. Guest compares
   against `protocol.VERSION`, sets `upgrade.needed` on mismatch, triggering
   Guest-initiated auto-upgrade (see above).
   The upgrade check runs both between command sessions and inside the command loop
   (v0.11.14+), ensuring idle Guests detect the signal promptly.
-- `std.http.Server` with `std.Thread` per-connection concurrency
-- Zero external dependencies: no Node.js, Python, SSH, curl
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
 
 ## Build & Run
@@ -305,10 +304,11 @@ utmm --version                       # Print version and exit
 ```
 
 > Management commands (`--status`/`--exec`/`--upload`/`--download`) connect to
-> `127.0.0.1:2121`. If the Host service is not running, they auto-start it via
-> `svc.ensure(.host)` before executing. A standalone `utmm --host` also ensures
-> the service and exits. `--host` combined with a management command ensures
-> once then executes. `--gen-init` and `--save-config` do not require the Host.
+> the Host daemon via IPC socket (`/var/run/utmm.sock`). If the Host service is not
+> running, they auto-start it via `svc.ensure(.host)` before executing.
+> `utmm --host` also ensures the service and exits. `--host` combined with
+> a management command ensures once then executes. `--gen-init` and `--save-config`
+> do not require the Host.
 
 ## Release Process
 
@@ -489,8 +489,9 @@ KCP matches the C reference implementation (skywind3000/kcp). Key behaviors:
 
 ### Chunked File Transfer Patterns
 
-- **8KB chunks**: each `file_chunk` fits in one KCP segment (frg=0 in message mode).
-  `peekSize()` returns immediately; each `recv()` returns exactly one message.
+- **1200B MSS-aligned chunks**: each `file_chunk` fits in exactly one KCP segment
+  (frg=0 in message mode, no KCP-layer fragmentation). `peekSize()` returns
+  immediately; each `recv()` returns exactly one message.
 - **Incremental SHA256**: `Sha256.init({})` → `.update(chunk)` per chunk →
   `.final(&hash)`. No full-file buffering needed.
 - **256KB fixed buffer**: `var rbuf: [262144]u8 = undefined` — large enough for
