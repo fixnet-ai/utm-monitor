@@ -152,6 +152,243 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 - **Finding 136** (winx64 LSA 信号): 网络隔离问题（192.168.3.x vs 64.x/65.x），非代码 bug
 - **Finding 137** (windowsvm install): Windows .exe 文件锁定机制，需单独设计
 
+## Phase 75: utmmd 监督进程架构重构 ✅ (2026-07-28)
+
+### 背景
+
+Phase 72-74 修复了自动升级的 5 个 bug，但这些都是治标。根本问题在于**架构设计错误**：
+
+```
+当前模型：系统服务管理器（launchd/systemd/SCM）→ 保活 → utmm（直接作为服务）
+                              ↑_____ 启动权冲突 _____↑
+升级时：utmm-new → stop → kill → copy → start
+        系统服务管理器在 stop 和 start 之间可能自行重启服务
+```
+
+**核心矛盾**：应用生命周期管理权分散在两个地方——系统服务管理器（保活）和 utmm 自身（升级时 stop→start），导致启动权冲突。
+
+### 解决方案
+
+引入 `utmmd` 监督进程层，将生命周期管理从系统服务管理器中完全剥离：
+
+```
+新模型：launchd/systemd/SCM →（仅开机启动，不保活）→ utmmd →（完全控制）→ utmm
+```
+
+### 决议
+
+| # | 决议 | 理由 |
+|---|------|------|
+| R1 | utmmd 自身不需要系统保活 | 生命周期管理必须在唯一一处，否则等于没改 |
+| R2 | IPC 用共享内存（mmap/CreateFileMapping） | Guest OS 兼容性最好，零拷贝、无序列化开销 |
+| R3 | 检测到升级可用时**立即**升级 | 版本不一致会带来不可预期的行为 |
+| R4 | 服务名称简化为单一 "utmmd" | 同一台机器 Guest/Host 互斥，后安装覆盖前者 |
+| R5 | 监督进程命名为 `utmmd` | 简短、Unix 守护进程命名传统 |
+| R6 | **不考虑向后兼容** | 软件在快速迭代阶段 |
+
+### 架构设计
+
+```
+┌──────────────────────────────────────────────────┐
+│ 系统服务管理器 (launchd/systemd/SCM)               │
+│ - 开机启动 only，NO keep-alive/auto-restart       │
+│ - 服务名: "utmmd" (单一名称)                      │
+│ - 二进制: /opt/utmmd/utmmd                       │
+└──────────────────┬───────────────────────────────┘
+                   │ start/stop
+                   ▼
+┌──────────────────────────────────────────────────┐
+│ utmmd (监督守护进程)                              │
+│ - 创建共享内存区域                                │
+│ - 启动/停止/监控 utmm 子进程                      │
+│ - 按退避算法重启（1s→2s→4s→8s→16s→32s→退出）     │
+│ - 处理升级命令（kill→替换二进制→重启）            │
+│ - 信号处理（SIGTERM→kill utmm→cleanup→exit）      │
+│ - Windows SCM 分发                               │
+└──────────────────┬───────────────────────────────┘
+                   │ mmap 共享内存 IPC
+                   │ 启动/杀掉/监控
+                   ▼
+┌──────────────────────────────────────────────────┐
+│ utmm (应用程序二进制)                             │
+│ - /opt/utmm/utmm                                 │
+│ - Guest 或 Host 模式                             │
+│ - 连接共享内存、更新心跳                          │
+│ - 发送升级/重启/关闭命令                          │
+└──────────────────────────────────────────────────┘
+```
+
+### 共享内存协议 (shm.zig)
+
+```
+Layout: 4096 字节（一页）
+
+偏移    大小   字段            方向        说明
+0       4      magic           -          0x55544D44 ("UTMD")
+4       4      version         -          协议版本=1
+8       4      svc_state       utmmd 写   0=init 1=running 2=stopping
+12      4      utmm_state      utmm 写    0=starting 1=running 2=stopping 3=upgrading
+16      4      utmm_pid        utmmd 写   utmm 进程 PID
+20      4      svc_pid         utmmd 写   utmmd 自身 PID
+24      8      svc_heartbeat   utmmd 写   单调时钟 ms
+32      8      utmm_heartbeat  utmm 写    单调时钟 ms
+40      4      cmd             utmm 写    0=none 1=restart 2=upgrade 3=shutdown
+44      4      cmd_status      utmmd 写   0=pending 1=accepted 2=done 3=failed
+48      4      restart_count   utmmd 写   utmm 累计重启次数
+52      4      last_exit_code  utmmd 写   utmm 上一次退出码
+56      4      backoff_sec     utmmd 写   当前重试延迟（秒）
+60      4      failure_count   utmmd 写   连续启动失败次数
+64      1024   cmd_data        utmm 写    命令附加数据（升级二进制路径）
+1088    3008   _reserved       -          保留
+```
+
+### 保活退避算法
+
+```
+failure_count = 0, backoff = 1s
+loop:
+  start utmm
+  wait STABILITY_THRESHOLD=10s（utmm 持续运行算稳定）
+  
+  if stable:
+    failure_count = 0, backoff = 1s
+    monitor: 检查心跳 + 处理命令 + 检测进程退出
+  
+  else (启动失败/快速崩溃):
+    failure_count += 1
+    if failure_count > 5: exit(1)  // 放弃
+    backoff = min(backoff * 2, 60)
+    sleep(backoff)
+    goto loop
+```
+
+重试序列：1s → 2s → 4s → 8s → 16s → 32s → 超过5次→退出
+
+### 升级流程
+
+```
+1. utmm 检测版本不匹配 (LSA)
+2. utmm 通过 KCP 下载新二进制到 /opt/utmm/.utmm-upgrade-XXXXX
+3. utmm 写 cmd_data = 升级路径
+4. utmm 写 cmd = CMD_UPGRADE(2), utmm_state = UPGRADING
+5. utmmd 检测 cmd == CMD_UPGRADE
+6. utmmd 写 cmd_status = ACCEPTED
+7. utmmd kill utmm (SIGKILL / TerminateProcess)
+8. utmmd 等待进程退出确认
+9. utmmd rename 新二进制 → /opt/utmm/utmm
+10. utmmd chmod +x (POSIX)
+11. utmmd 启动新 utmm
+12. 新 utmm 挂载共享内存 → utmm_state = RUNNING
+13. utmmd 写 cmd = NONE, cmd_status = DONE
+```
+
+### 安装流程
+
+```
+utmm --install --hostname myvm [--host]
+
+1. selfCopy utmm → /opt/utmm/utmm（总是执行，utmm 版本必然变化）
+
+2. 判断 utmmd 是否需要更新（三条件任一满足即需要）：
+   a. /opt/utmmd/utmmd 不存在（首次安装）
+   b. SHA256(已安装 utmmd) ≠ SHA256(内嵌 utmmd)（utmmd 版本变化）
+   c. 已安装的服务配置 ≠ 将写入的配置（参数变化）
+
+3a. 如需更新 utmmd：
+    3a.1 stop utmmd 服务（忽略未运行的错误）
+    3a.2 kill utmm 进程（防止旧 utmm 与新 utmmd 状态不一致）
+    3a.3 提取内嵌 utmmd → /opt/utmmd/utmmd
+    3a.4 chmod +x（POSIX）
+    3a.5 写入服务配置（无保活，仅开机启动）
+    3a.6 start utmmd 服务
+    3a.7 utmmd 启动 utmm
+
+3b. 如无需更新 utmmd（仅 utmm 版本变化）：
+    3b.1 检查 utmmd 是否在运行
+    3b.2 如未运行 → start utmmd 服务
+    3b.3 如已运行 → 打开共享内存，写 cmd=CMD_RESTART
+    3b.4 utmmd kill 旧 utmm + 启动新 utmm
+```
+
+**优化效果**：utmmd 稳定后，绝大多数 `--install` 只走 3b 路径——不触发系统服务管理器操作，无权限弹窗、无启停竞态。
+
+**比对数据存储**：复用现有 `/opt/utmm/utmm.conf` 配置文件，新增两个字段：
+```
+utmmd_sha256=<hex>    # 上次安装的 utmmd 二进制 SHA256
+utmmd_args=<params>   # 上次安装的 utmmd 服务参数
+```
+`loadConfig()` 当前是桩函数（返回默认值），Phase 75 中实现基本的 key=value 解析。`saveConfig()` 追加 utmmd 字段。安装时读取比对，全量更新后回写新值。
+
+### 卸载流程
+
+```
+utmm --uninstall
+1. stop utmmd 服务
+2. killAllUtmm + killAllUtmmd
+3. remove utmmd 服务配置（plist/systemd/sc）
+4. delete /opt/utmmd/ 目录
+5. delete /opt/utmm/ 目录
+```
+
+### 服务配置（无保活，仅开机启动）
+
+| 平台 | 关键配置 |
+|------|---------|
+| macOS | `RunAtLoad=true`, 无 `KeepAlive` |
+| Linux | `Type=simple`, 无 `Restart=` |
+| Windows | `start=auto`, `sc failure` actions 为空 |
+
+### 文件结构变更
+
+```
+src/
+├── shm.zig        ← 新增：共享内存协议（utmmd 与 utmm 共用）
+├── utmmd.zig      ← 新增：监督进程入口 (~350行)
+├── svc.zig        ← 修改：简化为纯 OS 服务配置管理（无保活，单名称 "utmmd"）
+├── main.zig       ← 修改：shm 连接 + 新 install/uninstall 流程
+├── broadcast.zig  ← 修改：升级流程改为 shm 驱动（替代自执行 --install）
+├── build.zig      ← 修改：两步构建（utmmd 先编译，@embedFile 嵌入 utmm）
+其他文件不变
+```
+
+### 任务列表
+
+| # | 任务 | 描述 | 依赖 | 状态 |
+|---|------|------|------|------|
+| 355 | 创建 `src/shm.zig` | 跨平台共享内存协议：ShmLayout(4096B) + create/open/close + 平台适配（POSIX shm_open/mmap, Windows CreateFileMapping/MapViewOfFile） | - | ✅ |
+| 356 | 创建 `src/utmmd.zig` | utmmd 监督进程完整实现：monitorLoop + backoff 退避 + 信号处理 + Windows SCM 分发 | 355 | ✅ |
+| 357 | 修改 `src/svc.zig` | 简化为纯 OS 服务管理：删保活配置、删 retry counter、删 winServiceRun、删 checkPendingUpgradeWindows、服务名 → "utmmd"、新增 canonicalSvcPath/extractUtmmd/shouldUpdateUtmmd（hash比对 + utmm.conf 配置比对） | 355 | ✅ |
+| 358 | 修改 `src/main.zig` | 启动时挂载 shm + 心跳协程 + install 流程（3a 全量/3b 仅重启两条路径）+ uninstall 清理 utmmd | 355, 357 | ✅ |
+| 359 | 修改 `src/broadcast.zig` | 升级流程改为 shm 驱动：写 cmd_data(路径) + cmd=UPGRADE → exit(0)，移除 applyUpgradeAndRestart | 355 | ✅ |
+| 360 | 修改 `build.zig` | 两步构建：utmmd 先编译 → 复制到 src/embed/utmmd.bin → utmm @embedFile + .gitignore embed/ | 356 | ✅ |
+| 361 | 编译 + 测试 | zig build + zig build test 全部通过 | 355-360 | ✅ |
+| 362 | 部署验证 | Host + linuxvm + macvm 部署测试，验证 3a/3b 两条安装路径 | 361 | 📋 待部署 |
+
+### 实现总结
+
+**完成时间**: 2026-07-28，四个阶段（Tasks 355-361）全部完成。
+
+**代码变更量**:
+| 文件 | 变更类型 | 行数 |
+|------|---------|------|
+| `src/shm.zig` | 新建 | ~400 行 |
+| `src/utmmd.zig` | 新建 | ~600 行 |
+| `src/svc.zig` | 重构 | -440/+200 行（净减 ~240） |
+| `src/main.zig` | 修改 | +200/-30 行 |
+| `src/broadcast.zig` | 修改 | +50/-90 行 |
+| `src/host.zig` | 清理 | -1 行 |
+| `build.zig` | 修改 | +25 行 |
+
+**关键实现细节**:
+- **shm.zig**: Zig 0.16.0 移除了 `posix.O`/`posix.mmap`/`posix.munmap` 的跨平台封装，改用原始 `extern "c"` 函数 + POSIX 常量绕过平台差异。`shm.open()` 返回 `*volatile ShmLayout`（mmap 映射的内存）。
+- **utmmd.zig**: macOS 信号处理用自定义 `c_sigaction` extern struct（`SIG_IGN` sentinel 需 `*align(1)` 类型）。`init.gpa` 替代已移除的 `GeneralPurposeAllocator`。Windows SCM `SERVICE_TABLE_ENTRYW` 手动声明。
+- **svc.zig**: 服务名统一为 `utmmd`（`com.utmmd`/`utmmd`/`UTM-MonitorD`），plist 移除 `KeepAlive`，systemd 移除 `Restart=`，Windows 移除 `sc failure`。存根函数（`checkRetryLimit` 等）在 Task 373 完成后已清理。
+- **main.zig**: `@embedFile("embed/utmmd.bin")` 编译期嵌入 ~2.1MB utmmd 二进制。`extractUtmmd` 在 `--install` 时强制写入，`extractUtmmdIfMissing` 在 `ensure` 时按需写入。`--svc` 路径：打开 shm → 设置 PID/状态 → 心跳线程(1s) → 运行主循环 → 清理。
+- **broadcast.zig**: `doAutoUpgrade` 下载新二进制后不再执行 `--install`，改为写 shm（`cmd=UPGRADE, cmd_data=临时路径`）后返回 `true`，外层循环检测后 `break` 退出。utmmd 接管重命名+重启。
+- **build.zig**: `addSystemCommand(&.{ "cp", "-f" })` 替代 `addInstallBinFile`（后者写入 zig-out/ 而非源码树）。
+
+**测试**: 全部 166 个测试通过，构建无警告。
+
 ## 待修复
 
 | Finding | 严重度 | 描述 |

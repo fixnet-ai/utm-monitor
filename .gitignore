@@ -44,3 +44,6 @@ test_write.o
 #       git won't ignore them, but it creates confusion.
 # ═════════════════════════════════════════════════════════════════════════
 utmm.lock
+
+# Embedded utmmd binary (generated at build time, not tracked)
+src/embed/

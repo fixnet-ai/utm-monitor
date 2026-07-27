@@ -903,7 +903,6 @@ fn startHost(
             "serving", "host",
         );
 
-        svc.resetRetryCounter(block_io, gpa, .host);
     }
 
     // Spawn tunnel manager thread — syncs LSA→guest table, connects tunnels.

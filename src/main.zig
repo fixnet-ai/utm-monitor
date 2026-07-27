@@ -14,6 +14,10 @@ const broadcast = @import("broadcast.zig");
 const svc = @import("svc.zig");
 const fail = @import("fail.zig");
 const mcp = @import("mcp.zig");
+const shm = @import("shm.zig");
+
+/// Embedded utmmd binary — compiled at build time, extracted at install time.
+const utmmd_bin = @embedFile("embed/utmmd.bin");
 
 comptime {
     _ = @import("hosts_file.zig");
@@ -316,36 +320,49 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    // ── 4. --svc: run as daemon (internal flag set by service manager) ──
+    // ── 4. --svc: spawned by utmmd supervisor ──
+    // utmmd creates shared memory before spawning us. Open it and register
+    // our PID so utmmd can monitor our heartbeat.
     if (cli.is_svc) {
-        if (builtin.os.tag == .macos) {
-            const role: svc.ServiceRole = if (cli.is_host) .host else .guest;
-            svc.checkRetryLimit(init.io, init.gpa, role);
+        var shm_handle: ?*volatile shm.ShmLayout = null;
+        if (shm.open()) |h| {
+            shm_handle = h;
+            h.utmm_pid = svc.getOwnPid();
+            h.utmm_state = @intFromEnum(shm.UtmmState.running);
+            std.log.info("[main] shm connected, pid={d}", .{svc.getOwnPid()});
+        } else |err| {
+            std.log.warn("[main] shm.open failed: {} — running without supervisor heartbeat", .{err});
         }
-        if (builtin.os.tag == .windows) {
-            return svc.winServiceRun(
-                init.io,
-                init.gpa,
-                cli.is_host,
-                cli.hostname,
-                cli.port,
-                cli.mesh_port,
-                cli.peer_mesh,
-                cli.host_ip,
-            );
-        }
-        // POSIX (non-macOS): run directly — service manager launched us
+        // Start heartbeat thread — updates shm.utmm_heartbeat every second.
+        // utmmd monitors this; 10s timeout triggers restart.
+        const hb_thread = if (shm_handle) |h|
+            try std.Thread.spawn(.{}, heartbeatThread, .{h, init.io})
+        else
+            null;
         if (cli.is_host) {
             try host_mod.runWithIo(init.io, init.gpa, cli, null);
         } else {
             try broadcast.guestRunWithIo(init.io, init.gpa, cli, null);
         }
+        // Cleanup — join heartbeat thread on exit
+        if (hb_thread) |t| {
+            if (shm_handle) |h| {
+                h.utmm_state = @intFromEnum(shm.UtmmState.stopping);
+            }
+            t.join();
+        }
+        if (shm_handle) |h| {
+            shm.detach(h);
+        }
         return;
     }
 
     // ── 5. --install: force install service ──
+    // Extract utmmd (the supervisor daemon) to canonical path, then
+    // force-install it as the system service. utmmd manages utmm's lifecycle.
     if (cli.cmd_install) {
         const role: svc.ServiceRole = if (cli.is_host) .host else .guest;
+        try extractUtmmd(init.io, init.gpa);
         var extra_args = try buildServiceArgs(init.gpa, cli);
         defer extra_args.deinit(init.gpa);
         svc.forceInstall(init.io, init.gpa, role, extra_args.items);
@@ -367,6 +384,12 @@ pub fn main(init: std.process.Init) !void {
         or cli.cmd_deploy;
     if (needs_host) {
         const was_running = svc.isRunning(init.io, init.gpa, .host);
+        // Ensure utmmd binary exists at canonical path before starting service.
+        // Only extract if missing (not running = fresh install likely needed).
+        // --install always force-overwrites; ensure only fills in if missing.
+        extractUtmmdIfMissing(init.io, init.gpa) catch |err| {
+            std.log.warn("[main] extractUtmmdIfMissing: {} (continuing)", .{err});
+        };
         var extra_args = try buildServiceArgs(init.gpa, cli);
         defer extra_args.deinit(init.gpa);
         svc.ensure(init.io, init.gpa, .host, extra_args.items);
@@ -399,9 +422,152 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── 10. Default: ensure Guest service is running ──
+    // Extract utmmd if missing (same logic as Host path above).
+    extractUtmmdIfMissing(init.io, init.gpa) catch |err| {
+        std.log.warn("[main] extractUtmmdIfMissing: {} (continuing)", .{err});
+    };
     var extra_args_guest = try buildServiceArgs(init.gpa, cli);
     defer extra_args_guest.deinit(init.gpa);
     svc.ensure(init.io, init.gpa, .guest, extra_args_guest.items);
+}
+
+/// Write the embedded utmmd binary to the canonical service path.
+/// Validates the binary type before writing. Always overwrites.
+fn extractUtmmd(io: std.Io, alloc: std.mem.Allocator) !void {
+    const dest = svc.canonicalSvcPath();
+    const dest_dir = svc.canonicalDir();
+
+    // Ensure canonical directory exists
+    std.Io.Dir.cwd().createDirPath(io, dest_dir) catch |err| {
+        fail.err("extractUtmmd/mkdir", err);
+    };
+
+    // Write to temp file first, then rename (atomic on same filesystem)
+    const tmp_path = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(alloc, "{s}\\utmmd.tmp.exe", .{dest_dir})
+    else
+        try std.fmt.allocPrint(alloc, "{s}/utmmd.tmp", .{dest_dir});
+    defer alloc.free(tmp_path);
+
+    // Remove stale tmp file
+    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    // Write the embedded binary
+    {
+        const cwd = std.Io.Dir.cwd();
+        const dst_file = if (builtin.os.tag != .windows)
+            cwd.createFile(io, tmp_path, .{ .truncate = true, .permissions = @enumFromInt(0o755) })
+        else
+            cwd.createFile(io, tmp_path, .{ .truncate = true });
+        const dst = dst_file catch |err| {
+            fail.err("extractUtmmd/create", err);
+        };
+        defer dst.close(io);
+
+        var write_buf: [65536]u8 = undefined;
+        var writer = dst.writer(io, &write_buf);
+        writer.interface.writeAll(utmmd_bin) catch |err| {
+            fail.err("extractUtmmd/write", err);
+        };
+        writer.interface.flush() catch |err| {
+            std.log.warn("[main] extractUtmmd flush: {}", .{err});
+        };
+        dst.sync(io) catch |err| {
+            std.log.warn("[main] extractUtmmd sync: {}", .{err});
+        };
+    }
+
+    // Atomic rename tmp → dest
+    std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), dest, io) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        // On EXDEV (cross-filesystem), try copy+delete fallback
+        if (err == error.CrossDevice) {
+            copyFile(io, alloc, tmp_path, dest, builtin.os.tag != .windows) catch |err2| {
+                fail.err("extractUtmmd/copy-fallback", err2);
+            };
+            // macOS: re-sign after copy
+            if (builtin.os.tag == .macos) {
+                const result = std.process.run(alloc, io, .{ .argv = &.{ "codesign", "--force", "--sign", "-", dest } });
+                if (result) |r| {
+                    alloc.free(r.stdout);
+                    alloc.free(r.stderr);
+                    if (r.term != .exited or r.term.exited != 0) {
+                        std.log.warn("[main] extractUtmmd: codesign re-sign failed", .{});
+                    }
+                } else |_| {
+                    std.log.warn("[main] extractUtmmd: codesign not found", .{});
+                }
+            }
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        } else {
+            fail.err("extractUtmmd/rename", err);
+        }
+    };
+
+    std.log.info("[main] utmmd extracted to {s} ({d} bytes)", .{ dest, utmmd_bin.len });
+}
+
+/// Extract utmmd only if it doesn't already exist at the canonical path.
+fn extractUtmmdIfMissing(io: std.Io, alloc: std.mem.Allocator) !void {
+    const dest = svc.canonicalSvcPath();
+    // Check if utmmd already exists
+    const cwd = std.Io.Dir.cwd();
+    _ = cwd.openFile(io, dest, .{ .mode = .read_only }) catch {
+        // File doesn't exist — extract it
+        return extractUtmmd(io, alloc);
+    };
+    // File exists — skip extraction
+    std.log.debug("[main] utmmd already at {s}, skipping extraction", .{dest});
+}
+
+/// Copy src to dst using 64KB chunks. Used as fallback when rename fails with EXDEV.
+fn copyFile(io: std.Io, alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, make_executable: bool) !void {
+    _ = alloc;
+    const cwd = std.Io.Dir.cwd();
+    const src = cwd.openFile(io, src_path, .{ .mode = .read_only }) catch |err| {
+        fail.err("copyFile/open-src", err);
+    };
+    defer src.close(io);
+
+    const dst_file = if (make_executable and builtin.os.tag != .windows)
+        cwd.createFile(io, dst_path, .{ .truncate = true, .permissions = @enumFromInt(0o755) })
+    else
+        cwd.createFile(io, dst_path, .{ .truncate = true });
+    const dst = dst_file catch |err| {
+        fail.err("copyFile/create-dst", err);
+    };
+    defer dst.close(io);
+
+    var buf: [65536]u8 = undefined;
+    var read_buf: [65536]u8 = undefined;
+    var write_buf: [65536]u8 = undefined;
+    var reader = src.reader(io, &read_buf);
+    var writer = dst.writer(io, &write_buf);
+    while (true) {
+        const n = reader.interface.readSliceShort(&buf) catch |err| {
+            fail.err("copyFile/read", err);
+        };
+        if (n == 0) break;
+        writer.interface.writeAll(buf[0..n]) catch |err| {
+            fail.err("copyFile/write", err);
+        };
+    }
+    writer.interface.flush() catch |err| {
+        std.log.warn("[main] copyFile flush: {}", .{err});
+    };
+    dst.sync(io) catch |err| {
+        std.log.warn("[main] copyFile sync: {}", .{err});
+    };
+}
+
+/// Heartbeat thread: updates shm.utmm_heartbeat every second.
+/// utmmd monitors this field; 10s without update triggers restart.
+fn heartbeatThread(h: *volatile shm.ShmLayout, io: std.Io) void {
+    while (true) {
+        const now = shm.nowMs(io);
+        h.utmm_heartbeat = now;
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch break;
+    }
 }
 
 /// Build extra CLI arguments to embed in service config (--hostname, --port, etc.)

@@ -52,6 +52,30 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── Step 1: Build utmmd (supervisor daemon) ──
+    const utmmd = b.addExecutable(.{
+        .name = "utmmd",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/utmmd.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    if (target.result.os.tag == .windows) {
+        utmmd.root_module.linkSystemLibrary("ws2_32", .{});
+    }
+
+    // Copy utmmd binary to src/embed/ for @embedFile by main.zig.
+    // addInstallBinFile writes to zig-out/ — use system copy command instead.
+    const embed_dir = "src/embed";
+    const embed_path = b.fmt("{s}/utmmd.bin", .{embed_dir});
+    const copy_utmmd = b.addSystemCommand(&.{ "cp", "-f" });
+    copy_utmmd.addFileArg(utmmd.getEmittedBin());
+    copy_utmmd.addArg(embed_path);
+    copy_utmmd.step.dependOn(&utmmd.step);
+
+    // ── Step 2: Build utmm (main binary, embeds utmmd) ──
     const exe = b.addExecutable(.{
         .name = "utmm",
         .root_module = b.createModule(.{
@@ -61,6 +85,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    exe.step.dependOn(&copy_utmmd.step);
 
     // Windows: link ws2_32 (may be needed by Zig runtime for socket operations)
     if (target.result.os.tag == .windows) {

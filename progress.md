@@ -11,6 +11,90 @@
 - **KCP Tunnel 稳定性修复**: session_gen 唯一 conv + epoch 范围验证 + 日志降级 ✅
 - **自动升级 forceInstall 修复**: killAllUtmm PID 感知 + waitForProcessExit + start() 重试 ✅
 
+## Phase 75: utmmd 监督进程架构重构 ✅ (2026-07-28 已完成)
+
+### 背景
+
+Phase 72-74 修复了自动升级的具体 bug，但根本架构问题（系统保活与自升级启动权冲突）未解决。
+Phase 75 引入 utmmd 监督进程，将生命周期管理从系统服务管理器中完全剥离。
+
+### 决议
+
+| R1 | utmmd 不需要系统保活 | R2 | IPC 用共享内存 | R3 | 检测到升级立即执行 |
+| R4 | 服务名称简化为 "utmmd" | R5 | 命名 `utmmd` | R6 | 不考虑向后兼容 |
+
+### 任务状态
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 355 | 创建 `src/shm.zig` — 跨平台共享内存协议 | ✅ |
+| 356 | 创建 `src/utmmd.zig` — 监督进程完整实现 | ✅ |
+| 357 | 修改 `src/svc.zig` — 简化为纯 OS 服务管理 | ✅ |
+| 358 | 修改 `src/main.zig` — shm 连接 + 新 install/uninstall | ✅ |
+| 359 | 修改 `src/broadcast.zig` — shm 驱动升级流程 | ✅ |
+| 360 | 修改 `build.zig` — 两步构建 + utmmd 嵌入 | ✅ |
+| 361 | 编译 + 测试 — 166/166 通过 | ✅ |
+| 362 | 部署验证 — Host + linuxvm + macvm | 📋 待部署 |
+
+### 实现详情
+
+**shm.zig** (~400行, Task 355):
+- `ShmLayout`: 4096 字节 extern struct（magic, version, svc_state, utmm_state, utmm_pid, svc_pid, svc_heartbeat, utmm_heartbeat, cmd, cmd_status, restart_count, last_exit_code, backoff_sec, failure_count, cmd_data[1024], _reserved[3008]）
+- `create(io)` / `open()` / `destroy(shm)` / `detach(shm)` / `nowMs(io)` 公共 API
+- POSIX: 原始 `extern "c" fn shm_open/mmap/munmap/shm_unlink` + 原始常量（O_CREAT, PROT_READ, MAP_SHARED 等）
+- Windows: `CreateFileMappingW` / `OpenFileMappingW` / `MapViewOfFile` / `UnmapViewOfFile`
+- 10 测试（size=4096, 默认值, enum 值验证）
+
+**utmmd.zig** (~600行, Task 356):
+- `parseArgs()` — `--role guest|host` + `--svc` 解析
+- `monitorLoop(io, alloc, shm, role)` — 主循环：startUtmm → stabilityCheck(10s) → monitorUtmm
+- `startUtmm()` — fork+exec (POSIX) / CreateProcessW (Windows) 启动 utmm --svc
+- `stabilityCheck(10s)` — 每秒检查 shm 心跳，10s 稳定算启动成功
+- `monitorUtmm()` — 每 1s 检查心跳（10s 超时触发重启）+ 处理 shm 命令（UPGRADE/RESTART/SHUTDOWN）
+- `upgradeUtmm()` — 重命名临时文件 → 规范路径，macOS codesign 重签，失败回退
+- `winServiceRun()` — Windows SCM 分发，SERVICE_CONTROL_STOP 处理
+- 退避算法：1s→2s→4s→8s→16s→32s→超过5次退出
+
+**svc.zig** (重构, Task 357):
+- 服务名统一：SVC_NAME_MACOS=`com.utmmd`, SVC_NAME_LINUX=`utmmd`, SVC_NAME_WINDOWS=`UTM-MonitorD`
+- `svcName()` 无参数（Guest/Host 互斥，单名称）
+- 新增 `canonicalSvcPath()` — `/opt/utmm/utmmd` 或 `C:\opt\utmm\utmmd.exe`
+- macOS plist: 移除 `KeepAlive` dict + `ThrottleInterval`
+- Linux systemd: 移除 `Restart=on-failure` + `RestartSec=5` + `StartLimitBurst=3`
+- Windows: 移除 `sc failure` 配置
+- 移除 SCM 集成（SvcGlobals, svcMain, svcCtrlHandler）→ 移入 utmmd.zig
+- 存根函数在 Task 373 完成后清理
+- `getOwnPid()` → `pub`（供 main.zig 使用）
+
+**main.zig** (修改, Task 358):
+- 新增 `@embedFile("embed/utmmd.bin")` + `extractUtmmd()` + `extractUtmmdIfMissing()`
+- `--install`: 调用 extractUtmmd 强制提取，然后 svc.forceInstall
+- `ensure`: 调用 extractUtmmdIfMissing（仅缺失时提取）
+- `--svc`: 打开 shm → 设置 PID/状态 → 心跳线程(1s) → 运行主循环 → 清理（设置 stopping 状态 + detach）
+- 新增 `heartbeatThread()` — 每秒更新 shm.utmm_heartbeat
+- 新增 `copyFile()` — 用于 extractUtmmd 的 EXDEV 回退路径
+
+**broadcast.zig** (修改, Task 359):
+- `doAutoUpgrade` 签名改为返回 `!bool`（是否成功通知 utmmd）
+- 下载后写 shm（cmd=UPGRADE, cmd_data=临时路径）替代执行 `--install`
+- 调用方（meshSessionLoop）检查返回值：成功 → break 退出；失败 → 恢复 serving 状态继续
+- 移除 `applyUpgradeAndRestart` 函数（~48 行）
+- 移除 `svc.resetRetryCounter` 和 `svc.checkPendingUpgradeWindows` 调用
+
+**host.zig** (清理, Task 359):
+- 移除 `svc.resetRetryCounter` 调用
+
+**build.zig** (修改, Task 360):
+- 新增 utmmd 编译步骤 + `addSystemCommand("cp -f")` 复制到 `src/embed/utmmd.bin`
+- utmm 构建步骤依赖 copy 步骤
+- `src/embed/` 加入 .gitignore
+
+### 验证
+
+- `zig build`: 编译成功（utmmd + utmm 两步构建）
+- `zig build test`: 166/166 全部通过
+- macOS aarch64 原生构建验证通过
+
 ## Phase 74: 自动升级 forceInstall 修复 (2026-07-28)
 
 | # | 任务 | 状态 |

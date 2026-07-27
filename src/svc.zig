@@ -14,32 +14,30 @@ const fail = @import("fail.zig");
 const lock = @import("lock.zig");
 const protocol = @import("protocol.zig");
 
-/// POSIX canonical install path.
+/// Canonical install path for utmm (the managed process).
 pub const CANONICAL_PATH_POSIX = "/opt/utmm/utmm";
-/// Windows canonical install path.
 pub const CANONICAL_PATH_WIN = "C:\\opt\\utmm\\utmm.exe";
 
-/// Service names per platform and role.
-const ServiceNames = struct {
-    guest: []const u8,
-    host: []const u8,
-};
+/// Canonical install path for utmmd (the supervisor daemon / system service).
+pub const CANONICAL_SVC_PATH_POSIX = "/opt/utmm/utmmd";
+pub const CANONICAL_SVC_PATH_WIN = "C:\\opt\\utmm\\utmmd.exe";
 
-const SERVICE_NAMES = switch (builtin.os.tag) {
-    .macos => ServiceNames{ .guest = "com.utmm.guest", .host = "com.utmm.host" },
-    .linux => ServiceNames{ .guest = "utmm-guest", .host = "utmm-host" },
-    .windows => ServiceNames{ .guest = "UTM-Monitor-Guest", .host = "UTM-Monitor-Host" },
-    else => ServiceNames{ .guest = "utmm-guest", .host = "utmm-host" },
-};
+/// Single service name — utmmd is the system service (v0.12.0+).
+/// Guest and Host are mutually exclusive on one machine.
+const SVC_NAME_MACOS = "com.utmmd";
+const SVC_NAME_LINUX = "utmmd";
+const SVC_NAME_WINDOWS = "UTM-MonitorD";
 
-pub const ServiceRole = enum { guest, host };
-
-fn svcName(role: ServiceRole) []const u8 {
-    return switch (role) {
-        .guest => SERVICE_NAMES.guest,
-        .host => SERVICE_NAMES.host,
+fn svcName() []const u8 {
+    return switch (builtin.os.tag) {
+        .macos => SVC_NAME_MACOS,
+        .linux => SVC_NAME_LINUX,
+        .windows => SVC_NAME_WINDOWS,
+        else => "utmmd",
     };
 }
+
+pub const ServiceRole = enum { guest, host };
 
 /// Return the canonical install path for the current platform.
 pub fn canonicalPath() []const u8 {
@@ -51,6 +49,12 @@ pub fn canonicalPath() []const u8 {
 pub fn canonicalDir() []const u8 {
     if (builtin.os.tag == .windows) return "C:\\opt\\utmm";
     return "/opt/utmm";
+}
+
+/// Return the canonical install path for utmmd (the supervisor daemon).
+pub fn canonicalSvcPath() []const u8 {
+    if (builtin.os.tag == .windows) return CANONICAL_SVC_PATH_WIN;
+    return CANONICAL_SVC_PATH_POSIX;
 }
 
 /// Check if the current process is running from the canonical path.
@@ -107,8 +111,9 @@ fn runCmdCheckExit(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Check if the service is currently running.
-pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) bool {
-    const name = svcName(role);
+pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) bool {
+    _ = _role;
+    const name = svcName();
     return switch (builtin.os.tag) {
         .macos => blk: {
             const result = runCmdStdout(alloc, io, &[_][]const u8{ "launchctl", "list" });
@@ -196,31 +201,32 @@ pub fn install(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_ar
 }
 
 fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) !void {
-    const name = svcName(role);
+    const name = svcName();
     const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name});
     defer alloc.free(plist_path);
 
-    const exe_path = canonicalPath();
+    const svc_path = canonicalSvcPath();
     const env = .{ .shell = "/bin/zsh", .home = "/var/root" };
 
-    // Build ProgramArguments string
+    // Build ProgramArguments string: utmmd --role guest|host [extra_args...]
     var args_list: std.ArrayListAligned(u8, null) = .empty;
     defer args_list.deinit(alloc);
     try args_list.appendSlice(alloc, "        <string>");
-    try args_list.appendSlice(alloc, exe_path);
+    try args_list.appendSlice(alloc, svc_path);
     try args_list.appendSlice(alloc, "</string>\n");
-    try args_list.appendSlice(alloc, "        <string>--svc</string>\n");
-    if (role == .host) {
-        try args_list.appendSlice(alloc, "        <string>--host</string>\n");
-    }
+    try args_list.appendSlice(alloc, "        <string>--role</string>\n");
+    try args_list.appendSlice(alloc, if (role == .host)
+        "        <string>host</string>\n"
+    else
+        "        <string>guest</string>\n");
     for (extra_args) |arg| {
         try args_list.appendSlice(alloc, "        <string>");
         try args_list.appendSlice(alloc, arg);
         try args_list.appendSlice(alloc, "</string>\n");
     }
 
-    const log_path = if (role == .host) "/var/log/utmm-host.log" else "/var/log/utmm-guest.log";
-    const err_log_path = if (role == .host) "/var/log/utmm-host-err.log" else "/var/log/utmm-guest-err.log";
+    const log_path = "/var/log/utmmd.log";
+    const err_log_path = "/var/log/utmmd-err.log";
 
     const plist = try std.fmt.allocPrint(alloc,
         \\<?xml version="1.0" encoding="UTF-8"?>
@@ -243,13 +249,6 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
         \\    </dict>
         \\    <key>RunAtLoad</key>
         \\    <true/>
-        \\    <key>KeepAlive</key>
-        \\    <dict>
-        \\        <key>SuccessfulExit</key>
-        \\        <false/>
-        \\    </dict>
-        \\    <key>ThrottleInterval</key>
-        \\    <integer>5</integer>
         \\    <key>StandardOutPath</key>
         \\    <string>{s}</string>
         \\    <key>StandardErrorPath</key>
@@ -291,21 +290,19 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
 }
 
 fn installLinux(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) !void {
-    const name = svcName(role);
+    const name = svcName();
     const unit_path = try std.fmt.allocPrint(alloc, "/etc/systemd/system/{s}.service", .{name});
     defer alloc.free(unit_path);
 
-    const exe_path = canonicalPath();
+    const svc_path = canonicalSvcPath();
     const env = .{ .shell = "/bin/bash", .home = "/root" };
 
-    // Build ExecStart args
+    // Build ExecStart args: utmmd --role guest|host [extra_args...]
     var exec_args: std.ArrayListAligned(u8, null) = .empty;
     defer exec_args.deinit(alloc);
-    try exec_args.appendSlice(alloc, exe_path);
-    try exec_args.appendSlice(alloc, " --svc");
-    if (role == .host) {
-        try exec_args.appendSlice(alloc, " --host");
-    }
+    try exec_args.appendSlice(alloc, svc_path);
+    try exec_args.appendSlice(alloc, " --role ");
+    try exec_args.appendSlice(alloc, if (role == .host) "host" else "guest");
     for (extra_args) |arg| {
         try exec_args.append(alloc, ' ');
         try exec_args.appendSlice(alloc, arg);
@@ -313,7 +310,7 @@ fn installLinux(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
 
     const unit = try std.fmt.allocPrint(alloc,
         \\[Unit]
-        \\Description=UTM Monitor {s}
+        \\Description=UTM Monitor Daemon ({s})
         \\After=network.target
         \\
         \\[Service]
@@ -322,17 +319,13 @@ fn installLinux(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
         \\Environment=HOME={s}
         \\ExecStart={s}
         \\WorkingDirectory=/opt/utmm
-        \\Restart=on-failure
-        \\RestartSec=5
-        \\StartLimitBurst=3
-        \\StartLimitIntervalSec=30
         \\StandardOutput=journal
         \\
         \\[Install]
         \\WantedBy=multi-user.target
         \\
     , .{
-        if (role == .host) "Host" else "Guest",
+        if (role == .host) "host" else "guest",
         env.shell,
         env.home,
         exec_args.items,
@@ -363,18 +356,16 @@ fn installLinux(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
 }
 
 fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) !void {
-    const name = svcName(role);
-    const exe_path = canonicalPath();
+    const name = svcName();
+    const svc_path = canonicalSvcPath();
 
-    // Build binPath with quoted exe and args
+    // Build binPath: utmmd --svc --role guest|host [extra_args...]
     var bin_path: std.ArrayListAligned(u8, null) = .empty;
     defer bin_path.deinit(alloc);
     try bin_path.appendSlice(alloc, "\"");
-    try bin_path.appendSlice(alloc, exe_path);
-    try bin_path.appendSlice(alloc, "\" --svc");
-    if (role == .host) {
-        try bin_path.appendSlice(alloc, " --host");
-    }
+    try bin_path.appendSlice(alloc, svc_path);
+    try bin_path.appendSlice(alloc, "\" --svc --role ");
+    try bin_path.appendSlice(alloc, if (role == .host) "host" else "guest");
     for (extra_args) |arg| {
         try bin_path.append(alloc, ' ');
         try bin_path.appendSlice(alloc, arg);
@@ -386,22 +377,13 @@ fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra
         std.log.warn("[svc] sc delete {s} failed (may not be installed)", .{name});
     }
 
-    // Create service
+    // Create service — no failure actions (utmmd handles its own restart/backoff)
     if (!runCmd(alloc, io, &[_][]const u8{
         "sc", "create", name,
         "binPath=", bin_path.items,
         "start=", "auto",
     })) {
         fail.msg("install/sc-create", "failed to create service {s}", .{name});
-    }
-
-    // Configure failure actions: 3 restarts then stop
-    if (!runCmd(alloc, io, &[_][]const u8{
-        "sc", "failure", name,
-        "reset=", "30",
-        "actions=", "restart/5000/restart/5000/restart/5000/none/5000",
-    })) {
-        fail.msg("install/sc-failure", "failed to configure failure actions for {s}", .{name});
     }
 
     // Add firewall rule (delete any previous rule first, ignore error if not found)
@@ -415,7 +397,7 @@ fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra
         "name=" ++ rule_name,
         "dir=", "in",
         "action=", "allow",
-        "program=", exe_path,
+        "program=", svc_path,
         "enable=", "yes",
     })) {
         fail.msg("install/firewall", "failed to add firewall rule", .{});
@@ -426,8 +408,9 @@ fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra
 
 /// Remove service configuration only (no binary deletion, no process killing).
 /// Used as rollback when forceInstall's start step fails.
-fn uninstallServiceConfig(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) void {
-    const name = svcName(role);
+fn uninstallServiceConfig(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) void {
+    _ = _role;
+    const name = svcName();
     switch (builtin.os.tag) {
         .macos => {
             const plist_path = std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name}) catch return;
@@ -465,7 +448,7 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
     // Stop and remove all service names (current + legacy)
     switch (builtin.os.tag) {
         .macos => {
-            const all_names = [_][]const u8{ SERVICE_NAMES.guest, SERVICE_NAMES.host, "com.utmm" };
+            const all_names = [_][]const u8{ SVC_NAME_MACOS, "com.utmm.guest", "com.utmm.host", "com.utmm" };
             for (all_names) |name| {
                 const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name});
                 defer alloc.free(plist_path);
@@ -474,7 +457,7 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
             }
         },
         .linux => {
-            const all_names = [_][]const u8{ SERVICE_NAMES.guest, SERVICE_NAMES.host, "utmm" };
+            const all_names = [_][]const u8{ SVC_NAME_LINUX, "utmm-guest", "utmm-host", "utmm" };
             for (all_names) |name| {
                 const unit_path = try std.fmt.allocPrint(alloc, "/etc/systemd/system/{s}.service", .{name});
                 defer alloc.free(unit_path);
@@ -485,7 +468,7 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
             runCmdQuiet(alloc, io, &[_][]const u8{ "systemctl", "daemon-reload" });
         },
         .windows => {
-            const all_names = [_][]const u8{ SERVICE_NAMES.guest, SERVICE_NAMES.host, "UTM-Monitor" };
+            const all_names = [_][]const u8{ SVC_NAME_WINDOWS, "UTM-Monitor-Guest", "UTM-Monitor-Host", "UTM-Monitor" };
             for (all_names) |name| {
                 runCmdQuiet(alloc, io, &[_][]const u8{ "sc", "stop", name });
                 runCmdQuiet(alloc, io, &[_][]const u8{ "sc", "delete", name });
@@ -499,18 +482,17 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
         else => {},
     }
 
-    // Clean up retry counter files (macOS)
-    if (builtin.os.tag == .macos) {
-        const cwd = std.Io.Dir.cwd();
-        cwd.deleteFile(io, "/var/run/utmm-guest.retry") catch {};
-        cwd.deleteFile(io, "/var/run/utmm-host.retry") catch {};
-    }
-
-    // Delete binary
+    // Delete binaries (both utmm and utmmd)
     const exe_path = canonicalPath();
     std.Io.Dir.cwd().deleteFile(io, exe_path) catch |err| {
         std.log.warn("[svc] could not delete binary at {s}: {}", .{ exe_path, err });
     };
+    const svc_path = canonicalSvcPath();
+    if (!std.mem.eql(u8, svc_path, exe_path)) {
+        std.Io.Dir.cwd().deleteFile(io, svc_path) catch |err| {
+            std.log.warn("[svc] could not delete utmmd binary at {s}: {}", .{ svc_path, err });
+        };
+    }
 
     // Kill any remaining utmm processes
     killAllUtmm(io, alloc) catch |err| {
@@ -522,7 +504,7 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
 
 /// Start the service.
 pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
-    const name = svcName(role);
+    const name = svcName();
     switch (builtin.os.tag) {
         .macos => {
             // If already running, do nothing. Otherwise kickstart (restarts
@@ -589,8 +571,9 @@ pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
 }
 
 /// Stop the service.
-pub fn stop(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
-    const name = svcName(role);
+pub fn stop(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) !void {
+    _ = _role;
+    const name = svcName();
     switch (builtin.os.tag) {
         .macos => {
             if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", name })) {
@@ -611,12 +594,14 @@ pub fn stop(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
     }
 }
 
+extern "c" fn getpid() c_int;
+
 /// Get our own process ID, cross-platform.
-fn getOwnPid() u32 {
+pub fn getOwnPid() u32 {
     if (builtin.os.tag == .windows) {
         return @intCast(std.os.windows.GetCurrentProcessId());
     }
-    return @intCast(std.posix.system.getpid());
+    return @intCast(getpid());
 }
 
 /// Kill all utmm processes (except self) — best-effort, never fails.
@@ -1011,7 +996,7 @@ pub fn forceInstall(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, ext
 
 /// Force-install without acquiring the lock (caller must hold it).
 fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) void {
-    const name = svcName(role);
+    const name = svcName();
     const dest_path = canonicalPath();
     std.log.info("[svc] force installing {s}...", .{name});
 
@@ -1076,7 +1061,7 @@ fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole,
 /// If already running: log and return.
 /// If not running: acquire singleton lock, then call forceInstallInternal.
 pub fn ensure(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) void {
-    const name = svcName(role);
+    const name = svcName();
     if (isRunning(io, alloc, role)) {
         std.log.info("[svc] {s} service already running", .{name});
         std.debug.print("utmm {s} service is running.\n", .{if (role == .host) "host" else "guest"});
@@ -1090,279 +1075,6 @@ pub fn ensure(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_arg
     forceInstallInternal(io, alloc, role, extra_args);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// macOS retry counter — prevents infinite restart loops
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Check restart count on macOS. If we've restarted >= 3 times within a
-/// short window, exit(0) so launchd stops restarting us.
-///
-/// Purpose: prevent infinite crash loops (service crashes on start →
-/// launchd restarts → crashes again → …). The counter is scoped to a time
-/// window: if the counter file is older than 120 seconds, the service
-/// ran successfully for a while (or was killed intentionally — e.g.
-/// upgrade, kickstart), so the counter resets to 1.
-///
-/// Call resetRetryCounter() after the service fully initializes (mesh up,
-/// HTTP serving) to clear hot-restart state.
-pub fn checkRetryLimit(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) void {
-    if (builtin.os.tag != .macos) return;
-
-    const retry_path = retryCounterPath(alloc, role) catch return;
-    defer alloc.free(retry_path);
-
-    var count: u32 = 0;
-    var should_reset: bool = false;
-
-    // Read existing counter with time-window check
-    if (std.Io.Dir.cwd().statFile(io, retry_path, .{})) |st| {
-        // If the counter file is older than 120 seconds, the previous run
-        // ran successfully for a meaningful interval — this isn't a crash
-        // loop. Reset the count so intentional restarts (upgrade, testing)
-        // aren't penalized.
-        const now = std.Io.Timestamp.now(io, .awake);
-        const age_ns: i96 = now.nanoseconds - st.mtime.nanoseconds;
-        if (age_ns > 120 * std.time.ns_per_s) {
-            should_reset = true;
-        }
-        if (std.Io.Dir.cwd().readFileAlloc(io, retry_path, alloc, std.Io.Limit.limited(1024))) |content| {
-            defer alloc.free(content);
-            count = std.fmt.parseInt(u32, std.mem.trim(u8, content, " \n\r"), 10) catch 0;
-        } else |_| {}
-    } else |_| {}
-
-    if (should_reset) {
-        count = 0;
-        std.log.info("[svc] retry counter stale (>{d}s), resetting", .{120});
-    }
-
-    count += 1;
-
-    if (count > 3) {
-        std.log.err("[svc] Too many restart attempts ({d}), stopping.", .{count});
-        std.Io.Dir.cwd().deleteFile(io, retry_path) catch {};
-        std.process.exit(0);
-    }
-
-    // Write updated counter
-    const new_content = std.fmt.allocPrint(alloc, "{d}\n", .{count}) catch return;
-    defer alloc.free(new_content);
-    std.Io.Dir.cwd().deleteFile(io, retry_path) catch {};
-    const f = std.Io.Dir.cwd().createFile(io, retry_path, .{}) catch return;
-    defer f.close(io);
-    f.writeStreamingAll(io, new_content) catch {};
-
-    std.log.info("[svc] retry count {d}/3", .{count});
-}
-
-/// Reset retry counter after successful startup (macOS only).
-pub fn resetRetryCounter(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) void {
-    if (builtin.os.tag != .macos) return;
-    const retry_path = retryCounterPath(alloc, role) catch return;
-    defer alloc.free(retry_path);
-    std.Io.Dir.cwd().deleteFile(io, retry_path) catch {};
-    std.log.info("[svc] retry counter reset", .{});
-}
-
-/// Windows only: check for a pending upgrade (.new file) from a previous
-/// auto-upgrade attempt. If found, replace the running binary and restart.
-/// Returns true if upgrade was applied (caller should exit), false otherwise.
-pub fn checkPendingUpgradeWindows(io: std.Io, alloc: std.mem.Allocator) bool {
-    if (builtin.os.tag != .windows) return false;
-
-    const exe_path = canonicalPath();
-    const new_path = std.fmt.allocPrint(alloc, "{s}.new", .{exe_path}) catch {
-        std.log.err("[svc] allocPrint for upgrade path failed", .{});
-        return false;
-    };
-    defer alloc.free(new_path);
-
-    if (std.Io.Dir.cwd().statFile(io, new_path, .{})) |_| {
-        std.log.info("[svc] pending upgrade found at {s}", .{new_path});
-    } else |_| {
-        return false;
-    }
-
-    // Delete old .exe (file is memory-mapped, directory entry can be replaced)
-    std.Io.Dir.cwd().deleteFile(io, exe_path) catch |err| {
-        std.log.err("[svc] cannot delete old .exe: {} — will retry next restart", .{err});
-        std.process.exit(42);
-    };
-
-    // Rename .new → .exe
-    std.Io.Dir.cwd().rename(new_path, std.Io.Dir.cwd(), exe_path, io) catch |err| {
-        std.log.err("[svc] upgrade rename failed: {}", .{err});
-        std.process.exit(42);
-    };
-
-    std.log.info("[svc] upgrade finalized. restarting...", .{});
-    std.process.exit(0);
-}
-
-fn retryCounterPath(alloc: std.mem.Allocator, role: ServiceRole) ![]const u8 {
-    const suffix = if (role == .host) "host" else "guest";
-    // Try /var/run first, fall back to /tmp
-    const path = try std.fmt.allocPrint(alloc, "/var/run/utmm-{s}.retry", .{suffix});
-    return path;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Windows SCM integration
-// ═══════════════════════════════════════════════════════════════════════════
-
-const windows = std.os.windows;
-
-const SERVICE_WIN32_OWN_PROCESS = 0x00000010;
-const SERVICE_ACCEPT_STOP = 0x00000001;
-const SERVICE_CONTROL_STOP = 0x00000001;
-const SERVICE_RUNNING = 0x00000004;
-const SERVICE_STOP_PENDING = 0x00000003;
-const SERVICE_STOPPED = 0x00000001;
-
-const SERVICE_STATUS = extern struct {
-    dwServiceType: u32,
-    dwCurrentState: u32,
-    dwControlsAccepted: u32,
-    dwWin32ExitCode: u32,
-    dwServiceSpecificExitCode: u32,
-    dwCheckPoint: u32,
-    dwWaitHint: u32,
-};
-
-const SERVICE_STATUS_HANDLE = *anyopaque;
-
-const SvcMainFn = *const fn (dwNumServiceArgs: u32, lpServiceArgVectors: [*]?[*:0]const u16) callconv(.winapi) void;
-
-const SERVICE_TABLE_ENTRYW = extern struct {
-    lpServiceName: ?[*:0]const u16,
-    lpServiceProc: ?SvcMainFn,
-};
-
-extern "advapi32" fn StartServiceCtrlDispatcherW(lpServiceStartTable: [*]const SERVICE_TABLE_ENTRYW) callconv(.winapi) u32;
-extern "advapi32" fn RegisterServiceCtrlHandlerExW(lpServiceName: [*:0]const u16, lpHandlerProc: ?*const fn (dwControl: u32, dwEventType: u32, lpEventData: ?*anyopaque, lpContext: ?*anyopaque) callconv(.winapi) u32, lpContext: ?*anyopaque) callconv(.winapi) ?SERVICE_STATUS_HANDLE;
-extern "advapi32" fn SetServiceStatus(hServiceStatus: ?SERVICE_STATUS_HANDLE, lpServiceStatus: *SERVICE_STATUS) callconv(.winapi) u32;
-
-const MAX_SVC_NAME_UTF16 = 64; // "UTM-Monitor-Guest" = 17 chars + null = 18 u16
-
-const SvcGlobals = struct {
-    var io: std.Io = undefined;
-    var gpa: std.mem.Allocator = undefined;
-    var is_host: bool = false;
-    var hostname_override: ?[]const u8 = null;
-    var port: u16 = 2121;
-    var mesh_port: u16 = 2121;
-    var peer_mesh: ?[]const u8 = null;
-    var host_ip: ?[]const u8 = null;
-    var status_handle: ?SERVICE_STATUS_HANDLE = null;
-    var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-    var svc_name_utf16: [MAX_SVC_NAME_UTF16]u16 = [_]u16{0} ** MAX_SVC_NAME_UTF16;
-};
-
-fn svcCtrlHandler(dwControl: u32, _: u32, _: ?*anyopaque, _: ?*anyopaque) callconv(.winapi) u32 {
-    if (dwControl == SERVICE_CONTROL_STOP) {
-        // Immediate hard-stop: report STOPPED to SCM and exit the process.
-        // Graceful shutdown via shutdown_flag + thread join is unreliable on
-        // Windows — the ptyReadLoop blocks in ReadFile which ARM64 AFD
-        // cannot cancel, and the mesh timer self-wake has timing races.
-        // Tracked as deferred: graceful Windows service shutdown (Finding 103).
-        var status = std.mem.zeroes(SERVICE_STATUS);
-        status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-        status.dwCurrentState = SERVICE_STOPPED;
-        status.dwControlsAccepted = 0;
-        _ = SetServiceStatus(SvcGlobals.status_handle, &status);
-
-        std.process.exit(0);
-    }
-    return 0;
-}
-
-fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
-    const h = RegisterServiceCtrlHandlerExW(@ptrCast(&SvcGlobals.svc_name_utf16), svcCtrlHandler, null);
-    SvcGlobals.status_handle = h;
-
-    if (h) |handle| {
-        var status = std.mem.zeroes(SERVICE_STATUS);
-        status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-        status.dwCurrentState = SERVICE_RUNNING;
-        status.dwControlsAccepted = SERVICE_ACCEPT_STOP;
-        _ = SetServiceStatus(handle, &status);
-    }
-
-    const host_mod = @import("host.zig");
-    const broadcast_mod = @import("broadcast.zig");
-
-    if (SvcGlobals.is_host) {
-        host_mod.runWithIo(SvcGlobals.io, SvcGlobals.gpa, .{
-            .is_host = true,
-            .port = SvcGlobals.port,
-            .mesh_port = SvcGlobals.mesh_port,
-            .peer_mesh = SvcGlobals.peer_mesh,
-            .hostname = SvcGlobals.hostname_override,
-            .host_ip = SvcGlobals.host_ip,
-        }, &SvcGlobals.shutdown_flag) catch |err| {
-            std.log.err("[svc] host run failed: {}", .{err});
-        };
-    } else {
-        broadcast_mod.guestRunWithIo(SvcGlobals.io, SvcGlobals.gpa, .{
-            .hostname = SvcGlobals.hostname_override,
-            .port = SvcGlobals.port,
-            .mesh_port = SvcGlobals.mesh_port,
-            .peer_mesh = SvcGlobals.peer_mesh,
-            .host_ip = SvcGlobals.host_ip,
-        }, &SvcGlobals.shutdown_flag) catch |err| {
-            std.log.err("[svc] guest run failed: {}", .{err});
-        };
-    }
-
-    if (h) |handle| {
-        var status = std.mem.zeroes(SERVICE_STATUS);
-        status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-        status.dwCurrentState = SERVICE_STOPPED;
-        status.dwControlsAccepted = 0;
-        _ = SetServiceStatus(handle, &status);
-    }
-}
-
-/// Run as a Windows service via SCM.
-pub fn winServiceRun(
-    sys_io: std.Io,
-    gpa: std.mem.Allocator,
-    is_host: bool,
-    hostname_override: ?[]const u8,
-    port: u16,
-    mesh_port: u16,
-    peer_mesh: ?[]const u8,
-    host_ip: ?[]const u8,
-) !void {
-    SvcGlobals.io = sys_io;
-    SvcGlobals.gpa = gpa;
-    SvcGlobals.is_host = is_host;
-    SvcGlobals.hostname_override = hostname_override;
-    SvcGlobals.port = port;
-    SvcGlobals.mesh_port = mesh_port;
-    SvcGlobals.peer_mesh = peer_mesh;
-    SvcGlobals.host_ip = host_ip;
-
-    // Build correct UTF-16 service name from role
-    const svc_name_utf8 = svcName(if (is_host) .host else .guest);
-    var i: usize = 0;
-    for (svc_name_utf8) |c| {
-        if (i >= MAX_SVC_NAME_UTF16 - 1) break;
-        SvcGlobals.svc_name_utf16[i] = @intCast(c);
-        i += 1;
-    }
-    SvcGlobals.svc_name_utf16[i] = 0;
-
-    var svc_table = [2]SERVICE_TABLE_ENTRYW{
-        .{ .lpServiceName = @ptrCast(&SvcGlobals.svc_name_utf16), .lpServiceProc = svcMain },
-        .{ .lpServiceName = null, .lpServiceProc = null },
-    };
-
-    if (StartServiceCtrlDispatcherW(&svc_table) == 0) {
-        std.debug.print("[svc] StartServiceCtrlDispatcher failed (error: {})\n", .{windows.GetLastError()});
-        return error.ServiceDispatchFailed;
-    }
-}
 
 // ========== Tests ==========
 

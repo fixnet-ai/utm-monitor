@@ -10,6 +10,7 @@ const tunnel_mod = @import("tunnel.zig");
 const tunproto = @import("tunproto.zig");
 const mesh_mod = @import("mesh.zig");
 const svc = @import("svc.zig");
+const shm = @import("shm.zig");
 
 /// Shared signal between udpDiscoveryListener (background thread) and
 /// wsAnnounceLoop (main thread). When the UDP listener detects a version
@@ -1104,7 +1105,6 @@ pub fn meshSessionLoop(
         };
 
         std.log.info("[guest-mesh] Mesh networking started (LSA on UDP :{d})", .{mesh_port});
-        svc.resetRetryCounter(io, allocator, .guest);
     }
 
     defer {
@@ -1158,7 +1158,7 @@ pub fn meshSessionLoop(
                 m.updateNodeInfo(new_info);
             }
 
-            doAutoUpgrade(io, allocator, &mesh_opt, info, shutdown) catch |err| {
+            const upgrade_ok = doAutoUpgrade(io, allocator, &mesh_opt, info, shutdown) catch |err| {
                 std.log.err("[guest-mesh] auto-upgrade failed: {}", .{err});
                 // Restore status so Host sees Guest as available again
                 if (mesh_opt) |*m| {
@@ -1168,7 +1168,21 @@ pub fn meshSessionLoop(
                     ) catch continue;
                     m.updateNodeInfo(new_info);
                 }
+                continue;
             };
+
+            if (upgrade_ok) {
+                std.log.info("[guest-mesh] upgrade signaled to utmmd, exiting for restart...", .{});
+                break;
+            }
+            // upgrade_ok == false: shm.open failed, restore serving status and continue
+            if (mesh_opt) |*m| {
+                const new_info = std.fmt.allocPrint(allocator,
+                    "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:serving",
+                    .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
+                ) catch continue;
+                m.updateNodeInfo(new_info);
+            }
         }
 
         // Wait for Host to establish a KCP tunnel and send pty_spawn
@@ -1731,65 +1745,18 @@ fn receiveUpgradeFile(
     }
 }
 
-/// Run the downloaded binary with --install and exit.
-/// This function never returns on success — the new binary's forceInstall
-/// kills the old process during its "kill" step.
-fn applyUpgradeAndRestart(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    temp_path: []const u8,
-    hostname: []const u8,
-) !void {
-    const dirname = svc.canonicalDir();
-    const new_name: []const u8 = if (builtin.os.tag == .windows) "utmm-new.exe" else "utmm-new";
-    const new_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dirname, new_name });
-    defer allocator.free(new_path);
-
-    // Delete any stale utmm-new from a previous upgrade
-    std.Io.Dir.cwd().deleteFile(io, new_path) catch {};
-
-    // Move downloaded binary to canonical dir as utmm-new
-    try std.Io.Dir.cwd().rename(temp_path, std.Io.Dir.cwd(), new_path, io);
-
-    // Set executable permission (POSIX)
-    if (builtin.os.tag != .windows) {
-        _ = std.posix.system.chmod(@ptrCast(new_path.ptr), 0o755);
-    }
-
-    std.log.info("[upgrade] running {s} --install --hostname {s} ...", .{ new_path, hostname });
-
-    // Run new binary with --install. The new binary's forceInstall does:
-    //   stop → kill(pkill utmm / taskkill utmm.exe) → self-copy → install(svc config) → start
-    // The OLD process name is "utmm" — the NEW binary runs as "utmm-new",
-    // so pkill/taskkill won't match it. The old process is killed during the
-    // kill step, so we never return from this call on success.
-    const result = std.process.run(allocator, io, .{
-        .argv = &.{ new_path, "--install", "--hostname", hostname },
-    }) catch |err| {
-        std.log.err("[upgrade] failed to start --install: {}", .{err});
-        return err;
-    };
-
-    // If we reach here, --install completed but didn't kill us (unusual).
-    // Exit so the service manager restarts with the new binary.
-    allocator.free(result.stdout);
-    allocator.free(result.stderr);
-    // Exit with non-zero code so the service manager (launchd KeepAlive,
-    // systemd Restart=on-failure) reliably restarts the service with the
-    // new binary. 42 is a recognizable sentinel for "upgrade completed".
-    std.log.info("[upgrade] --install ok, exiting with code 42 to trigger restart...", .{});
-    std.process.exit(42);
-}
-
 /// Perform auto-upgrade: connect to Host via KCP, download new binary,
-/// and run --install to replace the current installation.
+/// write the temp file path to shared memory, and signal utmmd to handle
+/// the upgrade. utmmd will rename the binary, restart utmm, and manage
+/// the backoff strategy.
+/// Returns true if upgrade was initiated (utmm should exit), false on error.
 fn doAutoUpgrade(
     io: std.Io,
     allocator: std.mem.Allocator,
     mesh_opt: *?mesh_mod.Mesh,
     info: SystemInfo,
     shutdown: ?*std.atomic.Value(bool),
-) !void {
+) !bool {
     // Get a KCP tunnel to the Host
     var tunnel = try waitForHostTunnel(io, allocator, mesh_opt, shutdown);
     defer tunnel.deinit();
@@ -1811,11 +1778,28 @@ fn doAutoUpgrade(
         allocator.free(temp_path);
     }
 
-    // Reset macOS retry counter before upgrade exit
-    svc.resetRetryCounter(io, allocator, .guest);
+    // Write upgrade command to shared memory for utmmd.
+    // utmmd reads cmd_data (temp file path) and cmd=UPGRADE, then:
+    //   1. Renames temp file → canonical path
+    //   2. Restarts utmm with the new binary
+    const h = shm.open() catch |err| {
+        std.log.err("[upgrade] shm.open failed: {} — cannot signal utmmd", .{err});
+        return false;
+    };
+    defer shm.detach(h);
 
-    // Apply upgrade and restart (never returns on success)
-    try applyUpgradeAndRestart(io, allocator, temp_path, info.hostname);
+    // Copy temp path into cmd_data (truncate if too long)
+    const max_len = @min(temp_path.len, h.cmd_data.len);
+    @memcpy(h.cmd_data[0..max_len], temp_path[0..max_len]);
+    if (temp_path.len < h.cmd_data.len) {
+        @memset(h.cmd_data[temp_path.len..], 0);
+    }
+    h.cmd = @intFromEnum(shm.Cmd.upgrade);
+    h.cmd_status = 0; // pending
+    h.utmm_state = @intFromEnum(shm.UtmmState.upgrading);
+
+    std.log.info("[upgrade] signaled utmmd: cmd=UPGRADE path={s}", .{temp_path});
+    return true;
 }
 
 /// Send a file as chunked transfer (download): open file, read MSS-aligned chunks,
@@ -2015,9 +1999,6 @@ pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig
             std.log.warn("[guest] chdir to /opt/utmm failed", .{});
         }
     }
-
-    // Windows: handle pending upgrade from a previous auto-upgrade attempt
-    _ = svc.checkPendingUpgradeWindows(io, gpa);
 
     // Mesh session loop — persistent KCP tunnel, real-time push.
     // UpgradeSignal allows mesh LSA version check to signal the main loop

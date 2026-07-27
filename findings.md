@@ -4,6 +4,165 @@
 
 ---
 
+## Phase 75: utmmd 监督进程架构 — 实现完成 (2026-07-28)
+
+### 实现总结
+
+Phase 75 全部 7 个编码任务（355-361）已完成，部署验证（362）待进行。核心变更：
+- **新建**: `src/shm.zig` (~400行) + `src/utmmd.zig` (~600行)
+- **重构**: `src/svc.zig` (净减 ~240行)
+- **修改**: `src/main.zig` (+170行) + `src/broadcast.zig` (-40行) + `build.zig` (+25行)
+- **测试**: 166/166 通过
+
+### Finding 148: Zig 0.16.0 shm/mmap 跨平台 API 彻底失效 (Implementation)
+
+Zig 0.16.0 不仅移除了个别函数，其 `posix.O`、`posix.PROT`、`posix.MAP` 等 packed struct 在不同平台（macOS vs Linux）有完全不同的字段布局，无法编写跨平台代码。
+
+**解决方案**: 完全绕过 Zig 标准库，使用原始 `extern "c"` 函数声明 + POSIX 原始常量：
+
+```zig
+// 不使用 std.posix.mmap / std.posix.O / std.posix.PROT
+// 改用原始 extern + 常量
+extern "c" fn shm_open(name: [*:0]const u8, oflag: c_int, mode: c_uint) c_int;
+extern "c" fn mmap(addr: ?*anyopaque, length: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) ?*anyopaque;
+
+const O_CREAT = 0o100;    // macOS/Linux 通用
+const O_RDWR = 0o2;
+const PROT_READ = 0x1;
+const PROT_WRITE = 0x2;
+const MAP_SHARED = 0x0001;
+```
+
+**影响**: `shm.zig` 中所有 POSIX 操作均使用此模式，避免平台条件编译。
+
+### Finding 149: volatile 指针需 @volatileCast 才能用于 @atomicStore/@ptrCast (Implementation)
+
+Zig 0.16.0 中 `shm.open()` 返回 `*volatile ShmLayout`（mmap 映射内存）。`@atomicStore` 和 `@ptrCast` 不接受 volatile 指针。
+
+**解决方案**: 对 volatile 字段直接赋值（`h.utmm_heartbeat = now`），对齐的 u32/u64 在 ARM64/x86_64 上天然原子。不需要 `@atomicStore`。
+
+### Finding 150: macOS fork/exec 后 shm 访问 (Architecture)
+
+经测试确认：`fork()` 后子进程继承父进程的 mmap 映射（包括 MAP_SHARED），但 `execve()` 后映射丢失。因此 utmmd 必须使用 **命名** 共享内存（`shm_open`），utmm 通过相同名称 `shm.open()` 获取映射。
+
+### Finding 151: utmmd 安装优化 — 当前仅做存在性检查 (Implementation)
+
+原计划在 `utmm.conf` 中存储 `utmmd_sha256` + `utmmd_args` 实现 hash 比对优化。当前实现简化为：
+- `--install`：总是强制提取 utmmd（`extractUtmmd`）
+- `ensure`（自动启动服务时）：仅检查 utmmd 文件是否存在（`extractUtmmdIfMissing`），不存在才提取
+
+后续可加 hash 比对避免不必要覆盖，但当前方案已正确工作。
+
+### Finding 152: `--svc` 路径简化 (Design)
+
+原设计中 utmm `--svc` 需 macOS `checkRetryLimit` + Windows `winServiceRun` 分发。重构后：
+- utmmd 拥有 SCM 分发（Windows `StartServiceCtrlDispatcherW` 在 utmmd.zig 中）
+- utmm `--svc` 仅做：shm 连接 → 心跳线程启动 → 运行主循环 → 清理
+- macOS retry counter、Windows SCM 代码已从 svc.zig 删除
+
+---
+
+### Finding 140: 自动升级启动权冲突根因分析 (Architecture)
+
+Phase 72-74 修复了 5 个自动升级 bug（Finding 123/129/135/138/139），但这些都是治标。根本问题在于架构设计错误：
+
+**系统保活与自升级的不可调和冲突**：
+
+```
+系统服务管理器（launchd KeepAlive / systemd Restart=on-failure / SCM sc failure）
+  ↓ 保活（5s 间隔自动重启）
+utmm（直接作为服务运行）
+  ↓ 升级时
+utmm-new --install → stop → kill → selfCopy → install → start
+                     ↑_____ 时间窗口：系统可能在 stop 和 start 之间重启旧版本 _____↑
+```
+
+三个平台的保活配置：
+- macOS: `KeepAlive SuccessfulExit=false` + `ThrottleInterval=5`
+- Linux: `Restart=on-failure` + `RestartSec=5` + `StartLimitBurst=3`
+- Windows: `sc failure actions=restart/5000/restart/5000/restart/5000`
+
+**为什么当前修复不够**：
+1. PID 感知 killAllUtmm (Fix A) — 解决不了系统管理器重新启动新进程
+2. waitForProcessExit (Fix B) — 只是缩小了时间窗口，没有消除
+3. start() 重试 (Fix C) — 处理症状而非根因
+4. exit(42) (Fix D) — 依赖系统保活来重启，本质上存在矛盾（一边依赖保活重启，一边和保活争抢）
+
+**解决方案原理**：将生命周期管理从系统服务管理器完全剥离到 utmmd 监督进程。系统只负责开机启动 utmmd（无保活），utmmd 拥有 utmm 的绝对控制权。
+
+**影响范围**：~600 行新代码（shm.zig + utmmd.zig），~300 行修改（svc.zig 简化 + broadcast.zig 升级流程 + main.zig 安装流程），~30 行构建变更（build.zig）。
+
+### Finding 141: shm_open 在 Zig 0.16.0 中的可用性
+
+Zig 0.16.0 移除了部分 `std.c` 函数（如 `strerror`），但 POSIX `shm_open`/`shm_unlink` 仍可通过 `@extern` 声明访问。跨平台方案：
+
+| 平台 | 创建 | 映射 | 清理 |
+|------|------|------|------|
+| Linux | `@extern fn shm_open(...)` | `std.posix.mmap()` | `@extern fn shm_unlink(...)` |
+| macOS | 同上（在 libSystem 中） | 同上 | 同上 |
+| Windows | `CreateFileMappingW` + `MapViewOfFile` | 同上 | `UnmapViewOfFile` + `CloseHandle` |
+
+**命名**：POSIX 用 `/utmmd-shm`（shm_open 的抽象命名空间，不是文件系统路径）。Windows 用 `Global\utmmd-shm`（session 0 服务可见）。
+
+### Finding 142: utmmd 需要 Windows SCM 分发
+
+Windows 服务必须通过 `StartServiceCtrlDispatcherW` 启动。utmmd 作为系统服务仍需要 SCM 集成，但比当前 `svc.winServiceRun` 简单得多——handler 只需要处理 `SERVICE_CONTROL_STOP`（杀 utmm 后退出）。不需要 `shutdown_flag` 线程协调，因为 utmmd 本身就监督 utmm 生命周期。
+
+### Finding 143: @embedFile 路径约束
+
+Zig 的 `@embedFile` 路径相对于源文件所在目录。要在 `src/main.zig` 中 `@embedFile("embed/utmmd.bin")`，需要：
+1. 构建 utmmd 先于 utmm
+2. 将 utmmd 二进制复制到 `src/embed/utmmd.bin`
+3. `src/embed/` 加入 `.gitignore`
+4. utmm 构建步骤依赖复制步骤
+
+两步构建是 Zig 构建系统的标准模式，`Compile.getEmittedBin()` 返回 `LazyPath`，可用于后续步骤。
+
+### Finding 144: macOS 上 fork+exec 后 MAP_SHARED 匿名映射不保留
+
+POSIX `mmap(MAP_ANONYMOUS | MAP_SHARED)` 在 fork 后子进程可见，但 execve 后丢失。因此必须用 `shm_open` 创建命名共享内存（而不是匿名 mmap + fork 继承）。utmmd 先创建命名 shm，然后启动 utmm，utmm 通过相同名称打开。
+
+---
+
+## Zig 0.16.0 shm/mmap API 适配 (Phase 75)
+
+### Finding 145: `std.posix.mmap` 原型
+
+Zig 0.16.0 中 `std.posix.mmap` 签名：
+```zig
+pub fn mmap(
+    ptr: ?[*]align(std.mem.page_size) u8,
+    length: usize,
+    prot: u32,
+    flags: u32,
+    fd: std.posix.fd_t,
+    offset: u64,
+) std.posix.MMapError![*]align(std.mem.page_size) u8
+```
+
+`PROT.READ | PROT.WRITE`，`MAP.SHARED`，`fd` 来自 `shm_open`。
+
+### Finding 147: utmmd 安装优化 — Hash + 配置文件比对
+
+utmmd 设计为极少变化的稳定组件。每次 `--install` 都重启 utmmd 服务是不必要的。通过安装前比对，决定走"全量更新"还是"仅重启 utmm"。
+
+**比对维度**：
+1. **二进制 Hash**：`SHA256(/opt/utmmd/utmmd)` vs comptime 内嵌 utmmd SHA256 — 不同则需替换
+2. **服务参数**：`/opt/utmm/utmm.conf` 中存储的 `utmmd_sha256` + `utmmd_args`，与当前参数比对 — 不同则需重写配置
+
+**存储**：复用现有 `utmm.conf` 配置文件（`--save-config` 已在使用），新增两个字段。`loadConfig()` 当前是桩函数，Phase 75 中实现基本 key=value 解析。
+
+### Finding 146: Windows `CreateFileMappingW` 与 `MapViewOfFile`
+
+Windows 等价于 mmap 的 API：
+```zig
+const INVALID_HANDLE_VALUE: windows.HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+const h = CreateFileMappingW(INVALID_HANDLE_VALUE, null, PAGE_READWRITE, 0, 4096, name);
+const ptr = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, 4096);
+```
+
+`name` 为 `L("Global\\utmmd-shm")` 确保 session 0 服务可见。需要在 `svc.zig` 中手动 extern 声明（Zig 0.16.0 移除了一些 Windows API 声明）。
+
 ## Phase 71: 版本号单文件管理 + GitHub 检测 (2026-07-28)
 
 ### Finding 130: `@embedFile` 路径必须位于 package 内
