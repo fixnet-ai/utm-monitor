@@ -318,17 +318,17 @@ utmm --version                       # Print version and exit
 - Clean working tree (no uncommitted changes)
 
 ### Step 1: Determine version
-Read `src/protocol.zig` for the current version (VERSION constant). Ask the user
-what the next version should be (suggest patch bump, e.g. `0.11.10` → `0.11.11`).
+Read `src/ver.txt` for the current version. Ask the user what the next version
+should be (suggest patch bump, e.g. `0.11.10` → `0.11.11`).
 If already bumped and not yet tagged, use that.
 
 ### Step 2: Bump version (if needed)
-Update two files:
-- `src/protocol.zig`: `pub const VERSION = "X.Y.Z";`
-- `build.zig.zon`: `.version = "X.Y.Z",`
+Update one file:
+- `src/ver.txt`: change version number (e.g. `0.11.18` → `0.11.19`)
 
-> `build.zig.zon` version is for the Zig package manager. Single source of truth
-> for runtime version is `src/protocol.zig`.
+`build.zig.zon` version is permanently `0.0.0` (never changes). Runtime version
+comes from `src/ver.txt` via `@embedFile` at compile time — single source of truth.
+Install scripts (`install.sh`/`install.bat`) also read `ver.txt` at runtime.
 
 ### Step 3: Commit & tag
 ```bash
@@ -378,7 +378,7 @@ Host never pushes upgrades — the Guest is fully self-upgrading.
 ```
 src/
 ├── main.zig           # Entry point, CLI parsing, mode dispatch (+ priv.zig isAdmin)
-├── protocol.zig       # Protocol constants, VERSION, deployment filename mapping (+ ver.zig)
+├── protocol.zig       # Protocol constants, VERSION via @embedFile("ver.txt"), deployment filename mapping
 ├── tunproto.zig       # Tunnel protocol over KCP: 10+ msg types, build/parse, chunked file transfer
 ├── kcp.zig            # KCP reliable ARQ protocol (matches C reference skywind3000/kcp)
 ├── mesh.zig           # LSA mesh networking: UDP broadcast, KCP session mgmt, relay

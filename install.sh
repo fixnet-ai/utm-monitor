@@ -27,7 +27,12 @@ set -e
 CANONICAL_DIR="/opt/utmm"
 BINARY_NAME="utmm"
 DOWNLOAD_URL="https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.zip"
-VERSION="0.11.18"
+# Read version from ver.txt (bundled in release zip); fall back for curl-pipe-to-sh
+if [ -f "ver.txt" ]; then
+    VERSION="$(tr -d '\n\r' < ver.txt)"
+else
+    VERSION="latest"
+fi
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 

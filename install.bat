@@ -26,7 +26,12 @@ setlocal enabledelayedexpansion
 set "CANONICAL_DIR=C:\opt\utmm"
 set "BINARY_NAME=utmm.exe"
 set "DOWNLOAD_URL=https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.zip"
-set "VERSION=0.11.18"
+:: Read version from ver.txt if present (bundled in release zip); fallback for standalone
+if exist "ver.txt" (
+    for /f "usebackq delims=" %%A in ("ver.txt") do set "VERSION=%%A"
+) else (
+    set "VERSION=latest"
+)
 
 :: ── admin check ─────────────────────────────────────────────────────────────
 

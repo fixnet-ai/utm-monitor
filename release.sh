@@ -122,10 +122,12 @@ build_target aarch64-linux-musl   utmm-aarch64-linux
 # ═══════════════════════════════════════════════════════════════════════════════
 
 echo ""
-echo "==> Adding install scripts..."
+echo "==> Adding install scripts + ver.txt..."
 cp install.sh install.bat release/
+cp src/ver.txt release/
 echo "  install.sh → release/"
 echo "  install.bat → release/"
+echo "  ver.txt → release/"
 
 echo ""
 echo "==> Creating utmm.zip..."

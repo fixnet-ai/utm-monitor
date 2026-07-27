@@ -651,6 +651,75 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
 // Host daemon (--host): Mesh LSA + KCP tunnels + IPC server
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Check that a version string looks like "X.Y.Z" (digits only).
+/// Rejects anything that doesn't match — human-verification pages, HTML, etc.
+fn isValidVersion(ver: []const u8) bool {
+    if (ver.len < 5) return false; // minimum: "0.0.0"
+    var parts = std.mem.splitSequence(u8, ver, ".");
+    var count: u8 = 0;
+    while (parts.next()) |part| : (count += 1) {
+        if (part.len == 0) return false;
+        for (part) |c| {
+            if (c < '0' or c > '9') return false;
+        }
+        if (count > 3) return false;
+    }
+    return count == 3;
+}
+
+/// Fire-and-forget OS thread: check GitHub for the latest release version.
+/// On mismatch, logs "New version X.Y.Z available on github" and returns.
+/// Never triggers any upgrade — purely informational.
+fn checkGitHubVersion() void {
+    // Own Io instance for HTTP request in this detached thread.
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const uri = std.Uri.parse("https://api.github.com/repos/fixnet-ai/utm-monitor/releases/latest") catch return;
+    // Allow up to 5 redirects — GitHub may issue 302.
+    var req = client.request(.GET, uri, .{ .redirect_behavior = .init(5) }) catch return;
+    defer req.deinit();
+
+    req.sendBodiless() catch return;
+
+    var redirect_buf: [4096]u8 = undefined;
+    _ = req.receiveHead(&redirect_buf) catch return;
+
+    // Read response body — use req.reader.bodyReader() directly since
+    // Response.reader() skips GET (checks requestHasBody, not responseHasBody).
+    var body_buf: [4096]u8 = undefined;
+    const body_reader = req.reader.bodyReader(&body_buf, req.response_transfer_encoding, req.response_content_length);
+
+    var body_data: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&body_data);
+    _ = body_reader.stream(&w, .limited(8192)) catch {};
+    const body = w.buffered();
+
+    // Parse "tag_name" from JSON response.
+    const tag_key = "\"tag_name\":\"";
+    if (std.mem.indexOf(u8, body, tag_key)) |start| {
+        const value_start = start + tag_key.len;
+        if (std.mem.indexOfScalar(u8, body[value_start..], '"')) |end| {
+            const tag = body[value_start .. value_start + end];
+            // Strip leading "v" (e.g. "v0.11.19" → "0.11.19")
+            const new_ver = if (tag.len > 0 and tag[0] == 'v') tag[1..] else tag;
+            // Validate version format — rejects human-verification pages, HTML, etc.
+            if (!isValidVersion(new_ver)) return;
+            if (!std.mem.eql(u8, new_ver, protocol.VERSION)) {
+                std.log.warn("[host] New version {s} available on github", .{new_ver});
+            }
+        }
+    }
+}
+
 fn startHost(
     block_io: std.Io,
     gpa: std.mem.Allocator,
@@ -662,6 +731,14 @@ fn startHost(
     const sd = serve_dir orelse "/opt/utmm";
     std.debug.print("[host] Host daemon starting (mesh UDP :{d})\n", .{mesh_port});
     std.debug.print("[host] Serve dir: {s}\n", .{sd});
+
+    // Spawn fire-and-forget GitHub version check thread.
+    // OS thread, detach immediately, runs once — no join needed.
+    if (std.Thread.spawn(.{}, checkGitHubVersion, .{})) |t| {
+        t.detach();
+    } else |_| {
+        // spawn failed — silently ignored
+    }
 
     // Initialize shared state (guest table + pending commands)
     var state = httpd.HostState.init(gpa);
@@ -1117,4 +1194,27 @@ test "genInit - windows has sc command" {
     try std.testing.expect(std.mem.indexOf(u8, script, "sc create") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "UTM-Monitor") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "C:\\opt\\utmm\\utmm.exe") != null);
+}
+
+test "isValidVersion - valid semver" {
+    try std.testing.expect(isValidVersion("0.11.18"));
+    try std.testing.expect(isValidVersion("1.0.0"));
+    try std.testing.expect(isValidVersion("10.20.30"));
+    try std.testing.expect(isValidVersion("0.0.0"));
+}
+
+test "isValidVersion - invalid" {
+    try std.testing.expect(!isValidVersion(""));
+    try std.testing.expect(!isValidVersion("0"));
+    try std.testing.expect(!isValidVersion("0.11"));
+    try std.testing.expect(!isValidVersion("0.11.18.1"));
+    try std.testing.expect(!isValidVersion("v0.11.18"));
+    try std.testing.expect(!isValidVersion("a.b.c"));
+    try std.testing.expect(!isValidVersion("0.11.alpha"));
+}
+
+test "isValidVersion - garbage (human verification page)" {
+    try std.testing.expect(!isValidVersion("<!DOCTYPE html>"));
+    try std.testing.expect(!isValidVersion("<html>captcha</html>"));
+    try std.testing.expect(!isValidVersion("Please verify you are human"));
 }

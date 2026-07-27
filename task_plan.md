@@ -25,12 +25,14 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 
 ## 当前状态
 
-- **版本**: v0.11.18（`src/protocol.zig`、`build.zig.zon`）
-- **源文件**: 16 个（`src/*.zig`）+ 2 skills（`zig`、`deploy`）
-- **测试**: 149/149 通过
+- **版本**: v0.11.18（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入）
+- **`build.zig.zon`**: `0.0.0`（永不再改）
+- **源文件**: 16 个（`src/*.zig`）+ 1 版本文件（`src/ver.txt`）+ 2 skills（`zig`、`deploy`）
+- **测试**: 166/166 通过
 - **部署**: macOS Host v0.11.18 ✅ | linuxvm v0.11.18 ✅ | macvm v0.11.18 ✅ | windowsvm v0.11.18 ✅ | winx64 v0.11.18 ✅
 - **健康检查**: 4/4 全部通过（status ✓ ping ✓ exec ✓）
 - **8 交叉编译目标**: aarch64/x86_64/x86 × linux-musl/macos/windows
+- **GitHub 版本检查**: Host 启动时 fire-and-forget OS 线程，支持 302 重定向，格式校验防污染
 
 ## 已完成阶段
 
@@ -57,6 +59,7 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 68 | 2026-07-27 | v0.11.18：修复 LSA restart 误判 — nonce 比较替代全 node_info 字符串比较 |
 | 69 | 2026-07-27 | ✅ 开发效率提升：二进制类型校验 + 一键部署 + 健康检查 + deploy skill |
 | 70 | 2026-07-27 | `--status` 增强：全部字段 + Host 显示 + role 字段区分 host/guest |
+| 71 | 2026-07-28 | 版本号单文件管理 + GitHub 新版本检测（OS线程 fire-and-forget） |
 
 ## 待修复
 
@@ -65,6 +68,26 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 123 | 🔴 CRITICAL | macOS 自动升级后 `exit(0)` + `KeepAlive SuccessfulExit=false` → 服务永久停止 |
 | 124 | ✅ 已修复 | LSA restart 用全 node_info 比较 → 动态字段(status:)触发误判 → nonce 比较 |
 | 129 | 🔴 | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
+
+## Phase 71: 版本号单文件管理 + GitHub 新版本检测 ✅ (2026-07-28)
+
+| # | 任务 | 描述 | 状态 |
+|---|------|------|------|
+| 334 | `ver.txt` + `build.zig.zon` | 新建 `src/ver.txt`（0.11.18 无换行），`build.zig.zon` → `0.0.0` 永不动 | ✅ |
+| 335 | `protocol.zig` @embedFile | `VERSION = "0.11.18"` → `@embedFile("ver.txt")` + comptime strip 换行 | ✅ |
+| 336 | release.sh + install 适配 | `cp src/ver.txt release/`，install.sh/bat 动态读版本 | ✅ |
+| 337 | GitHub 新版本检测 | `checkGitHubVersion()` OS 线程 fire-and-forget，5 次重定向，`isValidVersion()` 格式校验 | ✅ |
+| 338 | 编译测试验证 | zig build ✅，166/166 测试通过 ✅ | ✅ |
+
+### 变更摘要
+
+- **`src/ver.txt`** 为版本号唯一来源 — `@embedFile` 编译期嵌入，`build.zig.zon` 永为 `0.0.0`
+- **`checkGitHubVersion()`** — Host 启动时 spawn OS 线程，`std.http.Client` GET GitHub API
+  - `redirect_behavior = .init(5)` — 跟随最多 5 次重定向
+  - `isValidVersion()` — 严格校验 `X.Y.Z` 格式（纯数字），拒绝人机校验页面/HTML
+  - 完全 fire-and-forget：detach 后不 join，失败静默返回
+  - 日志：`[host] New version X.Y.Z available on github`（仅新版本时 warn）
+- **`src/main.zig` comptime 块加 `host.zig`** — 其 7 个测试（Platform/genInit/isValidVersion）之前从未编译进测试二进制
 
 ## Phase 69: 开发效率提升 ✅
 

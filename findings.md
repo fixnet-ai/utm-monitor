@@ -1,6 +1,25 @@
-# Findings: v0.11.16
+# Findings: v0.11.18
 
 记录重要的技术发现、Bug、设计决策和 Zig 0.16.0 API 笔记。
+
+---
+
+## Phase 71: 版本号单文件管理 + GitHub 检测 (2026-07-28)
+
+### Finding 130: `@embedFile` 路径必须位于 package 内
+Zig 0.16.0 的 `@embedFile` 拒绝 `..` 路径遍历。文件必须在 `build.zig.zon` 的 `paths` 声明目录内。解决方案：`ver.txt` 放入 `src/`，`@embedFile("ver.txt")` 从 `src/protocol.zig` 同目录引用。
+
+### Finding 131: `std.http.Client` 默认不跟随重定向
+`RequestOptions.redirect_behavior` 默认为 `.not_allowed`（0 次）。GitHub API 频繁 302 → 需 `redirect_behavior = .init(5)`。
+
+### Finding 132: `Response.reader()` 无法用于 GET 请求体
+`Response.reader()` 内部检查 `!req.method.requestHasBody()`，对 GET 返回 `.ending`（空 reader）。因为 GET 的 `requestHasBody` 为 false，但 `responseHasBody` 为 true。变通：直接使用 `req.reader.bodyReader(&buf, req.response_transfer_encoding, req.response_content_length)`。
+
+### Finding 133: `Io.Writer.stream()` 的 `limit` 参数类型为 `Io.Limit`
+不是整数，需用 `.limited(n)` 或 `.nothing` / `.unlimited`。
+
+### Finding 134: `host.zig` 测试从未被编译
+`main.zig` 的 comptime 块未包含 `@import("host.zig")`，导致 `host.zig` 中所有 `test` 块从未编译进测试二进制。加一行后新增 7 测试（Platform/genInit/isValidVersion），总测试数 149→166。
 
 ---
 

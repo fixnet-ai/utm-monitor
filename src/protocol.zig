@@ -78,8 +78,13 @@ pub fn parseDiscoveryVersion(data: []const u8) ?[]const u8 {
 pub const HOSTS_MARKER_BEGIN = "# UTM-MONITOR-BEGIN";
 pub const HOSTS_MARKER_END = "# UTM-MONITOR-END";
 
-/// Program version number — bump to trigger auto-upgrade
-pub const VERSION = "0.11.18";
+/// Program version number — bump to trigger auto-upgrade.
+/// Sourced from ver.txt at compile time via @embedFile.
+const embedded_ver = @embedFile("ver.txt");
+pub const VERSION: []const u8 = if (embedded_ver.len > 0 and embedded_ver[embedded_ver.len - 1] == '\n')
+    embedded_ver[0 .. embedded_ver.len - 1]
+else
+    embedded_ver[0..embedded_ver.len :0];
 
 /// Parse "IP:port" string to net.IpAddress for local testing peer mesh.
 /// Returns null on any parse failure.

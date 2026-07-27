@@ -3,11 +3,40 @@
 ## 当前状态
 
 - **分支**: `main`
-- **版本**: v0.11.18（`src/protocol.zig` VERSION、`build.zig.zon`）
-- **测试**: 149/149 通过
+- **版本**: v0.11.18（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入；`build.zig.zon` 永为 `0.0.0`）
+- **测试**: 166/166 通过
 - **部署**: macOS Host v0.11.18 ✅ | linuxvm v0.11.18 ✅ | macvm v0.11.18 ✅ | windowsvm v0.11.18 ✅ | winx64 v0.11.18 ✅
 - **健康检查**: 4/4 全部通过（`--verify` 全绿 ✓）
 - **状态增强**: Host + 4 Guest 全部显示，role/status/last_seen 正确
+- **GitHub 检查**: Host 启动时 fire-and-forget 线程，支持重定向+格式校验
+
+## Phase 71: 版本号单文件管理 + GitHub 新版本检测 (2026-07-28)
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 334 | `src/ver.txt`（0.11.18 无换行）+ `build.zig.zon` → `0.0.0` | ✅ |
+| 335 | `protocol.zig`: `@embedFile("ver.txt")` + comptime strip 换行 | ✅ |
+| 336 | `release.sh` 打包 ver.txt；`install.sh`/`install.bat` 动态读版本 | ✅ |
+| 337 | `checkGitHubVersion()` — OS 线程 fire-and-forget，5 redirect，格式校验 | ✅ |
+| 338 | 构建+测试 166/166 通过 | ✅ |
+
+### 变更摘要
+
+**版本号单文件管理**:
+- `src/ver.txt` — 版本号唯一来源，内容 `0.11.18`（无末尾换行）
+- `build.zig.zon` — 永为 `0.0.0`，不再改动
+- `protocol.zig` — `@embedFile("ver.txt")` 编译期嵌入，comptime strip 末尾换行
+- `release.sh` — `cp src/ver.txt release/`
+- `install.sh`/`install.bat` — 从 `ver.txt` 动态读版本，curl 流程回退 `"latest"`
+
+**GitHub 新版本检测** (`src/host.zig`):
+- `checkGitHubVersion()` — 独立 OS 线程，spawn+detach，fire-and-forget
+- 支持 302 重定向（`redirect_behavior = .init(5)`）
+- `isValidVersion()` 格式校验 — 纯数字 `X.Y.Z`，拒绝人机校验页面
+- 日志：`[host] New version X.Y.Z available on github`（仅新版本时）
+
+**附带修复**:
+- `src/main.zig` comptime 块加 `@import("host.zig")` → 7 个遗漏测试生效
 
 ## Phase 70: `--status` 增强 (2026-07-27)
 

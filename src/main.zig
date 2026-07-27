@@ -24,6 +24,7 @@ comptime {
     _ = @import("tunproto.zig");
     _ = @import("lock.zig");
     _ = @import("mcp.zig");
+    _ = @import("host.zig");
     _ = svc;
     _ = fail;
 }
