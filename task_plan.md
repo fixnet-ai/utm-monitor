@@ -26,9 +26,10 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 ## 当前状态
 
 - **版本**: v0.11.18（`src/protocol.zig`、`build.zig.zon`）
-- **源文件**: 16 个（`src/*.zig`）
-- **测试**: 149/149 通过
-- **部署**: macOS Host v0.11.18 待部署 | 4 Guest 待自动升级验证
+- **源文件**: 16 个（`src/*.zig`）+ 2 skills（`zig`、`deploy`）
+- **测试**: 159/159 通过
+- **部署**: macOS Host v0.11.18 ✅ | linuxvm v0.11.18 ✅ | macvm v0.11.18 ✅ | windowsvm v0.11.18 ✅ | winx64 v0.11.18 ✅
+- **健康检查**: 4/4 全部通过（status ✓ ping ✓ exec ✓）
 - **8 交叉编译目标**: aarch64/x86_64/x86 × linux-musl/macos/windows
 
 ## 已完成阶段
