@@ -840,12 +840,13 @@ pub const Mesh = struct {
 
         // ── Guest-side: Track Host epoch for KCP conv validation ──
         // Extract the Host's epoch (per-process nonce) from LSA node_info.
-        // Only track "role:host" LSAs when we are a Guest (host_gateway_ip is set).
+        // Only track "role:host" LSAs when we are a Guest (our own LSA
+        // has "role:guest" or no role field — NOT "role:host").
         // All nodes carry epoch:{nonce} in their node_info, but:
         // - Only the Host's epoch matters for conv validation (Host initiates KCP).
-        // - host_gateway_ip.len > 0 ensures only Guests track it — prevents a
-        //   multi-Host scenario where Host A sets expected_conv from Host B's LSA.
-        if (self.host_gateway_ip.len > 0 and std.mem.indexOf(u8, decoded.node_info, "role:host") != null) {
+        // - Self-role check prevents a multi-Host scenario where Host A
+        //   sets expected_conv from Host B's LSA.
+        if (std.mem.indexOf(u8, self.node_info, "role:host") == null and std.mem.indexOf(u8, decoded.node_info, "role:host") != null) {
             if (parseEpoch(decoded.node_info)) |epoch| {
                 const epoch_changed = self.host_epoch == null or self.host_epoch.? != epoch;
                 if (epoch_changed) {
