@@ -61,13 +61,13 @@ if "%ARCH%"=="" set "ARCH=%PROCESSOR_ARCHITECTURE%"
 
 if /i "%ARCH%"=="AMD64" (
     set "PLATFORM_ARCH=x86_64"
-    set "ZIP_BINARY=utmm-x86_64-windows.exe"
+    set "ZIP_BINARY=utmm-x86_64-windows-%VERSION%.exe"
 ) else if /i "%ARCH%"=="ARM64" (
     set "PLATFORM_ARCH=aarch64"
-    set "ZIP_BINARY=utmm-aarch64-windows.exe"
+    set "ZIP_BINARY=utmm-aarch64-windows-%VERSION%.exe"
 ) else if /i "%ARCH%"=="x86" (
     set "PLATFORM_ARCH=x86"
-    set "ZIP_BINARY=utmm-x86-windows.exe"
+    set "ZIP_BINARY=utmm-x86-windows-%VERSION%.exe"
 ) else (
     echo ERROR: Unsupported architecture: %ARCH%
     echo Supported: AMD64, ARM64, x86

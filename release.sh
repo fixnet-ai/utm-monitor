@@ -74,6 +74,11 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
+# Read version number from ver.txt (e.g. "0.11.19") for filename suffix
+VERSION_NUM=$(tr -d '\n\r' < src/ver.txt)
+echo "[OK] ver.txt version: ${VERSION_NUM}"
+echo ""
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tests
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -108,14 +113,14 @@ build_target() {
     printf "    %8s  %s\n" "$(wc -c < "release/$bin" | tr -d ' ')" "$bin"
 }
 
-build_target x86_64-windows       utmm-x86_64-windows.exe
-build_target aarch64-windows      utmm-aarch64-windows.exe
-build_target x86-windows-gnu      utmm-x86-windows.exe
-build_target x86_64-macos         utmm-x86_64-macos
-build_target aarch64-macos        utmm-aarch64-macos
-build_target x86-linux-musl       utmm-x86-linux
-build_target x86_64-linux-musl    utmm-x86_64-linux
-build_target aarch64-linux-musl   utmm-aarch64-linux
+build_target x86_64-windows       "utmm-x86_64-windows-${VERSION_NUM}.exe"
+build_target aarch64-windows      "utmm-aarch64-windows-${VERSION_NUM}.exe"
+build_target x86-windows-gnu      "utmm-x86-windows-${VERSION_NUM}.exe"
+build_target x86_64-macos         "utmm-x86_64-macos-${VERSION_NUM}"
+build_target aarch64-macos        "utmm-aarch64-macos-${VERSION_NUM}"
+build_target x86-linux-musl       "utmm-x86-linux-${VERSION_NUM}"
+build_target x86_64-linux-musl    "utmm-x86_64-linux-${VERSION_NUM}"
+build_target aarch64-linux-musl   "utmm-aarch64-linux-${VERSION_NUM}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Package

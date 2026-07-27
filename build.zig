@@ -1,14 +1,22 @@
 const std = @import("std");
 
-/// Map build target to simplified deployment filename
-/// See utm-vm/MANUAL.md §6.x for the full compatibility matrix
+/// Map build target to versioned deployment filename.
+/// Reads ver.txt via @embedFile at build time and appends '-VERSION' suffix.
+/// Windows: version is inserted before .exe (utmm-x86_64-windows-0.11.19.exe).
+/// See utm-vm/MANUAL.md §6.x for the full compatibility matrix.
 ///
 /// 32-bit x86 Windows uses x86-windows-gnu target triple (not x86-windows).
 /// Native x86-windows pulls in MinGW _system@4 which triggers a linker warning
 /// that Zig 0.16.0 promotes to error. x86-windows-gnu avoids this — the binary
 /// is valid PE32 i386 and runs correctly despite the build summary showing "failure".
-fn deploymentFilename(target: std.Target) []const u8 {
-    return switch (target.cpu.arch) {
+fn deploymentFilename(b: *std.Build, target: std.Target) []const u8 {
+    const embedded_ver = @embedFile("src/ver.txt");
+    const version = if (embedded_ver.len > 0 and embedded_ver[embedded_ver.len - 1] == '\n')
+        embedded_ver[0 .. embedded_ver.len - 1]
+    else
+        embedded_ver[0..embedded_ver.len :0];
+
+    const base = switch (target.cpu.arch) {
         .x86 => switch (target.os.tag) {
             .linux => "utmm-x86-linux",
             .windows => "utmm-x86-windows.exe",
@@ -28,6 +36,16 @@ fn deploymentFilename(target: std.Target) []const u8 {
         },
         else => "utmm",
     };
+
+    // Native/default binary stays as plain "utmm" (no version suffix).
+    // Only cross-compiled platform targets get the version suffix.
+    if (std.mem.eql(u8, base, "utmm")) return "utmm";
+
+    if (target.os.tag == .windows) {
+        // base ends with ".exe" — insert version before it
+        return b.fmt("{s}-{s}.exe", .{ base[0 .. base.len - 4], version });
+    }
+    return b.fmt("{s}-{s}", .{ base, version });
 }
 
 pub fn build(b: *std.Build) void {
@@ -54,7 +72,7 @@ pub fn build(b: *std.Build) void {
     // Deployment binary with unified filename (e.g. utmm-aarch64-linux, utmm-x86_64-macos, utmm-x86_64-windows.exe)
     // Host reads serve-dir by these names; protocol.deploymentFilename() does the mapping at runtime
     {
-        const target_filename = deploymentFilename(target.result);
+        const target_filename = deploymentFilename(b, target.result);
         const target_install = b.addInstallBinFile(exe.getEmittedBin(), target_filename);
         target_install.step.dependOn(&exe.step);
         b.getInstallStep().dependOn(&target_install.step);

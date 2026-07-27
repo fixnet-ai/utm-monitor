@@ -96,22 +96,24 @@ pub fn parsePeerMeshAddr(s: []const u8) ?std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parse(ip, port) catch null;
 }
 
-/// Map Guest target triple → deployment binary filename in serve-dir
-/// Returns null for unknown targets (Host skips auto-upgrade in that case)
+/// Map Guest target triple → versioned deployment binary filename in serve-dir.
+/// Filenames include the version suffix (e.g. utmm-aarch64-linux-0.11.19).
+/// The version suffix ensures a Host never serves stale binaries to Guests.
+/// Returns null for unknown targets (Host skips auto-upgrade in that case).
 pub fn deploymentFilename(target: []const u8) ?[]const u8 {
     const mappings = [_]struct { target: []const u8, filename: []const u8 }{
-        .{ .target = "aarch64-linux-musl", .filename = "utmm-aarch64-linux" },
-        .{ .target = "x86_64-linux-musl",  .filename = "utmm-x86_64-linux" },
-        .{ .target = "x86-linux-musl",     .filename = "utmm-x86-linux" },
-        .{ .target = "aarch64-macos",      .filename = "utmm-aarch64-macos" },
-        .{ .target = "x86_64-macos",       .filename = "utmm-x86_64-macos" },
-        .{ .target = "x86-windows",        .filename = "utmm-x86-windows.exe" },
-        .{ .target = "x86_64-windows",     .filename = "utmm-x86_64-windows.exe" },
-        .{ .target = "aarch64-windows",    .filename = "utmm-aarch64-windows.exe" },
+        .{ .target = "aarch64-linux-musl", .filename = "utmm-aarch64-linux-" ++ VERSION },
+        .{ .target = "x86_64-linux-musl",  .filename = "utmm-x86_64-linux-" ++ VERSION },
+        .{ .target = "x86-linux-musl",     .filename = "utmm-x86-linux-" ++ VERSION },
+        .{ .target = "aarch64-macos",      .filename = "utmm-aarch64-macos-" ++ VERSION },
+        .{ .target = "x86_64-macos",       .filename = "utmm-x86_64-macos-" ++ VERSION },
+        .{ .target = "x86-windows",        .filename = "utmm-x86-windows-" ++ VERSION ++ ".exe" },
+        .{ .target = "x86_64-windows",     .filename = "utmm-x86_64-windows-" ++ VERSION ++ ".exe" },
+        .{ .target = "aarch64-windows",    .filename = "utmm-aarch64-windows-" ++ VERSION ++ ".exe" },
         // Legacy (glibc Linux, pre-musl)
-        .{ .target = "aarch64-linux",      .filename = "utmm-aarch64-linux" },
-        .{ .target = "x86_64-linux",       .filename = "utmm-x86_64-linux" },
-        .{ .target = "x86-linux",          .filename = "utmm-x86-linux" },
+        .{ .target = "aarch64-linux",      .filename = "utmm-aarch64-linux-" ++ VERSION },
+        .{ .target = "x86_64-linux",       .filename = "utmm-x86_64-linux-" ++ VERSION },
+        .{ .target = "x86-linux",          .filename = "utmm-x86-linux-" ++ VERSION },
     };
     for (mappings) |m| {
         if (std.mem.eql(u8, target, m.target)) return m.filename;
@@ -120,19 +122,19 @@ pub fn deploymentFilename(target: []const u8) ?[]const u8 {
 }
 
 test "deploymentFilename - known targets" {
-    try std.testing.expectEqualStrings("utmm-aarch64-linux", deploymentFilename("aarch64-linux-musl").?);
-    try std.testing.expectEqualStrings("utmm-x86_64-linux", deploymentFilename("x86_64-linux-musl").?);
-    try std.testing.expectEqualStrings("utmm-x86_64-macos", deploymentFilename("x86_64-macos").?);
-    try std.testing.expectEqualStrings("utmm-aarch64-macos", deploymentFilename("aarch64-macos").?);
-    try std.testing.expectEqualStrings("utmm-x86-windows.exe", deploymentFilename("x86-windows").?);
-    try std.testing.expectEqualStrings("utmm-x86_64-windows.exe", deploymentFilename("x86_64-windows").?);
-    try std.testing.expectEqualStrings("utmm-aarch64-windows.exe", deploymentFilename("aarch64-windows").?);
+    try std.testing.expectEqualStrings("utmm-aarch64-linux-" ++ VERSION, deploymentFilename("aarch64-linux-musl").?);
+    try std.testing.expectEqualStrings("utmm-x86_64-linux-" ++ VERSION, deploymentFilename("x86_64-linux-musl").?);
+    try std.testing.expectEqualStrings("utmm-x86_64-macos-" ++ VERSION, deploymentFilename("x86_64-macos").?);
+    try std.testing.expectEqualStrings("utmm-aarch64-macos-" ++ VERSION, deploymentFilename("aarch64-macos").?);
+    try std.testing.expectEqualStrings("utmm-x86-windows-" ++ VERSION ++ ".exe", deploymentFilename("x86-windows").?);
+    try std.testing.expectEqualStrings("utmm-x86_64-windows-" ++ VERSION ++ ".exe", deploymentFilename("x86_64-windows").?);
+    try std.testing.expectEqualStrings("utmm-aarch64-windows-" ++ VERSION ++ ".exe", deploymentFilename("aarch64-windows").?);
 }
 
 test "deploymentFilename - legacy glibc targets" {
-    try std.testing.expectEqualStrings("utmm-aarch64-linux", deploymentFilename("aarch64-linux").?);
-    try std.testing.expectEqualStrings("utmm-x86_64-linux", deploymentFilename("x86_64-linux").?);
-    try std.testing.expectEqualStrings("utmm-x86-linux", deploymentFilename("x86-linux").?);
+    try std.testing.expectEqualStrings("utmm-aarch64-linux-" ++ VERSION, deploymentFilename("aarch64-linux").?);
+    try std.testing.expectEqualStrings("utmm-x86_64-linux-" ++ VERSION, deploymentFilename("x86_64-linux").?);
+    try std.testing.expectEqualStrings("utmm-x86-linux-" ++ VERSION, deploymentFilename("x86-linux").?);
 }
 
 test "deploymentFilename - unknown target" {

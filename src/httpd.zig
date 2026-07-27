@@ -805,7 +805,7 @@ pub fn handleMeshGuest(
                     continue;
                 }
                 std.log.info("[tun-hdl] upgrade request from {s} target={s}", .{ hostname, target_opt.? });
-                serveUpgradeFile(state.io.?, allocator, tun, cmd_id_opt.?, target_opt.?) catch |err| {
+                serveUpgradeFile(state.io.?, allocator, tun, cmd_id_opt.?, target_opt.?, state.serve_dir) catch |err| {
                     std.log.err("[tun-hdl] serveUpgradeFile failed: {}", .{err});
                 };
             },
@@ -837,6 +837,7 @@ fn serveUpgradeFile(
     tun: *tunnel_mod.Tunnel,
     cmd_id: []const u8,
     target: []const u8,
+    serve_dir: []const u8,
 ) !void {
     const filename = protocol.deploymentFilename(target) orelse {
         std.log.err("[upgrade] Unknown target: {s}", .{target});
@@ -846,14 +847,9 @@ fn serveUpgradeFile(
         return;
     };
 
-    // Use exe_dir to find the binary (same directory as running utmm)
-    var exe_path_buf: [4096]u8 = undefined;
-    const exe_len = try std.process.executablePath(io, &exe_path_buf);
-    const exe_path = exe_path_buf[0..exe_len];
-    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
-
+    // Resolve file path from serve_dir (same directory as platform binaries)
     var path_buf: [1024]u8 = undefined;
-    const file_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ exe_dir, filename });
+    const file_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ serve_dir, filename });
 
     const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch |err| {
         std.log.err("[upgrade] Cannot open {s}: {}", .{ file_path, err });

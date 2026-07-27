@@ -12,6 +12,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const fail = @import("fail.zig");
 const lock = @import("lock.zig");
+const protocol = @import("protocol.zig");
 
 /// POSIX canonical install path.
 pub const CANONICAL_PATH_POSIX = "/opt/utmm/utmm";
@@ -785,6 +786,63 @@ fn copyFile(io: std.Io, alloc: std.mem.Allocator, src_path: []const u8, dst_path
 // Core operations: forceInstall / ensure
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Copy platform-specific deployment binaries from the source exe directory
+/// to the canonical install directory (serve-dir). Only called for Host mode —
+/// these binaries are served to Guests for auto-upgrade.
+///
+/// Best-effort: missing source files are skipped with a warning.
+/// Skips the source binary itself (the one we just selfCopy'd).
+fn copySiblingBinariesToServeDir(io: std.Io, alloc: std.mem.Allocator, src_dir: []const u8) void {
+    const dst_dir = canonicalDir();
+
+    // If source and destination are the same directory, nothing to do.
+    if (std.mem.eql(u8, src_dir, dst_dir)) {
+        std.log.info("[svc] Platform binaries already in serve-dir, skipping copy.", .{});
+        return;
+    }
+
+    var src_dir_handle = std.Io.Dir.cwd().openDir(io, src_dir, .{ .iterate = true }) catch |err| {
+        std.log.warn("[svc] Cannot open source dir {s}: {} — skipping platform binary copy", .{ src_dir, err });
+        return;
+    };
+    defer src_dir_handle.close(io);
+
+    var iter = src_dir_handle.iterate();
+    var copied: usize = 0;
+
+    while (true) {
+        const entry = iter.next(io) catch {
+            std.log.warn("[svc] Failed to iterate source dir", .{});
+            break;
+        } orelse break;
+        const name = entry.name;
+        // Match platform binary files: utmm-* or utmm*.exe
+        if (!std.mem.startsWith(u8, name, "utmm-") and !(std.mem.startsWith(u8, name, "utmm") and std.mem.endsWith(u8, name, ".exe"))) {
+            continue;
+        }
+        // Skip the main binary (utmm or utmm.exe)
+        if (std.mem.eql(u8, name, "utmm") or std.mem.eql(u8, name, "utmm.exe")) continue;
+
+        const src_path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ src_dir, name }) catch continue;
+        defer alloc.free(src_path);
+        const dst_path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dst_dir, name }) catch continue;
+        defer alloc.free(dst_path);
+
+        copyFile(io, alloc, src_path, dst_path, builtin.os.tag != .windows) catch |err| {
+            std.log.warn("[svc] Failed to copy {s}: {}", .{name, err});
+            continue;
+        };
+        std.log.info("[svc] Copied {s} to serve-dir", .{name});
+        copied += 1;
+    }
+
+    if (copied > 0) {
+        std.log.info("[svc] Copied {d} platform binaries to serve-dir", .{copied});
+    } else {
+        std.log.warn("[svc] No platform binaries found in source directory {s} — Host will not serve upgrades.", .{src_dir});
+    }
+}
+
 /// Force install — unconditional overwrite.
 /// Stops any running service, kills all utmm processes, copies self to
 /// canonical path, registers service config, and starts the service.
@@ -819,6 +877,18 @@ fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole,
     selfCopy(io, alloc) catch |err| {
         fail.err("forceInstall/selfCopy", err);
     };
+
+    // 3.5. Host mode: copy platform binaries + ver.txt to serve-dir
+    // so Guests can auto-upgrade to the correct version.
+    if (role == .host) {
+        var src_buf: [4096]u8 = undefined;
+        if (std.process.executablePath(io, &src_buf)) |src_len| {
+            const src_dir = std.fs.path.dirname(src_buf[0..src_len]) orelse ".";
+            copySiblingBinariesToServeDir(io, alloc, src_dir);
+        } else |_| {
+            std.log.warn("[svc] Cannot get exe path — platform binary copy skipped.", .{});
+        }
+    }
 
     // 4. Install/overwrite service configuration.
     // If this fails, remove the binary we just copied so the system isn't

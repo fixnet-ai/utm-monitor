@@ -720,6 +720,48 @@ fn checkGitHubVersion() void {
     }
 }
 
+/// Verify that platform binaries in serve_dir match the running Host version.
+/// Checks each known deployment target's versioned filename exists.
+/// Returns true if at least one platform binary is found (partial deployment OK).
+/// Returns false only if NO platform binaries exist at all.
+fn verifyServeDirBinaries(io: std.Io, serve_dir: []const u8) bool {
+    const targets = [_][]const u8{
+        "aarch64-linux-musl", "x86_64-linux-musl", "x86-linux-musl",
+        "aarch64-macos", "x86_64-macos",
+        "x86-windows", "x86_64-windows", "aarch64-windows",
+        "aarch64-linux", "x86_64-linux", "x86-linux",
+    };
+
+    var found: usize = 0;
+    var missing: usize = 0;
+
+    for (targets) |target| {
+        const filename = protocol.deploymentFilename(target) orelse continue;
+        var path_buf: [1024]u8 = undefined;
+        const file_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ serve_dir, filename }) catch continue;
+
+        if (std.Io.Dir.cwd().statFile(io, file_path, .{})) |_| {
+            found += 1;
+        } else |_| {
+            missing += 1;
+        }
+    }
+
+    if (found == 0) {
+        std.log.err("[host] No platform binaries found in serve-dir '{s}'", .{serve_dir});
+        std.log.err("[host] Host version is {s} but no matching binaries exist.", .{protocol.VERSION});
+        std.log.err("[host] Please download the full release package and re-install.", .{});
+        return false;
+    }
+
+    if (missing > 0) {
+        std.log.warn("[host] {d} platform binaries missing from serve-dir (some Guests may not auto-upgrade)", .{missing});
+    }
+
+    std.log.info("[host] {d} platform binaries verified in serve-dir", .{found});
+    return true;
+}
+
 fn startHost(
     block_io: std.Io,
     gpa: std.mem.Allocator,
@@ -731,6 +773,15 @@ fn startHost(
     const sd = serve_dir orelse "/opt/utmm";
     std.debug.print("[host] Host daemon starting (mesh UDP :{d})\n", .{mesh_port});
     std.debug.print("[host] Serve dir: {s}\n", .{sd});
+
+    // Verify serve-dir platform binaries match running Host version.
+    // If no matching binaries exist, uninstall and exit to prevent
+    // infinite Guest upgrade loops (serving old binaries).
+    if (!verifyServeDirBinaries(block_io, sd)) {
+        std.debug.print("[host] ERROR: Serve-dir version mismatch. Uninstalling service.\n", .{});
+        svc.uninstall(block_io, gpa) catch {};
+        std.process.exit(1);
+    }
 
     // Spawn fire-and-forget GitHub version check thread.
     // OS thread, detach immediately, runs once — no join needed.

@@ -85,11 +85,11 @@ esac
 # Map platform → binary filename inside utmm.zip
 # Must match protocol.zig:deploymentFilename()
 case "${PLATFORM_OS}-${PLATFORM_ARCH}" in
-    linux-aarch64)  ZIP_BINARY="utmm-aarch64-linux" ;;
-    linux-x86_64)   ZIP_BINARY="utmm-x86_64-linux" ;;
-    linux-x86)      ZIP_BINARY="utmm-x86-linux" ;;
-    macos-aarch64)  ZIP_BINARY="utmm-aarch64-macos" ;;
-    macos-x86_64)   ZIP_BINARY="utmm-x86_64-macos" ;;
+    linux-aarch64)  ZIP_BINARY="utmm-aarch64-linux-${VERSION}" ;;
+    linux-x86_64)   ZIP_BINARY="utmm-x86_64-linux-${VERSION}" ;;
+    linux-x86)      ZIP_BINARY="utmm-x86-linux-${VERSION}" ;;
+    macos-aarch64)  ZIP_BINARY="utmm-aarch64-macos-${VERSION}" ;;
+    macos-x86_64)   ZIP_BINARY="utmm-x86_64-macos-${VERSION}" ;;
     *)              die "No binary for ${PLATFORM_OS}/${PLATFORM_ARCH}" 5 ;;
 esac
 
