@@ -7,6 +7,7 @@
 - **测试**: 149/149 通过
 - **部署**: macOS Host v0.11.18 ✅ | linuxvm v0.11.18 ✅ | macvm v0.11.18 ✅ | windowsvm v0.11.18 ✅ | winx64 v0.11.18 ✅
 - **健康检查**: 4/4 全部通过（`--verify` 全绿 ✓）
+- **状态增强**: Host + 4 Guest 全部显示，role/status/last_seen 正确
 
 ## Phase 70: `--status` 增强 (2026-07-27)
 
