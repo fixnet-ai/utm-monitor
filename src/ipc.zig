@@ -23,6 +23,82 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Windows API externs (removed from std.os.windows in Zig 0.16.0)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const windows = struct {
+    const HANDLE = std.os.windows.HANDLE;
+    const DWORD = std.os.windows.DWORD;
+    const LPVOID = ?*anyopaque;
+    const LPCSTR = [*:0]const u8;
+    const BOOL = i32;
+    const INVALID_HANDLE_VALUE = std.os.windows.INVALID_HANDLE_VALUE;
+    const CloseHandle = std.os.windows.CloseHandle;
+    const GetLastError = std.os.windows.GetLastError;
+
+    // Pipe open modes
+    const PIPE_ACCESS_DUPLEX: DWORD = 0x00000003;
+    const PIPE_TYPE_BYTE: DWORD = 0x00000000;
+    const PIPE_READMODE_BYTE: DWORD = 0x00000000;
+    const PIPE_WAIT: DWORD = 0x00000000;
+    const PIPE_UNLIMITED_INSTANCES: DWORD = 255;
+
+    // File access
+    const GENERIC_READ: DWORD = 0x80000000;
+    const GENERIC_WRITE: DWORD = 0x40000000;
+    const OPEN_EXISTING: DWORD = 3;
+
+    extern "kernel32" fn CreateNamedPipeA(
+        lpName: LPCSTR,
+        dwOpenMode: DWORD,
+        dwPipeMode: DWORD,
+        nMaxInstances: DWORD,
+        nOutBufferSize: DWORD,
+        nInBufferSize: DWORD,
+        nDefaultTimeOut: DWORD,
+        lpSecurityAttributes: LPVOID,
+    ) callconv(.winapi) HANDLE;
+
+    extern "kernel32" fn ConnectNamedPipe(
+        hNamedPipe: HANDLE,
+        lpOverlapped: LPVOID,
+    ) callconv(.winapi) BOOL;
+
+    extern "kernel32" fn CreateFileA(
+        lpFileName: LPCSTR,
+        dwDesiredAccess: DWORD,
+        dwShareMode: DWORD,
+        lpSecurityAttributes: LPVOID,
+        dwCreationDisposition: DWORD,
+        dwFlagsAndAttributes: DWORD,
+        hTemplateFile: ?HANDLE,
+    ) callconv(.winapi) HANDLE;
+
+    extern "kernel32" fn ReadFile(
+        hFile: HANDLE,
+        lpBuffer: [*]u8,
+        nNumberOfBytesToRead: DWORD,
+        lpNumberOfBytesRead: *DWORD,
+        lpOverlapped: LPVOID,
+    ) callconv(.winapi) BOOL;
+
+    extern "kernel32" fn WriteFile(
+        hFile: HANDLE,
+        lpBuffer: [*]const u8,
+        nNumberOfBytesToWrite: DWORD,
+        lpNumberOfBytesWritten: *DWORD,
+        lpOverlapped: LPVOID,
+    ) callconv(.winapi) BOOL;
+
+    extern "kernel32" fn SetNamedPipeHandleState(
+        hNamedPipe: HANDLE,
+        lpMode: *DWORD,
+        lpMaxCollectionCount: LPVOID,
+        lpCollectDataTimeout: LPVOID,
+    ) callconv(.winapi) BOOL;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Message types
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -143,6 +219,15 @@ pub fn socketPath() []const u8 {
     return "/var/run/utmm.sock";
 }
 
+/// Null-terminated path for C API calls (unlink, chmod, CreateNamedPipeA, etc.).
+/// String literals coerce directly to `[*:0]const u8` — no @ptrCast needed.
+fn socketPathZ() [*:0]const u8 {
+    if (builtin.os.tag == .windows) {
+        return "\\\\.\\pipe\\utmm";
+    }
+    return "/var/run/utmm.sock";
+}
+
 /// POSIX: a connected Unix domain socket, wrapped for reading/writing.
 /// Windows: a connected named pipe HANDLE.
 pub const Connection = struct {
@@ -150,7 +235,7 @@ pub const Connection = struct {
 
     pub fn close(self: Connection) void {
         if (builtin.os.tag == .windows) {
-            std.os.windows.CloseHandle(self.fd);
+            windows.CloseHandle(self.fd);
         } else {
             _ = std.posix.system.close(self.fd);
         }
@@ -162,10 +247,10 @@ pub const Connection = struct {
         _ = &self;
         if (builtin.os.tag == .windows) {
             // Use ReadFile for named pipe
-            var nread: std.os.windows.DWORD = 0;
-            const ok = std.os.windows.ReadFile(self.fd, buf.ptr, @intCast(buf.len), &nread, null);
+            var nread: windows.DWORD = 0;
+            const ok = windows.ReadFile(self.fd, buf.ptr, @intCast(buf.len), &nread, null);
             if (ok == 0) {
-                const err = std.os.windows.GetLastError();
+                const err = windows.GetLastError();
                 if (err == .BROKEN_PIPE or err == .NO_DATA) return error.EndOfStream;
                 return error.ReadFailed;
             }
@@ -179,8 +264,8 @@ pub const Connection = struct {
     fn writeAll(self: Connection, buf: []const u8) !void {
         _ = &self;
         if (builtin.os.tag == .windows) {
-            var written: std.os.windows.DWORD = 0;
-            _ = std.os.windows.WriteFile(self.fd, buf.ptr, @intCast(buf.len), &written, null);
+            var written: windows.DWORD = 0;
+            _ = windows.WriteFile(self.fd, buf.ptr, @intCast(buf.len), &written, null);
         } else {
             _ = std.posix.system.write(self.fd, buf.ptr, buf.len);
         }
@@ -222,7 +307,7 @@ fn startServerPosix(
     const path = socketPath();
 
     // Remove stale socket file from a previous (crashed) run
-    _ = std.posix.system.unlink(@ptrCast(path));
+    _ = std.posix.system.unlink(socketPathZ());
 
     const fd = std.posix.system.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
@@ -246,7 +331,7 @@ fn startServerPosix(
     );
 
     // Only root (or same user) can connect
-    _ = std.posix.system.chmod(@ptrCast(path), 0o600);
+    _ = std.posix.system.chmod(socketPathZ(), 0o600);
     _ = std.posix.system.listen(fd, 8);
 
     std.log.info("[ipc] listening on {s}", .{path});
@@ -294,40 +379,38 @@ fn startServerWindows(
     mesh_ptr: *anyopaque,
     shutdown: *std.atomic.Value(bool),
 ) !void {
-    const path = socketPath();
-
     // Windows named pipe accept loop: each pipe instance handles one client.
     // We create a pipe, wait for a client, spawn a handler, then create the next pipe.
     while (!shutdown.load(.acquire)) {
-        const pipe = std.os.windows.CreateNamedPipeA(
-            path,
-            std.os.windows.PIPE_ACCESS_DUPLEX,
-            std.os.windows.PIPE_TYPE_BYTE | std.os.windows.PIPE_READMODE_BYTE | std.os.windows.PIPE_WAIT,
-            std.os.windows.PIPE_UNLIMITED_INSTANCES,
+        const pipe = windows.CreateNamedPipeA(
+            socketPathZ(),
+            windows.PIPE_ACCESS_DUPLEX,
+            windows.PIPE_TYPE_BYTE | windows.PIPE_READMODE_BYTE | windows.PIPE_WAIT,
+            windows.PIPE_UNLIMITED_INSTANCES,
             65536,
             65536,
             0,
             null,
         );
 
-        if (pipe == std.os.windows.INVALID_HANDLE_VALUE) {
+        if (pipe == windows.INVALID_HANDLE_VALUE) {
             std.log.err("[ipc] CreateNamedPipe failed", .{});
             return error.NamedPipeCreateFailed;
         }
 
         // Block until a client connects
-        const connected = std.os.windows.ConnectNamedPipe(pipe, null);
+        const connected = windows.ConnectNamedPipe(pipe, null);
         if (connected == 0) {
-            const err = std.os.windows.GetLastError();
+            const err = windows.GetLastError();
             if (err != .PIPE_CONNECTED) {
                 std.log.err("[ipc] ConnectNamedPipe failed: {}", .{err});
-                std.os.windows.CloseHandle(pipe);
+                windows.CloseHandle(pipe);
                 continue;
             }
         }
 
         if (shutdown.load(.acquire)) {
-            std.os.windows.CloseHandle(pipe);
+            windows.CloseHandle(pipe);
             break;
         }
 
@@ -755,7 +838,7 @@ fn handleUpload(
     // Read file data from connection in 8KB chunks and send via KCP.
     // Use lock()+sendLocked()+flushLocked()+unlock() for batch efficiency
     // (same pattern as HTTP handleUpload in httpd.zig).
-    var file_buf: [8192]u8 = undefined;
+    var file_buf: [tunproto.FILE_CHUNK_DATA_MAX]u8 = undefined;
     var total_sent: u32 = 0;
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
     tun.lock() catch {
@@ -999,27 +1082,26 @@ fn clientConnectPosix(io: std.Io) !Connection {
 
 fn clientConnectWindows(io: std.Io) !Connection {
     _ = io;
-    const path = socketPath();
 
-    const pipe = std.os.windows.CreateFileA(
-        path,
-        std.os.windows.GENERIC_READ | std.os.windows.GENERIC_WRITE,
+    const pipe = windows.CreateFileA(
+        socketPathZ(),
+        windows.GENERIC_READ | windows.GENERIC_WRITE,
         0, // no sharing
         null,
-        std.os.windows.OPEN_EXISTING,
+        windows.OPEN_EXISTING,
         0,
         null,
     );
 
-    if (pipe == std.os.windows.INVALID_HANDLE_VALUE) {
-        const err = std.os.windows.GetLastError();
+    if (pipe == windows.INVALID_HANDLE_VALUE) {
+        const err = windows.GetLastError();
         if (err == .FILE_NOT_FOUND or err == .PIPE_BUSY) return error.IpcNotRunning;
         return error.IpcConnectFailed;
     }
 
     // Set pipe to byte mode
-    var mode: std.os.windows.DWORD = std.os.windows.PIPE_READMODE_BYTE;
-    _ = std.os.windows.SetNamedPipeHandleState(pipe, &mode, null, null);
+    var mode: windows.DWORD = windows.PIPE_READMODE_BYTE;
+    _ = windows.SetNamedPipeHandleState(pipe, &mode, null, null);
 
     return Connection{ .fd = pipe };
 }

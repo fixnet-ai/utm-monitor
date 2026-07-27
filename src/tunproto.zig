@@ -30,9 +30,20 @@ pub const MsgType = enum(u8) {
 
 		// Chunked file transfer (replaces blob-in-message for upload/download/upgrade)
 		upload_cmd = 0x1b, // Host→Guest: cmd_id(NT) + path(NT) + file_size(BE u32) + file_hash(NT)
-		file_chunk = 0x1c, // Bidirectional: cmd_id(NT) + data(blob) — 8KB file fragment
+		file_chunk = 0x1c, // Bidirectional: cmd_id(NT) + data(blob)
 		file_eof = 0x1d, // Bidirectional: cmd_id(NT) + exit_code(BE i32) + file_size(BE u32) + file_hash(NT)
 };
+
+/// Max file data bytes per file_chunk message.
+///
+/// Sized so the entire file_chunk frame (type + cmd_id NT + blob prefix + data)
+/// fits in one KCP segment (MSS = MTU 1266 - OVERHEAD 24 = 1242 bytes).
+/// Each file_chunk maps 1:1 to a KCP segment — no KCP-level frg fragmentation,
+/// no head-of-line blocking across segments within one chunk.
+///
+/// Frame overhead: type(1) + cmd_id(~24 with timestamp) + blob_len(4) ≈ 29.
+/// MSS 1242 - 29 = 1213. Reserve margin to 1200 for safety.
+pub const FILE_CHUNK_DATA_MAX: usize = 1200;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Serialization helpers
@@ -277,6 +288,26 @@ pub const UpgradeReqData = struct {
 // ═══════════════════════════════════════════════════════════════════════════
 // Parse functions
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// CRITICAL CONVENTION: ALL parse*() functions start at pos=0 and expect data
+// WITHOUT the leading type byte. Every dispatcher MUST pass `data[1..]`.
+//
+//   switch (data[0]) {                  // type byte consumed here
+//       @intFromEnum(.file_eof) => {
+//           const eof = parseFileEof(data[1..]);  // ✓ correct
+//           const eof = parseFileEof(data);       // ✗ BUG: 0x1D parsed as cmd_id[0]
+//       },
+//   }
+//
+// Forgetting to strip the type byte causes silent data corruption because
+// readString starts at position 0 and reads the type byte as part of the
+// first field. This was Finding 109 — parseFileEof(data) instead of
+// parseFileEof(data[1..]) caused all downloads to hang indefinitely.
+//
+// Note: parsePtyExecOutput/PtyExecInput are exceptions — their last field
+// captures the remaining bytes after the structured prefix (raw command
+// or output), so they can technically tolerate an extra byte. Do NOT rely
+// on this; always pass data[1..] to all parse functions.
 
 pub fn parsePtyExecInput(data: []const u8) ?PtyExecInputData {
     var pos: usize = 0;
@@ -505,15 +536,17 @@ test "file_chunk round-trip" {
     try std.testing.expectEqualSlices(u8, data, parsed.data);
 }
 
-test "file_chunk with 8KB payload" {
+test "file_chunk with MSS-aligned payload" {
     const allocator = std.testing.allocator;
-    const chunk: [8192]u8 = [_]u8{0xAB} ** 8192;
+    const chunk: [FILE_CHUNK_DATA_MAX]u8 = [_]u8{0xAB} ** FILE_CHUNK_DATA_MAX;
     const msg = try buildFileChunk(allocator, "fc2", &chunk);
     defer allocator.free(msg);
     try std.testing.expectEqual(@intFromEnum(MsgType.file_chunk), msg[0]);
     const parsed = parseFileChunk(msg[1..]) orelse return error.ParseFailed;
     try std.testing.expectEqualStrings("fc2", parsed.cmd_id);
     try std.testing.expectEqualSlices(u8, &chunk, parsed.data);
+        // Verify the full frame fits in one KCP segment (MSS = 1266 - 24 = 1242).
+        try std.testing.expect(msg.len <= 1242);
 }
 
 test "file_eof round-trip (success)" {

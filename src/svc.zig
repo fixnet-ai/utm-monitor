@@ -219,6 +219,7 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
     }
 
     const log_path = if (role == .host) "/var/log/utmm-host.log" else "/var/log/utmm-guest.log";
+    const err_log_path = if (role == .host) "/var/log/utmm-host-err.log" else "/var/log/utmm-guest-err.log";
 
     const plist = try std.fmt.allocPrint(alloc,
         \\<?xml version="1.0" encoding="UTF-8"?>
@@ -250,9 +251,11 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
         \\    <integer>5</integer>
         \\    <key>StandardOutPath</key>
         \\    <string>{s}</string>
+        \\    <key>StandardErrorPath</key>
+        \\    <string>{s}</string>
         \\</dict>
         \\</plist>
-    , .{ name, args_list.items, env.shell, env.home, log_path });
+    , .{ name, args_list.items, env.shell, env.home, log_path, err_log_path });
     defer alloc.free(plist);
 
     // Write plist file
@@ -858,6 +861,38 @@ pub fn resetRetryCounter(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole
     defer alloc.free(retry_path);
     std.Io.Dir.cwd().deleteFile(io, retry_path) catch {};
     std.log.info("[svc] retry counter reset", .{});
+}
+
+/// Windows only: check for a pending upgrade (.new file) from a previous
+/// auto-upgrade attempt. If found, replace the running binary and restart.
+/// Returns true if upgrade was applied (caller should exit), false otherwise.
+pub fn checkPendingUpgradeWindows(io: std.Io, alloc: std.mem.Allocator) bool {
+    _ = alloc;
+    if (builtin.os.tag != .windows) return false;
+
+    const exe_path = canonicalPath();
+    const new_path = exe_path ++ ".new";
+
+    if (std.Io.Dir.cwd().stat(io, new_path, .{})) |_| {
+        std.log.info("[svc] pending upgrade found at {s}", .{new_path});
+    } else |_| {
+        return false;
+    }
+
+    // Delete old .exe (file is memory-mapped, directory entry can be replaced)
+    std.Io.Dir.cwd().deleteFile(io, exe_path) catch |err| {
+        std.log.err("[svc] cannot delete old .exe: {} — will retry next restart", .{err});
+        std.process.exit(42);
+    };
+
+    // Rename .new → .exe
+    std.Io.Dir.cwd().rename(new_path, std.Io.Dir.cwd(), exe_path, io) catch |err| {
+        std.log.err("[svc] upgrade rename failed: {}", .{err});
+        std.process.exit(42);
+    };
+
+    std.log.info("[svc] upgrade finalized. restarting...", .{});
+    std.process.exit(0);
 }
 
 fn retryCounterPath(alloc: std.mem.Allocator, role: ServiceRole) ![]const u8 {

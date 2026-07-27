@@ -423,3 +423,124 @@ Phase 50-56 中 Guest 通过 `--install --hostname <name>` 部署，服务配置
 Host 的 `--status` 显示新旧两条记录（旧 hostname 的 stale entry 和新的自动检测名 entry），exec/upload 命令需用新主机名。Host 的 `guestIndex` 按 hostname 精确匹配，`/ping` 端点也按 hostname 查找。
 
 **解决方案**: 升级后手动修复服务配置（systemd unit / launchd plist / sc config），重启服务以使用正确 hostname。或改进 `--install` 流程避免 pkill 自伤。
+
+---
+
+## IPC 迁移部署测试发现 (2026-07-27)
+
+### Finding 109: `parseFileEof` type byte 污染导致 download 永久失败（Critical）
+
+`httpd.zig:handleMeshGuest` 的 `file_eof` 分支调用 `tunproto.parseFileEof(data)` 传入完整数据（含 type byte `0x1D`）。`parseFileEof` 从 `pos=0` 开始解析，将 `0x1D` 当作 `cmd_id` 的第一个字节。解析出的 `cmd_id` 为 `\x1Ddownload_<ts>` 而非 `download_<ts>`，导致 `completeOpState` 操作了错误的 op state。download handler 永远等不到正确的 op state 完成 → 超时 → `exit_code=-1`。
+
+对比其他分支：
+- `file_chunk` handler: `var pos: usize = 1;`（正确跳过 type byte）
+- `pty_exec_done` handler: `parsePtyExecDone(data[1..])`（正确跳过 type byte）
+- `file_eof` handler: `parseFileEof(data)` ← **遗漏了 `[1..]`**
+
+此 bug 自 chunked file transfer 引入以来一直存在，仅影响 download（Guest→Host），不影响 upload（Host→Guest，Guest 忽略 file_eof）。IPC 迁移前下载同样失败。
+
+**修复**: `parseFileEof(data)` → `parseFileEof(data[1..])`（提交 `a3b4672`）
+
+**教训**: 序列化/反序列化成对函数应保持一致的起始位置约定。添加新消息类型时，应检查同一 dispatch 块中其他分支的 pos 起始值。
+
+### Finding 110: macOS launchd plist 升级后丢失 StandardErrorPath
+
+macvm Guest 和本机 Host 的 launchd plist 在通过 SSH `--install` 或 `--svc` 安装时，未设置 `StandardErrorPath`。导致所有 `std.log` 输出（包括 `err` 级别）进入 ASL 系统日志而非文件日志，关键错误信息无法通过文件监控获取。
+
+**修复**: 手动用 `PlistBuddy -c 'Add :StandardErrorPath string ...'` 补充配置。应在 `svc.zig` 的 `installMacOS` 中总是设置 `StandardErrorPath`。
+
+### Finding 111: `cmdDownload` 双重 close 导致 unreachable panic
+
+`cmdDownload` 中 `tmp_file.close(block_io)` 显式关闭 + `defer tmp_file.close(block_io)` 延迟关闭，同一 fd 关闭两次触发 `std.Io.Threaded.BADF → unreachable` panic。
+
+**修复**: 移除显式关闭，仅保留 defer 关闭（提交 `a3b4672`）。
+
+### IPC 命令验证结果 (2026-07-27)
+
+| 命令 | 状态 | 说明 |
+|------|------|------|
+| `--status` | ✅ | 4 guests 全部正确显示 |
+| `--ping` | ✅ | JSON 响应正确（修复了 buffer 污染 + mesh_ptr 转换） |
+| `--exec` | ✅ | 命令输出正确 |
+| `--upload` | ✅ | 上传+sha256验证通过（修复了 KCP send+flush 竞态） |
+| `--download` | ✅ | 文件下载正确（修复了 parseFileEof type byte 污染） |
+
+IPC 协议通过 Unix Domain Socket `/var/run/utmm.sock` 工作正常。HTTP endpoint 保留用于未来 WebUI。
+
+---
+
+## Phase 58-59 发现 (2026-07-27)
+
+### Finding 112: `--install` 重写 macOS plist 时 StandardErrorPath 必然回归
+
+Finding 110 的手动修复（`PlistBuddy -c 'Add :StandardErrorPath ...'`）在 `--install` 部署新版本后**必然丢失**，因为 `svc.zig:installMacOS()` 的 plist 模板从未包含 `StandardErrorPath`。
+
+**影响**: 每次 `--install` 部署后，所有 `std.log` 输出（包括 `err` 级别）进入 ASL 系统日志而非文件。调试时完全看不到 Host 日志。
+
+**修复**: `svc.zig:installMacOS()` plist 模板新增 `<key>StandardErrorPath</key>`，路径同 stdout + `-err` 后缀。同时覆盖 Guest plist。
+
+**教训**: 手动修复 OS 配置文件不可持续 — 必须在代码生成路径中固化。
+
+### Finding 113: `handleMeshGuest` 缺少 `upload_result` (0x17) 处理分支
+
+Host 日志周期性出现 `error: [tun-hdl] unknown msg type 0x17 for macvm`。`upload_result` 是 Guest→Host 的 upload 完成通知，但 Host 的 `handleMeshGuest` switch 中没有对应分支。
+
+**影响**: 不影响功能 — upload 走 fire-and-forget（Host 发送完 chunks+eof 后立即返回 OK，不等待 Guest 的 upload_result）。但日志刷屏干扰排查。
+
+**待修**: 添加 `upload_result` 处理分支（至少静默消费）。
+
+### Finding 114: httpd.zig 测试未被编译入测试套件
+
+httpd.zig 包含约 31 个测试（jsonEscape、jsonGetString、jsonGetInt、buildCmdWithMarker、scanForMarker、HostState、Router 等），但 `zig build test` 仅报 149 个测试，未包含 httpd.zig 的任何测试。git HEAD (a3b4672) 同样如此，说明此问题早于 Phase 60。
+
+**可能原因**: httpd.zig 被 `@import` 但 Zig 编译器可能因某些原因未收集其 test 块。`mcp.zig` 有自己的 `jsonEscape` 副本（含独立测试）。
+
+**影响**: httpd.zig 的 `jsonEscape`（与 mcp.zig 重复实现）和 `buildCmdWithMarker`、`scanForMarker` 等关键函数缺少测试覆盖。
+
+**待排查**。
+
+---
+
+## Phase 62: Windows IPC 编译修复发现 (2026-07-27)
+
+### Finding 115: Zig 0.16.0 移除 Named Pipe API 需手动 extern
+
+`std.os.windows` 在 Zig 0.16.0 中移除了以下 API：`CreateNamedPipeA`、`ConnectNamedPipe`、`CreateFileA`、`ReadFile`、`WriteFile`、`SetNamedPipeHandleState`、Win32 常量（`PIPE_ACCESS_DUPLEX`、`GENERIC_READ` 等）、`.Win64` 调用约定。
+
+`broadcast.zig` 已使用 `@extern(*const fn(...) callconv(.winapi) ..., .{ .name = "...", .library_name = "kernel32" })` 模式声明这些 API。`ipc.zig` 需要同样的声明。
+
+### Finding 116: `callconv(.winapi)` 是 32-bit MinGW 必需
+
+6 个 `extern "kernel32"` 声明在没有 `callconv(.winapi)` 的情况下，64-bit Windows 构建正常（x86_64/aarch64 只有一种调用约定），但 32-bit MinGW (`x86-windows-gnu`) 链接失败：
+- `_CreateFileA`、`_ReadFile`、`_WriteFile` 等 6 个符号未定义
+- 原因：32-bit kernel32 使用 `__stdcall` 约定（`_FuncName@bytes`），`extern` 默认 C 约定（`_FuncName`）
+
+**修复**: 所有 `extern "kernel32" fn` 添加 `callconv(.winapi)`。
+
+### Finding 117: `null` 在 Zig 0.16.0 中无类型
+
+`CreateFileA(..., null)` 中 `null` 参数无法匹配 `hTemplateFile: HANDLE`（即 `*anyopaque`）。Zig 0.16.0 的 `null` 是无类型值，需要显式类型注解。
+
+**修复**: 参数类型改为 `?HANDLE`（`?*anyopaque`），与 Windows API 语义一致（hTemplateFile 可为 NULL）。
+
+### Finding 118: `@ptrCast` 不能将 slice 转为 sentinel 指针
+
+`@ptrCast(path)` 无法将 `[]const u8`（slice）转换为 `[*:0]const u8`（null-terminated 指针）。字符串字面量本身已是 `*const [N:0]u8`，可直接强制转换为 `[*:0]const u8`。
+
+**修复**: 新建 `socketPathZ()` 函数，直接返回字符串字面量（利用 Zig 的 sentinel 强制转换）。所有 C API 调用（`unlink`、`chmod`、`CreateNamedPipeA`、`CreateFileA`）改用 `socketPathZ()`。
+
+### Finding 119: 交叉编译覆盖 `zig-out/bin/utmm`
+
+与 Finding 78 和 106 相同问题：`zig build -Dtarget=x86-linux-musl` 将输出写入 `zig-out/bin/utmm`（同大小 7453740 bytes），覆盖原生 Mach-O aarch64 二进制。部署前最后一个 `zig build` 必须无 `-Dtarget`。
+
+### MSS-aligned chunk 部署验证 (2026-07-27)
+
+FILE_CHUNK_DATA_MAX = 1200 bytes，MSS 对齐，部署测试全部通过：
+
+| 命令 | 结果 |
+|------|------|
+| `--status` | ✅ 4 guests Online |
+| `--ping macvm` | ✅ `rtt_ms:10` |
+| `--exec macvm "uname -a"` | ✅ Darwin arm64 |
+| `--upload test.txt macvm` | ✅ OK |
+| `--download macvm test.txt` | ✅ 56B, FILES MATCH |

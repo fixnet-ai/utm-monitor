@@ -1157,6 +1157,38 @@ pub fn meshSessionLoop(
             break;
         }
 
+        // Check for pending auto-upgrade before entering any command session.
+        // This runs outside the command loop — no pty threads or in-flight
+        // commands exist at this point, so the upgrade can safely stop
+        // responding to Host requests.
+        if (upgrade.needed.load(.acquire)) {
+            std.log.info("[guest-mesh] upgrade signal detected, entering upgrade mode...", .{});
+            upgrade.needed.store(false, .release);
+
+            if (mesh_opt) |*m| {
+                const new_info = std.fmt.allocPrint(allocator,
+                    "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:upgrading",
+                    .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
+                ) catch {
+                    std.log.err("[guest-mesh] allocPrint for upgrade node_info failed", .{});
+                    continue;
+                };
+                m.updateNodeInfo(new_info);
+            }
+
+            doAutoUpgrade(io, allocator, &mesh_opt, info, shutdown) catch |err| {
+                std.log.err("[guest-mesh] auto-upgrade failed: {}", .{err});
+                // Restore status so Host sees Guest as available again
+                if (mesh_opt) |*m| {
+                    const new_info = std.fmt.allocPrint(allocator,
+                        "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:serving",
+                        .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
+                    ) catch continue;
+                    m.updateNodeInfo(new_info);
+                }
+            };
+        }
+
         // Wait for Host to establish a KCP tunnel and send pty_spawn
         std.log.info("[guest-mesh] Entering waitForHostTunnel...", .{});
         var tunnel = waitForHostTunnel(io, allocator, &mesh_opt, shutdown) catch |err| {
@@ -1296,7 +1328,7 @@ pub fn meshSessionLoop(
             }
 
             const msg_type: u8 = rbuf[0];
-            const payload = rbuf[1..n];
+            const payload = rbuf[1..n]; // strip type byte — parse*() expects data[0]=first field
 
             switch (msg_type) {
                 @intFromEnum(tunproto.MsgType.pty_spawn) => {
@@ -1588,7 +1620,208 @@ fn receiveChunkedFile(
     }
 }
 
-/// Send a file as chunked transfer (download): open file, read 8KB chunks,
+// ═══════════════════════════════════════════════════════════════════════════
+// Auto-upgrade functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Receive the upgrade binary from Host via KCP chunked transfer.
+/// Based on receiveChunkedFile but simplified: fixed destination dir,
+/// no upload_result response, adds timeout protection.
+/// Returns the path to the successfully received and verified temp file.
+fn receiveUpgradeFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    tun: *tunnel_mod.Tunnel,
+    cmd_id: []const u8,
+) ![]const u8 {
+    const dirname = svc.canonicalDir();
+    var rand_bytes: [8]u8 = undefined;
+    io.random(&rand_bytes);
+    var temp_hex: [16]u8 = undefined;
+    for (rand_bytes, 0..) |b, j| {
+        temp_hex[j * 2] = "0123456789abcdef"[b >> 4];
+        temp_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}/.utmm-upgrade-{s}", .{ dirname, &temp_hex });
+    errdefer allocator.free(temp_path);
+
+    // Clean up stale temp file from a previous failed upgrade
+    std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+
+    const temp_file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
+    defer temp_file.close(io);
+
+    var wb: [65536]u8 = undefined;
+    var writer = temp_file.writer(io, &wb);
+
+    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
+    var received: u32 = 0;
+
+    var rbuf: [262144]u8 = undefined;
+    var last_data_ts: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+
+    while (true) {
+        if (!tun.isAlive()) {
+            std.log.err("[upgrade] tunnel died during download", .{});
+            return error.TunnelDead;
+        }
+
+        // Timeout: 120s of no data
+        const now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+        if (now_ns - last_data_ts > 120 * std.time.ns_per_s) {
+            std.log.err("[upgrade] download timed out after 120s", .{});
+            return error.UpgradeTimeout;
+        }
+
+        const n = tun.recv(&rbuf) catch |err| {
+            std.log.err("[upgrade] recv error: {}", .{err});
+            return err;
+        };
+        if (n == 0) {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+            continue;
+        }
+        last_data_ts = now_ns;
+
+        const msg_type: u8 = rbuf[0];
+        const payload = rbuf[1..n];
+
+        switch (msg_type) {
+            @intFromEnum(tunproto.MsgType.file_chunk) => {
+                const chunk = tunproto.parseFileChunk(payload) orelse {
+                    std.log.err("[upgrade] parseFileChunk failed", .{});
+                    return error.ParseFailed;
+                };
+                if (!std.mem.eql(u8, chunk.cmd_id, cmd_id)) continue;
+
+                _ = writer.interface.write(chunk.data) catch |e| {
+                    std.log.err("[upgrade] write chunk: {}", .{e});
+                    return error.WriteFailed;
+                };
+                sha256.update(chunk.data);
+                received += @intCast(chunk.data.len);
+            },
+            @intFromEnum(tunproto.MsgType.file_eof) => {
+                const eof = tunproto.parseFileEof(payload) orelse {
+                    std.log.err("[upgrade] parseFileEof failed", .{});
+                    return error.ParseFailed;
+                };
+                if (!std.mem.eql(u8, eof.cmd_id, cmd_id)) continue;
+
+                writer.interface.flush() catch |err| {
+                    std.log.err("[upgrade] flush temp file: {}", .{err});
+                    return error.WriteFailed;
+                };
+
+                if (eof.exit_code != 0) {
+                    std.log.err("[upgrade] host rejected upgrade: exit_code={d}", .{eof.exit_code});
+                    return error.UpgradeRejected;
+                }
+
+                // Verify SHA256
+                var hash: [32]u8 = undefined;
+                sha256.final(&hash);
+                const actual_hex = try hexHash(allocator, &hash);
+                defer allocator.free(actual_hex);
+
+                if (eof.file_hash.len > 0 and !std.mem.eql(u8, actual_hex, eof.file_hash)) {
+                    std.log.err("[upgrade] hash mismatch: got {s}, expected {s}", .{ actual_hex, eof.file_hash });
+                    return error.HashMismatch;
+                }
+
+                std.log.info("[upgrade] download complete: {d} bytes, hash={s}", .{ received, actual_hex });
+                return temp_path;
+            },
+            else => continue,
+        }
+    }
+}
+
+/// Run the downloaded binary with --install and exit.
+/// This function never returns on success — the new binary's forceInstall
+/// kills the old process during its "kill" step.
+fn applyUpgradeAndRestart(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    temp_path: []const u8,
+    hostname: []const u8,
+) !void {
+    const dirname = svc.canonicalDir();
+    const new_name: []const u8 = if (builtin.os.tag == .windows) "utmm-new.exe" else "utmm-new";
+    const new_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dirname, new_name });
+    defer allocator.free(new_path);
+
+    // Delete any stale utmm-new from a previous upgrade
+    std.Io.Dir.cwd().deleteFile(io, new_path) catch {};
+
+    // Move downloaded binary to canonical dir as utmm-new
+    try std.Io.Dir.cwd().rename(temp_path, std.Io.Dir.cwd(), new_path, io);
+
+    // Set executable permission (POSIX)
+    if (builtin.os.tag != .windows) {
+        _ = std.posix.system.chmod(@ptrCast(new_path.ptr), 0o755);
+    }
+
+    std.log.info("[upgrade] running {s} --install --hostname {s} ...", .{ new_path, hostname });
+
+    // Run new binary with --install. The new binary's forceInstall does:
+    //   stop → kill(pkill utmm / taskkill utmm.exe) → self-copy → install(svc config) → start
+    // The OLD process name is "utmm" — the NEW binary runs as "utmm-new",
+    // so pkill/taskkill won't match it. The old process is killed during the
+    // kill step, so we never return from this call on success.
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ new_path, "--install", "--hostname", hostname },
+    }) catch |err| {
+        std.log.err("[upgrade] failed to start --install: {}", .{err});
+        return err;
+    };
+
+    // If we reach here, --install completed but didn't kill us (unusual).
+    // Exit so the service manager restarts with the new binary.
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
+    std.log.info("[upgrade] --install ok, exiting for restart...", .{});
+    std.process.exit(0);
+}
+
+/// Perform auto-upgrade: connect to Host via KCP, download new binary,
+/// and run --install to replace the current installation.
+fn doAutoUpgrade(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    mesh_opt: *?mesh_mod.Mesh,
+    info: SystemInfo,
+    shutdown: ?*std.atomic.Value(bool),
+) !void {
+    // Get a KCP tunnel to the Host
+    var tunnel = try waitForHostTunnel(io, allocator, mesh_opt, shutdown);
+    defer tunnel.deinit();
+
+    // Generate unique cmd_id for this upgrade
+    const cmd_id = try std.fmt.allocPrint(allocator, "upgrade_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds});
+    defer allocator.free(cmd_id);
+
+    // Send upgrade request
+    const req = try tunproto.buildUpgradeReq(allocator, cmd_id, info.target);
+    defer allocator.free(req);
+    _ = try tunnel.sendAndFlush(req, tunnel.session.mesh.clock_ms);
+    std.log.info("[upgrade] upgrade_req sent: target={s} cmd_id={s}", .{ info.target, cmd_id });
+
+    // Receive the new binary
+    const temp_path = try receiveUpgradeFile(io, allocator, &tunnel, cmd_id);
+    errdefer {
+        std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
+        allocator.free(temp_path);
+    }
+
+    // Reset macOS retry counter before upgrade exit
+    svc.resetRetryCounter(io, allocator, .guest);
+
+    // Apply upgrade and restart (never returns on success)
+    try applyUpgradeAndRestart(io, allocator, temp_path, info.hostname);
+}
+
+/// Send a file as chunked transfer (download): open file, read MSS-aligned chunks,
 /// send as file_chunk messages with incremental SHA256, finish with file_eof.
 fn sendChunkedFile(
     io: std.Io,
@@ -1597,6 +1830,26 @@ fn sendChunkedFile(
     cmd_id: []const u8,
     path: []const u8,
 ) !void {
+    // Chunk size: tunproto.FILE_CHUNK_DATA_MAX = 1200 bytes.
+    // KCP MSS = 1242 bytes (IKCP_MTU_DEFAULT 1266 - IKCP_OVERHEAD 24).
+    // file_chunk frame = type(1) + cmd_id(NT, ~24) + blob_len(4) + data(1200)
+    //                  = ~1229 bytes < MSS 1242
+    // Result: exactly 1 KCP segment per file_chunk — NO KCP-level fragmentation.
+    //
+    // Why MSS-aligned (not larger):
+    //   - Eliminates KCP frg reassembly: one lost segment = one lost chunk,
+    //     no head-of-line blocking across segments within a message.
+    //   - Simpler protocol: each KCP send() = 1 UDP datagram = 1 application chunk.
+    //   - No "secondary fragmentation": app chunks don't get re-split by KCP,
+    //     removing a layer of complexity from the protocol stack.
+    //
+    // Trade-off vs 8KB chunks: ~7x more sendAndFlush() calls per file.
+    // This is acceptable because (a) files are typically < 100MB in practice,
+    // (b) the per-chunk overhead (~24/1200 = 2%) is still small,
+    // (c) the protocol simplicity gain outweighs the syscall overhead.
+    //
+    // Each chunk is sent via sendAndFlush() — atomic lock->send->flush
+    // prevents KCP send-window stalls.
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         std.log.err("[guest-mesh] Download open failed: {}", .{err});
         if (tunproto.buildFileEof(allocator, cmd_id, -1, 0, "")) |eof| {
@@ -1611,8 +1864,8 @@ fn sendChunkedFile(
 
     var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
     var total: u32 = 0;
-    var chunk_buf: [8192]u8 = undefined;
-    var file_read_buf: [8192]u8 = undefined;
+    var chunk_buf: [tunproto.FILE_CHUNK_DATA_MAX]u8 = undefined;
+    var file_read_buf: [4096]u8 = undefined;  // disk read buffer, larger than chunk for efficiency
     var file_reader = file.reader(io, &file_read_buf);
 
     while (true) {
@@ -1765,6 +2018,9 @@ pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig
             std.log.warn("[guest] chdir to /opt/utmm failed", .{});
         }
     }
+
+    // Windows: handle pending upgrade from a previous auto-upgrade attempt
+    _ = svc.checkPendingUpgradeWindows(io, gpa);
 
     // Build host URL from --host-ip or default gateway (pass empty string to auto-detect)
     const host_url = if (cli.host_ip) |ip| blk: {

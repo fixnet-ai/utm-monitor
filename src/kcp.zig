@@ -42,6 +42,30 @@ pub const IKCP_WND_SND: u32 = 32; // send window
 pub const IKCP_WND_RCV: u32 = 128; // receive window (must be >= max fragment count)
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// MTU / MSS / Fragmentation — how KCP breaks up large messages
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// IKCP_MTU_DEFAULT = 1266  (UDP payload budget: 1280 − 14 mesh header)
+// IKCP_OVERHEAD    = 24    (KCP header: conv+cmd+frg+wnd+ts+sn+una+len)
+// MSS (segment)    = 1242  (MTU − OVERHEAD = 1266 − 24)
+//
+// Message mode (stream=false, used in this project):
+//   send(N bytes) → ceil(N / MSS) segments, each with same sn, frg down-counter.
+//   recv() reassembles frg=0..M into the original N-byte message transparently.
+//   Max single message: IKCP_WND_RCV × MSS = 128 × 1242 ≈ 159 KB.
+//
+//   DESIGN CHOICE: file_chunk data is capped at tunproto.FILE_CHUNK_DATA_MAX
+//   (1200 bytes) so the full frame (type + cmd_id + blob_len + data ≈ 1229)
+//   fits in ONE segment. This eliminates KCP fragmentation entirely for file
+//   transfer — each segment is a self-contained chunk with no frg reassembly.
+//   A lost segment = a lost chunk; no multi-segment head-of-line blocking.
+//
+// Stream mode (stream=true, NOT used in this project):
+//   Segments merged in snd_queue before encoding. No frg fragmentation —
+//   continuous byte stream; recv() may return partial reads like TCP.
+//   Message boundaries are not preserved.
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Output callback
 // ═══════════════════════════════════════════════════════════════════════════════
 
