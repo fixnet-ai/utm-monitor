@@ -1,8 +1,9 @@
 //! MCP stdio server — AI agent interface via stdin/stdout JSON-RPC 2.0.
 //!
 //! The utmm --mcp command starts a stdio MCP server. Tool calls (vm_status,
-//! vm_exec) are translated to HTTP management commands against the local Host
-//! service (127.0.0.1:2121), benefiting from auto-ensure (Phase 52).
+//! vm_exec, vm_ping, vm_upload, vm_download) are translated to IPC commands
+//! against the local Host service via /var/run/utmm.sock, benefiting from
+//! auto-ensure (Phase 52).
 //!
 //! Protocol: newline-delimited JSON, one JSON-RPC object per line.
 //! Logging goes to stderr; JSON-RPC traffic goes to stdout.
@@ -25,7 +26,10 @@ const SERVER_INFO =
 /// MCP tool definitions (JSON).
 const TOOLS_JSON =
     \\[{"name":"vm_status","description":"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.","inputSchema":{"type":"object","properties":{},"required":[]}},
-    \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check vm_status first to see each VM's shell type, then write compatible commands.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)"}},"required":["vm","command"]}}]
+    \\{"name":"vm_exec","description":"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check vm_status first to see each VM's shell type, then write compatible commands.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"},"command":{"type":"string","description":"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)"}},"required":["vm","command"]}},
+    \\{"name":"vm_ping","description":"Ping a Guest over the mesh network to test connectivity and measure RTT. Returns JSON with hostname, MAC address, and rtt_ms.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')"}},"required":["vm"]}},
+    \\{"name":"vm_upload","description":"Upload a file from the Host to a Guest VM. The file is transferred through the KCP tunnel with SHA256 verification.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname"},"local_path":{"type":"string","description":"Path to the file on the Host filesystem"},"remote_path":{"type":"string","description":"Destination path on the Guest (e.g. /opt/utmm/file.txt). Defaults to /opt/utmm/<basename> if omitted."}},"required":["vm","local_path"]}},
+    \\{"name":"vm_download","description":"Download a file from a Guest VM to the Host. The file is transferred through the KCP tunnel with SHA256 verification.","inputSchema":{"type":"object","properties":{"vm":{"type":"string","description":"Target VM hostname"},"remote_path":{"type":"string","description":"Path to the file on the Guest (e.g. /opt/utmm/core.dump)"},"local_path":{"type":"string","description":"Local path on the Host to save the file. Defaults to ./<basename> if omitted."}},"required":["vm","remote_path"]}}]
 ;
 
 /// MCP server entry point. Reads JSON-RPC from stdin, writes responses to stdout.
@@ -180,6 +184,81 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
             return jsonBuildResponse(gpa, id_val, result);
         }
 
+        if (std.mem.eql(u8, tool_name, "vm_ping")) {
+            if (args == null) {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm");
+            }
+            const vm = jsonGetString(args.?, "vm") orelse {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing argument: vm");
+            };
+            const result = handleVmPing(gpa, io, port, vm) catch |err| {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32603, @errorName(err));
+            };
+            defer gpa.free(result);
+            return jsonBuildResponse(gpa, id_val, result);
+        }
+
+        if (std.mem.eql(u8, tool_name, "vm_upload")) {
+            if (args == null) {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm, local_path");
+            }
+            const vm = jsonGetString(args.?, "vm") orelse {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing argument: vm");
+            };
+            const local_path = jsonGetString(args.?, "local_path") orelse {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing argument: local_path");
+            };
+            // remote_path defaults to /opt/utmm/<basename>
+            const remote_path = jsonGetString(args.?, "remote_path") orelse blk: {
+                const basename = if (std.mem.lastIndexOfScalar(u8, local_path, '/')) |pos|
+                    local_path[pos + 1 ..]
+                else
+                    local_path;
+                break :blk try std.fmt.allocPrint(gpa, "/opt/utmm/{s}", .{basename});
+            };
+            const result = handleVmUpload(gpa, io, port, vm, local_path, remote_path) catch |err| {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32603, @errorName(err));
+            };
+            defer gpa.free(result);
+            return jsonBuildResponse(gpa, id_val, result);
+        }
+
+        if (std.mem.eql(u8, tool_name, "vm_download")) {
+            if (args == null) {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm, remote_path");
+            }
+            const vm = jsonGetString(args.?, "vm") orelse {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing argument: vm");
+            };
+            const remote_path = jsonGetString(args.?, "remote_path") orelse {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing argument: remote_path");
+            };
+            // local_path defaults to ./<basename>
+            const local_path = jsonGetString(args.?, "local_path") orelse blk: {
+                const basename = if (std.mem.lastIndexOfScalar(u8, remote_path, '/')) |pos|
+                    remote_path[pos + 1 ..]
+                else
+                    remote_path;
+                break :blk try std.fmt.allocPrint(gpa, "./{s}", .{basename});
+            };
+            const result = handleVmDownload(gpa, io, port, vm, remote_path, local_path) catch |err| {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32603, @errorName(err));
+            };
+            defer gpa.free(result);
+            return jsonBuildResponse(gpa, id_val, result);
+        }
+
         if (is_notification) return gpa.dupe(u8, "");
         return jsonBuildError(gpa, id_val, -32601, "Unknown tool");
     }
@@ -274,6 +353,88 @@ fn formatExecMCP(gpa: std.mem.Allocator, vm: []const u8, command: []const u8, ou
     return std.fmt.allocPrint(gpa,
         "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** `$ {s}`:\\n```\\n{s}\\n```\"}}]}}",
         .{ esc_vm, esc_cmd, esc_out },
+    );
+}
+
+/// Handle vm_ping via IPC.
+fn handleVmPing(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8) ![]const u8 {
+    _ = port;
+    const json = try ipc_mod.ipcPing(io, gpa, vm);
+    defer gpa.free(json);
+    return formatPingMCP(gpa, vm, json);
+}
+
+/// Format ping JSON result into MCP content markdown.
+fn formatPingMCP(gpa: std.mem.Allocator, vm: []const u8, json_str: []const u8) ![]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_str, .{ .allocate = .alloc_always }) catch |err| {
+        std.log.err("[mcp] vm_ping JSON parse: {}", .{err});
+        return error.PingFailed;
+    };
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.PingFailed,
+    };
+
+    const mac = jsonGetString(obj, "mac") orelse "?";
+    const rtt = if (obj.get("rtt_ms")) |v| switch (v) {
+        .integer => |n| n,
+        else => @as(i64, 0),
+    } else @as(i64, 0);
+
+    const esc_vm = try jsonEscape(gpa, vm);
+    defer gpa.free(esc_vm);
+
+    return std.fmt.allocPrint(gpa,
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** ping: MAC={s}, RTT={d}ms\"}}]}}",
+        .{ esc_vm, mac, rtt },
+    );
+}
+
+/// Handle vm_upload via IPC.
+fn handleVmUpload(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, local_path: []const u8, remote_path: []const u8) ![]const u8 {
+    _ = port;
+    try ipc_mod.ipcUpload(io, gpa, vm, local_path, remote_path);
+
+    const esc_vm = try jsonEscape(gpa, vm);
+    defer gpa.free(esc_vm);
+    const esc_local = try jsonEscape(gpa, local_path);
+    defer gpa.free(esc_local);
+    const esc_remote = try jsonEscape(gpa, remote_path);
+    defer gpa.free(esc_remote);
+
+    return std.fmt.allocPrint(gpa,
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"Uploaded `{s}` → **{s}**:`{s}`\"}}]}}",
+        .{ esc_local, esc_vm, esc_remote },
+    );
+}
+
+/// Handle vm_download via IPC.
+fn handleVmDownload(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, remote_path: []const u8, local_path: []const u8) ![]const u8 {
+    _ = port;
+
+    // Open local file for writing
+    const file = std.Io.Dir.cwd().openFile(io, local_path, .{ .mode = .write_only }) catch |err| {
+        std.log.err("[mcp] Cannot open {s} for write: {}", .{ local_path, err });
+        return error.DownloadFailed;
+    };
+    defer file.close(io);
+
+    var fbuf: [65536]u8 = undefined;
+    var fw = file.writer(io, &fbuf);
+    const total_bytes = try ipc_mod.ipcDownload(io, gpa, vm, remote_path, &fw.interface);
+
+    const esc_vm = try jsonEscape(gpa, vm);
+    defer gpa.free(esc_vm);
+    const esc_remote = try jsonEscape(gpa, remote_path);
+    defer gpa.free(esc_remote);
+    const esc_local = try jsonEscape(gpa, local_path);
+    defer gpa.free(esc_local);
+
+    return std.fmt.allocPrint(gpa,
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"Downloaded **{s}**:`{s}` → `{s}` ({d} bytes)\"}}]}}",
+        .{ esc_vm, esc_remote, esc_local, total_bytes },
     );
 }
 

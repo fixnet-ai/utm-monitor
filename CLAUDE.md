@@ -199,8 +199,16 @@ ensure():
 **All paths require root** (except `--version` and `--help`). No privilege elevation code.
 **Fast-fail**: errors print function name + system error code + message, then exit(1).
 
-**Upgrade**: scp new binary to VM + `sudo ./utmm-new --install`. forceInstall handles
-stop→kill→copy→install→start. No KCP download, no utmm-old process.
+**Upgrade (manual)**: scp new binary to VM + `sudo ./utmm-new --install`. forceInstall handles
+stop→kill→copy→install→start.
+
+**Upgrade (automatic, v0.11.14+)**: Guest-initiated atomic operation:
+1. Guest detects Host version mismatch via mesh LSA
+2. Guest exits command loop, sends `upgrade_req` (0x19) via KCP tunnel
+3. Host responds with `file_chunk × N + file_eof` (binary download)
+4. Guest saves to temp dir, `chmod +x`, runs `--install --hostname <name>`
+5. `forceInstall` completes the deployment (stop→kill→copy→install→start)
+Host never pushes upgrades — the Guest is fully self-upgrading.
 
 ### Key Design Decisions
 
@@ -213,6 +221,12 @@ stop→kill→copy→install→start. No KCP download, no utmm-old process.
 - **Self-copy install model** (v0.12.0) — replaces utmm-old 10+ step KCP download
   upgrade (fork→mesh→connect→download→verify→replace→restart) with 4 steps
   (stop→kill→copy→start). Network-independent. No bat scripts for Windows.
+- **Guest-initiated auto-upgrade** (v0.11.14) — Guest detects version mismatch via
+  LSA, downloads new binary via KCP tunnel (`upgrade_req` → `file_chunk` × N →
+  `file_eof`), saves to temp, runs `--install --hostname <name>`. Host never pushes
+  upgrades — fully atomic on Guest side. Upgrade check runs in both the outer
+  mesh session loop and the inner command loop to ensure idle Guests detect the
+  signal promptly.
 - Single port 2121 for HTTP, static file serving, and mesh UDP
 - **Persistent pty per mesh session**: POSIX `posix_openpt` + fork + setsid + execve,
   Windows `CreatePipe` + `CreateProcessW("cmd.exe /k chcp 65001 ...")` + `SetConsoleOutputCP(65001)` — UTF-8 forced
@@ -224,8 +238,11 @@ stop→kill→copy→install→start. No KCP download, no utmm-old process.
 - **Chunked file transfer**: upload/download use `cmd → file_chunk × N → file_eof`
   protocol instead of blob-in-message. 8KB chunks, incremental SHA256, 256KB fixed buffer.
   Supports >1GB files with constant memory.
-- **LSA version broadcast**: Host broadcasts version in LSA every 2s. Guest detects
-  mismatch and logs info (no automatic upgrade trigger — upgrades are externally driven).
+- **LSA version broadcast**: Host broadcasts version in LSA every 2s. Guest compares
+  against `protocol.VERSION`, sets `upgrade.needed` on mismatch, triggering
+  Guest-initiated auto-upgrade (see above).
+  The upgrade check runs both between command sessions and inside the command loop
+  (v0.11.14+), ensuring idle Guests detect the signal promptly.
 - `std.http.Server` with `std.Thread` per-connection concurrency
 - Zero external dependencies: no Node.js, Python, SSH, curl
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
@@ -351,10 +368,10 @@ Open the release URL printed by the script and confirm:
 - Tag points to the right commit
 
 ### Post-release
-After release, the Host's HTTP server auto-serves new binaries from
-`/opt/utmm/`. Guests detect version mismatch via LSA broadcast and
-log info (no automatic upgrade — upgrades are externally driven via
-scp + `--install`).
+After release, the Host's serve-dir auto-serves new binaries. Guests detect
+version mismatch via LSA broadcast and trigger Guest-initiated auto-upgrade
+(v0.11.14+): download new binary via KCP tunnel → `--install --hostname <name>`.
+Host never pushes upgrades — the Guest is fully self-upgrading.
 
 ## Project File Structure
 

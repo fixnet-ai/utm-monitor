@@ -1,16 +1,128 @@
-# Progress: v0.11.11
+# Progress: v0.11.15
 
 ## 当前状态
 
-- **分支**: `main`（未推送）
-- **版本**: v0.11.11（`src/protocol.zig` VERSION、`build.zig.zon`）
+- **分支**: `main`
+- **版本**: v0.11.15（`src/protocol.zig` VERSION、`build.zig.zon`）
 - **测试**: 149/149 通过（EXIT=0）
-- **部署**: macOS Host ✅ | linuxvm ✅ | macvm ✅ | windowsvm ✅ | winx64 ✅
+- **部署**: macOS Host v0.11.15 ✅ | linuxvm v0.11.15 ✅ | macvm v0.11.15 ✅ | windowsvm v0.11.15 ✅ | winx64 v0.11.15 ✅
+- **最新提交**: `(pending)` v0.11.15: rewrite SKILL.md and MANUAL.md for v0.11.14+ architecture
+
+## Phase 64: 文档重写 + v0.11.15 发布 (2026-07-27)
+
+**目标**: 重写 `skills/utmm/SKILL.md` 和 `skills/utmm/MANUAL.md`，使其与 v0.11.14 代码现状一致。
+
+### 文档更新
+
+**SKILL.md** (216 行):
+- 架构描述：新增 IPC socket，明确无 HTTP
+- MCP 工具：2→5（新增 vm_ping、vm_upload、vm_download），完整参数说明
+- 新增文件传输工作流示例、Auto-Upgrade 节
+- Host 路径：新增 IPC socket（`/var/run/utmm.sock`、`\\.\pipe\utmm`）
+
+**MANUAL.md** (659 行):
+- 版本号：0.11.10→0.11.14
+- 端口 2121：TCP HTTP→UDP only（LSA + KCP）
+- CLI/MCP 通信方式：HTTP→IPC socket
+- MCP 工具数：2→5
+- 升级机制：无自动升级→Guest 自主升级（完整流程）
+- 源文件结构：14→15 文件（新增 ipc.zig）
+- IPC socket 路径表、服务名称表、完整 CLI flags 参考
+
+### v0.11.15 发布
+
+- Bump 版本：0.11.14→0.11.15
+- 构建 8 目标 + `./release.sh`
+- 本机 Host 部署 + 观察 VM 自动升级
+
+## Phase 63: Guest 自主升级方案 ✅ (2026-07-27)
+
+**目标**: 将升级从 Host 推送模式简化为 Guest 自主完成，实现可靠的原子化自升级。
+
+### v0.11.12 — Guest 自动升级初版 (commit `6ee2155`)
+
+**新增功能** (`src/broadcast.zig`):
+- `doAutoUpgrade()`: 检测 `upgrade.needed` → KCP 下载 → `--install`
+- `receiveUpgradeFile()`: 接收 file_chunk×N + file_eof，SHA256 校验
+- `applyUpgradeAndRestart()`: `chmod +x` → `std.process.run` 执行 `--install --hostname <name>`
+
+**协议**: Guest 发送 `upgrade_req` (0x19) → Host `serveUpgradeFile()` 响应 file_chunk + file_eof
+
+**Bug**: 升级检查只在外层循环，内层命令循环无法检测 → 升级信号死锁 (Finding 120)
+
+### v0.11.13 — 简化 Host 侧 (commit `98409c4`)
+
+**host.zig 移除** (~223 行):
+- `pushUpgradeToGuest()` 函数（~183 行）
+- `upgrade_cooldown` 状态变量和初始化
+- 推送触发逻辑（~40 行）
+
+**tunnelManager 简化**:
+- 删除 upgrading 特殊逻辑（Phase 2 搜索 Guest-initiated session → 死锁 Finding 122）
+- 统一 `m.connect()` 建立隧道
+- 添加注释说明：Auto-upgrade is Guest-initiated
+
+**设计原则确立**: Host 永不推送升级，Guest 完全自主。
+
+### v0.11.14 — 修复命令循环死锁 (commit `7178fb2`)
+
+**Critical Fix** (`src/broadcast.zig`):
+- 内层命令循环添加 `upgrade.needed.load(.acquire)` 检查
+- Guest 检测到升级信号后 `break` 退出命令循环，外层循环处理升级
+
+**版本发布**:
+- `src/protocol.zig`: VERSION "0.11.12" → "0.11.13" → "0.11.14"
+- `build.zig.zon`: version 同步更新
+- GitHub Release v0.11.14 已发布
+
+**Bootstrap 部署** (v0.11.11/v0.11.12 Guest 无法自动升级):
+| Guest | 方式 | 结果 |
+|-------|------|------|
+| linuxvm | SSH scp + sudo --install | ✅ |
+| macvm | SSH scp + sudo --install + 手动 launchctl bootstrap | ✅ (errno=2 后手动修复) |
+| windowsvm | SSH scp + --install | ✅ |
+| winx64 | 离线 | ⏸️ |
+
+**升级后验证**:
+| 命令 | linuxvm | macvm | windowsvm |
+|------|---------|-------|-----------|
+| `--status` | ✅ Online | ✅ Online | ✅ Online |
+| `--exec uname/ver` | ✅ Linux | ✅ Darwin | ✅ Windows |
+| `--ping` | ✅ | ✅ | ✅ |
+
+**hostname 持久化验证**: `--install --hostname <name>` 在所有平台上正确写入服务配置文件（systemd unit / launchd plist / sc binPath）。Guest 重启后保持原始 hostname。
+
+### 最终升级架构
+
+```
+Guest LSA handler: Host version ≠ protocol.VERSION → upgrade.needed = true
+Guest 命令循环: upgrade.needed? → break
+Guest 外层循环: doAutoUpgrade()
+  → waitForHostTunnel()
+  → 发送 upgrade_req(0x19, target)
+  → Host serveUpgradeFile() → deploymentFilename(target) → file_chunk×N + file_eof
+  → Guest receiveUpgradeFile() → temp path + SHA256 验证
+  → applyUpgradeAndRestart(temp_path, hostname)
+    → chmod +x (POSIX)
+    → std.process.run: <temp> --install --hostname <name>
+    → forceInstall: stop → kill → copy → install(service config) → start
+```
+
+**关键原则**:
+- Host 永不推送升级 — Guest 完全自主
+- `--install --hostname <name>` 保留原始 hostname（写入服务配置文件）
+- KCP 隧道复用正常命令通道，不创建特殊升级通道
+- 升级失败自动重试：下次 LSA 广播重新触发
 
 ## 最近提交
 
 ```
-(未提交 — Phase 60-62 变更待提交)
+7178fb2 v0.11.14: fix upgrade check in command loop
+98409c4 v0.11.13: simplify auto-upgrade to Guest-initiated download + --install
+578f55c feat: Host-initiated upgrade push for legacy Guests via KCP upload+exec
+13b4a03 fix: ++ concat requires comptime-known left operand in Zig 0.16.0
+6ee2155 v0.11.12: guest auto-upgrade via KCP tunnel with --install self-deployment
+a3b4672 fix: download + IPC command verification - 3 critical fixes
 ```
 
 ## Phase 62: Windows IPC 编译修复 + 全量部署测试 ✅ (2026-07-27)

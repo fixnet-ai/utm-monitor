@@ -1,4 +1,4 @@
-# Task Plan: v0.11.11
+# Task Plan: v0.11.14
 
 ## 架构概述
 
@@ -8,6 +8,7 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 - 删除 WebSocket，KCP Tunnel 为唯一传输层（v0.11.0）
 - 统一服务模型：Host 和 Guest 均为系统自动启动服务（v0.12.0）
 - 自复制模型：升级 = 新版本 `--install`，取消 utmm-old + agent.zig（v0.12.0）
+- **Guest 自主升级**（v0.11.14）：Guest 检测 LSA 版本不匹配 → KCP 下载新二进制 → `--install --hostname <name>` 自安装。Host 永不推送升级。
 - Fast-fail：不继续执行出错操作，打印错误退出
 - 所有操作要求 root/Administrator（除 `--version`/`--help`）
 
@@ -168,6 +169,63 @@ Zig 0.16.0 移除了大量 `std.os.windows` API（CreateNamedPipeA、ConnectName
 | winx64 | ✅ | ✅ RTT=10 | ✅ ver | ✅ 30B MATCH | ✅ 30B MATCH |
 
 macOS `launchctl bootstrap` 间歇性 errno=2/5（已知问题，Phase 57）：`--install` 最后一步失败，但 launchd 自动重启服务（二进制已复制到位）。
+
+### Phase 63: Guest 自主升级方案 ✅ (2026-07-27)
+
+**目标**: 将升级从 Host 推送模式简化为 Guest 自主完成，实现原子化自升级。
+
+**v0.11.12 — Guest 自动升级 (commit `6ee2155`)**:
+
+初始实现 Guest 自主升级：LSA 检测版本不匹配 → `doAutoUpgrade()` → KCP `upgrade_req` → Host `serveUpgradeFile` → `receiveUpgradeFile()` → `applyUpgradeAndRestart()` → `--install --hostname <name>`。
+
+**v0.11.13 — 简化 Host 侧 (commit `98409c4`)**:
+
+彻底移除 Host 推送升级的所有代码：
+- `host.zig`: 删除 `pushUpgradeToGuest()` 函数（~183 行）、`upgrade_cooldown` 状态、推送触发逻辑
+- `host.zig`: tunnelManager "Phase 2" 简化 — 移除 upgrading 特殊逻辑，统一使用 `m.connect()`
+- 升级完全由 Guest 发起，Host 仅响应 `upgrade_req`
+
+**v0.11.14 — 修复命令循环死锁 (commit `7178fb2`)**:
+
+**Critical Bug**: Guest `meshSessionLoop` 的升级检查只在**外层循环**（`waitForHostTunnel` 之前），但 Guest 在 `waitForHostTunnel` 之后进入**内层命令循环**（`while (!pty_dead.load(.acquire))`）永不退出。`upgrade.needed` 被设置后永远不会被检查 → 升级信号死锁。
+
+**修复**: 在内层命令循环中添加升级检查：
+```zig
+if (upgrade.needed.load(.acquire)) {
+    std.log.info("[guest-mesh] Upgrade signal detected, exiting command loop", .{});
+    break;
+}
+```
+
+**Bootstrap 部署**: v0.11.11/v0.11.12 Guest 由于上述 bug 无法自动升级。SSH 手动部署 v0.11.14 到 linuxvm/macvm/windowsvm（winx64 离线）。升级后所有 Guest 的 `--exec`、`--upload`、`--download` 验证通过。
+
+**最终升级流程**:
+```
+1. Guest LSA handler 检测 Host version != protocol.VERSION → upgrade.needed = true
+2. Guest 命令循环检测到 upgrade.needed → break 退出内层循环
+3. 外层循环: doAutoUpgrade()
+   a. waitForHostTunnel() 获取 KCP 隧道
+   b. 发送 upgrade_req(0x19) → Host serveUpgradeFile()
+   c. 接收 file_chunk × N + file_eof (SHA256 校验)
+   d. 保存到临时目录 → chmod +x
+   e. 运行 --install --hostname <name> → forceInstall 完整部署
+4. Host 永不推送升级 — Guest 完全自主
+```
+
+**Host 侧保留**: `serveUpgradeFile()` 响应 Guest 的 `upgrade_req`，通过 `deploymentFilename()` 查找匹配目标平台的二进制。
+
+### Phase 64: 文档重写 + v0.11.15 发布 ✅ (2026-07-27)
+
+**目标**: 重写 `skills/utmm/SKILL.md` 和 `skills/utmm/MANUAL.md`，使其与 v0.11.14 代码现状一致；发布 v0.11.15 验证文档更新后的完整发布流程。
+
+**文档修正**:
+
+| 文件 | 关键修正 |
+|------|---------|
+| `SKILL.md` | 架构描述（UDP+IPC 替代 HTTP）、MCP 工具 2→5（新增 vm_ping/vm_upload/vm_download）、IPC socket 路径、文件传输工作流、Auto-Upgrade 节 |
+| `MANUAL.md` | 版本号 0.11.10→0.11.14、端口 2121 TCP HTTP→UDP only、CLI 通信 HTTP→IPC socket、MCP 通信 HTTP→IPC socket、MCP 工具 2→5、升级"无自动升级"→Guest 自主升级、源文件 13→15（新增 ipc.zig） |
+
+**v0.11.15 发布**: 构建 8 目标 → `./release.sh` → GitHub Release → 本机 Host 安装 → 观察 VM 自动升级。
 
 ## 待办
 

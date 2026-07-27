@@ -19,20 +19,24 @@ Ethernet — they all show up in one flat `utmm --status`.
 
 ## AI Agent Experience
 
-Same capabilities, natural language. `utmm --mcp` provides three MCP tools over stdio
-for Claude Code and other agents:
+Same capabilities, natural language. `utmm --mcp` provides five MCP tools over stdio
+for Claude Code and other agents — the complete CLI command set exposed through the
+MCP protocol:
 
 | Tool | Description |
 |------|-------------|
 | `vm_status` | List all machines: hostname, IP, OS/arch, version, shell type |
 | `vm_exec` | Execute commands. Shell session persists — cd, export survive across calls |
 | `vm_ping` | Ping a guest over the mesh — test connectivity and measure RTT |
+| `vm_upload` | Upload a file from Host to Guest via KCP tunnel (SHA256 verified) |
+| `vm_download` | Download a file from Guest to Host via KCP tunnel (SHA256 verified) |
 
 Example prompts your AI agent can handle:
 - "Check the status of all my machines"
 - "linuxvm is slow — check CPU, memory, and disk IO"
 - "Attach lldb to my program on macvm, set a breakpoint at main, and show the backtrace"
 - "Upload the new build to all machines and restart the service"
+- "Download the core dump from linuxvm and analyze the crash"
 
 ## CLI Quick Start
 
@@ -123,30 +127,34 @@ utmm --version                     # Print version
 
 ## How It Works
 
-The Host runs an HTTP server on port 2121. Each Guest maintains a persistent
-Mesh + KCP tunnel to the Host via UDP. LSA (Link State Advertisement) broadcasts
-handle topology discovery. The Host distributes commands to Guests and streams
-results back — HTTP handlers send frames through KCP tunnels, pty sessions execute.
+The Host manages Guests through a **mesh network over UDP port 2121**. Each Guest
+maintains a persistent KCP tunnel to the Host. LSA (Link State Advertisement)
+broadcasts handle topology discovery and version detection. CLI commands and MCP
+talk to the Host through a local IPC socket (`/var/run/utmm.sock` on POSIX,
+named pipe on Windows) — no HTTP.
 
 ```
 Guest (linuxvm)      ──KCP/Mesh──┐
-Guest (macvm)        ──KCP/Mesh──┤──→ Host HTTP :2121 ── CLI (--status, --exec)
-Guest (windowsvm)    ──KCP/Mesh──┤                      ── Static files (/bin/)
+Guest (macvm)        ──KCP/Mesh──┤──→ Host ── IPC socket ── CLI (--status, --exec, --ping)
+Guest (windowsvm)    ──KCP/Mesh──┤          ── Static files (/bin/ via KCP upgrade_req)
 Guest (raspigw, LAN) ──KCP/Mesh──┘
                          ┌── LSA broadcast discovery ───┘   (topology + version detection)
                          │
-AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → HTTP 127.0.0.1:2121
+AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
 ```
 
-- **Streaming exec**: output flows in real time via HTTP chunked encoding with
-  `x-exit-code` trailer. No JSON wrapping, no timeout. Upload/download use chunked
-  stream (8KB blocks) over KCP tunnel.
+- **Streaming exec**: output flows in real time through KCP tunnel with `x-exit-code`
+  trailer. No JSON wrapping, no timeout. Upload/download use chunked stream (8KB
+  blocks over MSS-aligned KCP segments).
 - **Self-copy install**: binary copies itself to `/opt/utmm/utmm` (POSIX) or
   `C:\opt\utmm\utmm.exe` (Windows). `--install` = unconditional force overwrite.
   Upgrade = scp new binary + `--install`. Zero shell commands.
+- **Guest-initiated auto-upgrade** (v0.11.14+): Guest detects Host version change via
+  LSA broadcast, downloads new binary through KCP tunnel, and runs `--install
+  --hostname <name>` to complete deployment. Host never pushes upgrades.
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
-- **Single port**: 2121 for CLI + static file serving (TCP) and mesh networking (UDP)
-  MCP uses stdio (utmm --mcp), not HTTP — no port needed
+- **Single port**: 2121 for mesh networking (UDP only — LSA + KCP tunnel).
+  MCP and CLI use local IPC socket (stdio/stdin for MCP, Unix domain socket for CLI) — no port needed.
 - **Auto IP tracking**: Host syncs Guest IPs to `/etc/hosts` — hostnames always resolve
 - **Cross-platform**: macOS, Linux, Windows — both Host and Guest (aarch64, x86_64, x86)
 - **Persistent shell session**: shell state survives across `--exec` calls (pty model)

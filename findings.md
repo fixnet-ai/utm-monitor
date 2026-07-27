@@ -1,4 +1,4 @@
-# Findings: v0.11.11
+# Findings: v0.11.14
 
 仅保留当前仍相关的重要发现。历史发现（WebSocket 时代、utmm-old、agent.zig 等）已随架构演进过时，不再收录。
 
@@ -544,3 +544,46 @@ FILE_CHUNK_DATA_MAX = 1200 bytes，MSS 对齐，部署测试全部通过：
 | `--exec macvm "uname -a"` | ✅ Darwin arm64 |
 | `--upload test.txt macvm` | ✅ OK |
 | `--download macvm test.txt` | ✅ 56B, FILES MATCH |
+
+---
+
+## Phase 63: Guest 自主升级方案发现 (2026-07-27)
+
+### Finding 120: 升级信号在命令循环中死锁（Critical）
+
+Guest `meshSessionLoop` 的结构是两层循环：
+- **外层**: `while(true)` → `waitForHostTunnel()` → `ptySpawn()` → 进入内层
+- **内层**: `while (!pty_dead.load(.acquire))` → 处理命令（pty_exec_input/upload_cmd/download_cmd）
+
+`upgrade.needed` 的检查只在**外层循环**中（`waitForHostTunnel` 之前）。Guest 成功连接到 Host 后进入内层命令循环，永不退出。LSA handler 设置了 `upgrade.needed = true`，但内层循环永远看不到这个信号 → **升级信号死锁**。
+
+**症状**: Guest 和 Host 版本不同（LSA 日志可见），但 Guest 从不触发升级。v0.11.11/v0.11.12 Guest 均受此 bug 影响。
+
+**修复** (v0.11.14, commit `7178fb2`): 在内层命令循环的 `checkShutdown` 之后、`tunnel.isAlive()` 之前添加：
+```zig
+if (upgrade.needed.load(.acquire)) {
+    std.log.info("[guest-mesh] Upgrade signal detected, exiting command loop", .{});
+    break;
+}
+```
+
+**教训**: 嵌套事件循环中，信号检查必须在**所有层级**都存在。仅在外层检查，内层永不退出时会永远丢失信号。
+
+### Finding 121: Host 推送升级方案过度复杂且不可靠
+
+v0.11.12 的初始实现（commit `578f55c`）尝试 Host 推送升级：Host 检测 Guest 版本过旧 → 设置 status:upgrading → KCP 上传新二进制 → exec `--install --hostname <name>`。存在多个根本性问题：
+
+1. **pkill 自伤**: `--install` 内部的 `kill()` 步骤（POSIX `pkill utmm`、Windows `taskkill /f /im utmm.exe`）会杀掉所有 utmm 进程，包括 Host 自身的进程管理器 → 不可预测的行为
+2. **多 Guest 并发竞争**: 多个 Guest 同时检测到版本不匹配 → Host 资源竞争（KCP 带宽、同时上传）
+3. **错误恢复困难**: Host 推送失败后需要重试机制、冷却时间、状态追踪 → 复杂的状态机
+4. **难以测试调试**: 升级逻辑分散在 Host 和 Guest 两侧，端到端测试需要完整 mesh 环境
+
+**设计修正**: 用户明确要求简化为 Guest 自主方案（Host 永不推送）。Guest 端完成升级这个"原子操作"：检测版本不匹配 → 下载新二进制 → `--install`。方案简洁可靠，可独立测试每个环节。
+
+### Finding 122: `tunnelManager` upgrading 特殊逻辑导致死锁
+
+v0.11.12 的 `tunnelManager` 有"Phase 2"逻辑：当 Guest 状态为 upgrading 时，Host 搜索 Guest 主动发起的 KCP session（而非调用 `m.connect()` 创建新会话）。但 Guest 在 `doAutoUpgrade()` 中调用 `waitForHostTunnel()` 等待 Host 创建隧道 → Host 等待 Guest 创建隧道 → 双方互相等待 → **死锁**。
+
+**修复** (v0.11.13, commit `98409c4`): 移除 upgrading 特殊逻辑，升级期间统一使用 `m.connect()` 建立隧道。升级是 Guest 自主的——Guest 通过正常隧道发送 `upgrade_req`，Host 响应文件数据。
+
+

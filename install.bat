@@ -4,17 +4,97 @@ setlocal enabledelayedexpansion
 :: ═══════════════════════════════════════════════════════════════════════
 :: UTM Monitor — Windows Guest installer (batch)
 :: Downloads the correct binary from Host HTTP, installs service, starts Guest
+:: ═══════════════════════════════════════════════════════════════════════
 ::
-:: Usage (as Administrator):
-::   curl -fsSL http://<gateway>:2121/bin/install.bat -o install.bat && install.bat --guest --hostname windowsvm
+:: ─── Prerequisites ────────────────────────────────────────────────────
 ::
-::   Or local:
-::   install.bat --guest --hostname windowsvm
+::   Required tools (all built-in, no extra installs needed):
+::     - bitsadmin                 — bundled with Windows 7 / Server 2008 R2+;
+::                                   used as primary HTTP downloader
+::     - curl                      — bundled with Windows 10 build 17063+;
+::                                   used as automatic fallback if bitsadmin
+::                                   is unavailable or fails
+::     - Administrator privileges  — required for sc.exe service creation,
+::                                    writing to C:\opt\utmm\, and
+::                                    taskkill process management
 ::
-:: Parameters:
+::   Required permissions:
+::     - Must run as Administrator  — right-click "Run as Administrator",
+::       or from an elevated command prompt. Non-admin will fail at
+::       mkdir C:\opt\utmm\ and sc create.
+::
+::   Network requirements:
+::     - HTTP to Host at gateway:2121 — the Guest must be able to reach
+::       the UTM Host machine (typically the VM bridge gateway).
+::       No internet access required.
+::
+::   Supported Windows editions:
+::     - Windows 7  / Server 2008 R2  (x86, x86_64)
+::     - Windows 8  / 8.1 / Server 2012 / 2012 R2 (x86, x86_64)
+::     - Windows 10 / 11 / Server 2016 / 2019 / 2022 (x86_64, aarch64)
+::     - XP / Server 2003 — NOT supported (no bitsadmin by default,
+::       no curl; requires manual binary deployment)
+::
+::   Supported CPU architectures:
+::     - x86_64  / AMD64    (Intel/AMD 64-bit)
+::     - aarch64 / ARM64    (ARM 64-bit — Windows on ARM, Win10+ only)
+::     - x86                (Intel/AMD 32-bit)
+::
+:: ─── What this script does ────────────────────────────────────────────
+::
+::   1. Detect CPU architecture (PROCESSOR_ARCHITECTURE)
+::   2. Auto-discover Host gateway IP (route print + UTM bridge fallback)
+::   3. Download correct utmm-{arch}-windows.exe from Host HTTP /bin/
+::      (bitsadmin primary, curl fallback — covers Win7 through Win11)
+::   4. Stop existing utmm.exe process (taskkill)
+::   5. Move binary to C:\opt\utmm\utmm.exe
+::   6. Install Windows service (sc create) via utmm.exe --install
+::      Service name: UTM-Monitor-Guest, auto-start on boot
+::   7. Start service immediately
+::
+:: ─── Usage ────────────────────────────────────────────────────────────
+::
+::   Remote install from Host HTTP, as Administrator:
+::
+::     Win7+ (bitsadmin):  bitsadmin /transfer get_install /download /priority foreground "http://<gateway>:2121/bin/install.bat" "%TEMP%\install.bat" && call "%TEMP%\install.bat" --guest --hostname windowsvm
+::
+::     Win10+ (curl):      curl -fsSL http://<gateway>:2121/bin/install.bat -o install.bat && install.bat --guest --hostname windowsvm
+::
+::   Local install (binary already on disk):
+::     install.bat --guest --hostname windowsvm
+::
+:: ─── Parameters ───────────────────────────────────────────────────────
+::
 ::   --guest           Guest mode (required)
 ::   --hostname NAME   Guest hostname (required in guest mode)
-::   --port PORT       HTTP port (default: 2121)
+::                     Used for mesh identity and /etc/hosts sync on Host.
+::                     Must be unique across all Guests.
+::   --port PORT       Host HTTP port (default: 2121)
+::
+:: ─── Post-Install ─────────────────────────────────────────────────────
+::
+::   Verify on Host:   utmm --host --status
+::   Service control:  sc query UTM-Monitor-Guest
+::                     sc stop  UTM-Monitor-Guest
+::                     sc start UTM-Monitor-Guest
+::   Logs:             C:\opt\utmm\utmm.log
+::
+::   Auto-upgrade (v0.11.14+): Guest detects Host version change via
+::   mesh LSA and upgrades itself — no manual redeployment needed after
+::   the initial install. Host never pushes upgrades.
+::
+:: ─── Troubleshooting ──────────────────────────────────────────────────
+::
+::   "Access denied"        → Not running as Administrator. Re-run from
+::                            an elevated command prompt.
+::   "Could not detect Host gateway"
+::                          → Host service not running on gateway VM.
+::                            Start it: sudo utmm --host
+::   "Download failed"      → Host HTTP not reachable. Check network,
+::                            firewall, and that the Host serve-dir
+::                            contains the target binary.
+::   Service won't start    → Check retry limit: sc failure
+::                            Reinstall: install.bat --guest --hostname ...
 :: ═══════════════════════════════════════════════════════════════════════
 
 set "MODE="
@@ -42,7 +122,12 @@ if not "%MODE%"=="guest" (
     echo   install.bat --guest --hostname windowsvm
     echo.
     echo   Or via remote download:
-    echo   curl -fsSL http://[gateway]:2121/bin/install.bat -o install.bat ^&^& install.bat --guest --hostname windowsvm
+    echo   Win7+:  bitsadmin /transfer get_install /download /priority foreground
+    echo           "http://[gateway]:2121/bin/install.bat" "%%TEMP%%\install.bat"
+    echo           ^&^& call "%%TEMP%%\install.bat" --guest --hostname windowsvm
+    echo.
+    echo   Win10+: curl -fsSL http://[gateway]:2121/bin/install.bat -o install.bat
+    echo           ^&^& install.bat --guest --hostname windowsvm
     exit /b 1
 )
 
@@ -85,13 +170,20 @@ for /f "tokens=3" %%a in ('route print 0.0.0.0 ^| findstr /r "0\.0\.0\.0.*[0-9]\
     if "!GW!"=="" set "GW=%%a"
 )
 
-:: Method 2: Fallback — probe known UTM bridge IPs
+:: Method 2: Fallback — probe known UTM bridge IPs via bitsadmin
+:: bitsadmin is the most compatible HTTP client (Win7+).
+:: We check whether the downloaded temp file is non-empty.
 if "%GW%"=="" (
     set "FALLBACKS=192.168.64.1 192.168.65.1 192.168.66.1 192.168.67.1"
     for %%i in (!FALLBACKS!) do (
         if "!GW!"=="" (
-            curl -s -m 2 "http://%%i:%PORT%/version" >nul 2>&1
-            if !errorlevel! equ 0 set "GW=%%i"
+            set "PROBE_URL=http://%%i:%PORT%/version"
+            set "PROBE_OUT=%TEMP%\utmm_probe_%%i.txt"
+            bitsadmin /transfer utmm_probe /download /priority foreground "!PROBE_URL!" "!PROBE_OUT!" >nul 2>&1
+            if exist "!PROBE_OUT!" (
+                for %%f in ("!PROBE_OUT!") do if %%~zf gtr 0 set "GW=%%i"
+                del "!PROBE_OUT!" 2>nul
+            )
         )
     )
 )
@@ -122,14 +214,38 @@ echo ==^> Creating %INSTALL_DIR% ...
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 
 :: ─── 6. Download binary ──────────────────────────────────────────────────
+:: Primary: bitsadmin (Win7+, most compatible — covers all supported editions)
+:: Fallback: curl     (Win10 17063+, used if bitsadmin is unavailable/fails)
 echo ==^> Downloading %URL% ...
 set "TMP_BIN=%TEMP%\utmm-new.exe"
-curl -fSL --progress-bar -m 60 -o "%TMP_BIN%" "%URL%"
-if %errorlevel% neq 0 (
+
+:: Remove stale temp file from previous run
+if exist "%TMP_BIN%" del /f "%TMP_BIN%" 2>nul
+
+:: Try bitsadmin first — available on all supported Windows editions (7+)
+set "DL_OK=0"
+bitsadmin /transfer utmm_dl /download /priority foreground "%URL%" "%TMP_BIN%" >nul 2>&1
+if exist "%TMP_BIN%" (
+    for %%f in ("%TMP_BIN%") do if %%~zf gtr 0 set "DL_OK=1"
+)
+
+:: Fallback to curl if bitsadmin failed (e.g. disabled by policy, or Win10+)
+if "!DL_OK!"=="0" (
+    echo     bitsadmin unavailable or failed, trying curl...
+    if exist "%TMP_BIN%" del /f "%TMP_BIN%" 2>nul
+    curl -fSL -m 60 -o "%TMP_BIN%" "%URL%" >nul 2>&1
+    if exist "%TMP_BIN%" (
+        for %%f in ("%TMP_BIN%") do if %%~zf gtr 0 set "DL_OK=1"
+    )
+)
+
+if "!DL_OK!"=="0" (
     echo.
-    echo Error: Download failed ^(curl exit code %errorlevel%^)
+    echo Error: Download failed ^(both bitsadmin and curl unavailable or failed^)
     echo   Verify the Host is running: sudo utmm --host
     echo   Verify the binary exists on Host at %BIN%
+    echo   Verify network: ping %GW%
+    if exist "%TMP_BIN%" del /f "%TMP_BIN%" 2>nul
     exit /b 1
 )
 

@@ -1,19 +1,78 @@
 #!/bin/sh
-# UTM Monitor — one-click installation script
+# ═══════════════════════════════════════════════════════════════════════
+# UTM Monitor — one-click installation script (POSIX: Linux / macOS)
 # Supports both Host and Guest deployment modes
+# ═══════════════════════════════════════════════════════════════════════
 #
-# Host mode (default):
-#   curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
-#   → Downloads utmm.zip from GitHub Releases, extracts to /opt/utmm/, creates symlinks
+# ─── Prerequisites ────────────────────────────────────────────────────
 #
-# Guest mode (no internet needed — everything from Host HTTP at gateway IP):
-#   curl http://<gateway>:2121/bin/install.sh | sh -s -- --guest --hostname myvm
-#   → Auto-detects arch/OS, downloads correct binary from Host HTTP (gateway:2121),
-#     creates symlinks, installs service, starts Guest
+#   Required tools:
+#     - sh (POSIX shell)         — always present on Linux/macOS
+#     - curl or wget             — for downloading binaries; curl preferred
+#     - sudo                     — for privileged install to /opt/utmm/ and
+#                                  service registration
+#     - unzip (Host mode only)   — for extracting utmm.zip from GitHub Releases
 #
-# Environment:
+#   Required permissions:
+#     - root (via sudo)          — the install directory /opt/utmm/ is
+#                                  system-owned; service registration
+#                                  (systemd / launchd) requires root
+#
+#   Network requirements:
+#     - Host mode: outbound HTTPS to github.com (GitHub Releases)
+#     - Guest mode: HTTP to Host at gateway:2121 (no internet needed)
+#
+#   Supported operating systems:
+#     - Linux   (kernel 3.10+, glibc or musl)
+#     - macOS   (10.15 Catalina+)
+#
+#   Supported CPU architectures:
+#     - aarch64 / arm64   (ARM 64-bit — Apple Silicon, ARM servers)
+#     - x86_64  / amd64   (Intel/AMD 64-bit)
+#     - x86 / i386/i686   (Intel/AMD 32-bit — Linux only, no macOS 32-bit)
+#
+# ─── What this script does ────────────────────────────────────────────
+#
+#   Host mode:  download utmm.zip (all 8 platform binaries) → extract
+#               to /opt/utmm/ → detect arch/OS → create symlink
+#               /opt/utmm/utmm → /usr/local/bin/utmm
+#               Then: sudo utmm --host --install  (enable auto-start)
+#
+#   Guest mode: detect arch/OS → auto-discover Host gateway IP →
+#               download correct binary from Host HTTP (/bin/) →
+#               install to /opt/utmm/ → create symlinks →
+#               install systemd/launchd service → start Guest
+#               Then: sudo utmm --host --status (verify on Host)
+#
+# ─── Usage ────────────────────────────────────────────────────────────
+#
+#   Host mode (default):
+#     curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
+#     → Downloads utmm.zip from GitHub Releases, extracts to /opt/utmm/,
+#       creates symlinks
+#
+#   Guest mode (no internet needed — everything from Host HTTP at gateway IP):
+#     curl http://<gateway>:2121/bin/install.sh | sh -s -- --guest --hostname myvm
+#     → Auto-detects arch/OS, downloads correct binary from Host HTTP
+#       (gateway:2121), creates symlinks, installs service, starts Guest
+#
+# ─── Environment Variables ────────────────────────────────────────────
+#
 #   INSTALL_DIR   installation directory (default /opt/utmm)
 #   HTTP_PORT     Host HTTP port (default 2121)
+#
+# ─── Post-Install ─────────────────────────────────────────────────────
+#
+#   Host:  sudo utmm --host --install     (enable auto-start on boot)
+#          sudo utmm --host               (start now, or reboot)
+#
+#   Guest: service auto-started by --install; verify:
+#          sudo utmm --host --status      (run on Host machine)
+#
+#   Auto-upgrade (v0.11.14+): Guests detect Host version change via
+#   mesh LSA and upgrade themselves — no manual deployment needed after
+#   the initial install. Host never pushes upgrades.
+# ═══════════════════════════════════════════════════════════════════════
 
 set -e
 
