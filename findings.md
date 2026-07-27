@@ -285,7 +285,14 @@ linuxvm 稳定是因为它的升级尝试无声失败，从未进入升级循环
 
 **为什么 linuxvm 正常**: Linux 启动速度或网络时序差异使其侥幸避开竞态窗口。
 
-**状态**: 🔴 待修复
+**修复** (Phase 73, 2026-07-28):
+- `m.connect()` 不再销毁旧 session + 使用 `session_gen` 计数器产生唯一 conv
+- epoch 检查改为范围验证 `diff < 256`
+- `waitForHostTunnel()` mutex 解锁移到 `Tunnel.init()` 之后
+- `tunnel.deinit()` 加 `closeSession()` 消除泄露
+- 验证: macvm exec 4/4 成功（之前 exit=-1）
+
+**状态**: ✅ 已修复 (Phase 73)
 
 ### Finding 125: `nowMs()` RTT — 直连正确，中继异常
 
@@ -325,16 +332,107 @@ main.zig:393:35: dupe__anon in buildServiceArgs
 
 ---
 
+## v0.11.23 自动升级全流程测试发现 (2026-07-28)
+
+### Finding 135 (CRITICAL): linuxvm selfCopy 无法覆盖运行中二进制
+
+**现象**: v0.11.23 自动升级测试中，linuxvm 通过 KCP 下载 `utmm-new` = v0.11.23 成功（12.6MB），`applyUpgradeAndRestart()` 执行 `utmm-new --install`。但规范路径 `/opt/utmm/utmm` 仍为 v0.11.22，`/opt/utmm/utmm-new` 为 v0.11.23。
+
+**诊断**: 手动 `cp /opt/utmm/utmm-new /opt/utmm/utmm` 时得到 "Text file busy" 错误。服务进程持有的文件描述符阻止覆盖。
+
+**根因分析**: `forceInstall()` 序列：stop → kill → selfCopy → install → start。步骤 1 (stop) `systemctl stop utmm-guest` 应停止服务，步骤 3 (selfCopy) 才复制二进制。但步骤 1 可能：
+1. systemctl stop 返回成功但进程尚未完全退出（异步停止）
+2. 旧进程未完全释放文件锁，selfCopy 时的 tmp+rename 路径成功但 copyFile 到规范路径失败
+3. 16MB 二进制较大，selfCopy 时序窗口更长
+
+**影响**: 自动升级半完成 — 新二进制已下载但未部署，Guest 继续运行旧版本。Host 侧认为升级成功（命令流正常），但下次 LSA 版本检测仍不匹配 → 无限循环尝试升级。
+
+**状态**: 🔴 待修复
+
+### Finding 136 (CRITICAL): winx64 自动升级信号未检测到
+
+**现象**: v0.11.23 测试中 winx64 全程未触发自动升级，`utmm --status` 显示仍为 v0.11.22 serving。其他三台 Guest 均检测到并尝试升级。
+
+**可能原因**:
+1. LSA 广播未到达 winx64（网络路径问题 — winx64 在 192.168.3.x 子网，其他 VM 在 192.168.64.x/65.x）
+2. `upgrade.needed` 标志未被设置 — LSA 收到但版本比较逻辑未触发
+3. winx64 的 `meshSessionLoop` 升级检测代码路径与其他平台不同
+4. Guest 处于某种状态（如正在执行命令）导致升级检查被跳过
+
+**影响**: 该 Guest 永远不会自动升级，需手动干预。
+
+**状态**: 🔴 待调查
+
+### Finding 137: windowsvm 自动升级 install 失败，优雅回退
+
+**现象**: v0.11.23 测试中 windowsvm 通过 KCP 下载完成（~6MB），但 `applyUpgradeAndRestart()` 中的 `--install` 步骤失败。Guest 优雅回退到 v0.11.22 继续服务，未丢失。
+
+**积极面**:
+- Guest 未因升级失败而崩溃或失联
+- 下载的二进制未破坏运行中服务
+- 自动恢复到旧版本继续接受命令
+
+**对比 macvm/linuxvm**: 两者升级失败后需要手动恢复，windowsvm 自动恢复 — Windows 的 .exe 文件锁定反而成了保护机制。
+
+**状态**: 🟡 待调查（优雅回退是期望行为，但 install 失败根因需查）
+
+### Finding 138: KCP 自动升级下载性能瓶颈
+
+**现象**: 12.6MB 二进制下载耗时 13+ 分钟，有效吞吐仅 ~15KB/s。同时 Host 日志 `/var/log/utmm-host-err.log` 增长到 96MB。
+
+**根因**: `[mesh-kcp]` 和 `kcp_output` 日志以 info 级别打印每个 UDP 数据包的收发细节。对于 12.6MB 文件传输，1200B/chunk → ~10,500 chunks → 每个 chunk 触发多条日志 → 数十万条日志行写入磁盘。磁盘 I/O 成为瓶颈，拖慢整个事件循环。
+
+**修复方向**:
+- 将 mesh KCP 数据包日志降至 debug 级别
+- 或添加采样日志（每 N 个包打印一次）
+- 文件传输进度日志应独立于数据包日志
+
+**修复** (Phase 73, 2026-07-28): 3 条日志 `std.log.info` → `std.log.debug`。验证: 10 秒仅 3.5KB（之前 96MB）。
+
+**状态**: ✅ 已修复 (Phase 73)
+
+### Finding 139: Host 自 kill — `pkill -9 -x utmm` 杀死安装器自身
+
+**现象**: 当 Host 二进制位于规范路径 `/opt/utmm/utmm` 时，`sudo /opt/utmm/utmm --host --install` 在 `forceInstall` 的 kill 步骤（`pkill -9 -x utmm`）中匹配并杀死了正在执行的安装器进程自身。进程在 selfCopy 之前即被终止，安装中断。
+
+**规避方案**: 先将新二进制 `cp` 到规范路径（绕过 selfCopy），再用系统命令直接启动服务（绕过 `--install` 的 kill 步骤）。
+
+**与 Finding 107 的关系**: Finding 107 描述了 SSH 远程执行 `--install` 时被 pkill 自伤的同一问题。Finding 139 确认此问题同样影响 Host 本地安装。
+
+**状态**: 🟡 规避方案存在，需重新设计 kill 步骤（排除自身 PID）
+
+### Finding 123 更新: rollback 修复验证
+
+**原问题**: `forceInstallInternal()` 步骤 5（start）失败时触发回滚 — uninstall 服务配置 + deleteFile 删除二进制。自动升级场景中旧 Guest 进程已被步骤 2（kill）终止，回滚后 VM 彻底失联。
+
+**修复内容** (Phase 72): 删除步骤 5 的回滚逻辑。start 失败时保留二进制和服务配置，仅日志 err + fail.err 退出。
+
+**v0.11.23 测试验证**: macvm 上 launchctl bootstrap errno=2 后，二进制 v0.11.23 和 .plist 均保留。旧代码会删除两者 → VM 失联。修复生效。
+
+**剩余问题** (原 Finding 123 的另外两个根因):
+1. `pkill -9 -x utmm` 有时杀不掉旧进程 — 旧进程打出 "--install ok" 证明仍存活
+2. `exit(0)` + `KeepAlive SuccessfulExit=false` 不兼容 — 升级后应 exit(非零) 触发 launchd 重启
+
+**状态**: 部分修复（回滚路径已消除，pkill 失效 + exit(0) 问题待解决）
+
+---
+
 ## 已知问题
 
 | # | 问题 | 状态 |
 |---|------|------|
-| **123** | macOS 自动升级后服务永久停止 | 🔴 待修复 |
-| **124** | 非 Linux Guest 隧道不稳定 | 🔴 待调查 |
-| **125** | `nowMs()` RTT 中继路径异常 | 📋 不影响核心功能 |
-| **126** | DebugAllocator 泄漏 (`buildServiceArgs`) | 📋 仅 debug 构建 |
-| **127** | linuxvm 日志停止 | 📋 待调查 |
-| **128** | macOS bootstrap errno=5 在 bootout 后 | 📋 规避方案 |
+| **123** | macOS 自动升级后服务永久停止（回滚路径已修复，pkill+exit(0) 待解决） | 🔴 部分修复 |
+| **129** | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 | ✅ 已修复 (Phase 73) |
+| **135** | linuxvm selfCopy 无法覆盖运行中二进制（Text file busy） | 🔴 待修复 |
+| **136** | winx64 自动升级信号未检测到 | 🔴 待调查 |
+| **137** | windowsvm 自动升级 install 失败，优雅回退 | 🟡 待调查 |
+| **138** | KCP 自动升级下载性能瓶颈（~15KB/s，日志 I/O 阻塞） | ✅ 已修复 (Phase 73) |
+| **139** | Host 自 kill：`pkill -9 -x utmm` 杀死安装器自身 | 🟡 规避方案存在 |
+| 124 | 非 Linux Guest 隧道不稳定 | ✅ 已修复 (Finding 124) |
+| 125 | `nowMs()` RTT 中继路径异常 | 📋 不影响核心功能 |
+| 126 | DebugAllocator 泄漏 (`buildServiceArgs`) | 📋 仅 debug 构建 |
+| 127 | linuxvm 日志停止 | 📋 待调查 |
+| 128 | macOS bootstrap errno=5 在 bootout 后 | 📋 规避方案 |
 | 78/106 | 交叉编译覆盖 `zig-out/bin/utmm` | 📋 规避方案 |
 | 107 | SSH `--install` 被 pkill 自伤 | 📋 规避方案（手动配服务） |
 | 108 | 升级后 Guest hostname 丢失 | 📋 规避方案（手动修复） |

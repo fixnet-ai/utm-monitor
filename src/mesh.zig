@@ -342,12 +342,19 @@ pub const Mesh = struct {
     /// carry a different conv and are immediately rejected (Finding 93 / Task #254).
     nonce: u32,
 
+    /// Monotonically increasing counter appended to conv in connect() to make
+    /// each call produce a unique conv. Prevents KCP SN mismatch when a new
+    /// session reuses the same (host_id, guest_id, nonce) tuple while the peer
+    /// still holds state for the old session (Finding 129).
+    session_gen: u32 = 0,
+
     /// Guest-side: Host epoch (the Host's per-process nonce from LSA node_info).
     /// null until the first Host LSA arrives (bootstrap mode — accept any conv).
     host_epoch: ?u32 = null,
 
-    /// Guest-side: expected KCP conv from the Host, computed once host_epoch is known.
-    /// null during bootstrap. handleKcpData() validates incoming conv against this.
+    /// Guest-side: expected base KCP conv from the Host (without generation counter).
+    /// null during bootstrap. handleKcpData() accepts any conv in [base, base+256)
+    /// to allow the Host's connect() to increment session_gen for reconnections.
     host_expected_conv: ?u32 = null,
 
     /// Guest-side: NodeId of the Host (from LSA origin). Used to compute expected_conv.
@@ -428,6 +435,7 @@ pub const Mesh = struct {
             .shutdown = std.atomic.Value(bool).init(false),
             .upgrade_needed = upgrade_needed,
             .nonce = nonce,
+            .session_gen = 0,
             .clock_ms = 0,
         };
     }
@@ -776,6 +784,36 @@ pub const Mesh = struct {
                 _ = sess.kcp_inst.send(&[_]u8{0xFF}) catch {};
             }
         }
+
+        // ── Dead session cleanup (safety net) ──
+        // Sessions marked dead by keepalive are normally cleaned up when the
+        // owning Tunnel calls closeSession() via tunnel.deinit(). This is a
+        // safety net for orphaned sessions whose owning Tunnel was never
+        // properly deinitialized. Only cleans up sessions idle > 60s to give
+        // Tunnel owners ample time to call closeSession() themselves.
+        // Collect-then-remove avoids iterator invalidation during hashmap mutation.
+        {
+            var to_cleanup: std.ArrayList(u32) = .empty;
+            defer to_cleanup.deinit(self.allocator);
+            var s_iter2 = self.sessions.iterator();
+            while (s_iter2.next()) |entry2| {
+                const s = entry2.value_ptr.*;
+                if (s.dead) {
+                    const idle = self.clock_ms -| s.last_recv_ms;
+                    if (idle > 60_000) {
+                        to_cleanup.append(self.allocator, entry2.key_ptr.*) catch {};
+                    }
+                }
+            }
+            for (to_cleanup.items) |conv| {
+                if (self.sessions.get(conv)) |s| {
+                    std.log.info("[mesh] cleaning up orphaned dead session conv={d}", .{conv});
+                    _ = self.sessions.remove(conv);
+                    s.deinit();
+                    self.allocator.destroy(s);
+                }
+            }
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -917,16 +955,18 @@ pub const Mesh = struct {
                     self.host_node_id = decoded.origin;
                     self.host_expected_conv = computeConv(decoded.origin, self.node_id, epoch);
 
-                    // Mark existing sessions with wrong conv as dead.
+                    // Mark sessions outside the generation window as dead.
                     // Handles the bootstrap race: KCP data arrives before LSA,
                     // creating a session with an old conv. Now that we know
-                    // the correct conv, non-matching sessions must die.
+                    // the correct base conv, sessions from a different epoch
+                    // (outside the 256-gen window) must die.
                     self.sessions_mutex.lock(self.io) catch {};
                     defer self.sessions_mutex.unlock(self.io);
                     var s_it = self.sessions.iterator();
                     while (s_it.next()) |s_entry| {
-                        if (s_entry.key_ptr.* != self.host_expected_conv.?) {
-                            std.log.info("[mesh] marking session conv={d} dead (epoch changed, expected={d})", .{ s_entry.key_ptr.*, self.host_expected_conv.? });
+                        const diff = s_entry.key_ptr.* -% self.host_expected_conv.?;
+                        if (diff >= 256) {
+                            std.log.info("[mesh] marking session conv={d} dead (outside gen window, base={d})", .{ s_entry.key_ptr.*, self.host_expected_conv.? });
                             s_entry.value_ptr.*.dead = true;
                         }
                     }
@@ -1017,18 +1057,20 @@ pub const Mesh = struct {
         // Are we the destination?
         if (std.mem.eql(u8, &dst_mac, &self.node_id)) {
             // ── Conv epoch validation (Guest-side) ──
-            // Once we've received the Host's LSA and know its epoch,
-            // reject KCP packets with the wrong conv immediately.
-            // Prevents stale retransmissions from a previous Host process
-            // from creating dead sessions (Finding 93 / Task #254).
+            // Once we've received the Host's LSA and know its epoch base,
+            // accept any conv in [base, base+256). The Host's m.connect()
+            // increments a generation counter to produce unique convs for
+            // reconnections — range validation accommodates this while still
+            // rejecting stale packets from a previous Host process (Finding 93).
             if (self.host_expected_conv) |expected| {
-                if (kcp_conv != expected) {
-                    std.log.info("[mesh] Rejecting KCP packet from {any} conv={d} (expected={d}, epoch changed)", .{ from, kcp_conv, expected });
+                const diff = kcp_conv -% expected;
+                if (diff >= 256) {
+                    std.log.info("[mesh] Rejecting KCP packet from {any} conv={d} (outside gen window, base={d})", .{ from, kcp_conv, expected });
                     return;
                 }
             }
 
-            std.log.info("[mesh-kcp] recv UDP {d}B from {any} conv={d}", .{ data.len, from, kcp_conv });
+            std.log.debug("[mesh-kcp] recv UDP {d}B from {any} conv={d}", .{ data.len, from, kcp_conv });
             // Deliver to our KCP session (keyed by conv from packet header)
             self.sessions_mutex.lock(self.io) catch {
             // If the Io context is canceled, skip this periodicTasks cycle.
@@ -1047,7 +1089,7 @@ pub const Mesh = struct {
                 const new_peek = sess.kcp_inst.peekSize();
                 if (prev_peek != new_peek) {
                     const first_sn = sess.kcp_inst.firstRcvBufSn();
-                    std.log.info("[mesh-kcp] conv={d} peek {}→{} rcvQ={d} rcvB={d} rcvNxt={d} firstBufSn={any}", .{
+                    std.log.debug("[mesh-kcp] conv={d} peek {}→{} rcvQ={d} rcvB={d} rcvNxt={d} firstBufSn={any}", .{
                         kcp_conv, prev_peek, new_peek,
                         sess.kcp_inst.rcvQueueLen(),
                         sess.kcp_inst.rcvBufLen(),
@@ -1148,7 +1190,7 @@ pub const Mesh = struct {
         mesh.neighbors_mutex.lock(mesh.io) catch return;
         defer mesh.neighbors_mutex.unlock(mesh.io);
         if (mesh.neighbors.get(sess.next_hop)) |neighbor| {
-            std.log.info("[mesh] kcp_output: conv={d} len={d} to={} next_hop={any}", .{ conv, data.len, neighbor.addr, sess.next_hop });
+            std.log.debug("[mesh] kcp_output: conv={d} len={d} to={} next_hop={any}", .{ conv, data.len, neighbor.addr, sess.next_hop });
             var buf: [4096]u8 = undefined;
             buf[0] = protocol.MESH_TYPE_KCP;
             buf[1] = protocol.MESH_MAX_TTL;
@@ -1453,7 +1495,9 @@ pub const Mesh = struct {
     // ──────────────────────────────────────────────────────────────────────────
 
     /// Create a new KCP session to a remote node. Always creates a fresh KCP
-    /// instance — closes any existing session for the same destination first.
+    /// instance with a unique conv (base conv + generation counter). Does NOT
+    /// destroy old sessions for the same destination — they expire naturally
+    /// via keepalive timeout and are cleaned up by the owning Tunnel's deinit.
     /// Thread-safe: locks sessions_mutex to protect against concurrent mesh.run() access.
     pub fn connect(self: *Mesh, dest: NodeId) !*MeshSession {
         self.sessions_mutex.lock(self.io) catch {
@@ -1461,30 +1505,15 @@ pub const Mesh = struct {
         };
         defer self.sessions_mutex.unlock(self.io);
 
-        // KCP conv is purely a function of (host_id, guest_id, host_nonce).
-        // Host restart → new nonce → new conv → stale old-process KCP packets
-        // are immediately rejected at the conv level (Finding 93 / Task #254).
-        const conv = computeConv(self.node_id, dest, self.nonce);
-
-        // Close any existing session for the same destination. Always create
-        // a fresh KCP instance — even if conv hasn't changed (e.g. Guest
-        // reconnected without Host restart), the old KCP state has advanced
-        // SNs that would deadlock the Guest's fresh KCP (rcv_nxt=0 mismatch).
-        {
-            var s_iter = self.sessions.iterator();
-            while (s_iter.next()) |entry| {
-                if (std.mem.eql(u8, &entry.value_ptr.*.remote, &dest)) {
-                    const old_conv = entry.key_ptr.*;
-                    if (self.sessions.get(old_conv)) |old_sess| {
-                        std.log.info("[mesh] close stale session conv={d} for dest (new conv={d})", .{ old_conv, conv });
-                        _ = self.sessions.remove(old_conv);
-                        old_sess.deinit();
-                        self.allocator.destroy(old_sess);
-                    }
-                    break;
-                }
-            }
-        }
+        // KCP conv = deterministic base + monotonic generation counter.
+        // Host restart → new nonce → new base conv → stale old-process KCP
+        // packets are immediately rejected at the conv level (Finding 93).
+        // The generation counter ensures each connect() call produces a unique
+        // conv even without Host restart, preventing KCP SN mismatch when the
+        // peer still holds state for a previous session (Finding 129).
+        const base_conv = computeConv(self.node_id, dest, self.nonce);
+        const conv = base_conv +% self.session_gen;
+        self.session_gen +%= 1;
 
         const sess = try self.allocator.create(MeshSession);
         errdefer self.allocator.destroy(sess);

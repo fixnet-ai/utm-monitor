@@ -25,14 +25,15 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 
 ## 当前状态
 
-- **版本**: v0.11.18（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入）
+- **版本**: v0.11.23（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入）
 - **`build.zig.zon`**: `0.0.0`（永不再改）
 - **源文件**: 16 个（`src/*.zig`）+ 1 版本文件（`src/ver.txt`）+ 2 skills（`zig`、`deploy`）
 - **测试**: 166/166 通过
-- **部署**: macOS Host v0.11.18 ✅ | linuxvm v0.11.18 ✅ | macvm v0.11.18 ✅ | windowsvm v0.11.18 ✅ | winx64 v0.11.18 ✅
+- **部署**: macOS Host v0.11.23 ✅ | linuxvm v0.11.23 ✅ | macvm v0.11.23 ✅ | windowsvm v0.11.22 | winx64 v0.11.22
 - **健康检查**: 4/4 全部通过（status ✓ ping ✓ exec ✓）
 - **8 交叉编译目标**: aarch64/x86_64/x86 × linux-musl/macos/windows
 - **GitHub 版本检查**: Host 启动时 fire-and-forget OS 线程，支持 302 重定向，格式校验防污染
+- **自动升级 rollback 修复**: `forceInstallInternal()` 步骤 5 不再回滚删除二进制+配置 ✅
 
 ## 已完成阶段
 
@@ -60,14 +61,80 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 69 | 2026-07-27 | ✅ 开发效率提升：二进制类型校验 + 一键部署 + 健康检查 + deploy skill |
 | 70 | 2026-07-27 | `--status` 增强：全部字段 + Host 显示 + role 字段区分 host/guest |
 | 71 | 2026-07-28 | 版本号单文件管理 + GitHub 新版本检测（OS线程 fire-and-forget） |
+| 72 | 2026-07-28 | 自动升级 rollback 修复 + 全流程部署测试 |
+| 73 | 2026-07-28 | KCP Tunnel 稳定性 + 下载性能修复（Finding 129 + 138） |
+
+## Phase 72: 自动升级 rollback 修复 + 全流程部署测试 ✅ (2026-07-28)
+
+| # | 任务 | 描述 | 状态 |
+|---|------|------|------|
+| 339 | rollback 修复 | `forceInstallInternal()` 步骤 5 删除回滚逻辑，启动失败保留二进制+配置 | ✅ |
+| 340 | v0.11.21→v0.11.23 构建 | 三次 bump 版本，构建 8 目标，部署 Host | ✅ |
+| 341 | macvm 自动升级测试 | 下载成功，launchctl bootstrap errno=2，二进制+配置保留（新代码），手动恢复 | ✅ |
+| 342 | linuxvm 自动升级测试 | 下载成功但 selfCopy 未更新规范路径二进制（已有 bug），手动修复 | ✅ |
+| 343 | windowsvm 自动升级测试 | 下载完成 install 失败，优雅回退到旧版本 | ✅ |
+| 344 | winx64 自动升级测试 | 未检测到升级信号，仍运行旧版本 | ✅ |
+
+### 变更摘要
+
+**`src/svc.zig` — forceInstallInternal() 步骤 5**:
+- 删除 start 失败时的回滚逻辑（uninstallServiceConfig + deleteFile）
+- 改为保留二进制和配置，仅日志 err + fail.err 退出
+- 理由: 自动升级时旧进程已被 kill，删除一切 = VM 彻底失联
+
+### 测试结论
+
+**rollback 修复验证成功** — macvm 场景是最好证明：
+- launchctl bootstrap 失败后，旧代码会删除二进制+plist → VM 失联
+- 新代码保留二进制+配置 → 系统级恢复机制（重启、手动启动）仍可用
+
+**发现 5 个已有/新问题**（见 findings.md Finding 135-139），均非本次修改引入。
+
+## Phase 73: KCP Tunnel 稳定性 + 下载性能修复 ✅ (2026-07-28)
+
+| # | 任务 | 描述 | 状态 |
+|---|------|------|------|
+| 345 | Finding 138 修复 | 3 条 KCP 数据包日志 info→debug，消除 ~15KB/s 性能瓶颈 | ✅ |
+| 346 | Finding 129 修复 | 生成计数器唯一 conv + 移除旧 session 销毁 + epoch 范围验证 + 死 session 清理 | ✅ |
+| 347 | waitForHostTunnel 修复 | sessions_mutex 移到 Tunnel.init() 之后，消除 UAF 窗口 | ✅ |
+| 348 | tunnel.deinit 修复 | 加 closeSession() 调用，消除 session 泄露 | ✅ |
+| 349 | 测试 + 部署验证 | 166/166 测试通过，Host + macvm + linuxvm 部署，exec 验证 | ✅ |
+
+### 变更摘要
+
+**`src/mesh.zig`**:
+- 3 条日志 `std.log.info` → `std.log.debug`：`[mesh-kcp] recv`、`[mesh-kcp] peek`、`[mesh] kcp_output`
+- 新增 `session_gen: u32` 字段，`connect()` 使用 `base_conv + session_gen` 产生唯一 conv
+- 移除 `connect()` 中对同一 dest 旧 session 的销毁（UAF 根因）
+- epoch 检查改为范围验证 `diff < 256`（两处：`handleKcpData` + `handleLsa`）
+- `periodicTasks()` 增加孤立死 session 清理（60s 保险机制）
+
+**`src/broadcast.zig`**:
+- `waitForHostTunnel()`: sessions_mutex 解锁移到 `Tunnel.init()` 之后
+
+**`src/tunnel.zig`**:
+- `deinit()` 调用 `mesh.closeSession()` 正确释放 session
+
+### 验证结果
+
+| 测试 | 修复前 | 修复后 |
+|------|--------|--------|
+| macvm exec | exit=-1（几乎每次） | **4/4 成功** |
+| linuxvm exec | 正常 | 正常（无回归） |
+| macvm 文件上传 | 不稳定 | 成功 |
+| Host 日志增长 | ~96MB/数分钟 | ~3.5KB/10 秒 |
 
 ## 待修复
 
 | Finding | 严重度 | 描述 |
 |---------|--------|------|
 | 123 | 🔴 CRITICAL | macOS 自动升级后 `exit(0)` + `KeepAlive SuccessfulExit=false` → 服务永久停止 |
-| 124 | ✅ 已修复 | LSA restart 用全 node_info 比较 → 动态字段(status:)触发误判 → nonce 比较 |
-| 129 | 🔴 | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
+| 135 | 🔴 | linuxvm selfCopy 无法覆盖运行中二进制（Text file busy） |
+| 136 | 🔴 | winx64 自动升级信号未检测到 |
+| 137 | 🟡 | windowsvm 自动升级 install 失败，优雅回退 |
+| 139 | 🟡 | Host 自 kill：pkill -9 -x utmm 杀死正执行的安装器自身 |
+| 129 | ✅ 已修复 | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
+| 138 | ✅ 已修复 | KCP 自动升级下载性能瓶颈（~15KB/s，mesh 日志刷屏） |
 
 ## Phase 71: 版本号单文件管理 + GitHub 新版本检测 ✅ (2026-07-28)
 

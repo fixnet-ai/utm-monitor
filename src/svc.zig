@@ -901,15 +901,13 @@ fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole,
     };
 
     // 5. Start service.
-    // If this fails, uninstall the service + remove binary so the system
-    // isn't left with a service that won't start.
+    // Don't rollback on failure — binary and service config are already in
+    // place. System-level recovery (Restart=on-failure, KeepAlive, reboot,
+    // or manual intervention) can bring the service back. Deleting everything
+    // leaves the VM unreachable with no recovery path — especially critical
+    // for auto-upgrade where the old Guest process was already killed.
     start(io, alloc, role) catch |err| {
-        std.log.warn("[svc] start failed, rolling back install of {s}", .{name});
-        stop(io, alloc, role) catch {}; // best-effort stop
-        uninstallServiceConfig(io, alloc, role);
-        std.Io.Dir.cwd().deleteFile(io, dest_path) catch |rm_err| {
-            std.log.warn("[svc] cleanup binary after start failure: {}", .{rm_err});
-        };
+        std.log.err("[svc] start failed for {s}: {} — binary and config preserved, not rolling back", .{ name, err });
         fail.err("forceInstall/start", err);
     };
 

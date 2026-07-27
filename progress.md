@@ -1,14 +1,72 @@
-# Progress: v0.11.18
+# Progress: v0.11.23
 
 ## 当前状态
 
 - **分支**: `main`
-- **版本**: v0.11.18（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入；`build.zig.zon` 永为 `0.0.0`）
+- **版本**: v0.11.23（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入；`build.zig.zon` 永为 `0.0.0`）
 - **测试**: 166/166 通过
-- **部署**: macOS Host v0.11.18 ✅ | linuxvm v0.11.18 ✅ | macvm v0.11.18 ✅ | windowsvm v0.11.18 ✅ | winx64 v0.11.18 ✅
+- **部署**: macOS Host v0.11.23 ✅ | macvm v0.11.23 ✅ | linuxvm v0.11.23 ✅ | windowsvm v0.11.22 | winx64 v0.11.22
 - **健康检查**: 4/4 全部通过（`--verify` 全绿 ✓）
-- **状态增强**: Host + 4 Guest 全部显示，role/status/last_seen 正确
-- **GitHub 检查**: Host 启动时 fire-and-forget 线程，支持重定向+格式校验
+- **自动升级 rollback 修复**: `forceInstallInternal()` 步骤 5 不再回滚删除二进制+配置 ✅
+- **KCP Tunnel 稳定性修复**: session_gen 唯一 conv + epoch 范围验证 + 日志降级 ✅
+
+## Phase 73: KCP Tunnel 稳定性 + 下载性能修复 (2026-07-28)
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 345 | 3 条 KCP 日志 info→debug（Finding 138） | ✅ |
+| 346 | session_gen 计数 + 移除旧 session 销毁 + epoch 范围（Finding 129） | ✅ |
+| 347 | waitForHostTunnel mutex 解锁顺序修复 | ✅ |
+| 348 | tunnel.deinit 加 closeSession() | ✅ |
+| 349 | 部署验证（Host + macvm + linuxvm） | ✅ |
+
+### 变更摘要
+
+- **`src/mesh.zig`**: session_gen 字段、connect() 重写、2 处 epoch 检查改为范围验证、3 条日志降级、死 session 清理
+- **`src/broadcast.zig`**: waitForHostTunnel() mutex 移到 Tunnel.init() 之后
+- **`src/tunnel.zig`**: deinit() 调用 closeSession()
+
+### 验证结果
+
+- macvm exec 4/4 成功（修复前 exit=-1）
+- linuxvm exec 无回归
+- 日志 10 秒 3.5KB（修复前 96MB/数分钟）
+- Windows VM 仍 v0.11.22，显示旧行为（符合预期）
+
+## Phase 72: 自动升级 rollback 修复 + 全流程部署测试 (2026-07-28)
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 339 | `forceInstallInternal()` 步骤 5 删除回滚逻辑 | ✅ |
+| 340 | v0.11.21→v0.11.22→v0.11.23 构建 + Host 部署 | ✅ |
+| 341 | macvm 自动升级观察 | ✅ 下载成功，bootstrap errno=2，二进制+配置保留 |
+| 342 | linuxvm 自动升级观察 | ✅ 下载成功，selfCopy 未更新（Text file busy），手动修复 |
+| 343 | windowsvm 自动升级观察 | ✅ 下载成功，install 失败，优雅回退 |
+| 344 | winx64 自动升级观察 | ✅ 未检测到升级信号 |
+
+### 变更摘要
+
+**`src/svc.zig` — forceInstallInternal() 步骤 5**:
+- 删除 start 失败时的回滚逻辑（uninstallServiceConfig + deleteFile）
+- 改为保留二进制和配置，仅日志 err + fail.err 退出
+- 理由: 自动升级时旧进程已被 kill，删除一切 = VM 彻底失联
+
+### 自动升级结果矩阵
+
+| Guest | 下载 | install | 最终版本 | 根因 | Finding |
+|-------|------|---------|---------|------|---------|
+| macvm | ✅ 12.6MB | ⚠️ bootstrap errno=2 | v0.11.23 | launchctl bootstrap 间歇失败 | 92, 128 |
+| linuxvm | ✅ 12.6MB | ❌ selfCopy 未更新 | v0.11.23 (手动) | Text file busy — 服务未完全停止 | 135 |
+| windowsvm | ✅ 6MB | ❌ install 失败 | v0.11.22 | 待调查（优雅回退） | 137 |
+| winx64 | ❌ 未触发 | — | v0.11.22 | LSA 升级信号未检测到 | 136 |
+
+### 关键发现
+
+1. **rollback 修复验证成功** — macvm 场景是最佳证明：bootstrap 失败后二进制+配置保留，旧代码会删除一切
+2. **linuxvm selfCopy** — `systemctl stop` 异步，进程未完全退出前 selfCopy 遇到 "Text file busy"
+3. **KCP 下载性能** — info 级别 mesh 数据包日志导致 96MB 日志文件，有效吞吐 ~15KB/s
+4. **Host 自 kill** — `pkill -9 -x utmm` 匹配安装器自身进程
+5. **winx64 子网隔离** — 192.168.3.x 与 64.x/65.x 之间的 LSA 可达性待验证
 
 ## Phase 71: 版本号单文件管理 + GitHub 新版本检测 (2026-07-28)
 

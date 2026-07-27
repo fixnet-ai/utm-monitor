@@ -200,13 +200,13 @@ pub const Tunnel = struct {
         return self.session.kcp_inst.waiting();
     }
 
-    /// Close the tunnel and release the mesh session.
-    /// The caller must have access to the Mesh to properly close.
+    /// Deinit the tunnel and release the mesh session.
+    /// Calls mesh.closeSession() to remove the session from the sessions
+    /// hashmap and free KCP resources. Must NOT be called while holding
+    /// sessions_mutex (closeSession acquires it internally).
     pub fn deinit(self: *Tunnel) void {
-        // Note: actual session cleanup is done by mesh.closeSession()
-        // This just marks the tunnel as invalid. Debug mode will panic
-        // on subsequent use via assertAlive() checks.
         self._alive = false;
+        self.session.mesh.closeSession(self.session);
         self.* = undefined;
     }
 

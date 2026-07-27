@@ -1467,8 +1467,13 @@ fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_
                 }
                 if (best) |sess| {
                     std.log.debug("[guest-wait] selected conv={d} peek={d}", .{ sess.conv, sess.kcp_inst.peekSize() });
+                    // Must hold sessions_mutex during Tunnel.init() to prevent
+                    // the session from being freed by another thread between
+                    // unlock and init (Finding 129). Tunnel.init() is a pure
+                    // struct literal — no allocation, no blocking.
+                    const tun = tunnel_mod.Tunnel.init(allocator, m.io, sess);
                     m.sessions_mutex.unlock(m.io);
-                    return tunnel_mod.Tunnel.init(allocator, m.io, sess);
+                    return tun;
                 }
             }
             m.sessions_mutex.unlock(m.io);
