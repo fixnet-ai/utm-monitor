@@ -799,6 +799,18 @@ pub fn handleMeshGuest(
                     std.log.err("[tun-hdl] serveUpgradeFile failed: {}", .{err});
                 };
             },
+            @intFromEnum(tunproto.MsgType.upload_result) => {
+                const ur = tunproto.parseUploadResult(data[1..]) orelse {
+                    std.log.err("[tun-hdl] upload_result parse failed for {s}", .{hostname});
+                    continue;
+                };
+                std.log.info("[tun-hdl] upload_result from {s}: cmd={s} exit={d}", .{ hostname, ur.cmd_id, ur.exit_code });
+                // Complete any matching OpState (upload or upgrade operations)
+                if (!state.isOpDone(ur.cmd_id)) {
+                    state.completeOpState(ur.cmd_id, ur.exit_code);
+                    state.wake_event.set(state.io.?);
+                }
+            },
             else => {
                 std.log.err("[tun-hdl] unknown msg type 0x{x:0>2} for {s}", .{ msg_type, hostname });
             },

@@ -455,131 +455,31 @@ fn tunnelManager(
                     httpd.syncHostsFromState(state, allocator);
                 }
 
-                // Phase 2: Establish tunnel if not already active.
+                // Establish tunnel if not already active.
                 // Uses state.getGuestTunnel() as the sole source of truth —
                 // when handleMeshGuest disconnects, its defer calls
                 // removeGuestTunnel, and the next scan reconnects.
                 //
-                // When status changes to "upgrading" (utmm-old takes over),
-                // force-replace the old tunnel immediately instead of waiting
-                // for KCP keepalive timeout on the dead Guest connection.
+                // Auto-upgrade is Guest-initiated: the Guest detects version
+                // mismatch via LSA, connects through the normal tunnel, sends
+                // upgrade_req, and handleMeshGuest serves the new binary via
+                // serveUpgradeFile(). No special Host-side handling needed.
                 //
-                // For upgrading guests: prefer a Guest-initiated session (created
-                // via the Guest's m.connect()) over creating a new Host-initiated
-                // session. This avoids the dual-session mismatch that causes
-                // tunnel death during file transfer.
-                const upgrading = std.mem.eql(u8, status, "upgrading");
-                const status_just_changed = changed and upgrading;
-
                 // isTunnelDead holds state.mutex across the lookup+isAlive
                 // check, preventing use-after-free when the mesh handler
                 // thread concurrently frees the tunnel (Finding 78).
                 const tun_dead = state.isTunnelDead(hostname);
 
-                // Snapshot the tunnel's KCP conv for guest-session detection.
-                // We only need the conv for comparison — even if the tunnel is
-                // freed immediately after, the old conv value is safe to compare.
-                const existing_tun_conv: ?u32 = blk: {
-                    if (state.getGuestTunnel(hostname)) |tun| {
-                        // Must read conv while the pointer is still valid
-                        // (getGuestTunnel returned non-null → alive).
-                        // There is still a narrow race, but conv is an integer
-                        // and stale comparisons are harmless (they just cause
-                        // an unnecessary tunnel replace, which is safe).
-                        break :blk tun.session.conv;
-                    }
-                    break :blk null;
-                };
-
-                // Check if a Guest-initiated session (different conv) is now
-                // available — happens when the Host restarts, creates a fallback
-                // session via m.connect(), then the Guest reconnects with its
-                // own session. We must switch to the Guest's session or data
-                // flows through mismatched conv IDs and exec hangs.
-                const guest_session_available = if (!tun_dead and existing_tun_conv != null) blk: {
-                    const tun_conv = existing_tun_conv.?;
-                    var found: bool = false;
-                    m.sessions_mutex.lock(m.io) catch break :blk false;
-                    defer m.sessions_mutex.unlock(m.io);
-                    var s_it = m.sessions.iterator();
-                    while (s_it.next()) |s_entry| {
-                        if (std.mem.eql(u8, &s_entry.value_ptr.*.remote, &saved_node_id)) {
-                            if (s_entry.key_ptr.* != tun_conv) {
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                    break :blk found;
-                } else false;
-
-                // Note: guest_session_available is intentionally NOT a trigger
-                // for tunnel replacement during normal operation. When the Host
-                // restarts and creates a fresh session via m.connect(), the
-                // Guest's old keepalive session (different conv) is harmless and
-                // will expire via KCP keepalive timeout. Including it here causes
-                // an infinite tunnel-recreate loop: m.connect() → detect old
-                // keepalive → replace → m.connect() again → ...
-                if (tun_dead or status_just_changed) {
-                    if (!tun_dead) {
-                        std.log.info("[tun-mgr] {s} tunnel replace (dead={}, upgrading={}, guestSession={})", .{ hostname, tun_dead, status_just_changed, guest_session_available });
-                        state.removeGuestTunnel(hostname);
-                    }
-
-                    // For upgrading guests: search for a Guest-initiated session
-                    // with upgrade_req data pending. This is the only case where
-                    // we need the Guest's session — the Guest creates it during
-                    // the upgrade handshake with a conv that differs from the
-                    // Host's m.connect() conv.
-                    //
-                    // For normal (re)connection — including after Host restart —
-                    // always use m.connect() to create a fresh Host-initiated
-                    // session. The Guest will respond on this same conv, so
-                    // there is no dual-session mismatch. Old keepalive-probe
-                    // sessions from the previous Host epoch have different convs
-                    // and are harmless — they are never selected by tunnelManager
-                    // and expire via KCP keepalive timeout (~15 s).
-                    var sess: ?*mesh_mod.MeshSession = null;
-                    if (upgrading) {
-                        {
-                            m.sessions_mutex.lock(m.io) catch continue;
-                            defer m.sessions_mutex.unlock(m.io);
-
-                            var s_it = m.sessions.iterator();
-                            while (s_it.next()) |s_entry| {
-                                if (std.mem.eql(u8, &s_entry.value_ptr.*.remote, &saved_node_id)) {
-                                    if (s_entry.value_ptr.*.kcp_inst.peekSize() < 0) {
-                                        std.log.info("[tun-mgr] {s} skipping stale session conv={d} (no data)", .{ hostname, s_entry.key_ptr.* });
-                                        continue;
-                                    }
-                                    sess = s_entry.value_ptr.*;
-                                    std.log.info("[tun-mgr] {s} using guest-initiated session conv={d}", .{ hostname, s_entry.key_ptr.* });
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        // Normal reconnect — create fresh Host-initiated session.
-                        // This avoids the dual-session mismatch (Finding 93) that
-                        // occurs when tunnelManager picks an old keepalive session
-                        // instead of a session the Guest actually listens on.
-                        sess = m.connect(saved_node_id) catch |err| {
-                            std.log.err("[tun-mgr] connect to {s} failed: {} (will retry)", .{ hostname, err });
-                            continue;
-                        };
-                    }
-
-                    if (sess == null) {
-                        if (upgrading) {
-                            // Upgrading Guest hasn't sent upgrade_req yet — wait.
-                            continue;
-                        }
-                        // Should not reach here: non-upgrading always has a
-                        // session from m.connect() above.
+                if (tun_dead) {
+                    // Create fresh Host-initiated session via m.connect().
+                    // The Guest's waitForHostTunnel() picks it up on the
+                    // next poll cycle.
+                    const sess = m.connect(saved_node_id) catch |err| {
+                        std.log.err("[tun-mgr] connect to {s} failed: {} (will retry)", .{ hostname, err });
                         continue;
-                    }
+                    };
                     const tun_ptr = allocator.create(tunnel_mod.Tunnel) catch continue;
-                    tun_ptr.* = tunnel_mod.Tunnel.init(allocator, m.io, sess.?);
+                    tun_ptr.* = tunnel_mod.Tunnel.init(allocator, m.io, sess);
 
                     // Register with HostState
                     state.registerGuestTunnel(hostname, tun_ptr) catch |err| {
@@ -621,26 +521,9 @@ fn tunnelManager(
 
                     std.log.info("[tun-mgr] Tunnel + handler started for {s}", .{hostname});
 
-                    // Phase 3: Push upgrade to outdated Guests that lack
-                    // the auto-upgrade code (v0.11.11 bootstrapping).
-                    // Only push on fresh tunnels to avoid disrupting
-                    // active command sessions.
-                    if (!std.mem.eql(u8, version, protocol.VERSION) and !upgrading and version.len > 0) {
-                        std.log.info("[tun-mgr] {s} outdated ({s} < {s}), pushing upgrade...", .{
-                            hostname, version, protocol.VERSION,
-                        });
-                        pushUpgradeToGuest(
-                            allocator,
-                            state.io.?,
-                            tun_ptr,
-                            hostname,
-                            target,
-                            state.serve_dir,
-                            m.clock_ms,
-                        ) catch |err| {
-                            std.log.err("[tun-mgr] upgrade push to {s} failed: {}", .{ hostname, err });
-                        };
-                    }
+                    // Auto-upgrade is Guest-initiated: Guests detect version
+                    // mismatch via LSA and download the new binary themselves.
+                    // No Host-side push needed.
                 }
             }
         }
@@ -650,109 +533,6 @@ fn tunnelManager(
     }
 }
 
-/// Push upgrade binary to a legacy Guest (v0.11.11) that lacks the
-/// auto-upgrade code. Uses the KCP upload protocol (upload_cmd + file_chunk +
-/// file_eof) which the legacy Guest already supports, then sends a
-/// pty_exec_input to run --install. The Guest's forceInstall kills the old
-/// process during its "kill" step, completing the upgrade.
-fn pushUpgradeToGuest(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    tun: *tunnel_mod.Tunnel,
-    hostname: []const u8,
-    target: []const u8,
-    serve_dir: []const u8,
-    current_ms: u32,
-) !void {
-    const filename = protocol.deploymentFilename(target) orelse {
-        std.log.err("[upgrade-push] Unknown target {s} for {s}", .{ target, hostname });
-        return error.UnknownTarget;
-    };
-
-    // Determine Guest-side paths from target triple
-    const is_windows = std.mem.indexOf(u8, target, "windows") != null;
-    const guest_dir = if (is_windows) "C:\\opt\\utmm" else "/opt/utmm";
-    const new_name = if (is_windows) "utmm-new.exe" else "utmm-new";
-    const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ guest_dir, new_name });
-    defer allocator.free(dest_path);
-
-    // Open and read the deployment binary
-    const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ serve_dir, filename });
-    defer allocator.free(file_path);
-
-    const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch |err| {
-        std.log.err("[upgrade-push] Cannot open {s}: {}", .{ file_path, err });
-        return err;
-    };
-    defer file.close(io);
-
-    const file_size_u64 = try file.length(io);
-    if (file_size_u64 > 64 * 1024 * 1024) return error.FileTooLarge;
-    const file_size: u32 = @intCast(file_size_u64);
-
-    // Read entire binary into buffer to pre-compute SHA256
-    const data = try allocator.alloc(u8, file_size);
-    defer allocator.free(data);
-    _ = try file.readPositionalAll(io, data, 0);
-
-    // Compute SHA256
-    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
-    sha256.update(data);
-    var hash_bin: [32]u8 = undefined;
-    sha256.final(&hash_bin);
-    var hash_hex: [64]u8 = undefined;
-    for (hash_bin, 0..) |b, j| {
-        hash_hex[j * 2] = "0123456789abcdef"[b >> 4];
-        hash_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
-    }
-
-    std.log.info("[upgrade-push] Pushing {s} ({d} bytes, sha256={s}) to {s} at {s}", .{
-        filename, file_size, &hash_hex, hostname, dest_path,
-    });
-
-    // Phase 1: Upload binary via KCP upload protocol
-    const up_id = try std.fmt.allocPrint(allocator, "upgrade_{s}", .{hostname});
-    defer allocator.free(up_id);
-
-    const upload_frame = try tunproto.buildUploadCmd(allocator, up_id, dest_path, file_size, &hash_hex);
-    defer allocator.free(upload_frame);
-    _ = try tun.sendAndFlush(upload_frame, current_ms);
-
-    // Send file in 8KB chunks
-    const chunk_size: usize = 8192;
-    var offset: u32 = 0;
-    while (offset < file_size) {
-        const remaining = file_size - offset;
-        const sz = @min(remaining, chunk_size);
-        const chunk_frame = try tunproto.buildFileChunk(allocator, up_id, data[offset .. offset + sz]);
-        defer allocator.free(chunk_frame);
-        _ = try tun.sendAndFlush(chunk_frame, current_ms);
-        offset += @intCast(sz);
-    }
-
-    // Send file_eof
-    const eof_frame = try tunproto.buildFileEof(allocator, up_id, 0, file_size, &hash_hex);
-    defer allocator.free(eof_frame);
-    _ = try tun.sendAndFlush(eof_frame, current_ms);
-
-    std.log.info("[upgrade-push] Binary uploaded to {s}", .{hostname});
-
-    // Phase 2: Exec --install with appropriate MDELIM marker
-    const install_cmd = if (is_windows)
-        try std.fmt.allocPrint(allocator, "{s}/{s} --install --hostname {s} & echo MDELIM:%errorlevel%\r\n", .{ guest_dir, new_name, hostname })
-    else
-        try std.fmt.allocPrint(allocator, "{s}/{s} --install --hostname {s}; echo MDELIM:$?\n", .{ guest_dir, new_name, hostname });
-    defer allocator.free(install_cmd);
-
-    const exec_id = try std.fmt.allocPrint(allocator, "install_{s}", .{hostname});
-    defer allocator.free(exec_id);
-
-    const exec_frame = try tunproto.buildPtyExecInput(allocator, exec_id, install_cmd);
-    defer allocator.free(exec_frame);
-    _ = try tun.sendAndFlush(exec_frame, current_ms);
-
-    std.log.info("[upgrade-push] --install sent to {s}, Guest will restart", .{hostname});
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Platform detection + init script generation (曾 install.zig)
