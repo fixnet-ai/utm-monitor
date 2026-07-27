@@ -253,6 +253,21 @@ linuxvm 稳定是因为它的升级尝试无声失败，从未进入升级循环
 
 **状态**: ✅ 已修复
 
+### Finding 129: 非 Linux Guest 隧道不稳定 — KCP 并发 connect() 状态不一致
+
+**现象**: linuxvm exec 正常，但 macvm/windowsvm/winx64 的 exec 命令被 Guest 执行、输出通过 KCP 发送，但 Host CLI 收不到。Host 日志显示 keepalive dead 循环（每 ~3.5s），Guest 日志显示 `Tunnel dead (keepalive), reconnecting`。
+
+**诊断过程**:
+1. macvm Guest 日志确认命令已收到并执行（`echo hello_from_host` → `hello_from_host` 出现在 pty 输出中）
+2. Guest 通过 `kcp_output` 发送了大的 KCP 数据包（93-159B），但 Host 只记录收到小包（38-61B 的 keepalive）
+3. Host 的 `tunnelManager.connect()` 和 Guest 的 `handleKcpData` 可能创建竞态 KCP 会话
+
+**推测根因**: Host 和 Guest 各自独立创建/重建 KCP 会话。`connect()` 创建全新 KCP 实例（seq=0），但 Guest 可能已有运行中会话（seq=N）。新 KCP 实例的数据因 seq 不匹配被 Guest 拒绝，旧会话因 keepalive 超时被 Host 丢弃 → 双向死锁。
+
+**为什么 linuxvm 正常**: Linux 启动速度或网络时序差异使其侥幸避开竞态窗口。
+
+**状态**: 🔴 待修复
+
 ### Finding 125: `nowMs()` RTT — 直连正确，中继异常
 
 **现象**: 直接 ping/pong RTT 正确（2ms, 7ms），但中继 ping/pong RTT 为 uptime 级别（7 亿 ms ~ 13 亿 ms ≈ macOS 已启动天数）。

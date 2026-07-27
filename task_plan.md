@@ -61,6 +61,7 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 |---------|--------|------|
 | 123 | 🔴 CRITICAL | macOS 自动升级后 `exit(0)` + `KeepAlive SuccessfulExit=false` → 服务永久停止 |
 | 124 | ✅ 已修复 | LSA restart 用全 node_info 比较 → 动态字段(status:)触发误判 → nonce 比较 |
+| 129 | 🔴 | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
 | 125 | 📋 | `nowMs()` RTT 直连正确、中继异常（uptime 级别数值） |
 | 127 | 📋 | linuxvm Journal 停止 + 升级下载无声失败 |
 | 128 | 📋 | macOS `launchctl bootstrap` errno=5 在 bootout 后 |
