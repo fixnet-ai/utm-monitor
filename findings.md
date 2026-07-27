@@ -211,11 +211,84 @@ Host 等 Guest 建隧道、Guest 等 Host 建隧道 → 死锁。修复：统一
 
 ---
 
+---
+
+## v0.11.17 部署测试发现 (2026-07-27)
+
+### Finding 123 (CRITICAL): macOS 自动升级后服务永久停止
+
+**现象**: Guest 下载升级成功，`utmm-new --install` 执行完成（日志显示 "--install ok"），但服务停止后不再重启。`launchctl list` 显示 `- 0 com.utmm.guest`（未运行，退出码 0）。
+
+**根因分析**:
+1. `pkill -9 -x utmm` 没有杀掉旧进程 — 旧进程打出了 "--install ok" 确认它存活
+2. `forceInstall` 的 `start` 步骤（`launchctl bootstrap`）在 `bootout` 后失败（errno=5），服务未被加载
+3. 旧进程 `exit(0)` → `KeepAlive SuccessfulExit=false` → launchd 不重启干净退出的服务
+4. 结果：服务永久停止，需手动 `launchctl kickstart -k` 恢复
+
+**修复方向**:
+- `applyUpgradeAndRestart` 不应依赖旧进程被杀 — 旧进程可能存活
+- `exit(0)` 与 `KeepAlive SuccessfulExit=false` 不兼容 — 升级后应 `exit(42)` 或修改 plist
+- `start()` 中 `kickstart -k` 失败时应尝试 `bootstrap` 后再 `kickstart`
+
+**状态**: 🔴 待修复
+
+### Finding 124: 非 Linux Guest 隧道在升级后不稳定
+
+**现象**: macvm/windowsvm/winx64 在 Host 重启后频繁 `pty_spawn` → `handler exiting` → `handler started` 循环。exec 返回 `exit=-1`（`failAllPendingOps` 因隧道断开而设置）。
+
+**观察**: linuxvm 隧道稳定（exec 始终正常），非 Linux Guest 全部不稳定。可能与平台特定的 KCP/pty 行为有关。
+
+**状态**: 🔴 待调查
+
+### Finding 125: `nowMs()` RTT — 直连正确，中继异常
+
+**现象**: 直接 ping/pong RTT 正确（2ms, 7ms），但中继 ping/pong RTT 为 uptime 级别（7 亿 ms ~ 13 亿 ms ≈ macOS 已启动天数）。
+
+**分析**: `nowMs()` 使用 `std.Io.Timestamp.now(.awake)` 返回系统启动以来的毫秒数。直接 ping 由 Host 发时间戳、Guest 原样回传 → RTT = now - send_ts ≈ 正确。中继路径可能使用了不同的时钟源（`clock_ms` 事件计数器）或时间戳在某处被替换。
+
+**状态**: 📋 已知，不影响核心功能（直接 ping 用于隧道 keepalive）
+
+### Finding 126: DebugAllocator 泄漏 — `buildServiceArgs`
+
+**现象**: 交叉编译的 debug 二进制在 `--install` 退出时报内存泄漏：
+```
+main.zig:396:35: dupe__anon in buildServiceArgs
+main.zig:393:35: dupe__anon in buildServiceArgs
+```
+
+**影响**: 仅 debug 构建。ReleaseFast/ReleaseSafe 使用系统分配器无此问题。`--install` 调用 `exit(0)` 而非正常返回，这些泄漏实际上被 OS 回收。
+
+**状态**: 📋 低优先级（仅 debug 构建）
+
+### Finding 127: linuxvm 日志停止 + 升级下载无声失败
+
+**现象**: linuxvm journal 从 Jul 25 07:52 后无任何日志（进程持续运行 2 天）。升级时 Host 成功发送 8MB 二进制，Guest 侧无任何反应 — 无临时文件、无日志、无错误。
+
+**可能原因**: stderr 缓冲未刷新、日志级别变化、或进程在某种阻塞状态。升级下载在 `receiveUpgradeFile` 的 `tun.recv()` 中超时或 `file_eof` 未送达。
+
+**状态**: 📋 待调查
+
+### Finding 128: macOS `launchctl bootstrap` 在 bootout 后失败 (errno=5)
+
+**现象**: `launchctl bootout system com.utmm.guest` 后立即 `bootstrap system /Library/LaunchDaemons/com.utmm.guest.plist` 返回错误 5 (Input/output error)。需先 `enable` 再 `bootstrap`，或使用 `kickstart -k`。
+
+这是 Finding 92 的变体 — errno=5 是新的错误模式，不同于之前的 errno=2。
+
+**状态**: 📋 规避方案（`kickstart -k` 替代 `bootstrap`）
+
+---
+
 ## 已知问题
 
 | # | 问题 | 状态 |
 |---|------|------|
-| 78/106 | 交叉编译覆盖 `zig-out/bin/utmm` — 部署前最后一个 build 必须无 `-Dtarget` | 📋 规避方案 |
+| **123** | macOS 自动升级后服务永久停止 | 🔴 待修复 |
+| **124** | 非 Linux Guest 隧道不稳定 | 🔴 待调查 |
+| **125** | `nowMs()` RTT 中继路径异常 | 📋 不影响核心功能 |
+| **126** | DebugAllocator 泄漏 (`buildServiceArgs`) | 📋 仅 debug 构建 |
+| **127** | linuxvm 日志停止 | 📋 待调查 |
+| **128** | macOS bootstrap errno=5 在 bootout 后 | 📋 规避方案 |
+| 78/106 | 交叉编译覆盖 `zig-out/bin/utmm` | 📋 规避方案 |
 | 107 | SSH `--install` 被 pkill 自伤 | 📋 规避方案（手动配服务） |
 | 108 | 升级后 Guest hostname 丢失 | 📋 规避方案（手动修复） |
 | 92 | macOS launchctl bootstrap 间歇 errno=2/5 | 📋 launchd 自动重启兜底 |

@@ -1,11 +1,50 @@
-# Progress: v0.11.16
+# Progress: v0.11.17
 
 ## 当前状态
 
 - **分支**: `main`
-- **版本**: v0.11.16（`src/protocol.zig` VERSION、`build.zig.zon`）
+- **版本**: v0.11.17（`src/protocol.zig` VERSION、`build.zig.zon`）
 - **测试**: 149/149 通过
-- **部署**: macOS Host v0.11.16 ✅ | linuxvm ✅ | macvm ✅ | windowsvm ✅ | winx64 ✅
+- **部署**: macOS Host v0.11.17 ✅ | linuxvm v0.11.17 ✅ (手动) | macvm v0.11.17 ✅ (手动) | windowsvm v0.11.17 ✅ (手动) | winx64 v0.11.17 ✅ (手动)
+
+## Phase 67: v0.11.17 部署 + 自动升级测试 (2026-07-27)
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 320 | Bump 版本 v0.11.16→v0.11.17 | ✅ |
+| 321 | 构建 8 目标 + 149/149 tests | ✅ |
+| 322 | Host v0.11.17 部署 | ✅ `launchctl bootstrap` errno=2，kickstart 恢复 |
+| 323 | 自动升级观察 | ❌ 全部失败 — 4 台 Guest 下载成功，但 `--install` 均未生效 |
+| 324 | 手动升级 + 功能验证 | ✅ linuxvm (SCP+--install)、macvm (kickstart)、Windows (SCP+--install) |
+
+### 自动升级问题汇总
+
+| Guest | 下载 | --install | 最终状态 | 根因 |
+|-------|------|-----------|---------|------|
+| linuxvm | ✅ (8MB) | ❌ 无声失败，无日志 | 手动 SCP 恢复 | receiveUpgradeFile 未完成；Journal 停止 |
+| macvm | ✅ (4MB, 第3次) | ⚠️ 成功但服务停止 | 手动 kickstart | Finding 123: exit(0)+KeepAlive |
+| windowsvm | ✅ (3.5MB) | ❌ --install 未生效 | 手动 SCP 恢复 | 待调查 |
+| winx64 | ✅ (3.6MB) | ❌ --install 未生效 | 手动 SCP 恢复 | 待调查 |
+
+### 关键 Bug 发现
+
+| Finding | 严重度 | 描述 |
+|---------|--------|------|
+| 123 | 🔴 CRITICAL | macOS 自动升级后服务永久停止 |
+| 124 | 🔴 | 非 Linux Guest 隧道不稳定，exec 失败 |
+| 125 | 📋 | `nowMs()` RTT 中继路径异常 |
+| 126 | 📋 | DebugAllocator 泄漏（仅 debug 构建） |
+| 127 | 📋 | linuxvm 日志停止 + 升级无声失败 |
+| 128 | 📋 | macOS bootstrap errno=5 在 bootout 后 |
+
+### 功能验证 (手动升级后)
+
+| Guest | exec | upload | download |
+|-------|------|--------|----------|
+| linuxvm | ✅ | ✅ | ✅ |
+| macvm | ❌ exit=-1 | — | — |
+| windowsvm | ✅ | — | — |
+| winx64 | ❌ exit=-1 | — | — |
 
 ## Phase 66: 小修复收尾 ✅ (2026-07-27)
 

@@ -43,3 +43,4 @@ test_write.o
 #       Do NOT add wildcard patterns that would ignore tracked files —
 #       git won't ignore them, but it creates confusion.
 # ═════════════════════════════════════════════════════════════════════════
+utmm.lock

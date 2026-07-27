@@ -859,8 +859,11 @@ fn serveUpgradeFile(
 
     var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
     var total: u64 = 0;
+    // Separate buffers: file_buf for data, read_buf for the reader's internal buffering.
+    // Using the same buffer for both would cause @memcpy alias in readSliceAll.
     var file_buf: [8192]u8 = undefined;
-    var file_reader = file.reader(io, &file_buf);
+    var read_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &read_buf);
 
     while (true) {
         const remaining = file_size - total;
