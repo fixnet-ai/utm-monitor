@@ -15,7 +15,8 @@ if needed.
 **Mesh network & Zero config** ties everything together under the hood. Guests
 auto-discover the Host over the local network — no fixed IPs, no DNS, no manual
 wiring. A Linux VM on a bridge, a Windows laptop on Wi-Fi, a Raspberry Pi on
-Ethernet — they all show up in one flat `utmm --status`.
+Ethernet — they all show up alongside the Host in `utmm --status` with role, version,
+status, and last-seen time.
 
 ## AI Agent Experience
 
@@ -25,7 +26,7 @@ MCP protocol:
 
 | Tool | Description |
 |------|-------------|
-| `vm_status` | List all machines: hostname, IP, OS/arch, version, shell type |
+| `vm_status` | List all nodes (Host + Guests): hostname, role, IP, OS/arch, version, status, shell type |
 | `vm_exec` | Execute commands. Shell session persists — cd, export survive across calls |
 | `vm_ping` | Ping a guest over the mesh — test connectivity and measure RTT |
 | `vm_upload` | Upload a file from Host to Guest via KCP tunnel (SHA256 verified) |
@@ -58,7 +59,12 @@ utmm --exec linuxvm "cd /opt/myapp && source venv/bin/activate && pip list"
 utmm --exec linuxvm "pwd"     # /opt/myapp — still there
 
 # Check health across all machines with one command
-utmm --status
+utmm --status      # Host + all guests: role, version, status, last seen
+utmm --verify      # Health matrix: status + ping + exec echo per guest
+
+# One-shot deploy to all machines
+utmm --deploy      # Build + SCP + SSH install to all guests
+utmm --deploy linuxvm  # Deploy single guest
 
 # File transfer
 utmm --upload build.zip linuxvm
@@ -110,7 +116,8 @@ Or use the CLI: `claude mcp add utmm -- sudo /opt/utmm/utmm --mcp`
 ## CLI Reference
 
 ```bash
-utmm --status                      # All machines at a glance
+utmm --status                      # All nodes at a glance (Host + guests, role/status/version/last seen)
+utmm --verify                      # Health check matrix: status + ping + exec per guest
 utmm --ping linuxvm                # Ping a guest (Host→Guest mesh ping, returns JSON)
 utmm --exec linuxvm "uname -a"     # Command (streaming output, no timeout)
 utmm --exec linuxvm "gdb ..."      # Attach debugger
@@ -118,6 +125,7 @@ utmm --exec macvm "lldb ..."       # Same on macOS
 utmm --exec windowsvm "dir"        # Windows commands too
 utmm --upload build.zip linuxvm    # Push a build (raw binary)
 utmm --download linuxvm core ./    # Pull a core dump (streaming binary)
+utmm --deploy [<vm>]              # Build + SCP + SSH deploy to all guests (or single)
 utmm --version                     # Print version
 ```
 
@@ -159,6 +167,13 @@ AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
 
 ## Upgrade
 
+**`--deploy` (fastest, v0.11.18+):** cross-compile, SCP, and SSH install in one command.
+```bash
+sudo utmm --deploy                # All guests
+sudo utmm --deploy linuxvm        # Single guest
+```
+Requires `sshpass` on the Host. Validates binary type (ELF/Mach-O/PE) before copying.
+
 **Online machines:** re-run the install script — it upgrades in place.
 
 ```bash
@@ -177,8 +192,8 @@ extract, and run `./utmm --install --hostname <name>`.
 
 | Document | For |
 |----------|-----|
-| [SKILL.md](skills/utmm/SKILL.md) | AI agent instructions (MCP tool details, workflows) |
-| [MANUAL.md](skills/utmm/MANUAL.md) | Full user manual (architecture, deployment, troubleshooting) |
+| [SKILL.md](.claude/skills/utmm/SKILL.md) | AI agent instructions (MCP tool details, workflows) |
+| [MANUAL.md](.claude/skills/utmm/MANUAL.md) | Full user manual (architecture, deployment, troubleshooting) |
 | [mcp.json.example](mcp.json.example) | MCP configuration with Claude Code install guide |
 
 ## License
