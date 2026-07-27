@@ -100,6 +100,9 @@ echo ""
 echo "==> Building all 8 targets (ReleaseSafe)..."
 rm -rf release && mkdir -p release
 
+# Clean old deployment binaries so only current-version files end up in release/
+rm -f zig-out/bin/utmm-*
+
 # Filenames are determined by build.zig (deploymentFilename reads ver.txt).
 # We glob zig-out/bin/utmm-* after each build — no version string needed here.
 ALL_TARGETS="x86_64-windows aarch64-windows x86-windows-gnu x86_64-macos aarch64-macos x86-linux-musl x86_64-linux-musl aarch64-linux-musl"
