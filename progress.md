@@ -1,12 +1,12 @@
-# Progress: v0.11.15
+# Progress: v0.11.16-dev
 
 ## 当前状态
 
 - **分支**: `main`
-- **版本**: v0.11.15（`src/protocol.zig` VERSION、`build.zig.zon`）
-- **测试**: 149/149 通过（EXIT=0）
+- **版本**: 0.11.15 tagged; 代码已修改（自动升级修复）待 bump
+- **测试**: 149/149 通过
 - **部署**: macOS Host v0.11.15 ✅ | linuxvm v0.11.15 ✅ | macvm v0.11.15 ✅ | windowsvm v0.11.15 ✅ | winx64 v0.11.15 ✅
-- **最新提交**: `(pending)` v0.11.15: rewrite SKILL.md and MANUAL.md for v0.11.14+ architecture
+- **未提交修改**: 自动升级 IP gating 修复（mesh.zig + broadcast.zig + host.zig）
 
 ## Phase 64: 文档重写 + v0.11.15 发布 (2026-07-27)
 
@@ -34,6 +34,63 @@
 - Bump 版本：0.11.14→0.11.15
 - 构建 8 目标 + `./release.sh`
 - 本机 Host 部署 + 观察 VM 自动升级
+
+### 自动升级观察 — 关键 Bug 发现
+
+**结果**：3 台 Guest 在 2+ 分钟观察期内无一自动升级（轮询 ~24 轮×5s）。
+
+**根因**：`mesh.zig:901` — `remote_ip != self.host_gateway_ip` 条件失败。
+
+**详细分析**：
+- Host LSA 广播的 `ip:` 字段来自 `getSystemInfo().detectUnixIp()` — 找第一个物理 NIC，在多网卡 Host 上是主 IP（本机 `192.168.1.7` WiFi `en0`），bridge 接口（`bridge100`/`bridge101`）被 `isPhysicalInterface` 排除
+- Guest 的 `host_gateway_ip` 是网关 IP（linuxvm/macvm: `192.168.64.1`，windowsvm: `192.168.65.1`）
+- 「主 IP ≠ Guest 看到的网关 IP」→ `remote_ip != host_gateway_ip` 恒为 true → 版本检查代码从未执行
+
+**修复**（已编码，待 bump）：
+- 移除 `mesh.zig` 中的 `host_gateway_ip` 字段和 IP gating 条件
+- 移除 `broadcast.zig` 中的 `extractHostIp()` 和调用
+- `host.zig`: 移除 `Mesh.init()` 的 `""` 参数
+- 影响：3 文件，净删除 ~30 行
+
+**版本检查现在直接执行**：`remote_version != protocol.VERSION` — 无需 IP 匹配。
+版本不匹配即触发升级。其他 Guest 都运行相同 VERSION，无虚假触发风险。
+
+## Phase 65: 一键安装脚本 (install.sh + install.bat) ← 当前
+
+**目标**: 创建跨平台交互式安装脚本，一行命令即可完成首次安装/升级。
+
+**设计原则**（讨论共识）：
+- 全平台强制 root/Administrator 权限检查
+- 脚本交互提问 hostname/mode；`utmm` 二进制绝不交互
+- 纯 `.bat`（Win7+）— 不用 `.ps1`
+- 安装=升级，不分模式
+- Host 模式下保留全部 8 个平台二进制（Guest 自动升级依赖）
+- 支持离线安装：zip 自带 `install.sh`/`install.bat`
+- README/SKILL.md/MANUAL.md 去除 UTM 限定描述，适用所有 VM + 真机
+
+**涉及文件**：
+
+| 文件 | 操作 | 说明 |
+|------|------|------|
+| `install.sh` | 新建 | POSIX 安装脚本，~180行 |
+| `install.bat` | 新建 | Windows 安装脚本，~150行，Win7+ 兼容 |
+| `.gitattributes` | 更新 | `install.sh text eol=lf` / `install.bat text eol=crlf` |
+| `release.sh` | 修改 | zip 打包时追加 `install.sh install.bat` |
+| `README.md` | 修改 | One-Time Setup 重写；去除 SCP/UTM 限定描述 |
+| `SKILL.md` | 修改 | 安装指引同步为一键脚本 |
+| `MANUAL.md` | 修改 | 安装章节重写；去除 UTM 限定描述 |
+| `task_plan.md` | 更新 | Phase 65 计划 |
+| `progress.md` | 更新 | 进度跟踪 |
+
+**实现步骤**：
+1. 创建 `install.sh`（POSIX：curl/wget download + unzip + 交互 + --install）
+2. 创建 `install.bat`（Windows：curl/certutil download + tar/COM unzip + 交互 + --install）
+3. 更新 `.gitattributes` 强制 LF/CRLF 行尾
+4. 修改 `release.sh`，zip 追加 install 脚本
+5. 更新 `README.md` One-Time Setup 为一键命令
+6. 更新 `SKILL.md` / `MANUAL.md` 安装章节
+7. 更新 `build.zig.zon` + `src/protocol.zig` VERSION bump
+8. 构建 → 测试 → 发布 v0.11.16 → 部署观察自动升级
 
 ## Phase 63: Guest 自主升级方案 ✅ (2026-07-27)
 

@@ -79,7 +79,7 @@ pub const HOSTS_MARKER_BEGIN = "# UTM-MONITOR-BEGIN";
 pub const HOSTS_MARKER_END = "# UTM-MONITOR-END";
 
 /// Program version number — bump to trigger auto-upgrade
-pub const VERSION = "0.11.15";
+pub const VERSION = "0.11.16";
 
 /// Parse "IP:port" string to net.IpAddress for local testing peer mesh.
 /// Returns null on any parse failure.

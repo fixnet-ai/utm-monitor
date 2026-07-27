@@ -67,36 +67,32 @@ utmm --download linuxvm core ./core.dump
 
 ## One-Time Setup
 
-### 1. Install Host Service
+The install script detects your OS and architecture, downloads the latest
+release, and installs `utmm` as a system service (auto-start on boot). It
+prompts for hostname and mode (Host or Guest) — no manual steps needed.
+
+Root / Administrator privileges are required.
+
+**POSIX (Linux / macOS):**
 
 ```bash
-# Build for host platform, SCP to host machine
-zig build
-scp zig-out/bin/utmm root@<host>:/tmp/utmm
-
-# Force install as system auto-start service
-ssh root@<host> "chmod +x /tmp/utmm && /tmp/utmm --host --install"
+curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sudo sh
 ```
 
-Service auto-starts on boot. Binary self-copies to `/opt/utmm/utmm` (POSIX) or
-`C:\opt\utmm\utmm.exe` (Windows).
+**Windows (Administrator terminal):**
 
-### 2. Install Guest Service
-
-```bash
-# Build for target, SCP to guest
-zig build -Dtarget=aarch64-linux-musl
-scp zig-out/bin/utmm-aarch64-linux root@<guest>:/tmp/utmm
-
-# Force install with hostname
-ssh root@<guest> "chmod +x /tmp/utmm && /tmp/utmm --install --hostname myvm"
+```batch
+curl -fsSLo %TEMP%\install.bat https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.bat && %TEMP%\install.bat
 ```
 
-Guest auto-discovers Host via default gateway (UTM VMs) or `--host-ip` (physical machines).
+**Offline install:** download `utmm.zip` from the
+[latest release](https://github.com/fixnet-ai/utm-monitor/releases/latest),
+extract to the target machine, then run the bundled `install.sh` or `install.bat`.
 
-### 3. Register with AI Agent
+**Manual install** (no automation): see the comments at the top of
+[install.sh](install.sh) for the few manual commands needed.
 
-Add to your MCP config (`~/.claude/mcp.json` or `.mcp.json` in project):
+**Register with AI Agent** — add to your MCP config (`~/.claude/mcp.json` or `.mcp.json`):
 
 ```json
 {
@@ -163,14 +159,19 @@ AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
 
 ## Upgrade
 
+**Online machines:** re-run the install script — it upgrades in place.
+
 ```bash
-# Build new binary → SCP to VM → force reinstall
-scp zig-out/bin/utmm-aarch64-linux root@<vm>:/tmp/utmm-new
-ssh root@<vm> "chmod +x /tmp/utmm-new && /tmp/utmm-new --install --hostname <name>"
+curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sudo sh
 ```
 
-The force install flow: stop service → kill processes → self-copy to canonical
-path → overwrite service config → start. No KCP download, no utmm-old process.
+**Guest auto-upgrade (hands-free):** Guests detect a Host version change via
+LSA broadcast, download the new binary through the KCP tunnel, and run
+`--install --hostname <name>` automatically. No human intervention needed.
+
+**Offline/manual:** download `utmm.zip` from the
+[latest release](https://github.com/fixnet-ai/utm-monitor/releases/latest),
+extract, and run `./utmm --install --hostname <name>`.
 
 ## Docs
 

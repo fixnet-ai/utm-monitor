@@ -1001,33 +1001,15 @@ fn closePtyFd(fd: std.posix.fd_t) void {
     }
 }
 
-/// Extract bare IP from host_url. Input format: "http://IP:PORT" → "IP".
-/// Returns empty string if parsing fails (safe default: no upgrade filtering on error).
-fn extractHostIp(host_url: []const u8) []const u8 {
-    // Strip "http://" prefix
-    const without_scheme = if (std.mem.startsWith(u8, host_url, "http://"))
-        host_url["http://".len..]
-    else
-        host_url;
-    // Find port separator
-    const colon = std.mem.indexOfScalar(u8, without_scheme, ':') orelse return without_scheme;
-    return without_scheme[0..colon];
-}
-
 pub fn meshSessionLoop(
     io: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
-    host_url: []const u8,
     upgrade: *UpgradeSignal,
     mesh_port: u16,
     peer_mesh: ?[]const u8,
     shutdown: ?*std.atomic.Value(bool),
 ) !void {
-    // Extract Host IP from host_url for LSA version check filtering.
-    // host_url format: "http://IP:PORT" — strip to just the IP.
-    const host_gateway_ip = extractHostIp(host_url);
-
     // Start mesh networking thread (LSA broadcast + KCP data dispatch).
     // Mesh owns UDP :2121 for LSA + KCP relay + PING/PONG.
     var mesh_opt: ?mesh_mod.Mesh = null;
@@ -1104,7 +1086,7 @@ pub fn meshSessionLoop(
         };
 
         // Create mesh instance (mesh takes ownership of node_info and broadcast_addrs)
-        mesh_opt = mesh_mod.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs, host_gateway_ip) catch |err| {
+        mesh_opt = mesh_mod.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs) catch |err| {
             std.log.err("[guest-mesh] Mesh init failed: {}", .{err});
             allocator.free(node_info);
             mesh_socket.close(mesh_io);
@@ -2029,14 +2011,9 @@ pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig
     // Windows: handle pending upgrade from a previous auto-upgrade attempt
     _ = svc.checkPendingUpgradeWindows(io, gpa);
 
-    // Build host URL from --host-ip or default gateway (pass empty string to auto-detect)
-    const host_url = if (cli.host_ip) |ip| blk: {
-        break :blk try std.fmt.allocPrint(gpa, "{s}", .{ip});
-    } else "";
-
     // Mesh session loop — persistent KCP tunnel, real-time push.
     // UpgradeSignal allows mesh LSA version check to signal the main loop
     // when a version mismatch is detected from Host broadcast.
     var upgrade_signal = UpgradeSignal{};
-    try meshSessionLoop(io, gpa, sysinfo, host_url, &upgrade_signal, cli.mesh_port, cli.peer_mesh, shutdown);
+    try meshSessionLoop(io, gpa, sysinfo, &upgrade_signal, cli.mesh_port, cli.peer_mesh, shutdown);
 }

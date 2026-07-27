@@ -45,6 +45,12 @@ build_target x86_64-linux-musl    utmm-x86_64-linux
 build_target aarch64-linux-musl   utmm-aarch64-linux
 
 echo ""
+echo "==> Adding install scripts..."
+cp install.sh install.bat release/
+echo "  install.sh → release/"
+echo "  install.bat → release/"
+
+echo ""
 echo "==> Creating utmm.zip..."
 rm -f utmm.zip
 cd release && zip "../utmm.zip" * && cd ..

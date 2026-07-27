@@ -1,356 +1,272 @@
 #!/bin/sh
-# ═══════════════════════════════════════════════════════════════════════
-# UTM Monitor — one-click installation script (POSIX: Linux / macOS)
-# Supports both Host and Guest deployment modes
-# ═══════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# UTM Monitor — POSIX Install/Upgrade Script
+# https://github.com/fixnet-ai/utm-monitor
 #
-# ─── Prerequisites ────────────────────────────────────────────────────
+# One-line install:
+#   curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sudo sh
 #
-#   Required tools:
-#     - sh (POSIX shell)         — always present on Linux/macOS
-#     - curl or wget             — for downloading binaries; curl preferred
-#     - sudo                     — for privileged install to /opt/utmm/ and
-#                                  service registration
-#     - unzip (Host mode only)   — for extracting utmm.zip from GitHub Releases
+# Offline install:
+#   1. Download utmm.zip from https://github.com/fixnet-ai/utm-monitor/releases/latest
+#   2. unzip utmm.zip -d /opt/utmm/
+#   3. sudo sh /opt/utmm/install.sh
 #
-#   Required permissions:
-#     - root (via sudo)          — the install directory /opt/utmm/ is
-#                                  system-owned; service registration
-#                                  (systemd / launchd) requires root
-#
-#   Network requirements:
-#     - Host mode: outbound HTTPS to github.com (GitHub Releases)
-#     - Guest mode: HTTP to Host at gateway:2121 (no internet needed)
-#
-#   Supported operating systems:
-#     - Linux   (kernel 3.10+, glibc or musl)
-#     - macOS   (10.15 Catalina+)
-#
-#   Supported CPU architectures:
-#     - aarch64 / arm64   (ARM 64-bit — Apple Silicon, ARM servers)
-#     - x86_64  / amd64   (Intel/AMD 64-bit)
-#     - x86 / i386/i686   (Intel/AMD 32-bit — Linux only, no macOS 32-bit)
-#
-# ─── What this script does ────────────────────────────────────────────
-#
-#   Host mode:  download utmm.zip (all 8 platform binaries) → extract
-#               to /opt/utmm/ → detect arch/OS → create symlink
-#               /opt/utmm/utmm → /usr/local/bin/utmm
-#               Then: sudo utmm --host --install  (enable auto-start)
-#
-#   Guest mode: detect arch/OS → auto-discover Host gateway IP →
-#               download correct binary from Host HTTP (/bin/) →
-#               install to /opt/utmm/ → create symlinks →
-#               install systemd/launchd service → start Guest
-#               Then: sudo utmm --host --status (verify on Host)
-#
-# ─── Usage ────────────────────────────────────────────────────────────
-#
-#   Host mode (default):
-#     curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sh
-#     → Downloads utmm.zip from GitHub Releases, extracts to /opt/utmm/,
-#       creates symlinks
-#
-#   Guest mode (no internet needed — everything from Host HTTP at gateway IP):
-#     curl http://<gateway>:2121/bin/install.sh | sh -s -- --guest --hostname myvm
-#     → Auto-detects arch/OS, downloads correct binary from Host HTTP
-#       (gateway:2121), creates symlinks, installs service, starts Guest
-#
-# ─── Environment Variables ────────────────────────────────────────────
-#
-#   INSTALL_DIR   installation directory (default /opt/utmm)
-#   HTTP_PORT     Host HTTP port (default 2121)
-#
-# ─── Post-Install ─────────────────────────────────────────────────────
-#
-#   Host:  sudo utmm --host --install     (enable auto-start on boot)
-#          sudo utmm --host               (start now, or reboot)
-#
-#   Guest: service auto-started by --install; verify:
-#          sudo utmm --host --status      (run on Host machine)
-#
-#   Auto-upgrade (v0.11.14+): Guests detect Host version change via
-#   mesh LSA and upgrade themselves — no manual deployment needed after
-#   the initial install. Host never pushes upgrades.
-# ═══════════════════════════════════════════════════════════════════════
+# Manual install (no script):
+#   1. Download the correct binary for your platform from the latest release
+#   2. mkdir -p /opt/utmm && cp <binary> /opt/utmm/utmm && chmod +x /opt/utmm/utmm
+#   3. sudo /opt/utmm/utmm --host --install              (Host)
+#      sudo /opt/utmm/utmm --install --hostname mybox    (Guest)
+# ==============================================================================
 
 set -e
 
-REPO="fixnet-ai/utm-monitor"
-INSTALL_DIR="${INSTALL_DIR:-/opt/utmm}"
-HTTP_PORT="${HTTP_PORT:-2121}"
+CANONICAL_DIR="/opt/utmm"
+BINARY_NAME="utmm"
+DOWNLOAD_URL="https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.zip"
+VERSION="0.11.16"
 
-# ─── Argument routing ───────────────────────────────────────────────
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-MODE="host"
-HOSTNAME_OVERRIDE=""
-
-print_help() {
-    echo "Usage: install.sh [--guest [--hostname NAME] [--port PORT]] [--help]"
-    echo ""
-    echo "  (no args)    Install Host — download utmm.zip from GitHub Releases,"
-    echo "               extract all 8 platform binaries to /opt/utmm/, create symlinks"
-    echo ""
-    echo "  --guest      Install Guest — auto-detect arch/OS, download the correct"
-    echo "               binary from Host HTTP at gateway:$HTTP_PORT, install service,"
-    echo "               and start the Guest process"
-    echo "    --hostname NAME   Guest hostname (e.g., linuxvm, macvm, windowsvm)"
-    echo "    --port PORT       Host HTTP port (default 2121)"
-    echo ""
-    echo "  --help       Show this help"
-    exit 0
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+red()   { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
+banner() {
+    echo
+    bold  "========================================"
+    bold  "  utmm v${VERSION}  Install / Upgrade"
+    bold  "  https://github.com/fixnet-ai/utm-monitor"
+    bold  "========================================"
+    echo
 }
 
-case "${1:-}" in
-    --help|-h)
-        print_help
-        ;;
-    --guest)
-        MODE="guest"
-        shift
-        while [ $# -gt 0 ]; do
-            case "$1" in
-                --hostname) HOSTNAME_OVERRIDE="$2"; shift 2 ;;
-                --port)     HTTP_PORT="$2";        shift 2 ;;
-                *)          shift ;;
-            esac
-        done
-        ;;
-    "")
-        MODE="host"  # default
-        ;;
-    *)
-        echo "Unknown option: $1"
-        echo "Usage: install.sh [--guest [--hostname NAME]] [--help]"
-        exit 1
-        ;;
-esac
+die() {
+    red "ERROR: $1"
+    exit "${2:-1}"
+}
 
-# ─── Host mode ──────────────────────────────────────────────────────
+# ── root check ───────────────────────────────────────────────────────────────
 
-if [ "$MODE" = "host" ]; then
-    ZIP_URL="https://github.com/$REPO/releases/latest/download/utmm.zip"
-
-    echo "==> UTM Monitor installer (Host)"
-    echo "    install:  $INSTALL_DIR"
-    echo ""
-
-    # Download zip
-    TMP_ZIP="$(mktemp "/tmp/utmm.XXXXXX.zip")"
-    echo "==> Downloading $ZIP_URL ..."
-    if ! curl -fsSL --progress-bar "$ZIP_URL" -o "$TMP_ZIP"; then
-        echo ""
-        echo "==> Download failed. Build from source:"
-        echo "      git clone https://github.com/$REPO.git"
-        echo "      cd utm-monitor"
-        echo "      zig build -Doptimize=ReleaseSafe"
-        rm -f "$TMP_ZIP"
-        exit 1
-    fi
-
-    # Extract
-    echo "==> Extracting to $INSTALL_DIR ..."
-    sudo mkdir -p "$INSTALL_DIR"
-    sudo unzip -o "$TMP_ZIP" -d "$INSTALL_DIR"
-    rm -f "$TMP_ZIP"
-    sudo chmod +x "$INSTALL_DIR"/utmm-* 2>/dev/null || true
-
-    # Detect Host architecture (normalize uname -m -> our arch names)
-    HOST_ARCH="$(uname -m)"
-    case "$HOST_ARCH" in
-        arm64|aarch64) HOST_ARCH="aarch64" ;;
-        x86_64|amd64)  HOST_ARCH="x86_64" ;;
-        i386|i486|i586|i686) HOST_ARCH="x86" ;;
-        *) echo "Error: unsupported architecture: $HOST_ARCH"; exit 1 ;;
-    esac
-
-    HOST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-    case "$HOST_OS" in
-        darwin) HOST_OS="macos" ;;
-        linux)  HOST_OS="linux" ;;
-        *) echo "Error: unsupported OS: $HOST_OS"; exit 1 ;;
-    esac
-
-    HOST_BIN="utmm-${HOST_ARCH}-${HOST_OS}"
-
-    # Create symlink: /opt/utmm/utmm -> utmm-{arch}-{os}
-    echo "==> Creating symlink: $INSTALL_DIR/utmm -> $INSTALL_DIR/$HOST_BIN"
-    sudo ln -sf "$INSTALL_DIR/$HOST_BIN" "$INSTALL_DIR/utmm"
-
-    # Convenience symlink to /usr/local/bin
-    sudo mkdir -p /usr/local/bin
-    sudo ln -sf "$INSTALL_DIR/utmm" /usr/local/bin/utmm
-    echo "==> Symlink: /usr/local/bin/utmm -> $INSTALL_DIR/utmm"
-
-    echo ""
-    echo "==> Host installation complete!"
-    "$INSTALL_DIR/utmm" --version 2>/dev/null || true
-    echo ""
-    echo "==> To enable auto-start on boot:"
-    echo "    sudo utmm --host --install"
-    echo ""
-    echo "==> To start Host now:"
-    echo "    sudo utmm --host"
-
-    exit 0
+if [ "$(id -u)" -ne 0 ]; then
+    die "Root privileges required. Run with: sudo sh install.sh" 1
 fi
 
-# ─── Guest mode ─────────────────────────────────────────────────────
+# ── banner ───────────────────────────────────────────────────────────────────
 
-echo "==> UTM Monitor installer (Guest)"
-echo "    install:  $INSTALL_DIR"
-echo ""
+banner
 
-# 1. Detect CPU architecture
-GUEST_ARCH="$(uname -m)"
-case "$GUEST_ARCH" in
-    arm64|aarch64) GUEST_ARCH="aarch64" ;;
-    x86_64|amd64)  GUEST_ARCH="x86_64" ;;
-    i386|i486|i586|i686) GUEST_ARCH="x86" ;;
-    *)
-        echo "Error: unsupported architecture: $GUEST_ARCH"
-        echo "Supported: aarch64 (ARM 64-bit), x86_64 (Intel/AMD 64-bit), x86 (32-bit)"
-        exit 1
-        ;;
+# ── platform detection ───────────────────────────────────────────────────────
+
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+case "$OS" in
+    Linux)  PLATFORM_OS="linux" ;;
+    Darwin) PLATFORM_OS="macos" ;;
+    *)      die "Unsupported OS: $OS. Supported: Linux, macOS." 2 ;;
 esac
-echo "    arch:     $GUEST_ARCH"
 
-# 2. Detect OS
-GUEST_OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
-case "$GUEST_OS" in
-    darwin) GUEST_OS="macos" ;;
-    linux)  GUEST_OS="linux" ;;
-    *)
-        echo "Error: unsupported OS: $GUEST_OS"
-        echo "Supported: linux, macos"
-        exit 1
-        ;;
+case "$ARCH" in
+    aarch64|arm64) PLATFORM_ARCH="aarch64" ;;
+    x86_64|amd64)  PLATFORM_ARCH="x86_64" ;;
+    i686|i386)     PLATFORM_ARCH="x86" ;;
+    *)             die "Unsupported architecture: $ARCH. Supported: aarch64, x86_64, x86." 2 ;;
 esac
-echo "    os:       $GUEST_OS"
 
-# 3. Find default gateway (Host's bridge IP where HTTP server runs)
-echo "    detecting gateway..."
+# Map platform → binary filename inside utmm.zip
+# Must match protocol.zig:deploymentFilename()
+case "${PLATFORM_OS}-${PLATFORM_ARCH}" in
+    linux-aarch64)  ZIP_BINARY="utmm-aarch64-linux" ;;
+    linux-x86_64)   ZIP_BINARY="utmm-x86_64-linux" ;;
+    linux-x86)      ZIP_BINARY="utmm-x86-linux" ;;
+    macos-aarch64)  ZIP_BINARY="utmm-aarch64-macos" ;;
+    macos-x86_64)   ZIP_BINARY="utmm-x86_64-macos" ;;
+    *)              die "No binary for ${PLATFORM_OS}/${PLATFORM_ARCH}" 5 ;;
+esac
 
-GATEWAY=""
+echo "Detected: ${PLATFORM_OS} / ${PLATFORM_ARCH}  ->  ${ZIP_BINARY}"
+echo
 
-# Linux: ip route
-if [ "$GUEST_OS" = "linux" ]; then
-    GATEWAY=$(ip route show default 2>/dev/null | awk '{print $3; exit}')
-    if [ -z "$GATEWAY" ] && [ -f /proc/net/route ]; then
-        GATEWAY=$(awk '$2 == "00000000" {
-            printf "%d.%d.%d.%d",
-            strtonum("0x"substr($3,7,2)),
-            strtonum("0x"substr($3,5,2)),
-            strtonum("0x"substr($3,3,2)),
-            strtonum("0x"substr($3,1,2))
-        }' /proc/net/route 2>/dev/null)
+# ── interaction: hostname ────────────────────────────────────────────────────
+
+SYSTEM_HOSTNAME="$(hostname 2>/dev/null | cut -d. -f1)"
+if [ -z "${SYSTEM_HOSTNAME}" ]; then
+    SYSTEM_HOSTNAME="$(cat /etc/hostname 2>/dev/null | tr -d '\n')"
+fi
+if [ -z "${SYSTEM_HOSTNAME}" ]; then
+    SYSTEM_HOSTNAME="utmm-$(date +%s | tail -c5)"
+fi
+
+while true; do
+    printf "Hostname [%s]: " "${SYSTEM_HOSTNAME}"
+    read -r HOSTNAME_INPUT || die "Failed to read hostname." 1
+    HOSTNAME_INPUT="${HOSTNAME_INPUT:-${SYSTEM_HOSTNAME}}"
+
+    # Validate: 1-63 chars, starts with a-z/A-Z/0-9, only a-z0-9 _ -
+    if echo "${HOSTNAME_INPUT}" | grep -qE '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$'; then
+        HOSTNAME="${HOSTNAME_INPUT}"
+        break
+    fi
+    red "Invalid hostname. Use 1-63 chars: a-z, A-Z, 0-9, -, _. Must start with letter or digit."
+done
+
+# ── interaction: mode ────────────────────────────────────────────────────────
+
+while true; do
+    printf "Mode - [H]ost or [G]uest? [G]: "
+    read -r MODE_INPUT || die "Failed to read mode." 1
+    MODE_INPUT="${MODE_INPUT:-G}"
+
+    case "$(echo "${MODE_INPUT}" | tr '[:lower:]' '[:upper:]')" in
+        H) MODE="host"; break ;;
+        G) MODE="guest"; break ;;
+        *) red "Please enter H (Host) or G (Guest)." ;;
+    esac
+done
+
+# ── interaction: host-ip (Guest only) ────────────────────────────────────────
+
+HOST_IP_ARG=""
+if [ "${MODE}" = "guest" ]; then
+    printf "Host IP (blank = auto-detect via default gateway): "
+    read -r HOST_IP_INPUT || die "Failed to read Host IP." 1
+    HOST_IP_INPUT="$(echo "${HOST_IP_INPUT}" | tr -d '[:space:]')"
+    if [ -n "${HOST_IP_INPUT}" ]; then
+        HOST_IP_ARG="--host-ip ${HOST_IP_INPUT}"
     fi
 fi
 
-# macOS: route -n get default
-if [ "$GUEST_OS" = "macos" ]; then
-    GATEWAY=$(route -n get default 2>/dev/null | awk '/gateway:/ {print $2; exit}')
-fi
+echo
+echo "Summary:"
+echo "  Mode:     ${MODE}"
+echo "  Hostname: ${HOSTNAME}"
+[ -n "${HOST_IP_ARG}" ] && echo "  Host IP:  ${HOST_IP_INPUT}"
+[ -z "${HOST_IP_ARG}" ] && [ "${MODE}" = "guest" ] && echo "  Host IP:  (auto-detect)"
 
-# Fallback: probe known UTM bridge IPs
-if [ -z "$GATEWAY" ]; then
-    for gw in 192.168.64.1 192.168.65.1 192.168.66.1 192.168.67.1; do
-        if curl -fsSL --connect-timeout 2 "http://$gw:$HTTP_PORT/version" >/dev/null 2>&1; then
-            GATEWAY="$gw"
+# ── check if already extracted (offline mode) ────────────────────────────────
+
+mkdir -p "${CANONICAL_DIR}"
+
+if [ -f "${CANONICAL_DIR}/${ZIP_BINARY}" ]; then
+    echo
+    dim "Offline mode: ${ZIP_BINARY} found in ${CANONICAL_DIR}/ - skipping download."
+else
+    # ── download ─────────────────────────────────────────────────────────────
+
+    ZIP_PATH="$(mktemp /tmp/utmm.XXXXXX.zip)"
+    trap "rm -f '${ZIP_PATH}'" EXIT
+
+    echo
+    echo "Downloading utmm.zip ..."
+
+    download_file() {
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --connect-timeout 30 --max-time 120 \
+                -o "${ZIP_PATH}" "${DOWNLOAD_URL}" 2>&1
+            return $?
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q --timeout=30 --tries=3 \
+                -O "${ZIP_PATH}" "${DOWNLOAD_URL}" 2>&1
+            return $?
+        else
+            red "Neither curl nor wget found. Please install one of them."
+            echo "Or download utmm.zip manually from: ${DOWNLOAD_URL}"
+            echo "Then: unzip utmm.zip -d ${CANONICAL_DIR}/ && sudo sh ${CANONICAL_DIR}/install.sh"
+            exit 3
+        fi
+    }
+
+    DOWNLOAD_ATTEMPTS=3
+    for i in $(seq 1 ${DOWNLOAD_ATTEMPTS}); do
+        if download_file; then
             break
         fi
+        if [ "${i}" -eq "${DOWNLOAD_ATTEMPTS}" ]; then
+            die "Download failed after ${DOWNLOAD_ATTEMPTS} attempts. Check network or try offline install." 3
+        fi
+        echo "  Retry ${i}/${DOWNLOAD_ATTEMPTS} ..."
+        sleep 2
+    done
+
+    echo "Download OK ($(wc -c < "${ZIP_PATH}" | tr -d ' ') bytes)"
+
+    # ── extract ───────────────────────────────────────────────────────────────
+
+    echo "Extracting to ${CANONICAL_DIR}/ ..."
+
+    if ! command -v unzip >/dev/null 2>&1; then
+        die "unzip not found. Install unzip first, or use offline install." 4
+    fi
+
+    if ! unzip -o -q "${ZIP_PATH}" -d "${CANONICAL_DIR}/"; then
+        die "Extract failed. The zip file may be corrupted; try re-downloading." 4
+    fi
+
+    # Verify the binary we need is present
+    if [ ! -f "${CANONICAL_DIR}/${ZIP_BINARY}" ]; then
+        echo "Zip contents:"
+        ls -1 "${CANONICAL_DIR}/"
+        die "Binary '${ZIP_BINARY}' not found in utmm.zip. Platform not supported by this release." 5
+    fi
+
+    rm -f "${ZIP_PATH}"
+    trap - EXIT
+fi
+
+# ── file placement ───────────────────────────────────────────────────────────
+
+echo "Preparing files ..."
+
+cd "${CANONICAL_DIR}"
+
+# Always ensure the target binary is named "utmm" (overwrite if exists)
+cp -f "${ZIP_BINARY}" "${BINARY_NAME}"
+chmod +x "${BINARY_NAME}"
+
+if [ "${MODE}" = "guest" ]; then
+    # Guest: only keep the current-platform binary
+    echo "  Guest mode - removing other platform binaries ..."
+    find "${CANONICAL_DIR}" -maxdepth 1 -type f \( -name "utmm-*" -o -name "utmm*.exe" \) ! -name "${ZIP_BINARY}" -delete 2>/dev/null || true
+    # Also remove install scripts from Guest (not needed)
+    rm -f "${CANONICAL_DIR}/install.sh" "${CANONICAL_DIR}/install.bat" 2>/dev/null || true
+    dim "  Kept: ${ZIP_BINARY} (as utmm)"
+else
+    # Host: keep all platform binaries (Guest auto-upgrade needs them via serveUpgradeFile)
+    echo "  Host mode - keeping all platform binaries for Guest auto-upgrade."
+    for f in "${CANONICAL_DIR}"/utmm-* "${CANONICAL_DIR}"/utmm*.exe; do
+        [ -f "$f" ] && dim "  $(basename "$f")"
     done
 fi
 
-if [ -z "$GATEWAY" ]; then
-    echo ""
-    echo "Error: Could not detect Host gateway."
-    echo "  Is the Host machine running 'sudo utmm --host'?"
-    echo "  The Guest must be able to reach the Host at gateway:$HTTP_PORT"
-    echo ""
-    echo "  Manual fallback — specify the Host IP directly:"
-    echo "    GATEWAY=<host-ip> curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh | sh -s -- --guest --hostname myvm"
-    exit 1
+# ── install ──────────────────────────────────────────────────────────────────
+
+echo
+echo "Installing as ${MODE} ..."
+
+INSTALL_ARGS="--install --hostname ${HOSTNAME}"
+if [ "${MODE}" = "host" ]; then
+    INSTALL_ARGS="--host ${INSTALL_ARGS}"
+fi
+if [ -n "${HOST_IP_ARG}" ]; then
+    INSTALL_ARGS="${INSTALL_ARGS} ${HOST_IP_ARG}"
 fi
 
-echo "    gateway:  $GATEWAY"
-
-# 4. Construct binary name and download URL
-GUEST_BIN="utmm-${GUEST_ARCH}-${GUEST_OS}"
-DOWNLOAD_URL="http://${GATEWAY}:${HTTP_PORT}/bin/${GUEST_BIN}"
-
-echo "    binary:   $GUEST_BIN"
-echo "    download: $DOWNLOAD_URL"
-echo ""
-
-# 5. Create install directory
-echo "==> Creating $INSTALL_DIR ..."
-sudo mkdir -p "$INSTALL_DIR"
-
-# 6. Download binary
-echo "==> Downloading $DOWNLOAD_URL ..."
-TMP_BIN="$(mktemp "/tmp/utmm.XXXXXX")"
-trap 'rm -f "$TMP_BIN"' EXIT
-
-if curl -fsSL --connect-timeout 10 --max-time 60 "$DOWNLOAD_URL" -o "$TMP_BIN"; then
-    :
-elif command -v wget >/dev/null 2>&1; then
-    if ! wget -q --timeout=10 "$DOWNLOAD_URL" -O "$TMP_BIN"; then
-        echo ""
-        echo "Error: Download failed (wget returned error)."
-        echo "  Verify the Host is running: sudo utmm --host"
-        echo "  Verify the binary exists on Host: ls $INSTALL_DIR/$GUEST_BIN"
-        exit 1
+# shellcheck disable=SC2086
+if "${CANONICAL_DIR}/${BINARY_NAME}" ${INSTALL_ARGS}; then
+    echo
+    green "Done."
+    if [ "${MODE}" = "host" ]; then
+        echo "  Host service is running on UDP :2121"
+        echo "  Check: sudo ${CANONICAL_DIR}/${BINARY_NAME} --status"
+    else
+        echo "  Guest service is running - auto-starts on boot."
+        echo "  Check: run 'utmm --status' on the Host machine."
     fi
 else
-    echo "Error: No curl or wget available for download."
-    exit 1
+    EXIT_CODE=$?
+    red "'${BINARY_NAME} ${INSTALL_ARGS}' failed with exit code ${EXIT_CODE}."
+    echo "Check service logs for details:"
+    echo "  Linux:   journalctl -u utmm-${MODE} -n 50"
+    echo "  macOS:   cat /var/log/utmm-${MODE}-err.log"
+    exit ${EXIT_CODE}
 fi
-
-# 7. Install binary (keep it with the deployment name, create utmm symlink)
-echo "==> Installing binary..."
-# macOS: codesign is required for binaries run with sudo (launchd runs as root).
-# Binaries downloaded via curl lose their code signature, so AMFI sends SIGKILL.
-# Must sign in /tmp then mv — signing directly in /opt/utmm/ fails with
-# "internal error in Code Signing subsystem" due to SIP restrictions.
-if [ "$GUEST_OS" = "macos" ]; then
-    cp "$TMP_BIN" /tmp/utmm-sign
-    sudo codesign --force --sign - /tmp/utmm-sign 2>/dev/null || true
-    sudo mv /tmp/utmm-sign "$INSTALL_DIR/$GUEST_BIN"
-else
-    sudo mv "$TMP_BIN" "$INSTALL_DIR/$GUEST_BIN"
-fi
-sudo chmod +x "$INSTALL_DIR/$GUEST_BIN"
-
-# 8. Create symlinks
-echo "==> Creating symlink: $INSTALL_DIR/utmm -> $INSTALL_DIR/$GUEST_BIN"
-sudo ln -sf "$INSTALL_DIR/$GUEST_BIN" "$INSTALL_DIR/utmm"
-
-# Convenience symlink (Unix only)
-sudo mkdir -p /usr/local/bin
-sudo ln -sf "$INSTALL_DIR/utmm" /usr/local/bin/utmm
-echo "==> Symlink: /usr/local/bin/utmm -> $INSTALL_DIR/utmm"
-
-# 9. Install as system service (auto-start on boot)
-#    --install also starts the service immediately, so no separate start needed
-echo "==> Installing auto-start service..."
-if [ -n "$HOSTNAME_OVERRIDE" ]; then
-    if ! sudo "$INSTALL_DIR/utmm" --install --hostname "$HOSTNAME_OVERRIDE"; then
-        echo "Warning: Service installation failed. Trying manual start..."
-        sudo nohup "$INSTALL_DIR/utmm" --hostname "$HOSTNAME_OVERRIDE" > /var/log/utmm.log 2>&1 &
-        echo "    hostname: $HOSTNAME_OVERRIDE (manual)"
-    fi
-else
-    if ! sudo "$INSTALL_DIR/utmm" --install; then
-        echo "Warning: Service installation failed. Trying manual start..."
-        sudo nohup "$INSTALL_DIR/utmm" > /var/log/utmm.log 2>&1 &
-        echo "    (using OS hostname, manual)"
-    fi
-fi
-
-echo ""
-echo "==> Guest installation complete!"
-sleep 1
-"$INSTALL_DIR/utmm" --version 2>/dev/null || true
-echo ""
-echo "==> Verify on Host: utmm --host --status"

@@ -1,281 +1,332 @@
 @echo off
 setlocal enabledelayedexpansion
+:: =============================================================================
+:: UTM Monitor — Windows Install/Upgrade Script
+:: https://github.com/fixnet-ai/utm-monitor
+::
+:: Usage: Run this script in an Administrator terminal.
+::   curl -fsSLo %TEMP%\install.bat https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.bat && %TEMP%\install.bat
+::
+:: Offline install:
+::   1. Download utmm.zip from https://github.com/fixnet-ai/utm-monitor/releases/latest
+::   2. Extract utmm.zip to C:\opt\utmm\
+::   3. Run C:\opt\utmm\install.bat as Administrator
+::
+:: Manual install (no script):
+::   1. Download the correct .exe for your platform from the latest release
+::   2. mkdir C:\opt\utmm && copy <binary>.exe C:\opt\utmm\utmm.exe
+::   3. C:\opt\utmm\utmm.exe --host --install                  (Host)
+::      C:\opt\utmm\utmm.exe --install --hostname mybox        (Guest)
+:: =============================================================================
 
-:: ═══════════════════════════════════════════════════════════════════════
-:: UTM Monitor — Windows Guest installer (batch)
-:: Downloads the correct binary from Host HTTP, installs service, starts Guest
-:: ═══════════════════════════════════════════════════════════════════════
-::
-:: ─── Prerequisites ────────────────────────────────────────────────────
-::
-::   Required tools (all built-in, no extra installs needed):
-::     - bitsadmin                 — bundled with Windows 7 / Server 2008 R2+;
-::                                   used as primary HTTP downloader
-::     - curl                      — bundled with Windows 10 build 17063+;
-::                                   used as automatic fallback if bitsadmin
-::                                   is unavailable or fails
-::     - Administrator privileges  — required for sc.exe service creation,
-::                                    writing to C:\opt\utmm\, and
-::                                    taskkill process management
-::
-::   Required permissions:
-::     - Must run as Administrator  — right-click "Run as Administrator",
-::       or from an elevated command prompt. Non-admin will fail at
-::       mkdir C:\opt\utmm\ and sc create.
-::
-::   Network requirements:
-::     - HTTP to Host at gateway:2121 — the Guest must be able to reach
-::       the UTM Host machine (typically the VM bridge gateway).
-::       No internet access required.
-::
-::   Supported Windows editions:
-::     - Windows 7  / Server 2008 R2  (x86, x86_64)
-::     - Windows 8  / 8.1 / Server 2012 / 2012 R2 (x86, x86_64)
-::     - Windows 10 / 11 / Server 2016 / 2019 / 2022 (x86_64, aarch64)
-::     - XP / Server 2003 — NOT supported (no bitsadmin by default,
-::       no curl; requires manual binary deployment)
-::
-::   Supported CPU architectures:
-::     - x86_64  / AMD64    (Intel/AMD 64-bit)
-::     - aarch64 / ARM64    (ARM 64-bit — Windows on ARM, Win10+ only)
-::     - x86                (Intel/AMD 32-bit)
-::
-:: ─── What this script does ────────────────────────────────────────────
-::
-::   1. Detect CPU architecture (PROCESSOR_ARCHITECTURE)
-::   2. Auto-discover Host gateway IP (route print + UTM bridge fallback)
-::   3. Download correct utmm-{arch}-windows.exe from Host HTTP /bin/
-::      (bitsadmin primary, curl fallback — covers Win7 through Win11)
-::   4. Stop existing utmm.exe process (taskkill)
-::   5. Move binary to C:\opt\utmm\utmm.exe
-::   6. Install Windows service (sc create) via utmm.exe --install
-::      Service name: UTM-Monitor-Guest, auto-start on boot
-::   7. Start service immediately
-::
-:: ─── Usage ────────────────────────────────────────────────────────────
-::
-::   Remote install from Host HTTP, as Administrator:
-::
-::     Win7+ (bitsadmin):  bitsadmin /transfer get_install /download /priority foreground "http://<gateway>:2121/bin/install.bat" "%TEMP%\install.bat" && call "%TEMP%\install.bat" --guest --hostname windowsvm
-::
-::     Win10+ (curl):      curl -fsSL http://<gateway>:2121/bin/install.bat -o install.bat && install.bat --guest --hostname windowsvm
-::
-::   Local install (binary already on disk):
-::     install.bat --guest --hostname windowsvm
-::
-:: ─── Parameters ───────────────────────────────────────────────────────
-::
-::   --guest           Guest mode (required)
-::   --hostname NAME   Guest hostname (required in guest mode)
-::                     Used for mesh identity and /etc/hosts sync on Host.
-::                     Must be unique across all Guests.
-::   --port PORT       Host HTTP port (default: 2121)
-::
-:: ─── Post-Install ─────────────────────────────────────────────────────
-::
-::   Verify on Host:   utmm --host --status
-::   Service control:  sc query UTM-Monitor-Guest
-::                     sc stop  UTM-Monitor-Guest
-::                     sc start UTM-Monitor-Guest
-::   Logs:             C:\opt\utmm\utmm.log
-::
-::   Auto-upgrade (v0.11.14+): Guest detects Host version change via
-::   mesh LSA and upgrades itself — no manual redeployment needed after
-::   the initial install. Host never pushes upgrades.
-::
-:: ─── Troubleshooting ──────────────────────────────────────────────────
-::
-::   "Access denied"        → Not running as Administrator. Re-run from
-::                            an elevated command prompt.
-::   "Could not detect Host gateway"
-::                          → Host service not running on gateway VM.
-::                            Start it: sudo utmm --host
-::   "Download failed"      → Host HTTP not reachable. Check network,
-::                            firewall, and that the Host serve-dir
-::                            contains the target binary.
-::   Service won't start    → Check retry limit: sc failure
-::                            Reinstall: install.bat --guest --hostname ...
-:: ═══════════════════════════════════════════════════════════════════════
+set "CANONICAL_DIR=C:\opt\utmm"
+set "BINARY_NAME=utmm.exe"
+set "DOWNLOAD_URL=https://github.com/fixnet-ai/utm-monitor/releases/latest/download/utmm.zip"
+set "VERSION=0.11.16"
 
-set "MODE="
-set "HOSTNAME="
-set "PORT=2121"
+:: ── admin check ─────────────────────────────────────────────────────────────
 
-:parse_args
-if "%~1"=="" goto end_args
-if "%~1"=="--guest"   (set "MODE=guest"   & shift & goto parse_args)
-if "%~1"=="-g"        (set "MODE=guest"   & shift & goto parse_args)
-if "%~1"=="--hostname" (set "HOSTNAME=%~2" & shift & shift & goto parse_args)
-if "%~1"=="-h"         (set "HOSTNAME=%~2" & shift & shift & goto parse_args)
-if "%~1"=="--port"    (set "PORT=%~2"     & shift & shift & goto parse_args)
-if "%~1"=="-p"        (set "PORT=%~2"     & shift & shift & goto parse_args)
-shift & goto parse_args
-:end_args
-
-if not "%MODE%"=="guest" (
-    echo UTM Monitor installer
-    echo.
-    echo For Host installation, run install.sh on macOS/Linux:
-    echo   curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh ^| sh
-    echo.
-    echo For Guest installation on Windows:
-    echo   install.bat --guest --hostname windowsvm
-    echo.
-    echo   Or via remote download:
-    echo   Win7+:  bitsadmin /transfer get_install /download /priority foreground
-    echo           "http://[gateway]:2121/bin/install.bat" "%%TEMP%%\install.bat"
-    echo           ^&^& call "%%TEMP%%\install.bat" --guest --hostname windowsvm
-    echo.
-    echo   Win10+: curl -fsSL http://[gateway]:2121/bin/install.bat -o install.bat
-    echo           ^&^& install.bat --guest --hostname windowsvm
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo ERROR: Administrator privileges required.
+    echo Right-click on Command Prompt ^(or this .bat file^) and select "Run as Administrator".
+    pause
     exit /b 1
 )
 
-if "%HOSTNAME%"=="" (
-    echo Error: --hostname is required in guest mode
-    echo Usage: install.bat --guest --hostname NAME [--port PORT]
-    exit /b 1
-)
+:: ── banner ───────────────────────────────────────────────────────────────────
 
-set "INSTALL_DIR=C:\opt\utmm"
-
-echo ==^> UTM Monitor installer ^(Guest - Windows^)
-echo     install:  %INSTALL_DIR%
-echo     hostname: %HOSTNAME%
-echo     port:     %PORT%
+echo.
+echo ========================================
+echo   utmm v%VERSION%  Install / Upgrade
+echo   https://github.com/fixnet-ai/utm-monitor
+echo ========================================
 echo.
 
-:: ─── 1. Detect CPU architecture ──────────────────────────────────────────
-set "CPU_ARCH=%PROCESSOR_ARCHITECTURE%"
-if "%CPU_ARCH%"=="AMD64" (set "ARCH=x86_64"   & goto arch_done)
-if "%CPU_ARCH%"=="ARM64" (set "ARCH=aarch64"  & goto arch_done)
-:: x86, IA64, or unknown — default to x86
-set "ARCH=x86"
-:arch_done
-echo     arch:     %ARCH% ^(PROCESSOR_ARCHITECTURE=%CPU_ARCH%^)
+:: ── architecture detection ───────────────────────────────────────────────────
 
-:: ─── 2. OS ───────────────────────────────────────────────────────────────
-set "OS=windows"
-echo     os:       %OS%
+:: On 64-bit Windows, PROCESSOR_ARCHITECTURE may be "x86" when running
+:: inside a 32-bit cmd.exe (WoW64). Check PROCESSOR_ARCHITEW6432 first.
+set "ARCH=%PROCESSOR_ARCHITEW6432%"
+if "%ARCH%"=="" set "ARCH=%PROCESSOR_ARCHITECTURE%"
 
-:: ─── 3. Find default gateway ─────────────────────────────────────────────
-echo     detecting gateway...
-
-set "GW="
-
-:: Method 1: Parse route print for 0.0.0.0 default gateway
-:: Output columns: Network Netmask Gateway Interface Metric
-:: We want column 3 (Gateway)
-for /f "tokens=3" %%a in ('route print 0.0.0.0 ^| findstr /r "0\.0\.0\.0.*[0-9]\.[0-9]"') do (
-    if "!GW!"=="" set "GW=%%a"
+if /i "%ARCH%"=="AMD64" (
+    set "PLATFORM_ARCH=x86_64"
+    set "ZIP_BINARY=utmm-x86_64-windows.exe"
+) else if /i "%ARCH%"=="ARM64" (
+    set "PLATFORM_ARCH=aarch64"
+    set "ZIP_BINARY=utmm-aarch64-windows.exe"
+) else if /i "%ARCH%"=="x86" (
+    set "PLATFORM_ARCH=x86"
+    set "ZIP_BINARY=utmm-x86-windows.exe"
+) else (
+    echo ERROR: Unsupported architecture: %ARCH%
+    echo Supported: AMD64, ARM64, x86
+    pause
+    exit /b 2
 )
 
-:: Method 2: Fallback — probe known UTM bridge IPs via bitsadmin
-:: bitsadmin is the most compatible HTTP client (Win7+).
-:: We check whether the downloaded temp file is non-empty.
-if "%GW%"=="" (
-    set "FALLBACKS=192.168.64.1 192.168.65.1 192.168.66.1 192.168.67.1"
-    for %%i in (!FALLBACKS!) do (
-        if "!GW!"=="" (
-            set "PROBE_URL=http://%%i:%PORT%/version"
-            set "PROBE_OUT=%TEMP%\utmm_probe_%%i.txt"
-            bitsadmin /transfer utmm_probe /download /priority foreground "!PROBE_URL!" "!PROBE_OUT!" >nul 2>&1
-            if exist "!PROBE_OUT!" (
-                for %%f in ("!PROBE_OUT!") do if %%~zf gtr 0 set "GW=%%i"
-                del "!PROBE_OUT!" 2>nul
-            )
-        )
+echo Detected: windows / %PLATFORM_ARCH%  -^>  %ZIP_BINARY%
+echo.
+
+:: ── interaction: hostname ────────────────────────────────────────────────────
+
+:: Default hostname = COMPUTERNAME (always available on Windows)
+set "DEFAULT_HOSTNAME=%COMPUTERNAME%"
+
+:ask_hostname
+set "HOSTNAME_INPUT="
+set /p "HOSTNAME_INPUT=Hostname [%DEFAULT_HOSTNAME%]: "
+if "!HOSTNAME_INPUT!"=="" set "HOSTNAME_INPUT=%DEFAULT_HOSTNAME%"
+
+:: Validate: 1-63 chars, starts with letter/digit
+set "HOSTNAME_TMP=!HOSTNAME_INPUT!"
+:: Check length (rough: variable length)
+call :strlen "!HOSTNAME_TMP!" HOSTNAME_LEN
+if !HOSTNAME_LEN! lss 1 goto :bad_hostname
+if !HOSTNAME_LEN! gtr 63 goto :bad_hostname
+
+:: Check first char is alphanumeric
+set "FIRST_CHAR=!HOSTNAME_TMP:~0,1!"
+call :is_alnum !FIRST_CHAR! || goto :bad_hostname
+
+:: Check all chars are valid
+for /L %%i in (0,1,62) do (
+    if %%i lss !HOSTNAME_LEN! (
+        set "C=!HOSTNAME_TMP:~%%i,1!"
+        if "!C!"=="" goto :hostname_ok
+        call :is_valid_char !C! || goto :bad_hostname
     )
 )
 
-if "%GW%"=="" (
-    echo.
-    echo Error: Could not detect Host gateway.
-    echo   Is the Host machine running 'sudo utmm --host'?
-    echo   The Guest must be able to reach the Host at gateway:%PORT%
-    echo.
-    echo   Manual fallback:
-    echo     install.bat --guest --hostname myvm
-    echo     Then manually start with: utmm --hostname myvm --gw [gateway IP]
-    exit /b 1
+:hostname_ok
+set "HOSTNAME=!HOSTNAME_TMP!"
+goto :ask_mode
+
+:bad_hostname
+echo ERROR: Invalid hostname. Use 1-63 chars: a-z, A-Z, 0-9, -, _.
+echo        Must start with letter or digit.
+goto :ask_hostname
+
+:: ── interaction: mode ────────────────────────────────────────────────────────
+
+:ask_mode
+set "MODE_INPUT="
+set /p "MODE_INPUT=Mode - [H]ost or [G]uest? [G]: "
+if "!MODE_INPUT!"=="" set "MODE_INPUT=G"
+
+if /i "!MODE_INPUT!"=="H" (
+    set "MODE=host"
+    set "MODE_FLAG=--host"
+    goto :ask_hostip_done
+)
+if /i "!MODE_INPUT!"=="G" (
+    set "MODE=guest"
+    set "MODE_FLAG="
+    goto :ask_hostip
+)
+echo Please enter H (Host) or G (Guest).
+goto :ask_mode
+
+:: ── interaction: host-ip (Guest only) ────────────────────────────────────────
+
+:ask_hostip
+set "HOST_IP_INPUT="
+set /p "HOST_IP_INPUT=Host IP (blank = auto-detect via default gateway): "
+if not "!HOST_IP_INPUT!"=="" (
+    set "HOST_IP_ARG=--host-ip !HOST_IP_INPUT!"
+) else (
+    set "HOST_IP_ARG="
 )
 
-echo     gateway:  %GW%
-
-:: ─── 4. Construct download URL ───────────────────────────────────────────
-set "BIN=utmm-%ARCH%-%OS%.exe"
-set "URL=http://%GW%:%PORT%/bin/%BIN%"
-echo     binary:   %BIN%
-echo     download: %URL%
+:ask_hostip_done
 echo.
+echo Summary:
+echo   Mode:     !MODE!
+echo   Hostname: !HOSTNAME!
+if not "!HOST_IP_ARG!"=="" echo   Host IP:  !HOST_IP_INPUT!
+if "!HOST_IP_ARG!"=="" if "!MODE!"=="guest" echo   Host IP:  (auto-detect)
 
-:: ─── 5. Create install directory ─────────────────────────────────────────
-echo ==^> Creating %INSTALL_DIR% ...
-if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
+:: ── create canonical dir ────────────────────────────────────────────────────
 
-:: ─── 6. Download binary ──────────────────────────────────────────────────
-:: Primary: bitsadmin (Win7+, most compatible — covers all supported editions)
-:: Fallback: curl     (Win10 17063+, used if bitsadmin is unavailable/fails)
-echo ==^> Downloading %URL% ...
-set "TMP_BIN=%TEMP%\utmm-new.exe"
+if not exist "!CANONICAL_DIR!" mkdir "!CANONICAL_DIR!"
 
-:: Remove stale temp file from previous run
-if exist "%TMP_BIN%" del /f "%TMP_BIN%" 2>nul
+:: ── check if already extracted (offline mode) ────────────────────────────────
 
-:: Try bitsadmin first — available on all supported Windows editions (7+)
-set "DL_OK=0"
-bitsadmin /transfer utmm_dl /download /priority foreground "%URL%" "%TMP_BIN%" >nul 2>&1
-if exist "%TMP_BIN%" (
-    for %%f in ("%TMP_BIN%") do if %%~zf gtr 0 set "DL_OK=1"
+if exist "!CANONICAL_DIR!\!ZIP_BINARY!" (
+    echo.
+    echo [offline] !ZIP_BINARY! found in !CANONICAL_DIR! - skipping download.
+    goto :extract_done
 )
 
-:: Fallback to curl if bitsadmin failed (e.g. disabled by policy, or Win10+)
-if "!DL_OK!"=="0" (
-    echo     bitsadmin unavailable or failed, trying curl...
-    if exist "%TMP_BIN%" del /f "%TMP_BIN%" 2>nul
-    curl -fSL -m 60 -o "%TMP_BIN%" "%URL%" >nul 2>&1
-    if exist "%TMP_BIN%" (
-        for %%f in ("%TMP_BIN%") do if %%~zf gtr 0 set "DL_OK=1"
+:: ── download ─────────────────────────────────────────────────────────────────
+
+set "ZIP_PATH=%TEMP%\utmm_%RANDOM%.zip"
+echo.
+echo Downloading utmm.zip ...
+
+:: Try PowerShell (Invoke-WebRequest) first - most reliable on all Windows versions
+where powershell >nul 2>&1
+if %errorlevel% equ 0 (
+    powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%DOWNLOAD_URL%' -OutFile '%ZIP_PATH%' -UseBasicParsing" 2>nul
+    if exist "%ZIP_PATH%" goto :download_ok
+)
+
+:: Fallback 1: curl (Win10 1803+)
+where curl >nul 2>&1
+if %errorlevel% equ 0 (
+    curl -fsSL --connect-timeout 30 --max-time 120 -o "%ZIP_PATH%" "%DOWNLOAD_URL%" 2>nul
+    if exist "%ZIP_PATH%" goto :download_ok
+)
+
+:: Fallback 2: certutil (Win7+)
+where certutil >nul 2>&1
+if %errorlevel% equ 0 (
+    certutil -urlcache -split -f "%DOWNLOAD_URL%" "%ZIP_PATH%" >nul 2>&1
+    if exist "%ZIP_PATH%" goto :download_ok
+)
+
+:: Fallback 3: bitsadmin (Win7+)
+where bitsadmin >nul 2>&1
+if %errorlevel% equ 0 (
+    bitsadmin /transfer "utmm_dl" "%DOWNLOAD_URL%" "%ZIP_PATH%" >nul 2>&1
+    if exist "%ZIP_PATH%" goto :download_ok
+)
+
+echo ERROR: Download failed. No download tool available.
+echo Install curl, or download utmm.zip manually from:
+echo   %DOWNLOAD_URL%
+echo Then extract to %CANONICAL_DIR%\ and re-run this script.
+pause
+exit /b 3
+
+:download_ok
+echo Download OK
+
+:: ── extract ──────────────────────────────────────────────────────────────────
+
+echo Extracting to %CANONICAL_DIR%\ ...
+
+:: Try PowerShell Expand-Archive first (most reliable, all Windows versions)
+where powershell >nul 2>&1
+if %errorlevel% equ 0 (
+    powershell -NoProfile -Command "Expand-Archive -Path '%ZIP_PATH%' -DestinationPath '%CANONICAL_DIR%' -Force" 2>nul
+    if exist "!CANONICAL_DIR!\!ZIP_BINARY!" goto :extract_ok
+)
+
+:: Try tar (Win10 1803+)
+where tar >nul 2>&1
+if %errorlevel% equ 0 (
+    tar -xf "%ZIP_PATH%" -C "%CANONICAL_DIR%" >nul 2>&1
+    if exist "!CANONICAL_DIR!\!ZIP_BINARY!" goto :extract_ok
+)
+
+:: Fallback: COM Shell.Application (Win7/8 without PowerShell)
+echo Using COM shell for extraction ...
+set "VBS_PATH=%TEMP%\utmm_unzip.vbs"
+echo Set sa = CreateObject("Shell.Application")> "%VBS_PATH%"
+echo Set zip = sa.NameSpace("%ZIP_PATH%")>> "%VBS_PATH%"
+echo Set dest = sa.NameSpace("%CANONICAL_DIR%")>> "%VBS_PATH%"
+echo dest.CopyHere zip.Items(), 16>> "%VBS_PATH%"
+cscript //nologo "%VBS_PATH%" >nul 2>&1
+del "%VBS_PATH%" 2>nul
+if exist "!CANONICAL_DIR!\!ZIP_BINARY!" goto :extract_ok
+
+echo ERROR: Extract failed.
+echo Zip contents in %CANONICAL_DIR%\:
+dir /b "%CANONICAL_DIR%"
+echo.
+echo Expected binary: %ZIP_BINARY% not found.
+echo The zip may be corrupted; try re-downloading.
+del "%ZIP_PATH%" 2>nul
+pause
+exit /b 4
+
+:extract_ok
+echo Extract OK
+
+:: Clean up zip
+del "%ZIP_PATH%" 2>nul
+
+:extract_done
+
+:: ── file placement ───────────────────────────────────────────────────────────
+
+echo Preparing files ...
+
+cd /d "%CANONICAL_DIR%"
+
+:: Always ensure the target binary is named utmm.exe
+copy /y "%ZIP_BINARY%" "%BINARY_NAME%" >nul
+
+if /i "%MODE%"=="guest" (
+    :: Guest: only keep the current-platform binary
+    echo   Guest mode - removing other platform binaries ...
+    for %%f in (utmm-* utmm*.exe) do (
+        if /i not "%%f"=="%ZIP_BINARY%" del /q "%%f" 2>nul
+    )
+    :: Also remove install scripts from Guest
+    del /q install.sh install.bat 2>nul
+    echo   Kept: %ZIP_BINARY% (as utmm.exe)
+) else (
+    :: Host: keep all platform binaries for Guest auto-upgrade
+    echo   Host mode - keeping all platform binaries for Guest auto-upgrade:
+    for %%f in (utmm-* utmm*.exe) do (
+        if exist "%%f" echo     %%f
     )
 )
 
-if "!DL_OK!"=="0" (
+:: ── install ──────────────────────────────────────────────────────────────────
+
+echo.
+echo Installing as %MODE% ...
+
+set "INSTALL_ARGS=--install --hostname %HOSTNAME% %MODE_FLAG% %HOST_IP_ARG%"
+
+"%CANONICAL_DIR%\%BINARY_NAME%" %INSTALL_ARGS%
+if %errorlevel% neq 0 (
     echo.
-    echo Error: Download failed ^(both bitsadmin and curl unavailable or failed^)
-    echo   Verify the Host is running: sudo utmm --host
-    echo   Verify the binary exists on Host at %BIN%
-    echo   Verify network: ping %GW%
-    if exist "%TMP_BIN%" del /f "%TMP_BIN%" 2>nul
-    exit /b 1
+    echo ERROR: Installation failed (exit code %errorlevel%).
+    echo Check service logs: type C:\opt\utmm\utmm-%MODE%-err.log
+    pause
+    exit /b %errorlevel%
 )
 
-for %%f in ("%TMP_BIN%") do echo ==^> Downloaded: %%~zf bytes
-
-:: ─── 7. Stop existing process, replace binary ────────────────────────────
-echo ==^> Stopping existing utmm process...
-taskkill /f /im utmm.exe >nul 2>&1
-timeout /t 2 /nobreak >nul
-
-:: Move new binary to install dir
-echo ==^> Installing binary...
-move /y "%TMP_BIN%" "%INSTALL_DIR%\utmm.exe" >nul
-if %errorlevel% neq 0 (
-    echo Error: Failed to move binary to %INSTALL_DIR%\utmm.exe
-    exit /b 1
-)
-
-:: ─── 8. Install as system service ────────────────────────────────────────
-echo ==^> Installing auto-start service...
-"%INSTALL_DIR%\utmm.exe" --install --hostname "%HOSTNAME%"
-if %errorlevel% neq 0 (
-    echo Warning: utmm.exe --install exited with code %errorlevel%
-)
-
-timeout /t 1 /nobreak >nul
 echo.
-echo ==^> Guest installation complete!
-echo.
-echo ==^> Verify on Host: utmm --host --status
-"%INSTALL_DIR%\utmm.exe" --version 2>nul
+echo Done.
+if /i "%MODE%"=="host" (
+    echo   Host service is running on UDP :2121
+    echo   Check: %CANONICAL_DIR%\%BINARY_NAME% --status
+) else (
+    echo   Guest service is running - auto-starts on boot.
+    echo   Check: run 'utmm --status' on the Host machine.
+)
+goto :eof
 
-exit /b 0
+:: ── subroutines ──────────────────────────────────────────────────────────────
+
+:strlen  str  result
+    set "s=%~1"
+    set "len=0"
+    for /l %%a in (12,-1,0) do (
+        set /a "len|=1<<%%a"
+        for %%b in (!len!) do if "!s:~%%b,1!"=="" set /a "len&=~1<<%%a"
+    )
+    set "%~2=!len!"
+    goto :eof
+
+:is_alnum  char
+    set "ch=%~1"
+    if "%ch%" geq "a" if "%ch%" leq "z" exit /b 0
+    if "%ch%" geq "A" if "%ch%" leq "Z" exit /b 0
+    if "%ch%" geq "0" if "%ch%" leq "9" exit /b 0
+    exit /b 1
+
+:is_valid_char  char
+    set "ch=%~1"
+    if "%ch%" geq "a" if "%ch%" leq "z" exit /b 0
+    if "%ch%" geq "A" if "%ch%" leq "Z" exit /b 0
+    if "%ch%" geq "0" if "%ch%" leq "9" exit /b 0
+    if "%ch%"=="-" exit /b 0
+    if "%ch%"=="_" exit /b 0
+    exit /b 1

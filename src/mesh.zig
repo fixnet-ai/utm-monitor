@@ -342,9 +342,10 @@ pub const Mesh = struct {
     // Upgrade signal (set when version mismatch detected via LSA)
     upgrade_needed: *std.atomic.Value(bool),
 
-    // Host gateway IP (Guest only) — LSA version check only fires for this IP.
-    // Empty string on Host (no self-upgrade) or when host-ip is not known.
-    host_gateway_ip: []const u8,
+    // (was host_gateway_ip — removed. IP gating on version-mismatch check
+    //  was unreliable on multihomed hosts where the Host's primary IP ≠
+    //  guest-facing bridge/gateway IP. Version mismatch alone is sufficient:
+    //  other Guests share our protocol.VERSION and won't trigger.)
 
     // Clock (monotonic ms, advanced in run loop)
     clock_ms: u32,
@@ -366,7 +367,6 @@ pub const Mesh = struct {
         io: std.Io,
         upgrade_needed: *std.atomic.Value(bool),
         broadcast_addrs: std.ArrayList(net.IpAddress),
-        host_gateway_ip: []const u8,
     ) !Mesh {
         const nonce = generateNonce();
 
@@ -404,7 +404,6 @@ pub const Mesh = struct {
             .sessions_mutex = std.Io.Mutex.init,
             .shutdown = std.atomic.Value(bool).init(false),
             .upgrade_needed = upgrade_needed,
-            .host_gateway_ip = host_gateway_ip,
             .nonce = nonce,
             .clock_ms = 0,
         };
@@ -891,22 +890,18 @@ pub const Mesh = struct {
         }
 
         // Check for version mismatch (upgrade signal).
-        if (!self.upgrade_needed.load(.acquire) and self.host_gateway_ip.len > 0) {
-            var remote_ip: []const u8 = "";
-            if (std.mem.indexOf(u8, decoded.node_info, "ip:")) |ip_start| {
-                const ip_line = decoded.node_info[ip_start + "ip:".len ..];
-                const ip_end = std.mem.indexOfScalar(u8, ip_line, '\n') orelse ip_line.len;
-                remote_ip = ip_line[0..ip_end];
-            }
-            if (remote_ip.len > 0 and std.mem.eql(u8, remote_ip, self.host_gateway_ip)) {
-                if (std.mem.indexOf(u8, decoded.node_info, "version:")) |v_start| {
-                    const v_line = decoded.node_info[v_start + "version:".len ..];
-                    const v_end = std.mem.indexOfScalar(u8, v_line, '\n') orelse v_line.len;
-                    const remote_version = v_line[0..v_end];
-                    if (!std.mem.eql(u8, remote_version, protocol.VERSION)) {
-                        std.log.info("[mesh] LSA version mismatch from host: remote={s} local={s} — signalling upgrade", .{ remote_version, protocol.VERSION });
-                        self.upgrade_needed.store(true, .release);
-                    }
+        // No IP gating — on multihomed hosts the primary IP ≠ guest-facing
+        // bridge/gateway IP, so exact IP match would never fire.  Version
+        // mismatch alone is sufficient: other Guests share our VERSION,
+        // and the upgrade_req always goes to the Host via KCP tunnel.
+        if (!self.upgrade_needed.load(.acquire)) {
+            if (std.mem.indexOf(u8, decoded.node_info, "version:")) |v_start| {
+                const v_line = decoded.node_info[v_start + "version:".len ..];
+                const v_end = std.mem.indexOfScalar(u8, v_line, '\n') orelse v_line.len;
+                const remote_version = v_line[0..v_end];
+                if (!std.mem.eql(u8, remote_version, protocol.VERSION)) {
+                    std.log.info("[mesh] LSA version mismatch: remote={s} local={s} — signalling upgrade", .{ remote_version, protocol.VERSION });
+                    self.upgrade_needed.store(true, .release);
                 }
             }
         }

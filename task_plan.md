@@ -1,4 +1,4 @@
-# Task Plan: v0.11.14
+# Task Plan: v0.11.16
 
 ## 架构概述
 
@@ -9,8 +9,10 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 - 统一服务模型：Host 和 Guest 均为系统自动启动服务（v0.12.0）
 - 自复制模型：升级 = 新版本 `--install`，取消 utmm-old + agent.zig（v0.12.0）
 - **Guest 自主升级**（v0.11.14）：Guest 检测 LSA 版本不匹配 → KCP 下载新二进制 → `--install --hostname <name>` 自安装。Host 永不推送升级。
+- **一键安装脚本**（v0.11.16）：`install.sh`/`install.bat` 交互式跨平台安装/升级，一行命令
 - Fast-fail：不继续执行出错操作，打印错误退出
 - 所有操作要求 root/Administrator（除 `--version`/`--help`）
+- 支持所有 VM 超虚拟化 + 物理真机，不限于 UTM
 
 ## 活跃 VM
 
@@ -226,6 +228,46 @@ if (upgrade.needed.load(.acquire)) {
 | `MANUAL.md` | 版本号 0.11.10→0.11.14、端口 2121 TCP HTTP→UDP only、CLI 通信 HTTP→IPC socket、MCP 通信 HTTP→IPC socket、MCP 工具 2→5、升级"无自动升级"→Guest 自主升级、源文件 13→15（新增 ipc.zig） |
 
 **v0.11.15 发布**: 构建 8 目标 → `./release.sh` → GitHub Release → 本机 Host 安装 → 观察 VM 自动升级。
+
+**自动升级 Bug 发现**: Guest 全部未自动升级。根因：`mesh.zig:901` — IP gating 条件在多网卡 Host 上永远不匹配（Host LSA `ip:`=主IP, Guest `host_gateway_ip`=网关IP ≠ 主IP）。修复：移除 IP gating，版本检查不依赖 IP 匹配。已编码，待 bump 到 v0.11.16。
+
+### Phase 65: 一键安装脚本 (install.sh + install.bat) 🔴 当前
+
+**目标**: 一行命令完成 utmm 安装/升级，覆盖 POSIX + Windows (Win7+)，交互式 + 离线安装。
+
+**设计原则**:
+- 全平台强制 root/Administrator 权限检查
+- 脚本交互提问 hostname（默认系统 hostname）/ mode（Host/Guest）/ Host IP（仅 Guest，默认自动检测）
+- `utmm` 二进制绝不交互 — MCP/AI/CI/自动升级无人值守
+- 纯 `.bat`（Win7+）— curl→certutil fallback，tar→COM fallback
+- 安装 = 升级，不做区分
+- Host 保留全部 8 平台二进制（Guest 自动升级依赖 serve-dir）；Guest 仅保留当前平台
+- zip 自带 install 脚本支持离线安装
+- README/SKILL.md/MANUAL.md 全面去除 UTM 限定，适用所有 VM + 真机
+
+**下载/解压链路**:
+
+| | 方案 1 | 方案 2 | 方案 3 |
+|---|--------|--------|--------|
+| POSIX 下载 | curl -fsSLo | wget -qO | 退出 |
+| Win10 1803+ 下载 | curl.exe -fsSLo | — | — |
+| Win7/8 下载 | certutil -urlcache -split -f | bitsadmin /transfer | — |
+| POSIX 解压 | unzip -o | — | — |
+| Win10 1803+ 解压 | tar -xf | — | — |
+| Win7/8 解压 | ps Expand-Archive | COM Shell.Application | — |
+
+**实现步骤**:
+1. 创建 `install.sh`（~180行：权限检查 → 平台检测 → 交互 → 下载/离线 → 解压 → --install）
+2. 创建 `install.bat`（~150行：Admin 检查 → 平台检测 → 交互 → 下载/离线 → 解压 → --install）
+3. 更新 `.gitattributes` — `install.sh text eol=lf` / `install.bat text eol=crlf`
+4. 修改 `release.sh` — zip 追加 `install.sh install.bat`
+5. 更新 `README.md` One-Time Setup → 一键命令 + 离线安装 + 脚本注释手动步骤
+6. 更新 `SKILL.md` / `MANUAL.md` 安装章节 → 一键脚本
+7. VERSION bump（`src/protocol.zig` + `build.zig.zon`）0.11.15 → 0.11.16
+8. `zig build test` → 全绿 → 构建 8 目标 → `./release.sh` → GitHub Release
+9. 本机 Host 部署 → 观察 Guest 自动升级
+
+**涉及文件**: `install.sh`(新)、`install.bat`(新)、`.gitattributes`(改)、`release.sh`(改)、`README.md`(改)、`SKILL.md`(改)、`MANUAL.md`(改)、`task_plan.md`(改)、`progress.md`(改)、`src/protocol.zig`(改)、`build.zig.zon`(改)
 
 ## 待办
 

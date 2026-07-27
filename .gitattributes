@@ -1,0 +1,5 @@
+# Force LF line endings for POSIX scripts
+install.sh text eol=lf
+
+# Force CRLF line endings for Windows batch scripts
+install.bat text eol=crlf

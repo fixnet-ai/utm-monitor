@@ -305,7 +305,7 @@ fn startHost(
         };
 
         // Create mesh instance (epoch is auto-appended to node_info by init())
-        mesh_opt = mesh_mod.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, &upgrade_signal.needed, bc_addrs, "") catch |err| {
+        mesh_opt = mesh_mod.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, &upgrade_signal.needed, bc_addrs) catch |err| {
             std.log.err("[host] Mesh init failed: {}", .{err});
             gpa.free(node_info);
             mesh_socket.close(mesh_io);
