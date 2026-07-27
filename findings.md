@@ -249,6 +249,8 @@ linuxvm 稳定是因为它的升级尝试无声失败，从未进入升级循环
 
 **设计原则**: 进程身份（nonce）≠ 进程状态（status/ip），LSA restart 检测只应依赖身份。
 
+**补充修复**: 版本检测 (`upgrade.needed`) 扫描所有 LSA，未过滤 `role:host`。滚动升级期间已升级的 Guest（v0.11.18）看到其他 Guest（v0.11.17）的 LSA → 误触发升级信号 → 无限升级循环。修复：仅 `role:host` LSA 触发版本检测。
+
 **状态**: ✅ 已修复
 
 ### Finding 125: `nowMs()` RTT — 直连正确，中继异常
