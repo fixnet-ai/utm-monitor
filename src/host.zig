@@ -1,14 +1,13 @@
-//! Host mode — unified HTTP server on port 2121.
+//! Host mode — mesh networking daemon on UDP :2121.
 //!
-//! Single std.http.Server replaces UDP broadcast + TCP binary frames on port 2121.
-//! Management commands (--status/--exec/--upload/--download) are HTTP clients.
+//! LSA broadcast + KCP tunnel replace the old HTTP server (v0.11.0).
+//! Management commands (--status/--exec/--upload/--download) communicate via IPC socket.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const protocol = @import("protocol.zig");
-const http = std.http;
-const httpd = @import("httpd.zig");
+const hst = @import("state.zig");
 const broadcast = @import("broadcast.zig");
 const mesh_mod = @import("mesh.zig");
 const tunnel_mod = @import("tunnel.zig");
@@ -132,14 +131,14 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
             .object => |o| o,
             else => continue,
         };
-        const hostname = httpd.jsonGetString(g, "hostname") orelse "?";
-        const role = httpd.jsonGetString(g, "role") orelse "?";
-        const target = httpd.jsonGetString(g, "target") orelse "?";
-        const ip = httpd.jsonGetString(g, "ip") orelse "?";
-        const mac = httpd.jsonGetString(g, "mac") orelse "?";
-        const version = httpd.jsonGetString(g, "version") orelse "?";
-        const status = httpd.jsonGetString(g, "status") orelse "?";
-        const shell = httpd.jsonGetString(g, "shell") orelse "?";
+        const hostname = hst.jsonGetString(g, "hostname") orelse "?";
+        const role = hst.jsonGetString(g, "role") orelse "?";
+        const target = hst.jsonGetString(g, "target") orelse "?";
+        const ip = hst.jsonGetString(g, "ip") orelse "?";
+        const mac = hst.jsonGetString(g, "mac") orelse "?";
+        const version = hst.jsonGetString(g, "version") orelse "?";
+        const status = hst.jsonGetString(g, "status") orelse "?";
+        const shell = hst.jsonGetString(g, "shell") orelse "?";
         // Parse last_seen from JSON integer
         var last_seen: i64 = 0;
         if (g.get("last_seen")) |v| {
@@ -228,10 +227,10 @@ fn cmdVerify(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
             else => continue,
         };
         // Skip Host — no KCP tunnel to itself, ping/exec would fail
-        if (httpd.jsonGetString(g, "role")) |r| {
+        if (hst.jsonGetString(g, "role")) |r| {
             if (std.mem.eql(u8, r, "host")) continue;
         }
-        if (httpd.jsonGetString(g, "hostname")) |h| {
+        if (hst.jsonGetString(g, "hostname")) |h| {
             try hostnames.append(aa, try aa.dupe(u8, h));
         }
     }
@@ -792,7 +791,7 @@ fn startHost(
     }
 
     // Initialize shared state (guest table + pending commands)
-    var state = httpd.HostState.init(gpa);
+    var state = hst.HostState.init(gpa);
     state.io = block_io;
     state.serve_dir = sd;
     state.on_guest_changed = null;
@@ -912,7 +911,7 @@ fn startHost(
     var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ gpa, &state, &mesh_opt });
 
     // Spawn IPC server thread — Unix domain socket (POSIX) / named pipe (Windows).
-    // Shares HostState and Mesh with the HTTP server.
+    // Shares HostState and Mesh with the mesh networking layer.
     var ipc_shutdown = std.atomic.Value(bool).init(false);
     const ipc_mod = @import("ipc.zig");
     var ipc_thread = try std.Thread.spawn(.{}, ipc_mod.startServer, .{
@@ -970,7 +969,7 @@ fn parseNodeInfoLine(line: []const u8, key: []const u8) ?[]const u8 {
 /// per-guest handler threads (handleMeshGuest).
 fn tunnelManager(
     allocator: std.mem.Allocator,
-    state: *httpd.HostState,
+    state: *hst.HostState,
     mesh_opt: *?mesh_mod.Mesh,
 ) void {
     while (true) {
@@ -1027,7 +1026,7 @@ fn tunnelManager(
                 // Upsert to guest table
                 const changed = state.upsertGuest(hostname, ip, target, mac_str, version, shell, status, role);
                 if (changed and hostname.len > 0) {
-                    httpd.syncHostsFromState(state, allocator);
+                    hst.syncHostsFromState(state, allocator);
                 }
 
                 // Establish tunnel if not already active.
@@ -1082,7 +1081,7 @@ fn tunnelManager(
                         std.log.err("[tun-mgr] hostname dup failed for {s}", .{hostname});
                         continue;
                     };
-                    const t = std.Thread.spawn(.{}, httpd.handleMeshGuest, .{
+                    const t = std.Thread.spawn(.{}, hst.handleMeshGuest, .{
                         allocator, state, hostname_dup, tun_ptr,
                     }) catch |err| {
                         std.log.err("[tun-mgr] handleMeshGuest spawn failed for {s}: {}", .{ hostname, err });

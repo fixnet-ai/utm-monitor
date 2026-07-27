@@ -61,13 +61,13 @@ if "%ARCH%"=="" set "ARCH=%PROCESSOR_ARCHITECTURE%"
 
 if /i "%ARCH%"=="AMD64" (
     set "PLATFORM_ARCH=x86_64"
-    set "ZIP_BINARY=utmm-x86_64-windows-%VERSION%.exe"
+    set "BIN_PATTERN=utmm-x86_64-windows-*.exe"
 ) else if /i "%ARCH%"=="ARM64" (
     set "PLATFORM_ARCH=aarch64"
-    set "ZIP_BINARY=utmm-aarch64-windows-%VERSION%.exe"
+    set "BIN_PATTERN=utmm-aarch64-windows-*.exe"
 ) else if /i "%ARCH%"=="x86" (
     set "PLATFORM_ARCH=x86"
-    set "ZIP_BINARY=utmm-x86-windows-%VERSION%.exe"
+    set "BIN_PATTERN=utmm-x86-windows-*.exe"
 ) else (
     echo ERROR: Unsupported architecture: %ARCH%
     echo Supported: AMD64, ARM64, x86
@@ -75,7 +75,18 @@ if /i "%ARCH%"=="AMD64" (
     exit /b 2
 )
 
-echo Detected: windows / %PLATFORM_ARCH%  -^>  %ZIP_BINARY%
+:: Resolve ZIP_BINARY from the wildcard pattern (version-independent).
+:: build.zig determines the exact filename; we just find whatever matches.
+call :resolve_binary "%CANONICAL_DIR%" "%BIN_PATTERN%"
+if not "!ZIP_BINARY!"=="" (
+    :: Re-read version from ver.txt if available (bundled in zip)
+    if exist "!CANONICAL_DIR!\ver.txt" (
+        for /f "usebackq delims=" %%A in ("!CANONICAL_DIR!\ver.txt") do set "VERSION=%%A"
+    )
+)
+
+echo Detected: windows / %PLATFORM_ARCH%
+if not "!ZIP_BINARY!"=="" echo   Binary:  !ZIP_BINARY!  (v!VERSION!)
 echo.
 
 :: ── interaction: hostname ────────────────────────────────────────────────────
@@ -162,7 +173,7 @@ if not exist "!CANONICAL_DIR!" mkdir "!CANONICAL_DIR!"
 
 :: ── check if already extracted (offline mode) ────────────────────────────────
 
-if exist "!CANONICAL_DIR!\!ZIP_BINARY!" (
+if not "!ZIP_BINARY!"=="" if exist "!CANONICAL_DIR!\!ZIP_BINARY!" (
     echo.
     echo [offline] !ZIP_BINARY! found in !CANONICAL_DIR! - skipping download.
     goto :extract_done
@@ -239,13 +250,20 @@ echo Set dest = sa.NameSpace("%CANONICAL_DIR%")>> "%VBS_PATH%"
 echo dest.CopyHere zip.Items(), 16>> "%VBS_PATH%"
 cscript //nologo "%VBS_PATH%" >nul 2>&1
 del "%VBS_PATH%" 2>nul
-if exist "!CANONICAL_DIR!\!ZIP_BINARY!" goto :extract_ok
+
+:verify_extracted
+:: After extraction, re-read ver.txt and resolve platform binary by pattern
+if exist "!CANONICAL_DIR!\ver.txt" (
+    for /f "usebackq delims=" %%A in ("!CANONICAL_DIR!\ver.txt") do set "VERSION=%%A"
+)
+call :resolve_binary "%CANONICAL_DIR%" "%BIN_PATTERN%"
+if not "!ZIP_BINARY!"=="" goto :extract_ok
 
 echo ERROR: Extract failed.
 echo Zip contents in %CANONICAL_DIR%\:
 dir /b "%CANONICAL_DIR%"
 echo.
-echo Expected binary: %ZIP_BINARY% not found.
+echo No binary for windows / %PLATFORM_ARCH% found (pattern: %BIN_PATTERN%).
 echo The zip may be corrupted; try re-downloading.
 del "%ZIP_PATH%" 2>nul
 pause
@@ -269,10 +287,10 @@ cd /d "%CANONICAL_DIR%"
 copy /y "%ZIP_BINARY%" "%BINARY_NAME%" >nul
 
 if /i "%MODE%"=="guest" (
-    :: Guest: only keep the current-platform binary
+    :: Guest: only keep the current-platform binary and the main utmm.exe
     echo   Guest mode - removing other platform binaries ...
     for %%f in (utmm-* utmm*.exe) do (
-        if /i not "%%f"=="%ZIP_BINARY%" del /q "%%f" 2>nul
+        if /i not "%%f"=="%ZIP_BINARY%" if /i not "%%f"=="%BINARY_NAME%" del /q "%%f" 2>nul
     )
     :: Also remove install scripts from Guest
     del /q install.sh install.bat 2>nul
@@ -341,3 +359,14 @@ goto :eof
     if "%ch%"=="-" exit /b 0
     if "%ch%"=="_" exit /b 0
     exit /b 1
+
+:: Find the first file matching a wildcard pattern in a directory.
+:: %1 = directory, %2 = pattern (e.g. utmm-x86_64-windows-*.exe)
+:: Sets ZIP_BINARY to the basename of the first match, or empty string.
+:resolve_binary
+set "ZIP_BINARY="
+for /f "delims=" %%f in ('dir /b /o-n "%~1\%~2" 2^>nul') do (
+    set "ZIP_BINARY=%%f"
+    goto :eof
+)
+goto :eof

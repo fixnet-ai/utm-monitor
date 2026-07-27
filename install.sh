@@ -82,18 +82,31 @@ case "$ARCH" in
     *)             die "Unsupported architecture: $ARCH. Supported: aarch64, x86_64, x86." 2 ;;
 esac
 
-# Map platform → binary filename inside utmm.zip
-# Must match protocol.zig:deploymentFilename()
-case "${PLATFORM_OS}-${PLATFORM_ARCH}" in
-    linux-aarch64)  ZIP_BINARY="utmm-aarch64-linux-${VERSION}" ;;
-    linux-x86_64)   ZIP_BINARY="utmm-x86_64-linux-${VERSION}" ;;
-    linux-x86)      ZIP_BINARY="utmm-x86-linux-${VERSION}" ;;
-    macos-aarch64)  ZIP_BINARY="utmm-aarch64-macos-${VERSION}" ;;
-    macos-x86_64)   ZIP_BINARY="utmm-x86_64-macos-${VERSION}" ;;
-    *)              die "No binary for ${PLATFORM_OS}/${PLATFORM_ARCH}" 5 ;;
-esac
+# Look up the platform binary by wildcard pattern.
+# Filenames are determined by build.zig (src/protocol.zig:deploymentFilename).
+# Format: utmm-{arch}-{os}-{version}[.exe] — we wildcard the version part.
+# Call after extraction so the file actually exists in $1.
+resolve_binary() {
+    local dir="$1"
+    local pattern="utmm-${PLATFORM_ARCH}-${PLATFORM_OS}-*"
+    find "${dir}" -maxdepth 1 -type f -name "${pattern}" -print -quit 2>/dev/null
+}
 
-echo "Detected: ${PLATFORM_OS} / ${PLATFORM_ARCH}  ->  ${ZIP_BINARY}"
+# Detect platform binary (may not exist yet — resolved after extraction)
+ZIP_BINARY=$(resolve_binary "${CANONICAL_DIR}")
+if [ -n "${ZIP_BINARY}" ]; then
+    ZIP_BINARY=$(basename "${ZIP_BINARY}")
+    # Re-read version from ver.txt if available in CANONICAL_DIR
+    if [ -f "${CANONICAL_DIR}/ver.txt" ]; then
+        VERSION="$(tr -d '\n\r' < "${CANONICAL_DIR}/ver.txt")"
+    fi
+fi
+
+echo "Detected: ${PLATFORM_OS} / ${PLATFORM_ARCH}"
+if [ -n "${ZIP_BINARY}" ]; then
+    echo "  Binary:  ${ZIP_BINARY}"
+    echo "  Version: ${VERSION}"
+fi
 echo
 
 # ── interaction: hostname ────────────────────────────────────────────────────
@@ -156,7 +169,7 @@ echo "  Hostname: ${HOSTNAME}"
 
 mkdir -p "${CANONICAL_DIR}"
 
-if [ -f "${CANONICAL_DIR}/${ZIP_BINARY}" ]; then
+if [ -n "${ZIP_BINARY}" ] && [ -f "${CANONICAL_DIR}/${ZIP_BINARY}" ]; then
     echo
     dim "Offline mode: ${ZIP_BINARY} found in ${CANONICAL_DIR}/ - skipping download."
 else
@@ -211,12 +224,20 @@ else
         die "Extract failed. The zip file may be corrupted; try re-downloading." 4
     fi
 
-    # Verify the binary we need is present
-    if [ ! -f "${CANONICAL_DIR}/${ZIP_BINARY}" ]; then
+    # After extraction, ver.txt is available — re-read it for accurate version display
+    if [ -f "${CANONICAL_DIR}/ver.txt" ]; then
+        VERSION="$(tr -d '\n\r' < "${CANONICAL_DIR}/ver.txt")"
+    fi
+
+    # Resolve platform binary from extracted files (version-independent pattern)
+    ZIP_BINARY=$(resolve_binary "${CANONICAL_DIR}")
+    if [ -z "${ZIP_BINARY}" ]; then
         echo "Zip contents:"
         ls -1 "${CANONICAL_DIR}/"
-        die "Binary '${ZIP_BINARY}' not found in utmm.zip. Platform not supported by this release." 5
+        die "No binary for ${PLATFORM_OS}/${PLATFORM_ARCH} found in utmm.zip. Platform not supported by this release." 5
     fi
+    ZIP_BINARY=$(basename "${ZIP_BINARY}")
+    echo "  Binary: ${ZIP_BINARY} (v${VERSION})"
 
     rm -f "${ZIP_PATH}"
     trap - EXIT

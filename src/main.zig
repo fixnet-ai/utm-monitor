@@ -33,7 +33,7 @@ comptime {
 pub const CliArgs = struct {
     /// Whether in Host mode
     is_host: bool = false,
-    /// HTTP server port (Host mode)
+    /// Mesh UDP port (Host mode)
     port: u16 = protocol.DEFAULT_PORT,
     /// Mesh UDP port for LSA + KCP
     mesh_port: u16 = protocol.DEFAULT_PORT,
@@ -359,7 +359,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── 7. Ensure Host service for --host and management commands ──
-    // --status, --exec, --upload, --download all need the Host HTTP server.
+    // --status, --exec, --upload, --download all need the Host daemon (IPC socket).
     // Auto-start it if not running so users and AI agents can go directly
     // from "utmm --exec vm cmd" without a separate "utmm --host" step.
     const needs_host = cli.is_host or cli.cmd_status or cli.cmd_exec or cli.cmd_ping

@@ -98,7 +98,7 @@ Guest ←── LSA broadcast (UDP) ──┘  (topology discovery + version det
 5. Shell executes → output flows through pty → ptyReadLoop sends
    pty_output frames back to Host via KCP
 6. Host handleMeshGuest: appendOpOutput + scanForMarker
-7. Host IPC: respondStreaming() sends output as it arrives (chunked)
+7. Host IPC: streams output as it arrives
 8. When MDELIM:N\n found: strip marker, set exit_code=N, send x-exit-code trailer
 ```
 
@@ -119,7 +119,7 @@ Download (Guest→Host):
 3. handleDownload: tunproto download_cmd → Guest sendChunkedFile
 4. Guest: read file → file_chunk × N → file_eof (sha256)
 5. Host: appendOpOutput per chunk → file_eof marks completion
-6. IPC response: respondStreaming() chunked file bytes + x-exit-code trailer
+6. IPC response: streamed file bytes + x-exit-code trailer
 7. CLI: body_reader.stream(file_iface) → write to local file
 ```
 
@@ -160,7 +160,7 @@ only appends to snd_queue, `tunnel.recv()` only consumes rcv_queue — neither c
 update. KCP internal queues designed as single-producer/single-consumer.
 **Keepalive**: 5s idle → probe → 3 failures → dead.
 
-### HostState — Central Shared State (httpd.zig)
+### HostState — Central Shared State (state.zig)
 
 All handlers share one `HostState` instance, mutex-protected:
 - `guests`: ArrayList of `GuestEntry` (hostname, IP, target, MAC, version, shell)
@@ -383,10 +383,10 @@ src/
 ├── kcp.zig            # KCP reliable ARQ protocol (matches C reference skywind3000/kcp)
 ├── mesh.zig           # LSA mesh networking: UDP broadcast, KCP session mgmt, relay
 ├── tunnel.zig         # TCP-like stream wrapper over KCP sessions (send/recv/flush)
-├── httpd.zig          # HTTP server + endpoint handlers (+ host_http.zig)
-├── mcp.zig            # MCP stdio server: JSON-RPC stdin/stdout, HTTP client to Host
+├── state.zig          # Host shared state: guest table, tunnels, ops, JSON helpers
+├── mcp.zig            # MCP stdio server: JSON-RPC stdin/stdout, IPC client to Host
 ├── lock.zig           # Process singleton lock (utmm.lock PID file)
-├── host.zig           # Host orchestration: cmd dispatch + HTTP server + mesh start (+ install.zig Platform/genInit)
+├── host.zig           # Host orchestration: cmd dispatch + mesh start + IPC socket
 ├── broadcast.zig      # Guest core: system info, ptySpawn, ptyReadLoop, meshSessionLoop (+ guest.zig)
 ├── svc.zig            # Unified cross-platform service management (+ install.zig detectServiceEnv)
 ├── hosts_file.zig     # /etc/hosts marked block read/write
@@ -394,9 +394,9 @@ src/
 └── fail.zig           # Fast-fail helpers (err, msg — noreturn)
 ```
 
-> v0.11.10 consolidated from 19 to 13 source files; Phase 53 added mcp.zig + lock.zig = 14 files.
+> v0.11.10 consolidated from 19 to 13 source files; Phase 53 added mcp.zig + lock.zig; Phase 60 added ipc.zig = 16 files.
 > Merged: ver.zig→protocol.zig, priv.zig→main.zig, install.zig→svc.zig+host.zig,
-> guest.zig→broadcast.zig, host_http.zig→httpd.zig.
+> guest.zig→broadcast.zig, host_http.zig→state.zig.
 
 ## Code of Conduct / Guidelines
 
@@ -432,18 +432,16 @@ Before starting any work, read (if they exist): `./CLAUDE.md`, `./README.md`,
 - `Io.Timeout` union: `{ none, duration: Clock.Duration, deadline: Clock.Timestamp }`
   Use `.awake` clock: `.{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } }`
 
-### HTTP Patterns
+### HTTP Client Patterns (GitHub version check only)
+
+The Host daemon uses `std.http.Client` for fire-and-forget GitHub version polling.
+No HTTP server — Host daemon uses IPC socket for CLI/MCP, UDP mesh for Guest-Host.
+
 - **Custom request headers**: `request.iterateHeaders()` returns `HeaderIterator`,
   call `.next()` to get `http.Header{ .name, .value }`. Use `std.ascii.eqlIgnoreCase`
   for case-insensitive name matching.
-- **Raw body read**: `request.head.content_length` + `readerExpectNone(buf)` +
-  `body_reader.streamExact(&writer, content_length)`. Use `std.Io.Limit.limited(n)`
-  for streaming reads.
-- **Chunked streaming response**: `respondStreaming()` + `x-exit-code` trailer.
-  Must call `response.writer.flush()` before `response.flush()` for chunked data
-  to be sent.
-- **sendBodyComplete("")** not `sendBodiless()` for empty POST body — the latter
-  panics with chunked encoding (`unreachable` at Client.zig:914).
+- **Raw body read**: `request.head.content_length` + `body_reader.streamExact(&writer, content_length)`.
+  Use `std.Io.Limit.limited(n)` for streaming reads.
 
 ### KCP Patterns
 

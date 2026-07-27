@@ -1,8 +1,8 @@
 //! IPC module — Unix domain socket (POSIX) / Named pipe (Windows) transport
 //! for CLI/MCP → Host daemon communication.
 //!
-//! Replaces HTTP as the local IPC mechanism. The protocol is a lightweight
-//! binary framing scheme: 1-byte type + type-specific payload, connection-per-request.
+//! The protocol is a lightweight binary framing scheme: 1-byte type + type-specific
+//! payload, connection-per-request.
 //! String fields: null-terminated. Binary fields: 4-byte BE length prefix + data.
 //! Integer fields: 4-byte BE.
 //!
@@ -10,7 +10,7 @@
 //!
 //! Each CLI invocation opens a socket, sends one request, reads the response(s),
 //! then closes. The server accepts connections in a loop and dispatches to shared
-//! HostState handlers (same state as HTTP server handlers use).
+//! HostState handlers.
 //!
 //! ## Platform transport
 //!
@@ -281,7 +281,7 @@ pub const Connection = struct {
 ///
 /// `io`: caller's Io instance (shared across all Host threads).
 /// `gpa`: allocator for connection buffers.
-/// `state_ptr`: opaque pointer to httpd.HostState (avoid circular import).
+/// `state_ptr`: opaque pointer to state.HostState (avoid circular import).
 /// `mesh_ptr`: opaque pointer to mesh.Mesh (for ping handler).
 /// `shutdown`: atomic flag — when true, the server exits cleanly.
 pub fn startServer(
@@ -500,8 +500,8 @@ fn sendError(conn: Connection, msg: []const u8) void {
 }
 
 fn handleStatus(io: std.Io, gpa: std.mem.Allocator, state_ptr: *anyopaque, conn: Connection, _: []const u8) void {
-    // state_ptr is *httpd.HostState — build JSON guest list via its public API
-    const state = @as(*@import("httpd.zig").HostState, @ptrCast(@alignCast(state_ptr)));
+    // state_ptr is *state.HostState — build JSON guest list via its public API
+    const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
 
     // Lock and collect guest info
     state.mutex.lock(io) catch {
@@ -510,7 +510,7 @@ fn handleStatus(io: std.Io, gpa: std.mem.Allocator, state_ptr: *anyopaque, conn:
     };
     defer state.mutex.unlock(io);
 
-    // Build JSON manually (same as handleApiGuests in httpd.zig)
+    // Build JSON manually from HostState guest table
     var json: std.ArrayList(u8) = .empty;
     defer json.deinit(gpa);
 
@@ -543,16 +543,16 @@ fn handlePing(
     payload: []const u8,
 ) void {
     _ = gpa;
-    _ = mesh_ptr; // Use state.mesh instead (same as HTTP handler pattern)
+    _ = mesh_ptr; // Use state.mesh instead (same pattern as mesh handlers)
     var pos: usize = 0;
     const target = readString(payload, &pos) orelse {
         sendError(conn, "InvalidRequest: missing vm");
         return;
     };
 
-    const state = @as(*@import("httpd.zig").HostState, @ptrCast(@alignCast(state_ptr)));
+    const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
 
-    // Get mesh pointer from state (same pattern as HTTP handlePing in httpd.zig)
+    // Get mesh pointer from state (same pattern as state.zig handlers)
     const mesh_mod2 = @import("mesh.zig");
     const mesh_ptr2 = state.mesh orelse {
         sendError(conn, "MeshNotAvailable");
@@ -630,7 +630,7 @@ fn handleExec(
         return;
     };
 
-    const state = @as(*@import("httpd.zig").HostState, @ptrCast(@alignCast(state_ptr)));
+    const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
     const tunproto = @import("tunproto.zig");
 
     // Get guest shell type
@@ -796,7 +796,7 @@ fn handleUpload(
         return;
     };
 
-    const state = @as(*@import("httpd.zig").HostState, @ptrCast(@alignCast(state_ptr)));
+    const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
     const tunproto = @import("tunproto.zig");
 
     // Get guest tunnel
@@ -837,7 +837,7 @@ fn handleUpload(
 
     // Read file data from connection in 8KB chunks and send via KCP.
     // Use lock()+sendLocked()+flushLocked()+unlock() for batch efficiency
-    // (same pattern as HTTP handleUpload in httpd.zig).
+    // (same pattern as state.zig handleUpload).
     var file_buf: [tunproto.FILE_CHUNK_DATA_MAX]u8 = undefined;
     var total_sent: u32 = 0;
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
@@ -889,11 +889,11 @@ fn handleUpload(
     tun.flushLocked(tun.session.mesh.clock_ms);
 
     // Release tunnel lock and give mesh thread time to deliver EOF.
-    // Same pattern as HTTP handleUpload — fire-and-forget, no wait for
+    // Same pattern as handleUpload in state.zig — fire-and-forget, no wait for
     // upload_result. The Guest processes asynchronously.
     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
 
-    // Send OK response (match HTTP handler behavior)
+    // Send OK response (match state.zig handler behavior)
     var ok_buf: [1]u8 = undefined;
     ok_buf[0] = @intFromEnum(Response.ok);
     conn.writeAll( &ok_buf) catch {};
@@ -916,7 +916,7 @@ fn handleDownload(
         return;
     };
 
-    const state = @as(*@import("httpd.zig").HostState, @ptrCast(@alignCast(state_ptr)));
+    const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
     const tunproto = @import("tunproto.zig");
 
     const tun = state.getGuestTunnel(vm) orelse {

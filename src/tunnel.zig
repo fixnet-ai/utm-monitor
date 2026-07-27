@@ -1,7 +1,7 @@
 //! Mesh tunnel — TCP-like stream over KCP sessions.
 //!
-//! Provides blocking send/recv on top of mesh KCP tunnels. Used as a fallback
-//! transport when direct TCP WebSocket is unavailable.
+//! Provides blocking send/recv on top of mesh KCP tunnels.
+//! This is the primary (and only) Guest-Host transport layer.
 
 const std = @import("std");
 const kcp = @import("kcp.zig");

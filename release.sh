@@ -74,11 +74,6 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
-# Read version number from ver.txt (e.g. "0.11.19") for filename suffix
-VERSION_NUM=$(tr -d '\n\r' < src/ver.txt)
-echo "[OK] ver.txt version: ${VERSION_NUM}"
-echo ""
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Tests
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -105,22 +100,22 @@ echo ""
 echo "==> Building all 8 targets (ReleaseSafe)..."
 rm -rf release && mkdir -p release
 
-build_target() {
-    local target=$1 bin=$2
-    echo "  $target → $bin"
+# Filenames are determined by build.zig (deploymentFilename reads ver.txt).
+# We glob zig-out/bin/utmm-* after each build — no version string needed here.
+ALL_TARGETS="x86_64-windows aarch64-windows x86-windows-gnu x86_64-macos aarch64-macos x86-linux-musl x86_64-linux-musl aarch64-linux-musl"
+for target in $ALL_TARGETS; do
+    echo "  $target"
     zig build -Dtarget=$target -Doptimize=ReleaseSafe
-    cp "zig-out/bin/$bin" "release/"
-    printf "    %8s  %s\n" "$(wc -c < "release/$bin" | tr -d ' ')" "$bin"
-}
+done
 
-build_target x86_64-windows       "utmm-x86_64-windows-${VERSION_NUM}.exe"
-build_target aarch64-windows      "utmm-aarch64-windows-${VERSION_NUM}.exe"
-build_target x86-windows-gnu      "utmm-x86-windows-${VERSION_NUM}.exe"
-build_target x86_64-macos         "utmm-x86_64-macos-${VERSION_NUM}"
-build_target aarch64-macos        "utmm-aarch64-macos-${VERSION_NUM}"
-build_target x86-linux-musl       "utmm-x86-linux-${VERSION_NUM}"
-build_target x86_64-linux-musl    "utmm-x86_64-linux-${VERSION_NUM}"
-build_target aarch64-linux-musl   "utmm-aarch64-linux-${VERSION_NUM}"
+echo ""
+echo "==> Collecting deployment binaries..."
+for f in zig-out/bin/utmm-*; do
+    if [ -f "$f" ] && [ "$(basename "$f")" != "utmm" ]; then
+        cp "$f" release/
+        printf "    %8s  %s\n" "$(wc -c < "$f" | tr -d ' ')" "$(basename "$f")"
+    fi
+done
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Package

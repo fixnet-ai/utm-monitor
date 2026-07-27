@@ -1,13 +1,16 @@
-//! Minimal HTTP server on top of std.http.Server.
+//! Host shared state and handler functions.
 //!
 //! Provides:
-//!   - TCP accept loop with detached threads
-//!   - URL router dispatching on method + path
-//!   - HostState: mutex-protected guest table + pending command queue
-//!   - JSON helpers for reading POST bodies and building responses
+//!   - HostState: mutex-protected guest table, tunnels, and operation tracking
+//!   - JSON helpers for building and parsing JSON-RPC payloads
+//!   - handleMeshGuest: mesh guest session handler
+//!   - serveUpgradeFile: KCP-based binary upgrade serving
+//!   - syncHostsFromState: /etc/hosts sync from guest table
 //!
-//! std.http.Server handles HTTP/1.1 parsing, keep-alive, and response formatting.
-//! We add routing, concurrency, and application-level state.
+//! This module was formerly named httpd.zig. After WebSocket removal (v0.11.0)
+//! and HTTP endpoint cleanup (Phase 60), it no longer contains any HTTP/TCP code.
+//! The Host daemon uses IPC socket for CLI/MCP communication and UDP mesh for
+//! Guest-Host transport — no HTTP server on any port.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -592,7 +595,7 @@ pub const HostState = struct {
         }
 
         for (stale.items) |cmd_id| {
-            std.log.info("[httpd] cleaning up stale OpState: {s}", .{cmd_id});
+            std.log.info("[state] cleaning up stale OpState: {s}", .{cmd_id});
             if (self.op_states.fetchRemove(cmd_id)) |kv| {
                 var output = kv.value.output;
                 output.deinit(self.allocator);
@@ -843,7 +846,7 @@ fn serveUpgradeFile(
         std.log.err("[upgrade] Unknown target: {s}", .{target});
         const eof_frame = try tunproto.buildFileEof(allocator, cmd_id, 1, 0, &[_]u8{0} ** 64);
         defer allocator.free(eof_frame);
-        _ = tun.sendLocked(eof_frame) catch {};
+        _ = tun.send(eof_frame) catch {};
         return;
     };
 
@@ -949,7 +952,7 @@ pub fn syncHostsFromState(state: *HostState, allocator: std.mem.Allocator) void 
     }
 
     hosts_file.updateHosts(state.io.?, allocator, "/etc/hosts", entries.items) catch |err| {
-        std.log.err("[host-http] Failed to sync /etc/hosts: {}", .{err});
+        std.log.err("[host] Failed to sync /etc/hosts: {}", .{err});
     };
 }
 

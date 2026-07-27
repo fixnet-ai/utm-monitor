@@ -729,7 +729,7 @@ fn ptySpawn(allocator: std.mem.Allocator, shell: []const u8) !PtySession {
     // echoed back. Prevents MDELIM marker from matching echoed command text.
     // On Linux the master fd supports tcsetattr. On macOS/BSD the master
     // does not — the host-side scanForMarker handles echoed text via
-    // lastIndexOf + validation (see httpd.zig).
+    // lastIndexOf + validation (see state.zig).
     if (std.posix.tcgetattr(master)) |t| {
         var t2 = t;
         t2.lflag.ECHO = false;
