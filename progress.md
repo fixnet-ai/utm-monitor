@@ -10,18 +10,22 @@
 - **GitHub Release**: https://github.com/fixnet-ai/utm-monitor/releases/tag/v0.11.16
 - **当前阶段**: Phase 66 — 小修复收尾
 
-## Phase 66 计划 (2026-07-27)
+## Phase 66 完成 ✅ (2026-07-27)
 
 **目标**: 清理已知小问题，消除日志噪音，完善跨平台细节。
 
-| # | 任务 | 难度 | 依赖 | 预计影响 |
-|---|------|------|------|---------|
-| 1 | `upload_result` (0x17) handler | ★☆☆ | 无 | httpd.zig switch +1 分支 |
-| 2 | RTT → 真实毫秒 | ★★☆ | 无 | mesh.zig ping/pong 时间戳 |
-| 3 | F91: macOS codesign | ★★☆ | 无 | svc.zig selfCopy EXDEV 路径 |
-| 4 | 多网卡 LSA 广播可达性 | ★★★ | 无 | mesh.zig 广播策略 |
+| # | 任务 | 状态 | 变更 |
+|---|------|------|------|
+| 1 | `upload_result` (0x17) handler | ✅ 已完成（commit `98409c4`）| httpd.zig:802-813 已存在 |
+| 2 | RTT → 真实毫秒 | ✅ | mesh.zig: `nowMs()` + 5 处时间戳替换 |
+| 3 | F91: macOS codesign | ✅ | svc.zig: EXDEV 回退路径加 codesign |
+| 4 | 多网卡 LSA 广播可达性 | ✅ | mesh.zig: 每 30s 回调刷新广播地址列表 |
 
 **已取消**: httpd.zig 测试编译（httpd 已废弃）、Windows 优雅退出 Finding 103（永久延迟）
+
+**提交**: `3c6d7d4` feat: RTT real ms, macOS codesign re-sign, multi-NIC broadcast refresh
+
+**测试**: 149/149 通过
 
 ## Phase 64: 文档重写 + v0.11.15 发布 (2026-07-27)
 

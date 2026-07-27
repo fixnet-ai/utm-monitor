@@ -277,10 +277,15 @@ if (upgrade.needed.load(.acquire)) {
 
 | # | 任务 | 难度 | 状态 |
 |---|------|------|------|
-| 1 | `upload_result` (0x17) handler | ★☆☆ | 待开始 |
-| 2 | RTT → 真实毫秒 | ★★☆ | 待开始 |
-| 3 | F91: macOS codesign | ★★☆ | 待开始 |
-| 4 | 多网卡 LSA 广播可达性 | ★★★ | 待开始 |
+| 1 | `upload_result` (0x17) handler | ★☆☆ | ✅ 已完成（commit `98409c4`）|
+| 2 | RTT → 真实毫秒 | ★★☆ | ✅ `nowMs()` 替代 ping/pong 时钟 |
+| 3 | F91: macOS codesign | ★★☆ | ✅ EXDEV 路径 codesign 重新签名 |
+| 4 | 多网卡 LSA 广播可达性 | ★★★ | ✅ 回调刷新广播地址列表 |
+
+**关键变更** (commit `3c6d7d4`):
+- `mesh.zig`: `nowMs()` 真实单调时钟用于 ping/pong RTT；广播地址每 30s 回调刷新
+- `svc.zig`: copyFile 破坏签名后 `codesign --force --sign -` 修复
+- `host.zig` + `broadcast.zig`: Mesh.init() 传入 `getSubnetBroadcasts` 回调
 
 **已取消**:
 - ~~httpd.zig 测试未编译~~ → httpd 已废弃，自动取消
