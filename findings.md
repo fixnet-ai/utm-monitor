@@ -232,13 +232,24 @@ Host 等 Guest 建隧道、Guest 等 Host 建隧道 → 死锁。修复：统一
 
 **状态**: 🔴 待修复
 
-### Finding 124: 非 Linux Guest 隧道在升级后不稳定
+### Finding 124: 非 Linux Guest 隧道不稳定 — LSA restart 误判 (✅ 已修复)
 
 **现象**: macvm/windowsvm/winx64 在 Host 重启后频繁 `pty_spawn` → `handler exiting` → `handler started` 循环。exec 返回 `exit=-1`（`failAllPendingOps` 因隧道断开而设置）。
 
-**观察**: linuxvm 隧道稳定（exec 始终正常），非 Linux Guest 全部不稳定。可能与平台特定的 KCP/pty 行为有关。
+**根因**: `mesh.zig:819` LSA restart 检测用 `std.mem.eql(u8, decoded.node_info, existing.node_info)` 全字符串严格相等比较。但 `node_info` 包含动态字段 `status:`（`serving` ↔ `upgrading`），Guest 进入自升级流程时先改 `status:upgrading`，立即触发 Host 侧 LSA restart → 所有 KCP 会话标记 dead → 隧道断。升级失败后恢复 `status:serving`，又触发一次 LSA restart。这形成了自毁循环：升级的第一步（改 status）就断了升级需要的隧道（KCP 下载通道）。
 
-**状态**: 🔴 待调查
+linuxvm 稳定是因为它的升级尝试无声失败，从未进入升级循环 → `status:` 从未改变 → 不触发 LSA restart。
+
+**修复** (commit 待提交):
+1. `parseEpoch()` 扩展为同时接受 `nonce:` 和 `epoch:` 键名（向后兼容）
+2. 新增 `nonceChanged()` 辅助函数 — 比较 nonce 而非全字符串
+3. `handleLsa()` 重启检测改用 `nonceChanged()` — 只有 genuine 进程重启（nonce 变化）才触发
+4. `updateNodeInfo()` 每次更新时自动重新附加 `nonce:{self.nonce}` — 动态字段变化不丢失身份标识
+5. `init()` 统一使用 `nonce:` 键名（替代 `epoch:`）
+
+**设计原则**: 进程身份（nonce）≠ 进程状态（status/ip），LSA restart 检测只应依赖身份。
+
+**状态**: ✅ 已修复
 
 ### Finding 125: `nowMs()` RTT — 直连正确，中继异常
 

@@ -7,6 +7,20 @@
 - **测试**: 149/149 通过
 - **部署**: macOS Host v0.11.17 ✅ | linuxvm v0.11.17 ✅ (手动) | macvm v0.11.17 ✅ (手动) | windowsvm v0.11.17 ✅ (手动) | winx64 v0.11.17 ✅ (手动)
 
+## Phase 68: 修复 LSA restart 误判 (Finding 124) (2026-07-27)
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 325 | 实现 nonce 比较替代全 node_info 字符串比较 | ✅ |
+
+### 修复摘要
+
+**根因**: LSA restart 检测用全 node_info 字符串比较，但 `status:serving↔upgrading` 变化被误判为进程重启 → KCP 会话被杀 → 隧道循环断开。这是自毁循环：升级第一步（改 status）就断了升级需要的隧道。
+
+**fix**: `nonceChanged()` 用 nonce 比较替代全字符串比较；`updateNodeInfo()` 自动重新附加 nonce 保身份不丢失；`parseEpoch()` 兼容 `nonce:` 和 `epoch:` 键名。
+
+**测试**: 149/149 通过
+
 ## Phase 67: v0.11.17 部署 + 自动升级测试 (2026-07-27)
 
 | # | 任务 | 状态 |

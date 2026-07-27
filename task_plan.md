@@ -1,4 +1,4 @@
-# Task Plan: v0.11.17
+# Task Plan: v0.11.18
 
 ## 架构概述
 
@@ -25,10 +25,10 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 
 ## 当前状态
 
-- **版本**: v0.11.17（`src/protocol.zig`、`build.zig.zon`）
+- **版本**: v0.11.18（`src/protocol.zig`、`build.zig.zon`）
 - **源文件**: 16 个（`src/*.zig`）
 - **测试**: 149/149 通过
-- **部署**: macOS Host v0.11.17 + 4 Guest 全部 v0.11.17（手动升级，自动升级全部失败）
+- **部署**: macOS Host v0.11.18 待部署 | 4 Guest 待自动升级验证
 - **8 交叉编译目标**: aarch64/x86_64/x86 × linux-musl/macos/windows
 
 ## 已完成阶段
@@ -53,13 +53,14 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 65 | 2026-07-27 | install.sh + install.bat + v0.11.16 发布 + IP gating bug 修复 |
 | 66 | 2026-07-27 | RTT 真实毫秒 (`nowMs()`)、macOS codesign 重签、多网卡广播刷新 |
 | 67 | 2026-07-27 | v0.11.17：修复 `serveUpgradeFile` `@memcpy alias` crash + 自动升级全流程测试 |
+| 68 | 2026-07-27 | v0.11.18：修复 LSA restart 误判 — nonce 比较替代全 node_info 字符串比较 |
 
 ## 待修复
 
 | Finding | 严重度 | 描述 |
 |---------|--------|------|
 | 123 | 🔴 CRITICAL | macOS 自动升级后 `exit(0)` + `KeepAlive SuccessfulExit=false` → 服务永久停止 |
-| 124 | 🔴 | 非 Linux Guest 隧道不稳定，频繁重连，exec 返回 exit=-1 |
+| 124 | ✅ 已修复 | LSA restart 用全 node_info 比较 → 动态字段(status:)触发误判 → nonce 比较 |
 | 125 | 📋 | `nowMs()` RTT 直连正确、中继异常（uptime 级别数值） |
 | 127 | 📋 | linuxvm Journal 停止 + 升级下载无声失败 |
 | 128 | 📋 | macOS `launchctl bootstrap` errno=5 在 bootout 后 |

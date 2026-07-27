@@ -90,15 +90,28 @@ fn generateNonce() u32 {
 }
 
 /// Extract the Host epoch (per-process nonce) from an LSA node_info string.
-/// Format: "epoch:{nonce}" on its own line. Returns null if not found or malformed.
+/// Format: "epoch:{nonce}" or "nonce:{nonce}" on its own line. Returns null if not found or malformed.
 fn parseEpoch(node_info: []const u8) ?u32 {
     var it = std.mem.splitScalar(u8, node_info, '\n');
     while (it.next()) |line| {
-        if (std.mem.startsWith(u8, line, "epoch:")) {
-            return std.fmt.parseInt(u32, line["epoch:".len..], 10) catch null;
+        if (std.mem.startsWith(u8, line, "epoch:") or std.mem.startsWith(u8, line, "nonce:")) {
+            const colon = std.mem.indexOfScalar(u8, line, ':').?;
+            return std.fmt.parseInt(u32, line[colon + 1 ..], 10) catch null;
         }
     }
     return null;
+}
+
+/// Compare two node_info strings for LSA restart detection.
+/// Returns true if the nonce differs (genuine process restart), false if same.
+/// Falls back to full string comparison when nonce is missing (backward compat
+/// with pre-nonce LSA entries).
+fn nonceChanged(a: []const u8, b: []const u8) bool {
+    const na = parseEpoch(a);
+    const nb = parseEpoch(b);
+    if (na != null and nb != null) return na.? != nb.?;
+    // Fallback: at least one LSA entry has no nonce — compare full strings
+    return !std.mem.eql(u8, a, b);
 }
 
 /// Read the KCP conversation ID from a KCP packet embedded in mesh KCP data.
@@ -381,16 +394,14 @@ pub const Mesh = struct {
     ) !Mesh {
         const nonce = generateNonce();
 
-        // Append epoch (nonce) to node_info so Guests can detect Host restarts
-        // via LSA node_info change (Finding 93). Build it here inside init() so
-        // the first LSA broadcast already carries the epoch — no updateNodeInfo()
-        // call window where a stale epoch-less LSA could leak out and cause a
-        // double LSA restart detection on the Guest.
-        const node_info_with_epoch = std.fmt.allocPrint(allocator, "{s}\nepoch:{d}", .{ node_info, nonce }) catch {
-            // If alloc fails, fall back to the original node_info without epoch.
-            // The Guest can still detect restarts via LSA seq reset (though less
-            // reliable — same node_info means the lower-seq accept path at
-            // handleLsa line 702 won't trigger lsa_restart).
+        // Append nonce to node_info so remote nodes can detect process restarts
+        // via LSA nonce change (Finding 93). Build it here inside init() so
+        // the first LSA broadcast already carries the nonce — no updateNodeInfo()
+        // call window where a stale nonce-less LSA could leak out and cause a
+        // double LSA restart detection on the remote side.
+        // parseEpoch() accepts both "nonce:" and "epoch:" keys for backward compat.
+        const node_info_with_epoch = std.fmt.allocPrint(allocator, "{s}\nnonce:{d}", .{ node_info, nonce }) catch {
+            // If alloc fails, fall back to the original node_info without nonce.
             allocator.free(node_info);
             return error.OutOfMemory;
         };
@@ -475,9 +486,18 @@ pub const Mesh = struct {
     /// Replace the LSA node_info string dynamically (e.g. to signal
     /// status change from "serving" to "upgrading"). Next LSA broadcast
     /// will carry the new info. Takes ownership of new_info.
+    /// The per-process nonce is re-appended so dynamic field changes
+    /// (status:, ip:) don't trigger spurious LSA restart detection.
     pub fn updateNodeInfo(self: *Mesh, new_info: []const u8) void {
         self.allocator.free(self.node_info);
-        self.node_info = new_info;
+        // Append nonce so LSA restart detection can distinguish genuine
+        // process restarts from dynamic field changes (Finding 124).
+        const with_nonce = std.fmt.allocPrint(self.allocator, "{s}\nnonce:{d}", .{ new_info, self.nonce }) catch {
+            self.node_info = new_info;
+            return;
+        };
+        self.allocator.free(new_info);
+        self.node_info = with_nonce;
     }
 
     /// Main UDP receive/dispatch loop. Blocks until shutdown is signaled.
@@ -812,24 +832,28 @@ pub const Mesh = struct {
             self.lsas_mutex.lock(self.io) catch return;
             defer self.lsas_mutex.unlock(self.io);
 
-            // Check if we already have a newer or same-seq LSA
+            // Check if we already have a newer or same-seq LSA.
+            // LSA restart detection: compare nonce (per-process identity) rather
+            // than the full node_info string. Dynamic fields like status:/ip: must
+            // not trigger restart detection — only a genuine process restart
+            // changes the nonce (Finding 124 / Task #325).
             if (self.lsas.getPtr(decoded.origin)) |existing| {
                 const diff: i32 = @bitCast(decoded.seq -% existing.seq);
                 if (diff <= 0) {
-                    if (!std.mem.eql(u8, decoded.node_info, existing.node_info)) {
-                        std.log.info("[mesh] LSA restart detected: node_info changed, accepting lower seq", .{});
+                    if (nonceChanged(decoded.node_info, existing.node_info)) {
+                        std.log.info("[mesh] LSA restart detected: nonce changed, accepting lower seq", .{});
                         existing.deinit(self.allocator);
                         lsa_restart = true;
                     } else {
                         return; // existing is same or newer
                     }
-                } else if (!std.mem.eql(u8, decoded.node_info, existing.node_info)) {
-                    // Higher seq with different node_info: stale relayed LSA
+                } else if (nonceChanged(decoded.node_info, existing.node_info)) {
+                    // Higher seq with different nonce: stale relayed LSA
                     // from an older process whose seq counter was ahead.
                     // Keep the current (lower-seq, newer-process) entry —
                     // replacing it would let the next genuine LSA trigger a
                     // spurious second restart (Finding 93 / Task #254).
-                    std.log.info("[mesh] Ignoring stale high-seq LSA from {any} (node_info differs)", .{decoded.origin});
+                    std.log.info("[mesh] Ignoring stale high-seq LSA from {any} (nonce differs)", .{decoded.origin});
                     return;
                 } else {
                     existing.deinit(self.allocator);
