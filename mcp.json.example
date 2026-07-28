@@ -14,20 +14,20 @@
 #
 # QUICK INSTALL (Claude Code)
 # -----------------------------------------------------------------------------
-# Option A — claude CLI (recommended):
-#   claude mcp add utm-monitor -- sudo -n /opt/utmm/utmm --mcp
+# Option A — claude CLI (recommended, available across all projects):
+#   claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp
 #
-#   This stores the config in ~/.claude.json (project-scoped), which takes
-#   precedence over ~/.claude/mcp.json. Use `claude mcp list` to verify.
+#   --scope user registers the server at user level in ~/.claude.json, so it's
+#   available in ALL projects. Default --scope local is project-only.
+#   Use `claude mcp list` to verify.
 #
 #   To update an existing registration:
 #     claude mcp remove utm-monitor
-#     claude mcp add utm-monitor -- sudo -n /opt/utmm/utmm --mcp
+#     claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp
 #
-# Option B — manual JSON config (if not using claude CLI):
-#   Copy the JSON below into your MCP config. Note: if the same server name
-#   was registered via `claude mcp add`, the CLI registration in ~/.claude.json
-#   takes precedence over this file.
+# Option B — manual JSON config:
+#   Copy the JSON below into your MCP config. Note: project-level registrations
+#   (--scope local/project) in ~/.claude.json take precedence over this file.
 #
 #   Config locations:
 #     Claude Code:     ~/.claude/mcp.json  (user)  or  .mcp.json (project)
@@ -56,7 +56,7 @@
 # | "Failed to reconnect: -32000"        | Check `claude mcp list` — may have  |
 # |                                      | stale registration. Remove & re-add:|
 # |                                      | `claude mcp remove utm-monitor`     |
-# |                                      | `claude mcp add utm-monitor -- ...` |
+# |                                      | `claude mcp add --scope user ...`   |
 # | MCP tools not showing in Claude      | Restart Claude Code after config    |
 # |                                      | change; verify with `claude mcp list`|
 # | utmm --mcp hangs                     | Ensure stdin is not a TTY (piped)   |

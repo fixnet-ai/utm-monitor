@@ -101,11 +101,12 @@ extract to the target machine, then run the bundled `install.sh` or `install.bat
 **Register with AI Agent** — use the Claude Code CLI (recommended):
 
 ```bash
-claude mcp add utm-monitor -- sudo -n /opt/utmm/utmm --mcp
+claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp
 ```
 
-> **Note:** `claude mcp add` stores config in `~/.claude.json` (project-scoped) and
-> takes precedence over manual `mcp.json` edits. Use `claude mcp list` to verify.
+> **Note:** `--scope user` registers at user level in `~/.claude.json`, available
+> across all projects. Default `--scope local` is project-only.
+> Use `claude mcp list` to verify.
 > See [mcp.json.example](mcp.json.example) for manual config and troubleshooting.
 
 ## CLI Reference
