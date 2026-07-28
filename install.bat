@@ -298,8 +298,6 @@ if /i "%MODE%"=="guest" (
     for %%f in (utmm-* utmm*.exe) do (
         if /i not "%%f"=="%ZIP_BINARY%" if /i not "%%f"=="%BINARY_NAME%" del /q "%%f" 2>nul
     )
-    :: Also remove install scripts from Guest
-    del /q install.sh install.bat 2>nul
     echo   Kept: %ZIP_BINARY% (as utmm.exe)
 ) else (
     :: Host: keep all platform binaries for Guest auto-upgrade via KCP tunnel
@@ -336,6 +334,8 @@ if /i "%MODE%"=="host" (
 ) else (
     echo   utmmd supervisor installed — Guest auto-starts on boot.
     echo   Check: run 'utmm --status' on the Host machine.
+    :: Remove install scripts from Guest (safe here — install is already complete)
+    del /q install.sh install.bat 2>nul
 )
 goto :eof
 

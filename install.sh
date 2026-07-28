@@ -263,8 +263,6 @@ if [ "${MODE}" = "guest" ]; then
     # Guest: only keep the current-platform binary (utmm contains both utmmd and utmm)
     echo "  Guest mode - removing other platform binaries ..."
     find "${CANONICAL_DIR}" -maxdepth 1 -type f \( -name "utmm-*" -o -name "utmm*.exe" \) ! -name "${ZIP_BINARY}" -delete 2>/dev/null || true
-    # Also remove install scripts from Guest (not needed)
-    rm -f "${CANONICAL_DIR}/install.sh" "${CANONICAL_DIR}/install.bat" 2>/dev/null || true
     dim "  Kept: ${ZIP_BINARY} (as utmm, contains utmmd supervisor)"
 else
     # Host: keep all platform binaries for Guest auto-upgrade via KCP tunnel
@@ -299,6 +297,8 @@ if "${CANONICAL_DIR}/${BINARY_NAME}" ${INSTALL_ARGS}; then
     else
         echo "  utmmd supervisor installed — Guest auto-starts on boot."
         echo "  Check: run 'utmm --status' on the Host machine."
+        # Remove install scripts from Guest (safe here — install is already complete)
+        rm -f "${CANONICAL_DIR}/install.sh" "${CANONICAL_DIR}/install.bat" 2>/dev/null || true
     fi
 else
     EXIT_CODE=$?
