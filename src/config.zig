@@ -89,7 +89,6 @@ pub fn saveConfig(io: std.Io, _: std.mem.Allocator, config: Config, path: []cons
 
     try writer.interface.print("# UTM Monitor config file\n", .{});
     try writer.interface.print("port={d}\n", .{config.port});
-    try writer.interface.print("port={d}\n", .{config.port});
     try writer.interface.print("name={s}\n", .{config.name});
     try writer.interface.print("hosts_file={s}\n", .{config.hosts_file});
     try writer.interface.print("marker={s}\n", .{config.marker});
@@ -103,14 +102,14 @@ pub fn saveConfig(io: std.Io, _: std.mem.Allocator, config: Config, path: []cons
     std.debug.print("[config] configuration saved to {s}\n", .{path});
 }
 
-/// Load configuration from file
-pub fn loadConfig(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Config {
+/// Load configuration from file.
+/// Returns error.Unimplemented — config file parsing is not yet implemented.
+/// Callers should use Config{} defaults and override via CLI flags.
+pub fn loadConfig(io: std.Io, allocator: std.mem.Allocator, path: []const u8) error{Unimplemented}!Config {
     _ = io;
     _ = allocator;
     _ = path;
-    // Simplified implementation: return default config
-    // TODO: full config file parsing implementation
-    return Config{};
+    return error.Unimplemented;
 }
 
 test "Config default port is 2121" {

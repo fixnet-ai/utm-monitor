@@ -4,7 +4,7 @@
 
 - **分支**: `refac/layered-arch`
 - **源文件**: 20 → 16
-- **测试**: 150 执行 / 141 唯一测试，全部通过
+- **测试**: 150 执行 / 141 唯一测试 + 43 集成测试场景，全部通过
 - **设计文档**: `refac.md`
 
 ## 架构概述
@@ -50,17 +50,42 @@ DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 | 15 | 新增 config.auto_upgrade 开关（默认 false）| ✅ |
 
 
-### Phase 5: 集成测试 📋
+### Phase 5: 集成测试 ✅
 
 | # | 任务 | 状态 |
 |---|------|------|
-| 16 | 测试基础设施 `tests/common.zig` | 📋 |
-| 17 | `tcp_frame` TCP 帧协议 + SOCKS4a 集成测试 | 📋 |
-| 18 | `lsa_routing` LSA 编解码 + Dijkstra 路由集成测试 | 📋 |
-| 19 | `dpipe_relay` DuplexPipe relay 集成测试 | 📋 |
-| 20 | `svc_install` 安装/卸载集成测试 | 📋 |
-| 21 | `auto_upgrade` 自动升级集成测试 | 📋 |
-| 22 | build.zig 集成 `test-integration` 构建步骤 | 📋 |
+| 16 | 测试基础设施 `tests/common.zig` | ✅ |
+| 17 | `tcp_frame` TCP 帧协议 + SOCKS4a 集成测试（6 场景）| ✅ |
+| 18 | `lsa_routing` LSA 编解码 + Dijkstra 路由集成测试（6 场景）| ✅ |
+| 19 | `dpipe_relay` DuplexPipe relay 集成测试（5 场景）| ✅ |
+| 20 | `svc_install` 安装/卸载集成测试（7 场景）| ✅ |
+| 21 | `auto_upgrade` 自动升级集成测试（5 场景）| ✅ |
+| 22 | `exec_e2e` exec 端到端 TCP loopback 全协议流程（4 场景）| ✅ |
+| 23 | `upload_e2e` upload 端到端 TCP loopback 全流程（4 场景）| ✅ |
+| 24 | `download_e2e` download 端到端 TCP loopback 全流程（4 场景）| ✅ |
+| 25 | `upgrade_e2e` upgrade 端到端 TCP loopback 全流程（4 场景）| ✅ |
+
+### Phase 6: 代码审查修复 ✅
+
+| # | 任务 | 来源 | 状态 |
+|---|------|------|------|
+| 26 | C1 双重 MDELIM 标记 fix | REVIEW_FINDINGS.md | ✅ |
+| 27 | C2 GuestTable Mutex 并发保护 | REVIEW_FINDINGS.md | ✅ |
+| 28 | I1 自动升级 TCP 完整流程实现 | REVIEW_FINDINGS.md | ✅ |
+| 29 | I2 genInit 模板服务名修正 | REVIEW_FINDINGS.md | ✅ |
+| 30 | I3/I4 buildCmdWithMarker/scanForMarker 统一 | REVIEW_FINDINGS.md | ✅ |
+| 31 | M1 saveConfig 重复 port 行删除 | REVIEW_FINDINGS.md | ✅ |
+| 32 | M2 loadConfig 改为返回 error.Unimplemented | REVIEW_FINDINGS.md | ✅ |
+| 33 | M3 heartbeatThread 日志 | REVIEW_FINDINGS.md | ✅ |
+| 34 | M4 tunnelManager 锁分两阶段 | REVIEW_FINDINGS.md | ✅ |
+| 35 | M5 svc.zig remove 内存泄漏修复 | REVIEW_FINDINGS.md | ✅ |
+| 36 | M6 死代码标记 | REVIEW_FINDINGS.md | ✅ |
+
+### Phase 7: CLAUDE.md 部署门禁 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 37 | 添加 Deployment Gating Rule（改代码→集成测试→真机）| ✅ |
 
 ## 删除文件清单（10 个）
 
@@ -115,3 +140,6 @@ src/
 | 10 | dpipe_file hash mismatch: warn→debug | Zig 0.16.0 测试运行器对 stderr warn 日志敏感 |
 | 11 | build.zig 去重 tcp/lsa，新增 shm | tcp/lsa 已在主二进制中；shm 10 个测试之前从未运行 |
 | 12 | auto_upgrade 默认 false | 避免自动升级在测试中干扰；部署时 --auto-upgrade 显式启用 |
+| 13 | Integration tests 新增 4 个 e2e | exec/upload/download/upgrade 端到端 TCP loopback 协议验证，补全 REVIEW 指出的测试缺口 |
+| 14 | system.read/write 返回 isize 非 error union | Zig 0.16.0 POSIX 系统调用返回 C 风格返回值，需 @intCast 且不能 try/catch |
+| 15 | 部署前必须通过集成测试 | 协议回归（如双 MDELIM）在真机调测前先被集成测试捕获，低修复成本 |

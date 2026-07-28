@@ -40,12 +40,13 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── 场景 2: genInit 脚本生成（3 平台）──
+    // v0.13.0: 服务名统一为 utmmd 守护进程模型
     {
         var tc = runner.case("genInit — macOS plist");
         const script = svc.genInit(.macos);
-        tc.expectTrue(std.mem.indexOf(u8, script, "com.utmm.guest") != null, "包含 com.utmm.guest");
-        tc.expectTrue(std.mem.indexOf(u8, script, "/opt/utmm/utmm") != null, "包含二进制路径");
-        tc.expectTrue(std.mem.indexOf(u8, script, "--svc") != null, "包含 --svc 参数");
+        tc.expectTrue(std.mem.indexOf(u8, script, "com.utmmd") != null, "包含 com.utmmd");
+        tc.expectTrue(std.mem.indexOf(u8, script, "/opt/utmm/utmmd") != null, "包含 utmmd 二进制路径");
+        tc.expectTrue(std.mem.indexOf(u8, script, "--role") != null, "包含 --role 参数");
         tc.expectTrue(std.mem.indexOf(u8, script, "RunAtLoad") != null, "包含 RunAtLoad");
         tc.expectTrue(std.mem.indexOf(u8, script, "LaunchDaemons") != null, "包含 LaunchDaemons 注释");
         tc.deinit();
@@ -55,17 +56,17 @@ pub fn main(init: std.process.Init) !void {
         const script = svc.genInit(.linux);
         tc.expectTrue(std.mem.indexOf(u8, script, "[Unit]") != null, "包含 [Unit]");
         tc.expectTrue(std.mem.indexOf(u8, script, "ExecStart=") != null, "包含 ExecStart");
-        tc.expectTrue(std.mem.indexOf(u8, script, "/opt/utmm/utmm") != null, "包含二进制路径");
-        tc.expectTrue(std.mem.indexOf(u8, script, "--svc") != null, "包含 --svc 参数");
+        tc.expectTrue(std.mem.indexOf(u8, script, "/opt/utmm/utmmd") != null, "包含 utmmd 二进制路径");
+        tc.expectTrue(std.mem.indexOf(u8, script, "--role") != null, "包含 --role 参数");
         tc.expectTrue(std.mem.indexOf(u8, script, "Restart=on-failure") != null, "包含 Restart=on-failure");
         tc.deinit();
     }
     {
         var tc = runner.case("genInit — Windows sc");
         const script = svc.genInit(.windows);
-        tc.expectTrue(std.mem.indexOf(u8, script, "UTM-Monitor-Guest") != null, "包含服务名");
-        tc.expectTrue(std.mem.indexOf(u8, script, "utmm.exe") != null, "包含 utmm.exe");
-        tc.expectTrue(std.mem.indexOf(u8, script, "--svc") != null, "包含 --svc 参数");
+        tc.expectTrue(std.mem.indexOf(u8, script, "UTM-MonitorD") != null, "包含服务名 UTM-MonitorD");
+        tc.expectTrue(std.mem.indexOf(u8, script, "utmmd.exe") != null, "包含 utmmd.exe");
+        tc.expectTrue(std.mem.indexOf(u8, script, "--role") != null, "包含 --role 参数");
         tc.expectTrue(std.mem.indexOf(u8, script, "sc create") != null, "包含 sc create");
         tc.expectTrue(std.mem.indexOf(u8, script, "start= auto") != null, "包含 start= auto");
         tc.deinit();

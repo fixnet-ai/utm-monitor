@@ -246,21 +246,16 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("TcpListener 创建与绑定");
 
-        const port = common.findFreePort(io) catch {
-            tc.skip("无法获取空闲端口");
-            tc.deinit();
-            return;
-        };
-
-        var listener = tcp.TcpListener.init(io, port) catch |err| {
+        // 使用 port 0 = OS 分配任意空闲端口，避免 findFreePort 竞态条件
+        var listener = tcp.TcpListener.init(io, 0) catch |err| {
             tc.expect(false, "TcpListener.init 失败: {}", .{err});
             tc.deinit();
             return;
         };
         defer listener.deinit();
 
-        // 验证 listener 成功绑定
-        tc.expectTrue(listener.socket.address.getPort() > 0, "端口已绑定");
+        const bound_port = listener.socket.address.getPort();
+        tc.expectTrue(bound_port > 0, "端口已绑定");
 
         // 验证客户端可以连接到该端口
         var connected = std.atomic.Value(bool).init(false);
@@ -271,7 +266,7 @@ pub fn main(init: std.process.Init) !void {
                 flag.store(true, .release);
                 stream.close(io2);
             }
-        }.f, .{ io, port, &connected });
+        }.f, .{ io, bound_port, &connected });
 
         client_thread.join();
         tc.expectTrue(connected.load(.acquire), "客户端可以连接到 TcpListener");

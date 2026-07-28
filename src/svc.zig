@@ -1528,11 +1528,12 @@ pub fn genInit(platform: Platform) []const u8 {
         \\<plist version="1.0">
         \\<dict>
         \\    <key>Label</key>
-        \\    <string>com.utmm.guest</string>
+        \\    <string>com.utmmd</string>
         \\    <key>ProgramArguments</key>
         \\    <array>
-        \\        <string>/opt/utmm/utmm</string>
-        \\        <string>--svc</string>
+        \\        <string>/opt/utmm/utmmd</string>
+        \\        <string>--role</string>
+        \\        <string>guest</string>
         \\    </array>
         \\    <key>EnvironmentVariables</key>
         \\    <dict>
@@ -1551,25 +1552,25 @@ pub fn genInit(platform: Platform) []const u8 {
         \\    <key>ThrottleInterval</key>
         \\    <integer>5</integer>
         \\    <key>StandardOutPath</key>
-        \\    <string>/var/log/utmm-guest.log</string>
+        \\    <string>/var/log/utmmd.log</string>
         \\</dict>
         \\</plist>
         \\
-        \\<!-- Install: sudo cp this file to /Library/LaunchDaemons/com.utmm.guest.plist -->
-        \\<!-- Load:    sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmm.guest.plist -->
+        \\<!-- Install: sudo cp this file to /Library/LaunchDaemons/com.utmmd.plist -->
+        \\<!-- Load:    sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmmd.plist -->
         \\
-        \\<!-- Host mode: replace --svc with --svc --host, change Label/Log to utmm-host -->
+        \\<!-- Host mode: change --role guest to --role host -->
         ,
         .linux =>
         \\[Unit]
-        \\Description=UTM Monitor Guest Service
+        \\Description=UTM Monitor Service (utmmd)
         \\After=network.target
         \\
         \\[Service]
         \\Type=simple
         \\Environment=SHELL=/bin/bash
         \\Environment=HOME=/root
-        \\ExecStart=/opt/utmm/utmm --svc
+        \\ExecStart=/opt/utmm/utmmd --role guest
         \\WorkingDirectory=/opt/utmm
         \\Restart=on-failure
         \\RestartSec=5
@@ -1580,20 +1581,20 @@ pub fn genInit(platform: Platform) []const u8 {
         \\[Install]
         \\WantedBy=multi-user.target
         \\
-        \\<!-- Install: sudo cp this file to /etc/systemd/system/utmm-guest.service -->
-        \\<!-- Enable:  sudo systemctl daemon-reload && sudo systemctl enable utmm-guest -->
+        \\<!-- Install: sudo cp this file to /etc/systemd/system/utmmd.service -->
+        \\<!-- Enable:  sudo systemctl daemon-reload && sudo systemctl enable utmmd -->
         \\
-        \\<!-- Host mode: add --host to ExecStart, change Description to Host -->
+        \\<!-- Host mode: change --role guest to --role host in ExecStart -->
         ,
         .windows =>
-        \\:: UTM Monitor Guest auto-start service
+        \\:: UTM Monitor auto-start service (utmmd)
         \\::
-        \\:: Install: sc create "UTM-Monitor-Guest" binPath= "\"C:\opt\utmm\utmm.exe\" --svc" start= auto
-        \\::           sc failure "UTM-Monitor-Guest" reset=30 actions=restart/5000/restart/5000/restart/5000/none/5000
-        \\::           sc start "UTM-Monitor-Guest"
-        \\:: Remove:  sc stop "UTM-Monitor-Guest" & sc delete "UTM-Monitor-Guest"
+        \\:: Install: sc create "UTM-MonitorD" binPath= "\"C:\opt\utmm\utmmd.exe\" --role guest" start= auto
+        \\::           sc failure "UTM-MonitorD" reset=30 actions=restart/5000/restart/5000/restart/5000/none/5000
+        \\::           sc start "UTM-MonitorD"
+        \\:: Remove:  sc stop "UTM-MonitorD" & sc delete "UTM-MonitorD"
         \\
-        \\:: Host mode: replace UTM-Monitor-Guest with UTM-Monitor-Host, add --host to binPath
+        \\:: Host mode: change --role guest to --role host in binPath
         ,
     };
 }
@@ -1607,25 +1608,25 @@ test "Platform.detect returns valid platform" {
 
 test "genInit - linux has systemd service" {
     const script = genInit(.linux);
-    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmmd") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "[Unit]") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "[Service]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "--svc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--role guest") != null);
 }
 
 test "genInit - macos has launchd plist" {
     const script = genInit(.macos);
-    try std.testing.expect(std.mem.indexOf(u8, script, "com.utmm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "com.utmmd") != null);
     try std.testing.expect(std.mem.indexOf(u8, script, "plist") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmm") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "--svc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmmd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--role") != null);
 }
 
 test "genInit - windows has sc command" {
     const script = genInit(.windows);
     try std.testing.expect(std.mem.indexOf(u8, script, "sc create") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "UTM-Monitor") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "C:\\opt\\utmm\\utmm.exe") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "UTM-MonitorD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "C:\\opt\\utmm\\utmmd.exe") != null);
 }
 
 // ========== Tests ==========

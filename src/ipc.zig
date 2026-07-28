@@ -635,7 +635,7 @@ fn handleExec(
     defer gpa.free(cmd_id);
 
     // Build command with marker
-    const cmd_with_marker = buildCmdWithMarker(gpa, guest.shell, command) catch {
+    const cmd_with_marker = ptcl.buildCmdWithMarker(gpa, guest.shell, command) catch {
         sendError(conn, "AllocFailed");
         return;
     };
@@ -905,13 +905,6 @@ fn handleDownload(
     std.log.info("[ipc-download] done {s}", .{cmd_id});
 }
 
-/// Build command string with shell-appropriate exit code marker.
-fn buildCmdWithMarker(gpa: std.mem.Allocator, shell: []const u8, command: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, shell, "cmd.exe") != null) {
-        return std.fmt.allocPrint(gpa, "{s} & echo MDELIM:%errorlevel%\r\n", .{command});
-    }
-    return std.fmt.allocPrint(gpa, "{s}; echo MDELIM:$?\n", .{command});
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Client API (CLI and MCP use these to talk to the Host daemon)

@@ -604,7 +604,10 @@ fn heartbeatThread(h: *volatile shm.ShmLayout, io: std.Io) void {
     while (true) {
         const now = shm.nowMs(io);
         h.utmm_heartbeat = now;
-        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch break;
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {
+            std.log.err("[main] heartbeat sleep failed, exiting heartbeat thread", .{});
+            break;
+        };
     }
 }
 

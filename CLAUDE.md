@@ -568,3 +568,10 @@ No HTTP server — Host daemon uses IPC socket for CLI/MCP, UDP mesh for Guest-H
 2. **Simplicity first** — minimum code, no speculative features
 3. **Precise changes** — only change what's necessary, match existing style
 4. **Goal-driven** — define criteria, verify with `zig build test`
+
+### Deployment Gating Rule
+**Code changes must pass integration tests before deployment to real devices.**
+- `zig build test` and `zig build test-integration` must both pass (all scenarios, 0 failures)
+- This catches protocol regressions (double MDELIM, frame format mismatches, etc.)
+  before they reach physical VMs where debugging is slow and recovery difficult
+- No exceptions for "trivial" changes — protocol bugs often come from one-line edits

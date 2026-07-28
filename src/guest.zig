@@ -776,9 +776,10 @@ pub fn guestTcpLoop(
 
         // 检查升级信号（仅 auto_upgrade 启用时）
         if (auto_upgrade and upgrade.needed.load(.acquire)) {
-            std.log.info("[guest] upgrade signal detected", .{});
             upgrade.needed.store(false, .release);
-            // TODO: TCP 版本自动升级
+            if (mesh_opt) |*m| {
+                tryPerformUpgrade(io, allocator, info, m, mesh_port);
+            }
         }
 
         // Accept SOCKS4 连接
@@ -794,6 +795,127 @@ pub fn guestTcpLoop(
             std.log.err("[guest] handleOneCommand: {}", .{err});
         };
         conn.deinit();
+    }
+}
+
+/// 尝试执行自动升级：连接 Host TCP → 发送 upgrade_req → 接收二进制 → 保存 → 通知 utmmd。
+/// 所有错误被捕获并记录，不会导致主循环崩溃。
+fn tryPerformUpgrade(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    info: SystemInfo,
+    mesh: *lsa.Mesh,
+    mesh_port: u16,
+) void {
+    std.log.info("[guest] upgrade signal detected, starting auto-upgrade", .{});
+
+    // ── 1. 从 LSA 数据库查找 Host IP ──
+    var host_ip: ?[]const u8 = null;
+    defer if (host_ip) |h| allocator.free(h);
+
+    {
+        mesh.lsas_mutex.lock(mesh.io) catch {
+            std.log.warn("[guest] upgrade: failed to lock LSA database", .{});
+            return;
+        };
+        defer mesh.lsas_mutex.unlock(mesh.io);
+
+        var it = mesh.lsas.iterator();
+        while (it.next()) |entry| {
+            const ni = entry.value_ptr.node_info;
+            if (std.mem.indexOf(u8, ni, "role:host") != null) {
+                if (std.mem.indexOf(u8, ni, "ip:")) |ip_start| {
+                    const ip_line = ni[ip_start + 3 ..];
+                    const ip_end = std.mem.indexOfScalar(u8, ip_line, '\n') orelse ip_line.len;
+                    host_ip = allocator.dupe(u8, ip_line[0..ip_end]) catch null;
+                }
+                break;
+            }
+        }
+    }
+
+    const hip = host_ip orelse {
+        std.log.warn("[guest] upgrade: no Host IP found in LSA database", .{});
+        return;
+    };
+    std.log.info("[guest] upgrade: connecting to Host {s}:{d}", .{ hip, mesh_port });
+
+    // ── 2. 连接 Host TCP（直连，不走 SOCKS4a） ──
+    const host_addr = std.Io.net.IpAddress.parse(hip, mesh_port) catch |err| {
+        std.log.warn("[guest] upgrade: parse Host addr: {}", .{err});
+        return;
+    };
+    const stream = host_addr.connect(io, .{ .mode = .stream }) catch |err| {
+        std.log.warn("[guest] upgrade: connect to Host: {}", .{err});
+        return;
+    };
+    defer stream.close(io);
+    const fd = stream.socket.handle;
+
+    // ── 3. 发送 upgrade_req ──
+    const cmd_id = std.fmt.allocPrint(allocator, "upgrade_{d}", .{
+        std.Io.Timestamp.now(io, .real).nanoseconds,
+    }) catch return;
+    defer allocator.free(cmd_id);
+
+    const frame = protocol.buildUpgradeReq(allocator, cmd_id, info.target) catch |err| {
+        std.log.err("[guest] upgrade: buildUpgradeReq: {}", .{err});
+        return;
+    };
+    defer allocator.free(frame);
+
+    tcp.sendFrame(fd, frame) catch |err| {
+        std.log.err("[guest] upgrade: send upgrade_req: {}", .{err});
+        return;
+    };
+    std.log.info("[guest] upgrade: sent upgrade_req target={s}", .{info.target});
+
+    // ── 4. 接收二进制流，保存到临时文件 ──
+    const tmp_path = "/opt/utmm/utmm.new";
+    // 先清理可能残留的旧 temp 文件
+    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    const tmp_file = std.Io.Dir.cwd().createFile(io, tmp_path, .{
+        .permissions = @enumFromInt(0o755),
+    }) catch |err| {
+        std.log.err("[guest] upgrade: create temp file {s}: {}", .{ tmp_path, err });
+        return;
+    };
+
+    var rbuf: [65536]u8 = undefined;
+    var total_bytes: usize = 0;
+    while (true) {
+        const nr = std.posix.system.read(fd, &rbuf, rbuf.len);
+        if (nr < 0) {
+            std.log.err("[guest] upgrade: read error at {d} bytes", .{total_bytes});
+            tmp_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+            return;
+        }
+        if (nr == 0) break; // EOF — Host closed after sending binary
+        tmp_file.writeStreamingAll(io, rbuf[0..@intCast(nr)]) catch |err| {
+            std.log.err("[guest] upgrade: write temp file: {}", .{err});
+            tmp_file.close(io);
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+            return;
+        };
+        total_bytes += @intCast(nr);
+    }
+    tmp_file.close(io);
+
+    std.log.info("[guest] upgrade: received {d} bytes → {s}", .{ total_bytes, tmp_path });
+
+    // ── 5. 通过 shm 通知 utmmd 执行升级 ──
+    if (shm.open()) |h| {
+        defer shm.detach(h);
+        h.cmd = @intFromEnum(shm.Cmd.upgrade);
+        @memset(&h.cmd_data, 0);
+        const copy_len = @min(tmp_path.len, h.cmd_data.len - 1);
+        @memcpy(h.cmd_data[0..copy_len], tmp_path[0..copy_len]);
+        h.utmm_state = @intFromEnum(shm.UtmmState.stopping);
+        std.log.info("[guest] upgrade: utmmd signalled, exiting for restart", .{});
+    } else |err| {
+        std.log.err("[guest] upgrade: shm.open failed: {}", .{err});
     }
 }
 
@@ -854,10 +976,6 @@ fn handleExecCmd(
 
     std.log.info("[guest] exec cmd_id={s} cmd={s}", .{ input.cmd_id, input.command });
 
-    // 生成带 MDELIM 标记的命令
-    const cmd_with_marker = try buildCmdWithMarker(allocator, input.command);
-    defer allocator.free(cmd_with_marker);
-
     // 使用 dpipe_shell 创建 shell 管道
     const shell = dpipe_shell.create(allocator, info.shell) catch |err| {
         std.log.err("[guest] dpipe_shell.create failed: {}", .{err});
@@ -868,8 +986,8 @@ fn handleExecCmd(
     };
     defer shell.close();
 
-    // 写入命令到 shell
-    shell.write(cmd_with_marker) catch |err| {
+    // 写入命令到 shell（命令已由 Host 端 ipc.zig buildCmdWithMarker 添加 MDELIM 标记）
+    shell.write(input.command) catch |err| {
         std.log.err("[guest] shell write failed: {}", .{err});
         const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
         defer allocator.free(done_msg);
@@ -891,20 +1009,19 @@ fn handleExecCmd(
 
         accumulated.appendSlice(allocator, output_buf[0..nr]) catch continue;
 
-        // 扫描 MDELIM 标记
-        if (scanForMarker(accumulated.items)) |exit_code| {
-            const marker_pos = std.mem.lastIndexOf(u8, accumulated.items, "MDELIM:") orelse accumulated.items.len;
-            const clean_output = accumulated.items[0..marker_pos];
-            if (clean_output.len > 0) {
-                const output_msg = protocol.buildPtyExecOutput(allocator, input.cmd_id, clean_output) catch continue;
+        // 扫描 MDELIM 标记（protocol.scanForMarker 会剥离标记）
+        const marker_result = protocol.scanForMarker(&accumulated);
+        if (marker_result.found) {
+            if (accumulated.items.len > 0) {
+                const output_msg = protocol.buildPtyExecOutput(allocator, input.cmd_id, accumulated.items) catch continue;
                 defer allocator.free(output_msg);
                 _ = conn.sendAndFlush(output_msg, 0) catch {};
             }
 
-            const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, exit_code) catch break;
+            const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, marker_result.exit_code) catch break;
             defer allocator.free(done_msg);
             _ = conn.sendAndFlush(done_msg, 0) catch {};
-            std.log.info("[guest] exec done: cmd_id={s} exit={d}", .{ input.cmd_id, exit_code });
+            std.log.info("[guest] exec done: cmd_id={s} exit={d}", .{ input.cmd_id, marker_result.exit_code });
             return;
         }
     }
@@ -1004,23 +1121,6 @@ fn handleDownload(
     std.log.info("[guest] download complete: {s}", .{cmd.path});
 }
 
-/// 构建带 MDELIM 标记的命令行。
-fn buildCmdWithMarker(allocator: std.mem.Allocator, cmd: []const u8) ![]const u8 {
-    if (builtin.os.tag == .windows) {
-        return std.fmt.allocPrint(allocator, "{s}\r\necho MDELIM:%ERRORLEVEL%\r\n", .{cmd});
-    }
-    return std.fmt.allocPrint(allocator, "{s}; echo MDELIM:$?\n", .{cmd});
-}
-
-/// 扫描累积输出中的 MDELIM 标记。返回 exit code，未找到返回 null。
-fn scanForMarker(data: []const u8) ?i32 {
-    const marker = "MDELIM:";
-    const pos = std.mem.lastIndexOf(u8, data, marker) orelse return null;
-    const after_marker = data[pos + marker.len ..];
-    const end = std.mem.indexOfAny(u8, after_marker, "\r\n") orelse return null;
-    const num_str = after_marker[0..end];
-    return std.fmt.parseInt(i32, num_str, 10) catch null;
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Guest mode entry points (曾 guest.zig)

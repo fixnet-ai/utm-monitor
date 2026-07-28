@@ -759,6 +759,120 @@ fn verifyServeDirBinaries(io: std.Io, serve_dir: []const u8) bool {
     return true;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 升级 TCP 监听器 — Guest 连接 Host 下载新二进制
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 处理单个升级连接：接收 upgrade_req → 流式返回二进制。
+fn handleUpgradeConnection(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    fd: std.posix.socket_t,
+    serve_dir: []const u8,
+) void {
+    defer {
+        _ = std.posix.system.shutdown(fd, 2);
+        _ = std.posix.system.close(fd);
+    }
+
+    // 接收 upgrade_req 帧（sendFrame 写入 4B BE length + payload）
+    const frame = tcp.recvFrame(allocator, fd) catch |err| {
+        std.log.warn("[host] upgrade: recv upgrade_req: {}", .{err});
+        return;
+    };
+    defer allocator.free(frame);
+
+    // frame[0] = type byte, frame[1..] = cmd_id + target
+    if (frame.len < 1 or frame[0] != @intFromEnum(protocol.MsgType.upgrade_req)) {
+        std.log.warn("[host] upgrade: unexpected frame type 0x{x}", .{frame[0]});
+        return;
+    }
+
+    const req = protocol.parseUpgradeReq(frame[1..]) orelse {
+        std.log.warn("[host] upgrade: parse upgrade_req failed", .{});
+        return;
+    };
+
+    std.log.info("[host] upgrade: serving binary for target={s}", .{req.target});
+
+    // 构造二进制文件名并打开
+    const filename = protocol.deploymentFilename(req.target) orelse {
+        std.log.err("[host] upgrade: unknown target '{s}'", .{req.target});
+        return;
+    };
+    var path_buf: [512]u8 = undefined;
+    const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ serve_dir, filename }) catch {
+        std.log.err("[host] upgrade: path too long: {s}/{s}", .{ serve_dir, filename });
+        return;
+    };
+
+    const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch |err| {
+        std.log.err("[host] upgrade: open {s}: {}", .{ full_path, err });
+        return;
+    };
+    defer file.close(io);
+
+    // 流式发送文件内容（原始字节，无帧协议，sendFrame 不适合大文件）
+    var rbuf: [65536]u8 = undefined;
+    while (true) {
+        const nr = file.readStreaming(io, &.{rbuf[0..]}) catch |err| {
+            std.log.err("[host] upgrade: read {s}: {}", .{ full_path, err });
+            return;
+        };
+        if (nr == 0) break; // EOF
+
+        const nw = std.posix.system.write(fd, &rbuf, nr);
+        if (nw != @as(isize, @intCast(nr))) {
+            std.log.err("[host] upgrade: send binary failed", .{});
+            return;
+        }
+    }
+
+    std.log.info("[host] upgrade: served {s} successfully", .{filename});
+}
+
+/// TCP 升级监听器线程入口。
+fn upgradeTcpListener(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    port: u16,
+    serve_dir: []const u8,
+    shutdown: *std.atomic.Value(bool),
+) void {
+    const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", port) catch |err| {
+        std.log.err("[host] upgrade listener: bind addr parse: {}", .{err});
+        return;
+    };
+    const sock = bind_addr.bind(io, .{ .mode = .stream }) catch |err| {
+        std.log.err("[host] upgrade listener: TCP bind :{d}: {}", .{ port, err });
+        return;
+    };
+    defer sock.close(io);
+
+    _ = std.posix.system.listen(sock.handle, 8);
+    std.log.info("[host] upgrade TCP listener on :{d}", .{port});
+
+    while (!shutdown.load(.acquire)) {
+        var addr: std.Io.net.IpAddress = undefined;
+        var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
+        const client_fd = std.posix.system.accept(sock.handle, @ptrCast(&addr), &addr_len);
+        if (client_fd < 0) {
+            const e = std.posix.errno(client_fd);
+            if (e == .AGAIN or e == .INTR) {
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+                continue;
+            }
+            std.log.err("[host] upgrade listener: accept failed", .{});
+            continue;
+        }
+
+        // 处理升级连接（阻塞，但连接是独立的且通常很快）
+        handleUpgradeConnection(io, allocator, client_fd, serve_dir);
+    }
+
+    std.log.info("[host] upgrade TCP listener stopped", .{});
+}
+
 fn startHost(
     block_io: std.Io,
     gpa: std.mem.Allocator,
@@ -792,7 +906,7 @@ fn startHost(
     }
 
     // Initialize guest table
-    var state = GuestTable.init(gpa);
+    var state = GuestTable.init(gpa, block_io);
     defer state.deinit();
 
     // Upgrade signal for version mismatch detection via LSA (only when auto_upgrade enabled).
@@ -905,6 +1019,19 @@ fn startHost(
     // Must spawn before the defer below so join() runs in correct order.
     var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ block_io, gpa, &state, &mesh_opt });
 
+    // Spawn upgrade TCP listener thread — serves binary to upgrading Guests.
+    // Only spawned when auto_upgrade is enabled.
+    var upgrade_shutdown = std.atomic.Value(bool).init(false);
+    var upgrade_thread: ?std.Thread = null;
+    if (auto_upgrade) {
+        upgrade_thread = std.Thread.spawn(.{}, upgradeTcpListener, .{
+            block_io, gpa, mesh_port, sd, &upgrade_shutdown,
+        }) catch |err| {
+            std.log.err("[host] upgrade listener thread spawn failed: {}", .{err});
+            upgrade_thread = null;
+        };
+    }
+
     // Spawn IPC server thread — Unix domain socket (POSIX) / named pipe (Windows).
     // Shares HostState and Mesh with the mesh networking layer.
     var ipc_shutdown = std.atomic.Value(bool).init(false);
@@ -914,13 +1041,15 @@ fn startHost(
     });
 
     defer {
-        // 1. Signal IPC server to stop — unblock accept loop
+        // 1. Signal all background threads to stop
         ipc_shutdown.store(true, .release);
+        upgrade_shutdown.store(true, .release);
         // 2. Signal mesh shutdown — tunnelManager checks this each loop iteration
         if (mesh_opt) |*m| m.signalShutdown();
 
-        // 3. Join threads (order: IPC → tunnel mgr → mesh)
+        // 3. Join threads (order: IPC → upgrade → tunnel mgr → mesh)
         ipc_thread.join();
+        if (upgrade_thread) |t| t.join();
         tun_mgr_thread.join();
 
         // 4. Join mesh thread after all consumers have exited
@@ -967,63 +1096,82 @@ fn tunnelManager(
     state: *GuestTable,
     mesh_opt: *?lsa.Mesh,
 ) void {
+    // Pre-allocated list for LSA snapshots (reused across iterations).
+    var snapshots: std.ArrayList(struct { node_id: lsa.NodeId, info_copy: []const u8 }) = .empty;
+    defer {
+        for (snapshots.items) |s| allocator.free(s.info_copy);
+        snapshots.deinit(allocator);
+    }
+
     while (true) {
         // Check shutdown
         if (mesh_opt.*) |*m| {
             if (m.shutdown.load(.acquire)) break;
         } else break;
 
-        // Sync LSA nodes → guest table
+        // ── Phase 1: snapshot LSAs under lock ──
         if (mesh_opt.*) |*m| {
             m.lsas_mutex.lock(m.io) catch continue;
             defer m.lsas_mutex.unlock(m.io);
+
+            // Clear previous snapshot
+            for (snapshots.items) |s| allocator.free(s.info_copy);
+            snapshots.clearRetainingCapacity();
+
             var lsa_it = m.lsas.iterator();
             while (lsa_it.next()) |entry| {
-                const lsa_entry = entry.value_ptr.*;
-                const saved_node_info = allocator.dupe(u8, lsa_entry.node_info) catch continue;
-                defer allocator.free(saved_node_info);
-                const saved_node_id: lsa.NodeId = entry.key_ptr.*;
-
                 // Skip self (Host node)
-                if (std.mem.eql(u8, &saved_node_id, &m.node_id)) continue;
+                if (std.mem.eql(u8, entry.key_ptr, &m.node_id)) continue;
 
-                // Parse guest info from LSA node_info string
-                var hostname: []const u8 = "";
-                var ip: []const u8 = "";
-                var target: []const u8 = "";
-                var version: []const u8 = "";
-                var shell: []const u8 = "";
-                var mac_str: []const u8 = "";
-                var status: []const u8 = "";
-                var role: []const u8 = "";
+                const info_copy = allocator.dupe(u8, entry.value_ptr.node_info) catch continue;
+                snapshots.append(.{
+                    .node_id = entry.key_ptr.*,
+                    .info_copy = info_copy,
+                }) catch {
+                    allocator.free(info_copy);
+                    continue;
+                };
+            }
+        }
 
-                var line_it = std.mem.splitScalar(u8, saved_node_info, '\n');
-                while (line_it.next()) |line| {
-                    if (parseNodeInfoLine(line, "hostname")) |v| hostname = v;
-                    if (parseNodeInfoLine(line, "ip")) |v| ip = v;
-                    if (parseNodeInfoLine(line, "target")) |v| target = v;
-                    if (parseNodeInfoLine(line, "version")) |v| version = v;
-                    if (parseNodeInfoLine(line, "shell")) |v| shell = v;
-                    if (parseNodeInfoLine(line, "status")) |v| status = v;
-                    if (parseNodeInfoLine(line, "role")) |v| role = v;
-                }
+        // ── Phase 2: process snapshot outside lock ──
+        for (snapshots.items) |s| {
+            // Parse guest info from LSA node_info string
+            var hostname: []const u8 = "";
+            var ip: []const u8 = "";
+            var target: []const u8 = "";
+            var version: []const u8 = "";
+            var shell: []const u8 = "";
+            var mac_str: []const u8 = "";
+            var status: []const u8 = "";
+            var role: []const u8 = "";
 
-                if (hostname.len == 0 or ip.len == 0) continue;
+            var line_it = std.mem.splitScalar(u8, s.info_copy, '\n');
+            while (line_it.next()) |line| {
+                if (parseNodeInfoLine(line, "hostname")) |v| hostname = v;
+                if (parseNodeInfoLine(line, "ip")) |v| ip = v;
+                if (parseNodeInfoLine(line, "target")) |v| target = v;
+                if (parseNodeInfoLine(line, "version")) |v| version = v;
+                if (parseNodeInfoLine(line, "shell")) |v| shell = v;
+                if (parseNodeInfoLine(line, "status")) |v| status = v;
+                if (parseNodeInfoLine(line, "role")) |v| role = v;
+            }
 
-                // Convert mesh NodeId to MAC string
-                mac_str = std.fmt.allocPrint(allocator, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
-                    saved_node_id[0], saved_node_id[1], saved_node_id[2],
-                    saved_node_id[3], saved_node_id[4], saved_node_id[5],
-                }) catch continue;
-                defer allocator.free(mac_str);
+            if (hostname.len == 0 or ip.len == 0) continue;
 
-                // Upsert to guest table and set mesh MAC
-                const now_ms = @as(i64, @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms)));
-                const changed = state.upsert(hostname, ip, target, mac_str, version, shell, status, role, @intCast(now_ms));
-                if (changed and hostname.len > 0) {
-                    state.setMeshMac(hostname, saved_node_id);
-                    syncHostsFromTable(io, allocator, state);
-                }
+            // Convert mesh NodeId to MAC string
+            mac_str = std.fmt.allocPrint(allocator, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+                s.node_id[0], s.node_id[1], s.node_id[2],
+                s.node_id[3], s.node_id[4], s.node_id[5],
+            }) catch continue;
+            defer allocator.free(mac_str);
+
+            // Upsert to guest table and set mesh MAC
+            const now_ms = @as(i64, @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms)));
+            const changed = state.upsert(hostname, ip, target, mac_str, version, shell, status, role, @intCast(now_ms));
+            if (changed and hostname.len > 0) {
+                state.setMeshMac(hostname, s.node_id);
+                syncHostsFromTable(io, allocator, state);
             }
         }
 
@@ -1060,11 +1208,15 @@ pub const GuestEntry = struct {
 pub const GuestTable = struct {
     guests: std.ArrayList(GuestEntry),
     allocator: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex,
 
-    pub fn init(allocator: std.mem.Allocator) GuestTable {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io) GuestTable {
         return .{
             .guests = .empty,
             .allocator = allocator,
+            .io = io,
+            .mutex = .init,
         };
     }
 
@@ -1090,6 +1242,8 @@ pub const GuestTable = struct {
     }
 
     pub fn findByHostname(self: *GuestTable, hostname: []const u8) ?GuestEntry {
+        self.mutex.lock(self.io) catch return null;
+        defer self.mutex.unlock(self.io);
         const idx = self.indexOf(hostname) orelse return null;
         return self.guests.items[idx];
     }
@@ -1106,6 +1260,8 @@ pub const GuestTable = struct {
         role: []const u8,
         last_seen: i64,
     ) bool {
+        self.mutex.lock(self.io) catch return false;
+        defer self.mutex.unlock(self.io);
         if (self.indexOf(hostname)) |idx| {
             var changed = false;
             const existing = &self.guests.items[idx];
@@ -1160,6 +1316,8 @@ pub const GuestTable = struct {
     }
 
     pub fn remove(self: *GuestTable, hostname: []const u8) void {
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
         const idx = self.indexOf(hostname) orelse return;
         const entry = self.guests.swapRemove(idx);
         self.allocator.free(entry.hostname);
@@ -1173,6 +1331,8 @@ pub const GuestTable = struct {
     }
 
     pub fn setMeshMac(self: *GuestTable, hostname: []const u8, mac_bytes: [6]u8) void {
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
         const idx = self.indexOf(hostname) orelse return;
         self.guests.items[idx].mesh_mac = mac_bytes;
     }
@@ -1264,16 +1424,24 @@ test "isValidVersion - garbage (human verification page)" {
 // GuestTable tests (from state.zig)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Helper: create a single-threaded Io for tests (needed by GuestTable mutex).
+fn testIo() std.Io {
+    const ti = struct {
+        var threaded: std.Io.Threaded = .init_single_threaded;
+    };
+    return ti.threaded.io();
+}
+
 test "GuestTable init and deinit" {
     const allocator = std.testing.allocator;
-    var table = GuestTable.init(allocator);
+    var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
     try std.testing.expectEqual(@as(usize, 0), table.guests.items.len);
 }
 
 test "GuestTable upsert and findByHostname" {
     const allocator = std.testing.allocator;
-    var table = GuestTable.init(allocator);
+    var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
     _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "serving", "guest", 1000);
@@ -1292,7 +1460,7 @@ test "GuestTable upsert and findByHostname" {
 
 test "GuestTable upsert updates existing guest" {
     const allocator = std.testing.allocator;
-    var table = GuestTable.init(allocator);
+    var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
     _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
@@ -1311,7 +1479,7 @@ test "GuestTable upsert updates existing guest" {
 
 test "GuestTable upsert no-change returns false" {
     const allocator = std.testing.allocator;
-    var table = GuestTable.init(allocator);
+    var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
     _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "serving", "guest", 1000);
@@ -1323,7 +1491,7 @@ test "GuestTable upsert no-change returns false" {
 
 test "GuestTable remove" {
     const allocator = std.testing.allocator;
-    var table = GuestTable.init(allocator);
+    var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
     _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
@@ -1340,7 +1508,7 @@ test "GuestTable remove" {
 
 test "GuestTable setMeshMac" {
     const allocator = std.testing.allocator;
-    var table = GuestTable.init(allocator);
+    var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
     _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
@@ -1356,7 +1524,7 @@ test "GuestTable setMeshMac" {
 
 test "GuestTable findByHostname after update" {
     const allocator = std.testing.allocator;
-    var table = GuestTable.init(allocator);
+    var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
     _ = table.upsert("winx64", "192.168.3.1", "x86_64-windows", "ff:ee:dd:cc:bb:aa", "0.13.0", "cmd.exe", "upgrading", "guest", 3000);

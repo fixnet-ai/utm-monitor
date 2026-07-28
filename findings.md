@@ -209,3 +209,66 @@ tcp.zig 和 lsa.zig 的测试在主测试二进制（通过 main.zig → host.zi
 - 所有自动升级相关代码路径（Guest 升级信号检查、Host GitHub 版本轮询、serve-dir 校验）均按开关门控
 
 **影响文件**: config.zig, main.zig, lsa.zig, guest.zig, host.zig（5 文件）
+
+### Finding 179: Zig 0.16.0 `system.read` / `system.write` 非 error union
+
+**背景**: 编写集成测试时需要直接调用 POSIX `read`/`write` 进行原始字节流传输（upload/download/upgrade 的文件数据在帧协议之后以裸流形式传输）。
+
+**发现**:
+- `std.posix.system.read(fd, buf, len)` 返回 `isize`（C 风格返回值），**不是 error union**
+- `std.posix.system.write(fd, buf, len)` 返回 `isize`，同样不是 error union
+- `-1` 表示错误，需手动检查 `<= 0`
+- `system.write` 的 `buf` 参数类型为 `[*]const u8`（C 指针），非 `[]const u8`
+
+**错误模式**:
+```zig
+// ❌ 错误：system.read/system.write 不返回 error union，不能用 try/catch
+const n = try system.read(fd, &rbuf, len);
+_ = try system.write(fd, data, data.len);
+
+// ❌ 错误：[]const u8 不能隐式转换为 [*]const u8
+_ = system.write(fd, some_slice, len);
+```
+
+**正确模式**:
+```zig
+// ✅ 正确：检查返回值，@intCast 转换
+const raw_n = system.read(fd, &rbuf, len);
+if (raw_n <= 0) return; // 或 break
+const n: usize = @intCast(raw_n);
+
+// ✅ 使用 .ptr 获取 [*]const u8
+_ = system.write(fd, some_slice.ptr, some_slice.len);
+```
+
+**影响**: upload_e2e、download_e2e、upgrade_e2e 三个测试文件（共 ~10 处调用点）。
+
+### Finding 180: Zig 0.16.0 `ArrayList.fromOwnedSlice` API 变更
+
+**背景**: 集成测试中需要复制帧数据到 ArrayList 进行 MDELIM 扫描。
+
+**发现**:
+- `std.ArrayList(T).fromOwnedSlice(allocator, slice)` 在 Zig 0.16.0 中参数签名已变更
+- 应使用 `.empty` + `.appendSlice(allocator, slice)` 替代
+- deinit 需传入 allocator：`defer list.deinit(alloc)` （因为 ArrayList 现在是 unmanaged 版本）
+
+**正确模式**:
+```zig
+// ✅ Zig 0.16.0
+var list: std.ArrayList(u8) = .empty;
+try list.appendSlice(alloc, data);
+defer list.deinit(alloc);
+```
+
+**影响**: exec_e2e 测试（4 处）。
+
+### Finding 181: 部署门禁 — 代码变更后集成测试先行
+
+**背景**: REVIEW_FINDINGS.md 指出的多个缺陷（C1 双重标记、C2 并发竞争、I2 genInit 过时等）如果在真机调测前有集成测试，可在几秒内发现，而非在物理 VM 上耗费数小时排查。
+
+**决策**: 在 CLAUDE.md 新增 `Deployment Gating Rule`：
+- 修改代码后必须先通过 `zig build test` + `zig build test-integration`
+- 全部场景 0 失败才能上真机
+- 无例外 — "trivial" 变更同样可能引入协议回归（如 C1 就是一行 Host 端 buildCmdWithMarker 调用导致的）
+
+**关联**: [[Finding 175]]（测试覆盖不足）、[[Finding 177]]（代码扫描结论）

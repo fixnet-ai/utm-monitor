@@ -4,13 +4,43 @@
 
 - **分支**: `refac/layered-arch`
 - **版本**: v0.13.0-pre（尚未发布）
-- **测试**: 150 执行 / 141 唯一测试，全部通过
+- **测试**: 150 执行 / 141 唯一测试 + 43 集成测试场景，全部通过
 - **源文件**: 16 个（20 → 16）
 - **全部任务完成** ✅
 
 ## 会话记录
 
-### 2026-07-29 (最新) — Phase 4 清理收尾 + 代码扫描
+### 2026-07-29 (最新) — Phase 5-7：集成测试补充 + 代码审查修复 + 部署门禁
+
+**成果**: 新增 4 个 e2e 集成测试（16 场景）、12 项代码审查修复全部完成、CLAUDE.md 部署门禁规则
+
+| 任务 | 描述 | 状态 |
+|------|------|------|
+| Phase 5 | 9 集成测试全部实现（43 场景，0 FAIL）| ✅ |
+| Phase 6 | REVIEW_FINDINGS.md 12 项全部修复（C1-C2, I1-I4, M1-M6）| ✅ |
+| Phase 7 | CLAUDE.md 添加 Deployment Gating Rule | ✅ |
+
+**新增集成测试详情**:
+| 测试 | 场景数 | 验证内容 |
+|------|--------|---------|
+| `exec_e2e` | 4 | 命令执行 + MDELIM 标记 + exit code（捕获 C1 双重标记回归）|
+| `upload_e2e` | 4 | 小文件/零字节/二进制上传 + SHA256 验证 + 错误码回传 |
+| `download_e2e` | 4 | 小文件/128KB 流式下载 + 零字节 + 失败退出码 |
+| `upgrade_e2e` | 4 | upgrade_req → 256KB 二进制流接收 + SHA256 校验 + 编解码 |
+
+**编译问题修复记录**:
+- `fromOwnedSlice(alloc, slice)` → `.empty` + `appendSlice` (Zig 0.16.0 ArrayList API)
+- `system.read` / `system.write` 返回 `isize` 非 error union → 不能 try/catch
+- `system.write` 参数需 `[*]const u8` 非 `[]const u8` → 使用 `.ptr`
+- `catch |_| {}` → Zig 0.16.0 不允许丢弃 error capture
+
+**CLAUDE.md 部署门禁**:
+```markdown
+### Deployment Gating Rule
+Code changes must pass integration tests before deployment to real devices.
+- zig build test AND zig build test-integration must both pass
+- No exceptions for "trivial" changes
+```
 
 **成果**: CLAUDE.md 更新 + dpipe_file 测试修复 + build.zig 去重 + 代码库遗留问题扫描
 
