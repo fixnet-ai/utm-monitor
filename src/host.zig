@@ -71,7 +71,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 
     // --host (via --svc): start Host daemon
     if (cli.is_host) {
-        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown);
+        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, cli.auto_upgrade, shutdown);
         return;
     }
 }
@@ -765,39 +765,42 @@ fn startHost(
     mesh_port: u16,
     serve_dir: ?[]const u8,
     peer_mesh: ?[]const u8,
+    auto_upgrade: bool,
     shutdown: ?*std.atomic.Value(bool),
 ) !void {
     const sd = serve_dir orelse "/opt/utmm";
     std.debug.print("[host] Host daemon starting (mesh UDP :{d})\n", .{mesh_port});
     std.debug.print("[host] Serve dir: {s}\n", .{sd});
 
-    // Verify serve-dir platform binaries match running Host version.
-    // Missing binaries are logged as warnings; the Host continues running
-    // so Guests can still be managed (exec/upload/download). Guest
-    // auto-upgrade is degraded until matching binaries are provided.
-    // Auto-uninstall was removed: self-destructing on version mismatch
-    // leaves the machine unreachable with zero recovery path — far worse
-    // than an upgrade loop (which is self-limiting anyway).
-    _ = verifyServeDirBinaries(block_io, sd);
+    if (auto_upgrade) {
+        // Verify serve-dir platform binaries match running Host version.
+        // Missing binaries are logged as warnings; the Host continues running
+        // so Guests can still be managed (exec/upload/download). Guest
+        // auto-upgrade is degraded until matching binaries are provided.
+        // Auto-uninstall was removed: self-destructing on version mismatch
+        // leaves the machine unreachable with zero recovery path — far worse
+        // than an upgrade loop (which is self-limiting anyway).
+        _ = verifyServeDirBinaries(block_io, sd);
 
-    // Spawn fire-and-forget GitHub version check thread.
-    // OS thread, detach immediately, runs once — no join needed.
-    if (std.Thread.spawn(.{}, checkGitHubVersion, .{})) |t| {
-        t.detach();
-    } else |_| {
-        // spawn failed — silently ignored
+        // Spawn fire-and-forget GitHub version check thread.
+        // OS thread, detach immediately, runs once — no join needed.
+        if (std.Thread.spawn(.{}, checkGitHubVersion, .{})) |t| {
+            t.detach();
+        } else |_| {
+            // spawn failed — silently ignored
+        }
     }
 
     // Initialize guest table
     var state = GuestTable.init(gpa);
     defer state.deinit();
 
-    // Upgrade signal for version mismatch detection via LSA
+    // Upgrade signal for version mismatch detection via LSA (only when auto_upgrade enabled).
     var upgrade_signal = guest.UpgradeSignal{};
 
     // Spawn mesh networking thread — replaces periodic UDP guest.
     // Mesh broadcasts LSA every 2s (carries version for auto-upgrade),
-    // maintains guest topology via LSA database, and relays KCP_DATA.
+    // maintains guest topology via LSA database.
     var mesh_opt: ?lsa.Mesh = null;
     var mesh_thread: ?std.Thread = null;
 
@@ -869,7 +872,7 @@ fn startHost(
         };
 
         // Create mesh instance (epoch is auto-appended to node_info by init())
-        mesh_opt = lsa.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, &upgrade_signal.needed, bc_addrs, guest.getSubnetBroadcasts) catch |err| {
+        mesh_opt = lsa.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, if (auto_upgrade) &upgrade_signal.needed else null, bc_addrs, guest.getSubnetBroadcasts) catch |err| {
             std.log.err("[host] Mesh init failed: {}", .{err});
             gpa.free(node_info);
             mesh_socket.close(mesh_io);

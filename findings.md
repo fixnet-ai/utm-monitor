@@ -194,3 +194,18 @@ tcp.zig 和 lsa.zig 的测试在主测试二进制（通过 main.zig → host.zi
 - refac.md §3.7 残留过时描述（"install.zig 可独立构建"），已修正为实际决策
 
 **结论**: 重构阶段可彻底收工。分支可直接合并 main。
+
+### Finding 178: auto_upgrade 开关设计 — 默认关闭避免测试干扰
+
+**背景**: 测试过程中自动升级行为会不断干扰测试流程和结果：
+- Host 侧 `checkGitHubVersion()` 发出 HTTP 请求到 GitHub API
+- Host 侧 `verifyServeDirBinaries()` 在 serve-dir 缺少平台二进制时输出告警
+- Guest 侧 LSA 版本比对触发升级信号，干扰正常测试输出
+
+**设计**:
+- `config.auto_upgrade: bool = false` — 默认关闭
+- `--auto-upgrade` CLI flag — 部署时显式启用
+- `lsa.Mesh.upgrade_needed` 改为 `?*std.atomic.Value(bool)` — null 时完全跳过版本比对
+- 所有自动升级相关代码路径（Guest 升级信号检查、Host GitHub 版本轮询、serve-dir 校验）均按开关门控
+
+**影响文件**: config.zig, main.zig, lsa.zig, guest.zig, host.zig（5 文件）

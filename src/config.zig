@@ -11,6 +11,11 @@ pub const Config = struct {
     hosts_file: []const u8 = "/etc/hosts",
     marker: []const u8 = "UTM-MONITOR",
 
+    /// Enable automatic upgrade (Guest detects version mismatch via LSA →
+    /// requests new binary from Host). Default false to avoid interfering
+    /// with testing.
+    auto_upgrade: bool = false,
+
     /// VM SSH configuration — deployment-specific, empty by default.
     vms: []const VmConfig = &.{},
 };

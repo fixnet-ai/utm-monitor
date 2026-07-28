@@ -655,6 +655,7 @@ pub fn guestTcpLoop(
     allocator: std.mem.Allocator,
     info: SystemInfo,
     upgrade: *UpgradeSignal,
+    auto_upgrade: bool,
     mesh_port: u16,
     peer_mesh: ?[]const u8,
     shutdown: ?*std.atomic.Value(bool),
@@ -720,7 +721,7 @@ pub fn guestTcpLoop(
             break :start_mesh;
         };
 
-        mesh_opt = lsa.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs, getSubnetBroadcasts) catch |err| {
+        mesh_opt = lsa.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, if (auto_upgrade) &upgrade.needed else null, broadcast_addrs, getSubnetBroadcasts) catch |err| {
             std.log.err("[guest] Mesh init: {}", .{err});
             allocator.free(node_info);
             mesh_socket.close(mesh_io);
@@ -773,8 +774,8 @@ pub fn guestTcpLoop(
             }
         }
 
-        // 检查升级信号
-        if (upgrade.needed.load(.acquire)) {
+        // 检查升级信号（仅 auto_upgrade 启用时）
+        if (auto_upgrade and upgrade.needed.load(.acquire)) {
             std.log.info("[guest] upgrade signal detected", .{});
             upgrade.needed.store(false, .release);
             // TODO: TCP 版本自动升级
@@ -1077,5 +1078,5 @@ pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig
     // UpgradeSignal allows mesh LSA version check to signal the main loop
     // when a version mismatch is detected from Host broadcast.
     var upgrade_signal = UpgradeSignal{};
-    try guestTcpLoop(io, gpa, sysinfo, &upgrade_signal, cli.mesh_port, cli.peer_mesh, shutdown);
+    try guestTcpLoop(io, gpa, sysinfo, &upgrade_signal, cli.auto_upgrade, cli.mesh_port, cli.peer_mesh, shutdown);
 }

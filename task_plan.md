@@ -47,6 +47,7 @@ DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 | 12 | 修复 dpipe_file hash mismatch 测试（warn→debug）| ✅ |
 | 13 | 清理 build.zig standalone_test_modules（去重 tcp/lsa，新增 shm）| ✅ |
 | 14 | 代码库扫描（TODO、日志、refac.md 修正）| ✅ |
+| 15 | 新增 config.auto_upgrade 开关（默认 false，跳过自动升级避免测试干扰）| ✅ |
 
 ## 删除文件清单（10 个）
 
@@ -100,3 +101,4 @@ src/
 | 9 | Platform/genInit → svc.zig（不独立构建）| 独立构建收益低，聚合到服务管理层即可 |
 | 10 | dpipe_file hash mismatch: warn→debug | Zig 0.16.0 测试运行器对 stderr warn 日志敏感 |
 | 11 | build.zig 去重 tcp/lsa，新增 shm | tcp/lsa 已在主二进制中；shm 10 个测试之前从未运行 |
+| 12 | auto_upgrade 默认 false | 避免自动升级在测试中干扰；部署时 --auto-upgrade 显式启用 |

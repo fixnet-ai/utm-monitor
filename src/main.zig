@@ -62,6 +62,8 @@ pub const CliArgs = struct {
     serve_dir: ?[]const u8 = null,
     /// Whether to save config
     save_config: bool = false,
+    /// Enable automatic upgrade (Guest→Host version matching via LSA)
+    auto_upgrade: bool = false,
     /// Run as daemon via service manager (--svc, set by service configs)
     is_svc: bool = false,
 
@@ -181,6 +183,8 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             }
         } else if (std.mem.eql(u8, arg, "--save-config")) {
             cli.save_config = true;
+        } else if (std.mem.eql(u8, arg, "--auto-upgrade")) {
+            cli.auto_upgrade = true;
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (i + 1 < args.len) {
                 i += 1;
@@ -262,6 +266,7 @@ pub fn printHelp() void {
         \\  --config PATH       Config file path
         \\  --log-file PATH     Log file path
         \\  --save-config       Save current parameters to config file
+        \\  --auto-upgrade      Enable automatic Guest→Host version matching via LSA
         \\
         \\Management commands (require Host service running):
         \\  --status            Query all online guest status

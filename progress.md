@@ -20,6 +20,15 @@
 | Task 12 | 修复 dpipe_file hash mismatch 测试（warn→debug）| ✅ |
 | Task 13 | 清理 build.zig standalone_test_modules（去重 tcp/lsa，新增 shm）| ✅ |
 | Task 14 | 代码库遗留问题扫描（TODO、日志、refac.md）| ✅ |
+| Task 15 | 新增 config.auto_upgrade 开关（默认 false，5 文件变更）| ✅ |
+
+**auto_upgrade 开关详情**:
+- `config.zig`: 新增 `auto_upgrade: bool = false` 字段
+- `main.zig`: 新增 `--auto-upgrade` CLI flag（显式启用）及 help text
+- `lsa.zig`: `upgrade_needed` 从 `*std.atomic.Value(bool)` 改为 `?*`，null 时跳过版本比对
+- `guest.zig`: `guestTcpLoop` 新增 `auto_upgrade` 参数，升级检查和 Mesh 信号按开关门控
+- `host.zig`: `startHost` 新增 `auto_upgrade` 参数，GitHub 检查、serve-dir 校验、升级信号均门控
+- 编译和测试全通过，5 文件变更
 
 **代码扫描发现**:
 - 3 个 TODO 注释：config.zig:107（功能缺口）、guest.zig:780（TCP 自动升级未闭环）、lsa.zig:496（Zig stdlib 问题）
