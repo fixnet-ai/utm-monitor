@@ -1,62 +1,73 @@
-//! Mesh networking layer: UDP broadcast discovery via LSA, link-state routing
-//! (Dijkstra), and ping/pong reachability probes.
+//! LSA (Link-State Advertisement) mesh networking and /etc/hosts management.
+//!
+//! Merged from mesh.zig + hosts_file.zig — all mesh topology discovery, link-state
+//! routing (Dijkstra), ping/pong probes, and /etc/hosts marker-block sync in one module.
 //!
 //! Binary protocol on UDP :2121 with first-byte dispatch for message type
 //! identification. LSA carries topology and version info for auto-upgrade.
+//!
+//! /etc/hosts marker block:
+//!   # UTM-MONITOR-BEGIN
+//!   192.168.64.5  macvm
+//!   192.168.64.8  linuxvm
+//!   # UTM-MONITOR-END
 
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
-const cmdchan = @import("cmdchan.zig");
 
 const net = std.Io.net;
 const assert = std.debug.assert;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Types
+// NodeId — types & helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Node identifier (MAC address, 6 bytes)
 pub const NodeId = [6]u8;
 
-/// Parse "aa:bb:cc:dd:ee:ff" → NodeId. Returns error on malformed input.
+/// Parse a colon-separated MAC address string (aa:bb:cc:dd:ee:ff).
 pub fn parseNodeId(text: []const u8) !NodeId {
     if (text.len != 17) return error.InvalidFormat;
     var id: NodeId = undefined;
     var i: usize = 0;
-    var it = std.mem.splitScalar(u8, text, ':');
-    while (it.next()) |byte_str| {
-        if (i >= 6) return error.InvalidFormat;
-        id[i] = try std.fmt.parseInt(u8, byte_str, 16);
-        i += 1;
+    while (i < 6) : (i += 1) {
+        const pos = i * 3;
+        if (i < 5 and text[pos + 2] != ':') return error.InvalidFormat;
+        id[i] = try std.fmt.parseInt(u8, text[pos .. pos + 2], 16);
     }
-    if (i != 6) return error.InvalidFormat;
     return id;
 }
 
-/// Derive a unique NodeId by hashing MAC + suffix together.
-/// Used when multiple mesh nodes share a physical MAC (e.g. local testing
-/// with Host + Guest on the same machine using --peer-mesh).
-pub fn deriveNodeId(mac_text: []const u8, suffix: []const u8) !NodeId {
-    const mac_id = try parseNodeId(mac_text);
-    var hasher = std.hash.Wyhash.init(0);
-    hasher.update(&mac_id);
-    hasher.update(suffix);
-    const h: u64 = hasher.final();
-    const h_bytes: [8]u8 = @bitCast(h);
+/// Derive a NodeId for a registered MAC that may be longer than 6 bytes
+/// (virtual MAC from UTM). Uses first 4 bytes of hostname hash with last
+/// 2 bytes of MAC.
+pub fn deriveNodeId(mac: []const u8, hostname: []const u8) !NodeId {
+    if (mac.len < 6) return error.InvalidFormat;
     var id: NodeId = undefined;
-    @memcpy(&id, h_bytes[0..6]);
+    // Use a rolling hash over the hostname
+    var h: u32 = 5381;
+    for (hostname) |c| {
+        h = ((h << 5) + h) + c;
+    }
+    id[0] = @truncate(h >> 24);
+    id[1] = @truncate(h >> 16);
+    id[2] = @truncate(h >> 8);
+    id[3] = @truncate(h);
+    // Last 2 bytes from MAC to reduce collision probability
+    id[4] = mac[mac.len - 2];
+    id[5] = mac[mac.len - 1];
     return id;
 }
 
-/// Format NodeId → "aa:bb:cc:dd:ee:ff"
+/// Format a NodeId to an allocator-allocated string (aa:bb:cc:dd:ee:ff).
 pub fn formatNodeId(id: NodeId, allocator: std.mem.Allocator) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
         id[0], id[1], id[2], id[3], id[4], id[5],
     });
 }
 
-/// Format NodeId into a caller-provided buffer (17 bytes needed: 12 hex + 5 colons).
+/// Format a NodeId into a pre-allocated buffer (18 bytes recommended).
 /// Returns the formatted slice, or "??:??:??:??:??:??" on overflow.
 pub fn formatNodeIdBuf(id: NodeId, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
@@ -147,12 +158,12 @@ pub fn encodeLsa(
 ) usize {
     const needed = 15 + node_info.len + 1 + neighbors.len * 7;
     if (buf.len < needed) {
-        std.log.warn("[mesh] encodeLsa: buffer too small (need {d}, have {d})", .{ needed, buf.len });
+        std.log.warn("[lsa] encodeLsa: buffer too small (need {d}, have {d})", .{ needed, buf.len });
         // Guard: if buffer can't even hold the header, encode with zero neighbors
         // to avoid infinite recursion (buf.len -| X saturating to 0 → 0 neighbors → try again).
         const min_header = 16 + node_info.len;
         if (buf.len < min_header) {
-            std.log.err("[mesh] encodeLsa: buffer too small for header (need {d}, have {d})", .{ min_header, buf.len });
+            std.log.err("[lsa] encodeLsa: buffer too small for header (need {d}, have {d})", .{ min_header, buf.len });
             return encodeLsa(buf, origin, seq, ttl, flags, node_info, &[0]NeighborEntry{});
         }
         // Try to fit as many neighbors as possible
@@ -291,20 +302,6 @@ pub const Mesh = struct {
     /// by comparing this value across LSA entries.
     nonce: u32,
 
-    // Command channel (IPC→Mesh). Single producer (IPC thread), single consumer (Mesh thread).
-    // Null until Phase 4 (IPC integration). Mesh thread polls this each event loop iteration.
-    // Once non-null, it stays non-null for the lifetime of the Mesh.
-    cmd_queue: ?*cmdchan.CmdQueue,
-
-    /// Opaque pointer to HostState (set by host.zig). Used by cmd_handler callback
-    /// for tunnel lookup, completion registration, and guest table access.
-    state_ptr: ?*anyopaque,
-
-    /// Command dispatch callback. Called by dispatchCmd for each command popped
-    /// from cmd_queue. Implemented in host.zig to bridge Mesh with HostState
-    /// (tunnels, completions, guest table).
-    cmd_handler: ?*const fn (*anyopaque, *Mesh, *const cmdchan.Cmd) void,
-
     // Shutdown
     shutdown: std.atomic.Value(bool),
 
@@ -343,9 +340,6 @@ pub const Mesh = struct {
         upgrade_needed: *std.atomic.Value(bool),
         broadcast_addrs: std.ArrayList(net.IpAddress),
         broadcast_refresh_fn: ?*const fn (std.mem.Allocator) anyerror!std.ArrayList(net.IpAddress),
-        cmd_queue: ?*cmdchan.CmdQueue,
-        state_ptr: ?*anyopaque,
-        cmd_handler: ?*const fn (*anyopaque, *Mesh, *const cmdchan.Cmd) void,
     ) !Mesh {
         const nonce = generateNonce();
 
@@ -380,9 +374,6 @@ pub const Mesh = struct {
             .routes_mutex = std.Io.Mutex.init,
             .shutdown = std.atomic.Value(bool).init(false),
             .upgrade_needed = upgrade_needed,
-            .cmd_queue = cmd_queue,
-            .state_ptr = state_ptr,
-            .cmd_handler = cmd_handler,
             .nonce = nonce,
             .clock_ms = 0,
         };
@@ -461,40 +452,6 @@ pub const Mesh = struct {
         return self.runPosix();
     }
 
-    /// Check for pending IPC commands and dispatch them.
-    /// Called from the event loop each iteration.
-    fn processPendingCommands(self: *Mesh) void {
-        if (self.cmd_queue) |queue| {
-            var cmds: [16]cmdchan.Cmd = undefined;
-            const count = queue.popBatch(&cmds);
-            for (cmds[0..count]) |*cmd| {
-                self.dispatchCmd(cmd);
-            }
-        }
-    }
-
-    /// Dispatch a single command from the IPC thread.
-    /// Calls the registered cmd_handler callback (Phase 3) if set;
-    /// otherwise logs the command as a no-op stub (Phase 2).
-    fn dispatchCmd(self: *Mesh, cmd: *const cmdchan.Cmd) void {
-        if (self.cmd_handler) |handler| {
-            if (self.state_ptr) |sp| {
-                handler(sp, self, cmd);
-                return;
-            } else {
-                std.log.err("[mesh-cmd] cmd_handler set but state_ptr is null", .{});
-            }
-        }
-        // Fallback: log as stub
-        switch (cmd.tag) {
-            .exec => std.log.info("[mesh-cmd] exec {s} on {s}: {s}", .{ cmd.cmdIdStr(), cmd.vmStr(), cmd.arg1Str() }),
-            .upload => std.log.info("[mesh-cmd] upload to {s}: {s} ({d} bytes)", .{ cmd.vmStr(), cmd.arg1Str(), cmd.file_size }),
-            .download => std.log.info("[mesh-cmd] download from {s}: {s}", .{ cmd.vmStr(), cmd.arg1Str() }),
-            .status => std.log.info("[mesh-cmd] status", .{}),
-            .ping => std.log.info("[mesh-cmd] ping {s}", .{ cmd.vmStr() }),
-        }
-    }
-
     /// POSIX: use receiveTimeout with 1-second timeout for periodic tasks.
     fn runPosix(self: *Mesh) !void {
         var buf: [4096]u8 = undefined;
@@ -509,7 +466,7 @@ pub const Mesh = struct {
                         continue;
                     },
                     else => {
-                        std.log.err("[mesh] receive error: {}", .{err});
+                        std.log.err("[lsa] receive error: {}", .{err});
                         continue;
                     },
                 }
@@ -521,7 +478,7 @@ pub const Mesh = struct {
 
             switch (msg.data[0]) {
                 protocol.MESH_TYPE_LSA => self.handleLsa(msg.data[1..], msg.from) catch |err| {
-                    std.log.err("[mesh] handleLsa failed: {}", .{err});
+                    std.log.err("[lsa] handleLsa failed: {}", .{err});
                 },
                 protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
                 protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
@@ -529,10 +486,9 @@ pub const Mesh = struct {
             }
 
             self.periodicTasks();
-            self.processPendingCommands();
         }
 
-        std.log.info("[mesh] Shutting down", .{});
+        std.log.info("[lsa] Shutting down", .{});
     }
 
     /// Windows: blocking receive on mesh Io with a separate timer thread.
@@ -547,7 +503,7 @@ pub const Mesh = struct {
 
         // Periodic timer thread: wake every 1s to drive keepalive.
         const timer_thread = std.Thread.spawn(.{}, runWindowsTimer, .{self}) catch |err| {
-            std.log.err("[mesh] Failed to spawn timer thread: {}", .{err});
+            std.log.err("[lsa] Failed to spawn timer thread: {}", .{err});
             return err;
         };
         timer_thread.detach();
@@ -555,7 +511,7 @@ pub const Mesh = struct {
         while (!self.shutdown.load(.acquire)) {
             const msg = self.socket.receive(self.io, &buf) catch |err| {
                 if (self.shutdown.load(.acquire)) break;
-                std.log.err("[mesh] receive error: {}", .{err});
+                std.log.err("[lsa] receive error: {}", .{err});
                 std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
                 continue;
             };
@@ -566,7 +522,7 @@ pub const Mesh = struct {
 
             switch (msg.data[0]) {
                 protocol.MESH_TYPE_LSA => self.handleLsa(msg.data[1..], msg.from) catch |err| {
-                    std.log.err("[mesh] handleLsa failed: {}", .{err});
+                    std.log.err("[lsa] handleLsa failed: {}", .{err});
                 },
                 protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
                 protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
@@ -574,10 +530,9 @@ pub const Mesh = struct {
             }
 
             self.periodicTasks();
-            self.processPendingCommands();
         }
 
-        std.log.info("[mesh] Shutting down", .{});
+        std.log.info("[lsa] Shutting down", .{});
     }
 
     /// Periodic timer for Windows blocking receive fallback.
@@ -638,7 +593,7 @@ pub const Mesh = struct {
 
         for (self.broadcast_addrs.items) |*addr| {
             self.socket.send(self.io, addr, lsa_buf[0..len]) catch |err| {
-                std.log.err("[mesh] initial broadcast LSA to {any} failed: {}", .{ addr, err });
+                std.log.err("[lsa] initial broadcast LSA to {any} failed: {}", .{ addr, err });
             };
         }
     }
@@ -661,7 +616,7 @@ pub const Mesh = struct {
             if (self.clock_ms >= self.broadcast_refresh_next_ms) {
                 self.broadcast_refresh_next_ms = self.clock_ms + 30_000;
                 const new_addrs = refresh_fn(self.allocator) catch |err| {
-                    std.log.err("[mesh] broadcast address refresh failed: {}", .{err});
+                    std.log.err("[lsa] broadcast address refresh failed: {}", .{err});
                     self.broadcast_refresh_next_ms = self.clock_ms + 30_000;
                     return;
                 };
@@ -739,7 +694,7 @@ pub const Mesh = struct {
         // Send to every broadcast address (subnet-directed + 255.255.255.255)
         for (self.broadcast_addrs.items) |*addr| {
             self.socket.send(self.io, addr, lsa_buf[0..len]) catch |err| {
-                std.log.err("[mesh] broadcast LSA to {any} failed: {}", .{ addr, err });
+                std.log.err("[lsa] broadcast LSA to {any} failed: {}", .{ addr, err });
             };
         }
     }
@@ -767,7 +722,7 @@ pub const Mesh = struct {
                 const diff: i32 = @bitCast(decoded.seq -% existing.seq);
                 if (diff <= 0) {
                     if (nonceChanged(decoded.node_info, existing.node_info)) {
-                        std.log.info("[mesh] LSA restart detected: nonce changed, accepting lower seq", .{});
+                        std.log.info("[lsa] LSA restart detected: nonce changed, accepting lower seq", .{});
                         existing.deinit(self.allocator);
                         lsa_restart = true;
                     } else {
@@ -779,7 +734,7 @@ pub const Mesh = struct {
                     // Keep the current (lower-seq, newer-process) entry —
                     // replacing it would let the next genuine LSA trigger a
                     // spurious second restart (Finding 93 / Task #254).
-                    std.log.info("[mesh] Ignoring stale high-seq LSA from {any} (nonce differs)", .{decoded.origin});
+                    std.log.info("[lsa] Ignoring stale high-seq LSA from {any} (nonce differs)", .{decoded.origin});
                     return;
                 } else {
                     existing.deinit(self.allocator);
@@ -838,7 +793,7 @@ pub const Mesh = struct {
                     const v_end = std.mem.indexOfScalar(u8, v_line, '\n') orelse v_line.len;
                     const remote_version = v_line[0..v_end];
                     if (!std.mem.eql(u8, remote_version, protocol.VERSION)) {
-                        std.log.info("[mesh] LSA version mismatch: remote={s} local={s} — signalling upgrade", .{ remote_version, protocol.VERSION });
+                        std.log.info("[lsa] LSA version mismatch: remote={s} local={s} — signalling upgrade", .{ remote_version, protocol.VERSION });
                         self.upgrade_needed.store(true, .release);
                     }
                 }
@@ -851,7 +806,7 @@ pub const Mesh = struct {
         // ── relay section: lock, iterate, send, unlock ──
         if (decoded.ttl > 2) {
             if (data.len > 1279) {
-                std.log.warn("[mesh] LSA relay dropped: data too large ({d} bytes)", .{data.len});
+                std.log.warn("[lsa] LSA relay dropped: data too large ({d} bytes)", .{data.len});
                 return;
             }
             var relay_buf: [1280]u8 = undefined;
@@ -895,7 +850,7 @@ pub const Mesh = struct {
             if (std.mem.eql(u8, &dst_mac, &self.node_id)) {
                 // Yes — respond with pong (direct reply to relay source)
                 var src_buf: [18]u8 = undefined;
-                std.log.info("[mesh] relayed ping reached target from {s}", .{formatNodeIdBuf(src_mac, &src_buf)});
+                std.log.info("[lsa] relayed ping reached target from {s}", .{formatNodeIdBuf(src_mac, &src_buf)});
                 var pong: [11]u8 = undefined;
                 pong[0] = protocol.MESH_TYPE_PONG;
                 @memcpy(pong[1..7], &self.node_id);
@@ -920,7 +875,7 @@ pub const Mesh = struct {
                         var src_buf: [18]u8 = undefined;
                         var dst_buf: [18]u8 = undefined;
                         var hop_buf: [18]u8 = undefined;
-                        std.log.info("[mesh] ping relay fwd: {s} → {s} via {s} ttl={d}", .{
+                        std.log.info("[lsa] ping relay fwd: {s} → {s} via {s} ttl={d}", .{
                             formatNodeIdBuf(src_mac, &src_buf),
                             formatNodeIdBuf(dst_mac, &dst_buf),
                             formatNodeIdBuf(next_hop, &hop_buf),
@@ -949,7 +904,7 @@ pub const Mesh = struct {
         const send_ts = std.mem.readInt(u32, data[6..10], .big);
         const rtt = self.nowMs() -% send_ts;
         var mac_buf: [18]u8 = undefined;
-        std.log.info("[mesh] pong from {s} rtt={d}ms", .{ formatNodeIdBuf(src_mac, &mac_buf), rtt });
+        std.log.info("[lsa] pong from {s} rtt={d}ms", .{ formatNodeIdBuf(src_mac, &mac_buf), rtt });
 
         // Store for --ping command (lock-free read: worst case is stale data)
         self.last_pong_mutex.lock(self.io) catch return;
@@ -993,7 +948,7 @@ pub const Mesh = struct {
     pub fn sendPing(self: *Mesh, dest_id: NodeId) void {
         const next_hop = self.routeTo(dest_id) orelse {
             var mac_buf: [18]u8 = undefined;
-            std.log.info("[mesh] ping: no route to {s}", .{formatNodeIdBuf(dest_id, &mac_buf)});
+            std.log.info("[lsa] ping: no route to {s}", .{formatNodeIdBuf(dest_id, &mac_buf)});
             return;
         };
 
@@ -1008,7 +963,7 @@ pub const Mesh = struct {
                 std.mem.writeInt(u32, ping[7..11], self.nowMs(), .big);
                 self.socket.send(self.io, &neighbor.addr, &ping) catch {};
                 var dst_buf: [18]u8 = undefined;
-                std.log.info("[mesh] ping direct: → {s} addr={any}", .{ formatNodeIdBuf(dest_id, &dst_buf), neighbor.addr });
+                std.log.info("[lsa] ping direct: → {s} addr={any}", .{ formatNodeIdBuf(dest_id, &dst_buf), neighbor.addr });
             }
             return;
         }
@@ -1027,7 +982,7 @@ pub const Mesh = struct {
             var src_buf: [18]u8 = undefined;
             var dst_buf: [18]u8 = undefined;
             var hop_buf: [18]u8 = undefined;
-            std.log.info("[mesh] ping relay: {s} → {s} via {s}", .{
+            std.log.info("[lsa] ping relay: {s} → {s} via {s}", .{
                 formatNodeIdBuf(self.node_id, &src_buf),
                 formatNodeIdBuf(dest_id, &dst_buf),
                 formatNodeIdBuf(next_hop, &hop_buf),
@@ -1271,8 +1226,199 @@ pub const NodeInfo = struct {
     }
 };
 
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// Tests
+// /etc/hosts marker block management (from hosts_file.zig)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Maintain a block wrapped by marker comments in the hosts file:
+//   # UTM-MONITOR-BEGIN
+//   192.168.64.5  macvm
+//   192.168.64.8  linuxvm
+//   # UTM-MONITOR-END
+//
+// Update logic: read file → replace marker block → write back (write to temp file then rename)
+
+/// A single hosts entry
+pub const HostEntry = struct {
+    ip: []const u8,
+    name: []const u8,
+};
+
+/// Update the marker block in the hosts file.
+/// Uses range-based replacement: finds marker boundaries in the original content
+/// and only replaces the block itself — everything outside is preserved byte-for-byte.
+/// This avoids the empty-line accumulation bug (Finding 169) caused by the old
+/// splitScalar + rebuild method, which added a spurious trailing newline on every
+/// write when the file ends with \n (as all well-formed text files do).
+///
+/// If the marker block does not exist, appends it to the end of the file.
+/// Uses temp file + atomic rename for safety.
+pub fn updateHosts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    entries: []const HostEntry,
+) !void {
+    // Read existing file content
+    const original = readFile(io, allocator, file_path) catch |err| switch (err) {
+        error.FileNotFound => {
+            return writeNewHosts(io, allocator, file_path, entries);
+        },
+        else => return err,
+    };
+    defer allocator.free(original);
+
+    const begin_line = protocol.HOSTS_MARKER_BEGIN;
+    const end_line = protocol.HOSTS_MARKER_END;
+
+    // Build new content via range replacement
+    var new_content: std.ArrayList(u8) = .empty;
+    defer new_content.deinit(allocator);
+    try new_content.ensureTotalCapacity(allocator, original.len + 512);
+
+    // Find marker block boundaries in the original content.
+    // We look for lines that match the begin/end markers (after trimming whitespace).
+    const begin_pos = findMarkerLine(original, begin_line);
+    const end_pos = if (begin_pos != null)
+        findMarkerLine(original[begin_pos.? + begin_line.len ..], end_line)
+    else
+        null;
+
+    if (begin_pos != null and end_pos != null) {
+        const block_start = begin_pos.?;
+        const block_end = block_start + begin_line.len + end_pos.? + end_line.len;
+
+        // Find end of the END-marker line (skip past trailing \r\n)
+        var actual_end = block_end;
+        while (actual_end < original.len and (original[actual_end] == '\r' or original[actual_end] == '\n')) {
+            actual_end += 1;
+        }
+
+        // Copy content before the marker block
+        try new_content.appendSlice(allocator, original[0..block_start]);
+
+        // Write new block
+        try new_content.appendSlice(allocator, begin_line);
+        try new_content.append(allocator, '\n');
+        for (entries) |entry| {
+            try new_content.print(allocator, "{s}  {s}\n", .{ entry.ip, entry.name });
+        }
+        try new_content.appendSlice(allocator, end_line);
+        try new_content.append(allocator, '\n');
+
+        // Copy content after the marker block
+        if (actual_end < original.len) {
+            try new_content.appendSlice(allocator, original[actual_end..]);
+        }
+    } else {
+        // No marker block exists — copy original and append new block
+        try new_content.appendSlice(allocator, original);
+
+        // Ensure trailing newline before appending block
+        if (new_content.items.len > 0 and new_content.items[new_content.items.len - 1] != '\n') {
+            try new_content.append(allocator, '\n');
+        }
+        try new_content.appendSlice(allocator, begin_line);
+        try new_content.append(allocator, '\n');
+        for (entries) |entry| {
+            try new_content.print(allocator, "{s}  {s}\n", .{ entry.ip, entry.name });
+        }
+        try new_content.appendSlice(allocator, end_line);
+        try new_content.append(allocator, '\n');
+    }
+
+    // Write to temp file
+    const tmp_path = try std.mem.concat(allocator, u8, &.{ file_path, ".tmp" });
+    defer allocator.free(tmp_path);
+
+    try writeFile(io, tmp_path, new_content.items);
+
+    // Atomic rename using the file's parent directory (not cwd, which may change).
+    // For absolute paths like /etc/hosts, this opens /etc as the dir handle.
+    const parent_dir_path = std.fs.path.dirname(file_path) orelse "/";
+    const parent_dir = try std.Io.Dir.cwd().openDir(io, parent_dir_path, .{});
+    defer parent_dir.close(io);
+    const file_basename = std.fs.path.basename(file_path);
+    try parent_dir.rename(tmp_path, parent_dir, file_basename, io);
+}
+
+/// Read entire file content
+fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+
+    const size = try file.length(io);
+    const buf = try allocator.alloc(u8, @intCast(size));
+    errdefer allocator.free(buf);
+
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    try reader.interface.readSliceAll(buf);
+    return buf;
+}
+
+/// Write entire file content
+fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = @enumFromInt(0o644) });
+    defer file.close(io);
+
+    var write_buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &write_buf);
+    try writer.interface.writeAll(content);
+    try writer.interface.flush();
+}
+
+/// Create a new hosts file (with marker block)
+fn writeNewHosts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    entries: []const HostEntry,
+) !void {
+    _ = allocator;
+    const file = try std.Io.Dir.cwd().createFile(io, file_path, .{ .permissions = @enumFromInt(0o644) });
+    defer file.close(io);
+
+    var write_buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &write_buf);
+
+    try writer.interface.print("{s}\n", .{protocol.HOSTS_MARKER_BEGIN});
+    for (entries) |entry| {
+        try writer.interface.print("{s}  {s}\n", .{ entry.ip, entry.name });
+    }
+    try writer.interface.print("{s}\n", .{protocol.HOSTS_MARKER_END});
+    try writer.interface.flush();
+}
+
+/// Find the byte offset of a marker line within content.
+/// The marker must appear at the start of a line (after optional leading whitespace).
+/// Returns the byte position of the FIRST character of the marker, or null if not found.
+fn findMarkerLine(content: []const u8, marker: []const u8) ?usize {
+    var pos: usize = 0;
+    while (pos < content.len) {
+        // Skip leading whitespace on this line
+        var line_start = pos;
+        while (line_start < content.len and (content[line_start] == ' ' or content[line_start] == '\t' or content[line_start] == '\r')) {
+            line_start += 1;
+        }
+        // Check if this line starts with the marker
+        if (line_start + marker.len <= content.len and std.mem.eql(u8, content[line_start..][0..marker.len], marker)) {
+            // Verify it's at the start of a line or preceded by \n
+            if (pos == 0 or content[pos - 1] == '\n') {
+                return line_start;
+            }
+        }
+        // Advance to next line
+        while (pos < content.len and content[pos] != '\n') : (pos += 1) {}
+        if (pos < content.len) pos += 1; // skip the \n
+    }
+    return null;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests — mesh (from mesh.zig)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test "parseNodeId" {
@@ -1327,4 +1473,169 @@ test "encodeLsa + decodeLsa round-trip" {
     try std.testing.expectEqual(@as(usize, 1), parsed.items.len);
     try std.testing.expect(std.mem.eql(u8, &parsed.items[0].mac, &neighbors[0].mac));
     try std.testing.expectEqual(@as(u8, 1), parsed.items[0].cost);
+}
+
+test "nonceChanged" {
+    const a = "hostname:test\nnonce:42";
+    const b = "hostname:test\nnonce:99";
+    const c = "hostname:test\nnonce:42";
+    const d = "hostname:test\n"; // no nonce
+    const e = ""; // no nonce
+
+    // Same nonce → false
+    try std.testing.expect(!nonceChanged(a, c));
+    // Different nonce → true
+    try std.testing.expect(nonceChanged(a, b));
+    // Same string (no nonce) → false
+    try std.testing.expect(!nonceChanged(a, a));
+    // Different strings, both no nonce → fallback to full comparison
+    try std.testing.expect(nonceChanged(d, e));
+    // One with nonce, one without → fallback to full comparison (different strings)
+    try std.testing.expect(nonceChanged(a, d));
+    // One with nonce, one without but same non-nonce content → fallback (different strings)
+    try std.testing.expect(nonceChanged(a, "hostname:test\n"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests — hosts file (from hosts_file.zig)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test "HostEntry struct basics" {
+    const e = HostEntry{ .ip = "10.0.0.1", .name = "testvm" };
+    try std.testing.expectEqualStrings("10.0.0.1", e.ip);
+    try std.testing.expectEqualStrings("testvm", e.name);
+}
+
+test "HostEntry with FQDN" {
+    const e = HostEntry{ .ip = "192.168.1.100", .name = "linuxvm.aarch64-linux-musl.utm" };
+    try std.testing.expectEqualStrings("192.168.1.100", e.ip);
+    try std.testing.expectEqualStrings("linuxvm.aarch64-linux-musl.utm", e.name);
+}
+
+test "HostEntry with IPv6 address" {
+    const e = HostEntry{ .ip = "fe80::1", .name = "ipv6host" };
+    try std.testing.expectEqualStrings("fe80::1", e.ip);
+    try std.testing.expectEqualStrings("ipv6host", e.name);
+}
+
+test "HostEntry with empty name" {
+    const e = HostEntry{ .ip = "1.2.3.4", .name = "" };
+    try std.testing.expectEqualStrings("1.2.3.4", e.ip);
+    try std.testing.expectEqualStrings("", e.name);
+}
+
+test "multiple entries with different IPs" {
+    const entries = [_]HostEntry{
+        .{ .ip = "10.0.0.1", .name = "vm1" },
+        .{ .ip = "10.0.0.2", .name = "vm2" },
+        .{ .ip = "10.0.0.3", .name = "vm3" },
+    };
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings("10.0.0.1", entries[0].ip);
+    try std.testing.expectEqualStrings("vm2", entries[1].name);
+    try std.testing.expectEqualStrings("10.0.0.3", entries[2].ip);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests — hosts file range replacement (Finding 169 fix)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test "findMarkerLine - basic" {
+    const content = "127.0.0.1 localhost\n# UTM-MONITOR-BEGIN\n1.2.3.4 vm\n# UTM-MONITOR-END\n";
+    const pos = findMarkerLine(content, "# UTM-MONITOR-BEGIN").?;
+    // "127.0.0.1 localhost\n" = 20 bytes, so '#' is at offset 20
+    try std.testing.expectEqual(@as(usize, 20), pos);
+}
+
+test "findMarkerLine - not found" {
+    const content = "127.0.0.1 localhost\nno markers here\n";
+    try std.testing.expectEqual(@as(?usize, null), findMarkerLine(content, "# UTM-MONITOR-BEGIN"));
+}
+
+test "findMarkerLine - with leading whitespace" {
+    const content = "127.0.0.1 localhost\n  # UTM-MONITOR-BEGIN\n1.2.3.4 vm\n# UTM-MONITOR-END\n";
+    const pos = findMarkerLine(content, "# UTM-MONITOR-BEGIN");
+    try std.testing.expect(pos != null);
+}
+
+test "findMarkerLine - end marker" {
+    const content = "127.0.0.1 localhost\n# UTM-MONITOR-BEGIN\n1.2.3.4 vm\n# UTM-MONITOR-END\n";
+    const begin = findMarkerLine(content, "# UTM-MONITOR-BEGIN").?;
+    const after = content[begin + "# UTM-MONITOR-BEGIN".len ..];
+    const end = findMarkerLine(after, "# UTM-MONITOR-END").?;
+    // end offset is the position within `after`
+    try std.testing.expect(end < after.len);
+}
+
+test "updateHosts range replacement - no empty line accumulation" {
+    // Simulate the range replacement logic: write a file with marker block,
+    // then "update" it twice and verify no trailing empty lines accumulate.
+
+    const allocator = std.testing.allocator;
+    const begin_line = "# UTM-MONITOR-BEGIN";
+    const end_line = "# UTM-MONITOR-END";
+
+    // Build a file that ends with newline (normal well-formed text file)
+    const original = "127.0.0.1 localhost\n\n# UTM-MONITOR-BEGIN\n192.168.64.5 macvm\n# UTM-MONITOR-END\n";
+    const entries = [_]HostEntry{
+        .{ .ip = "10.0.0.1", .name = "vm1" },
+        .{ .ip = "10.0.0.2", .name = "vm2" },
+    };
+
+    // Run the range-replacement logic 3 times, simulating repeated updateHosts calls
+    var content = try allocator.dupe(u8, original);
+
+    for (0..3) |_| {
+        const begin_pos = findMarkerLine(content, begin_line);
+        const end_pos = if (begin_pos != null)
+            findMarkerLine(content[begin_pos.? + begin_line.len ..], end_line)
+        else
+            null;
+
+        var new_content: std.ArrayList(u8) = .empty;
+        try new_content.ensureTotalCapacity(allocator, content.len + 128);
+
+        if (begin_pos != null and end_pos != null) {
+            const block_start = begin_pos.?;
+            const block_end = block_start + begin_line.len + end_pos.? + end_line.len;
+            var actual_end = block_end;
+            while (actual_end < content.len and (content[actual_end] == '\r' or content[actual_end] == '\n')) {
+                actual_end += 1;
+            }
+            try new_content.appendSlice(allocator, content[0..block_start]);
+            try new_content.appendSlice(allocator, begin_line);
+            try new_content.append(allocator, '\n');
+            for (entries) |entry| {
+                try new_content.print(allocator, "{s}  {s}\n", .{ entry.ip, entry.name });
+            }
+            try new_content.appendSlice(allocator, end_line);
+            try new_content.append(allocator, '\n');
+            if (actual_end < content.len) {
+                try new_content.appendSlice(allocator, content[actual_end..]);
+            }
+        }
+
+        // Replace old content with new
+        const new_slice = try new_content.toOwnedSlice(allocator);
+        allocator.free(content);
+        content = new_slice;
+    }
+
+    // After 3 iterations, verify:
+    // 1. No duplicate empty lines
+    // 2. The file doesn't grow unboundedly
+    // 3. Content before the block is preserved
+    try std.testing.expect(std.mem.startsWith(u8, content, "127.0.0.1 localhost\n\n"));
+    try std.testing.expect(std.mem.indexOf(u8, content, "# UTM-MONITOR-BEGIN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "10.0.0.1  vm1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "10.0.0.2  vm2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "# UTM-MONITOR-END") != null);
+
+    // The content should end with the END marker + newline — no extra trailing empty lines
+    try std.testing.expect(std.mem.endsWith(u8, content, "# UTM-MONITOR-END\n"));
+
+    // Verify no trailing empty lines after the end marker (no \n\n at end)
+    try std.testing.expect(!std.mem.endsWith(u8, content, "\n\n"));
+
+    allocator.free(content);
 }

@@ -135,9 +135,12 @@ pub fn build(b: *std.Build) void {
 
     // Tests — refac/layered-arch new modules (P0-P5) + TCP/SOCKS4
     const refac_modules = [_][]const u8{
-        "tcpf.zig",
-        "socks4.zig",
-        "netconn.zig",
+        "tcp.zig",
+        "lsa.zig",
+        "dpipe.zig",
+        "dpipe_shell.zig",
+        "dpipe_file.zig",
+        "guest.zig",
     };
     for (refac_modules) |mod_src| {
         const mod = b.createModule(.{

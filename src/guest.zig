@@ -1,16 +1,21 @@
-//! UDP broadcast module (Guest side)
-//! Broadcast local hostname + IP + target + MAC to LAN every second
+//! Guest 端模块 — 系统信息采集 + 命令处理 + LSA mesh 启动。
+//!
+//! Guest 在 TCP :2121 上侦听，通过 SOCKS4a 握手接受 Host 连接，
+//! 每条 TCP 连接处理一条命令（exec/upload/download），命令结束即关闭连接。
+//! 使用 dpipe 抽象层进行 Shell 管理和文件 I/O。
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
 const protocol = @import("protocol.zig");
-const tunproto = @import("tunproto.zig");
-const mesh_mod = @import("mesh.zig");
-const netconn = @import("netconn.zig");
+const lsa = @import("lsa.zig");
+const tcp = @import("tcp.zig");
 const svc = @import("svc.zig");
 const shm = @import("shm.zig");
+const dpipe = @import("dpipe.zig");
+const dpipe_shell = @import("dpipe_shell.zig");
+const dpipe_file = @import("dpipe_file.zig");
 
 /// Shared signal between udpDiscoveryListener (background thread) and
 /// wsAnnounceLoop (main thread). When the UDP listener detects a version
@@ -266,7 +271,7 @@ fn getMacAddress(io: std.Io, allocator: std.mem.Allocator, iface_name: []const u
         defer allocator.free(path);
 
         const content = readSysFs(io, allocator, path) catch |err| {
-            std.debug.print("[broadcast] Failed to read MAC ({s}): {}\n", .{ path, err });
+            std.debug.print("[guest] Failed to read MAC ({s}): {}\n", .{ path, err });
             return allocator.dupe(u8, "00:00:00:00:00:00");
         };
         return content;
@@ -331,7 +336,7 @@ fn detectUnixIp(allocator: std.mem.Allocator) !?struct { ip: []const u8, iface_n
 
         const ip = try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
         const iface_name = try allocator.dupe(u8, name);
-        std.debug.print("[broadcast] Physical NIC {s}: {s}\n", .{ name, ip });
+        std.debug.print("[guest] Physical NIC {s}: {s}\n", .{ name, ip });
         return .{ .ip = ip, .iface_name = iface_name };
     }
     return null;
@@ -366,7 +371,7 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
 
     while (attempt < MAX_IP_RETRIES) : (attempt += 1) {
         if (attempt > 0) {
-            std.debug.print("[broadcast] IP not ready (attempt {}/{}), waiting {d}ms...\n", .{ attempt + 1, MAX_IP_RETRIES, IP_RETRY_DELAY_MS });
+            std.debug.print("[guest] IP not ready (attempt {}/{}), waiting {d}ms...\n", .{ attempt + 1, MAX_IP_RETRIES, IP_RETRY_DELAY_MS });
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(IP_RETRY_DELAY_MS), .awake) catch {};
         }
 
@@ -503,7 +508,7 @@ fn getGatewayMacOS(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
 
 fn getGatewayLinux(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     const content = readSysFs(io, allocator, "/proc/net/route") catch |err| {
-        std.debug.print("[broadcast] Failed to read /proc/net/route: {}\n", .{err});
+        std.debug.print("[guest] Failed to read /proc/net/route: {}\n", .{err});
         return error.GatewayNotFound;
     };
     defer allocator.free(content);
@@ -574,543 +579,6 @@ fn getGatewayWindows(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     return error.GatewayNotFound;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// v0.11.0: pty session model — persistent pty per connection
-// ═══════════════════════════════════════════════════════════════════════════
-
-// POSIX pty externs (available on macOS and Linux via libc)
-extern "c" fn posix_openpt(flags: u32) std.posix.fd_t;
-extern "c" fn grantpt(fd: std.posix.fd_t) c_int;
-extern "c" fn unlockpt(fd: std.posix.fd_t) c_int;
-extern "c" fn ptsname(fd: std.posix.fd_t) ?[*:0]u8;
-extern "c" fn fork() std.posix.pid_t;
-extern "c" fn setsid() std.posix.pid_t;
-extern "c" fn execve(path: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
-extern "c" fn open(path: [*:0]const u8, flags: u32, mode: u32) std.posix.fd_t;
-extern "c" fn dup2(old: std.posix.fd_t, new: std.posix.fd_t) std.posix.fd_t;
-extern "c" fn close(fd: std.posix.fd_t) c_int;
-extern "c" fn kill(pid: std.posix.pid_t, sig: c_int) c_int;
-extern "c" fn write(fd: std.posix.fd_t, buf: [*]const u8, count: usize) isize;
-extern "c" fn read(fd: std.posix.fd_t, buf: [*]u8, count: usize) isize;
-
-const O_RDWR: u32 = 2;
-const SIGINT: c_int = 2;
-const SIGTERM: c_int = 15;
-const SIGKILL: c_int = 9;
-
-/// Pty session state: master fd + child pid + shell description.
-/// On Windows, stdin_fd holds the write end of the stdin pipe.
-const PtySession = struct {
-    master_fd: std.posix.fd_t, // pty master (POSIX) or stdout_read pipe (Windows)
-    child_pid: std.posix.pid_t, // child process id/handle
-    shell: []const u8, // "bash --login" or "cmd.exe /k"
-    stdin_fd: std.posix.fd_t, // Windows: stdin_write pipe handle (unused on POSIX)
-};
-
-/// Write data to the pty/stdin. Cross-platform wrapper.
-/// Returns error.WriteFailed if the write fails (OS error or short write on Windows).
-fn ptyWrite(session: *const PtySession, data: []const u8) error{ WriteFailed, Interrupted }!void {
-    if (builtin.os.tag == .windows) {
-        const WriteFile = @extern(
-            *const fn (std.os.windows.HANDLE, [*]const u8, std.os.windows.DWORD, *std.os.windows.DWORD, ?*anyopaque) callconv(.winapi) std.os.windows.BOOL,
-            .{ .name = "WriteFile", .library_name = "kernel32" },
-        );
-        var written: std.os.windows.DWORD = 0;
-        if (@intFromEnum(WriteFile(session.stdin_fd, data.ptr, @intCast(data.len), &written, null)) == 0) {
-            return error.WriteFailed;
-        }
-        if (written < data.len) {
-            return error.WriteFailed;
-        }
-    } else {
-        var offset: usize = 0;
-        while (offset < data.len) {
-            const n = write(session.master_fd, data.ptr + offset, data.len - offset);
-            if (n < 0) return error.WriteFailed;
-            if (n == 0) return error.WriteFailed; // unexpected EOF on pty write
-            offset += @intCast(n);
-        }
-    }
-}
-
-/// Read from the pty/stdout. Cross-platform wrapper. Returns bytes read or error.
-fn ptyRead(master_fd: std.posix.fd_t, buf: []u8) !usize {
-    if (builtin.os.tag == .windows) {
-        const ReadFile = @extern(
-            *const fn (std.os.windows.HANDLE, [*]u8, std.os.windows.DWORD, *std.os.windows.DWORD, ?*anyopaque) callconv(.winapi) std.os.windows.BOOL,
-            .{ .name = "ReadFile", .library_name = "kernel32" },
-        );
-        var nread: std.os.windows.DWORD = 0;
-        if (@intFromEnum(ReadFile(master_fd, buf.ptr, @intCast(buf.len), &nread, null)) == 0) {
-            return error.ReadFailed;
-        }
-        return @intCast(nread);
-    } else {
-        const n = read(master_fd, buf.ptr, buf.len);
-        if (n < 0) return error.ReadFailed;
-        return @intCast(n);
-    }
-}
-
-/// Spawn a persistent pty with shell --login.
-/// POSIX: posix_openpt → fork → setsid → dup2 → exec bash/zsh --login
-/// Windows: CreatePipe + persistent cmd.exe /k (ConPTY fallback not yet implemented)
-fn ptySpawn(allocator: std.mem.Allocator, shell: []const u8) !PtySession {
-    if (builtin.os.tag == .windows) {
-        return ptySpawnWindows(allocator);
-    }
-
-    // POSIX: open /dev/ptmx via posix_openpt
-    const master = posix_openpt(O_RDWR);
-    if (master < 0) {
-        std.log.err("[guest-pty] posix_openpt failed", .{});
-        return error.PtyOpenFailed;
-    }
-    errdefer _ = close(master);
-
-    if (grantpt(master) != 0) {
-        std.log.err("[guest-pty] grantpt failed", .{});
-        return error.PtyGrantFailed;
-    }
-    if (unlockpt(master) != 0) {
-        std.log.err("[guest-pty] unlockpt failed", .{});
-        return error.PtyUnlockFailed;
-    }
-
-    const slave_name = ptsname(master) orelse {
-        std.log.err("[guest-pty] ptsname returned null", .{});
-        return error.PtyPtsnameFailed;
-    };
-
-    const pid = fork();
-    if (pid < 0) {
-        std.log.err("[guest-pty] fork failed", .{});
-        return error.PtyForkFailed;
-    }
-
-    if (pid == 0) {
-        // Child: setup controlling terminal and exec shell
-        _ = setsid();
-
-        const slave = open(slave_name, O_RDWR, 0);
-        if (slave < 0) @panic("pty: open slave failed");
-
-        // On macOS, TIOCSCTTY must be called before dup2
-        const TIOCSCTTY: usize = if (builtin.os.tag == .macos) 0x20007461 else 0x540E;
-        _ = std.c.ioctl(slave, TIOCSCTTY, @as(usize, 0));
-
-        _ = dup2(slave, 0);
-        _ = dup2(slave, 1);
-        _ = dup2(slave, 2);
-        _ = close(slave);
-        _ = close(master);
-
-        // Disable pty echo on slave (fd 0) before exec.
-        // The host-side scanForMarker handles echoed text (lastIndexOf +
-        // validation), but disabling ECHO here gives cleaner output.
-        if (std.posix.tcgetattr(0)) |t| {
-            var t2 = t;
-            t2.lflag.ECHO = false;
-            std.posix.tcsetattr(0, .NOW, t2) catch {};
-        } else |_| {}
-
-        // Detect shell: use user's $SHELL or fallback to /bin/sh
-        const shell_path: [:0]const u8 = if (std.c.getenv("SHELL")) |sh| blk: {
-            const s = std.mem.sliceTo(sh, 0);
-            if (s.len > 0) break :blk @as([:0]const u8, @ptrCast(s[0..s.len :0]));
-            break :blk "/bin/sh";
-        } else "/bin/sh";
-
-        const argv = [_:null]?[*:0]const u8{ shell_path.ptr, @as(?[*:0]const u8, @ptrFromInt(@intFromPtr("-l"))), null };
-        _ = std.c.execve(shell_path.ptr, &argv, std.c.environ);
-        @panic("pty: execve failed");
-    }
-
-    // Parent: disable pty echo so commands sent via pty_input are not
-    // echoed back. Prevents MDELIM marker from matching echoed command text.
-    // On Linux the master fd supports tcsetattr. On macOS/BSD the master
-    // does not — the host-side scanForMarker handles echoed text via
-    // lastIndexOf + validation (see state.zig).
-    if (std.posix.tcgetattr(master)) |t| {
-        var t2 = t;
-        t2.lflag.ECHO = false;
-        std.posix.tcsetattr(master, .NOW, t2) catch {};
-    } else |_| {}
-
-    // Parent: close slave, return session
-    std.log.info("[guest-pty] pty spawned: master={d} shell={s} pid={d}", .{ master, shell, pid });
-    return PtySession{
-        .master_fd = master,
-        .child_pid = pid,
-        .shell = try allocator.dupe(u8, shell),
-        .stdin_fd = 0,
-    };
-}
-
-/// Windows pty: CreatePipe + persistent cmd.exe /k.
-fn ptySpawnWindows(allocator: std.mem.Allocator) !PtySession {
-    const w = std.os.windows;
-    const BOOL = w.BOOL;
-    const HANDLE = w.HANDLE;
-    const DWORD = w.DWORD;
-    const LPVOID = w.LPVOID;
-    const PROCESS_INFORMATION = extern struct {
-        hProcess: HANDLE,
-        hThread: HANDLE,
-        dwProcessId: DWORD,
-        dwThreadId: DWORD,
-    };
-
-    const CreatePipe = @extern(
-        *const fn (phReadPipe: *HANDLE, phWritePipe: *HANDLE, lpPipeAttributes: ?*w.SECURITY_ATTRIBUTES, nSize: DWORD) callconv(.winapi) BOOL,
-        .{ .name = "CreatePipe", .library_name = "kernel32" },
-    );
-    const SetHandleInformation = @extern(
-        *const fn (hObject: HANDLE, dwMask: DWORD, dwFlags: DWORD) callconv(.winapi) BOOL,
-        .{ .name = "SetHandleInformation", .library_name = "kernel32" },
-    );
-    const CloseHandle = @extern(
-        *const fn (hObject: HANDLE) callconv(.winapi) BOOL,
-        .{ .name = "CloseHandle", .library_name = "kernel32" },
-    );
-    const CreateProcessW = @extern(
-        *const fn (lpApplicationName: ?[*:0]const u16, lpCommandLine: [*:0]u16, lpProcessAttributes: ?*w.SECURITY_ATTRIBUTES, lpThreadAttributes: ?*w.SECURITY_ATTRIBUTES, bInheritHandles: BOOL, dwCreationFlags: DWORD, lpEnvironment: ?LPVOID, lpCurrentDirectory: ?[*:0]const u16, lpStartupInfo: *w.STARTUPINFOW, lpProcessInformation: *PROCESS_INFORMATION) callconv(.winapi) BOOL,
-        .{ .name = "CreateProcessW", .library_name = "kernel32" },
-    );
-    const SetConsoleOutputCP = @extern(
-        *const fn (wCodePageID: w.UINT) callconv(.winapi) w.BOOL,
-        .{ .name = "SetConsoleOutputCP", .library_name = "kernel32" },
-    );
-    const SetConsoleCP_ext = @extern(
-        *const fn (wCodePageID: w.UINT) callconv(.winapi) w.BOOL,
-        .{ .name = "SetConsoleCP", .library_name = "kernel32" },
-    );
-
-    const HANDLE_FLAG_INHERIT: DWORD = 1;
-
-    var sa: w.SECURITY_ATTRIBUTES = .{
-        .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
-        .bInheritHandle = @enumFromInt(1),
-        .lpSecurityDescriptor = null,
-    };
-
-    var stdin_read: HANDLE = undefined;
-    var stdin_write: HANDLE = undefined;
-    if (@intFromEnum(CreatePipe(&stdin_read, &stdin_write, &sa, 0)) == 0) {
-        return error.PipeCreateFailed;
-    }
-    errdefer { _ = CloseHandle(stdin_read); _ = CloseHandle(stdin_write); }
-
-    // Don't inherit the write end of stdin pipe
-    _ = SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
-
-    var stdout_read: HANDLE = undefined;
-    var stdout_write: HANDLE = undefined;
-    if (@intFromEnum(CreatePipe(&stdout_read, &stdout_write, &sa, 0)) == 0) {
-        return error.PipeCreateFailed;
-    }
-    errdefer { _ = CloseHandle(stdout_read); _ = CloseHandle(stdout_write); }
-
-    _ = SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
-
-    var si: w.STARTUPINFOW = std.mem.zeroes(w.STARTUPINFOW);
-    si.cb = @sizeOf(w.STARTUPINFOW);
-    si.hStdInput = stdin_read;
-    si.hStdOutput = stdout_write;
-    si.hStdError = stdout_write;
-    si.dwFlags |= w.STARTF_USESTDHANDLES;
-
-    var pi: PROCESS_INFORMATION = undefined;
-
-    // Best-effort: set UTF-8 code page on our console BEFORE spawning cmd.exe.
-    // If utmm runs as a service (no console), these calls fail silently and
-    // we rely on the "chcp 65001" in the cmd command line below instead.
-    _ = SetConsoleOutputCP(65001);
-    _ = SetConsoleCP_ext(65001);
-
-    // Convert UTF-8 command line to null-terminated UTF-16LE for CreateProcessW.
-    // std.unicode.utf8ToUtf16LeWithNull was removed in Zig 0.16.0.
-    const cmd_u8 = "cmd.exe /k chcp 65001 >nul & set LANG=en_US.UTF-8";
-    const cmd_utf16 = try allocator.alloc(u16, cmd_u8.len + 1); // +1 for null
-    defer allocator.free(cmd_utf16);
-    const end_idx = try std.unicode.utf8ToUtf16Le(cmd_utf16, cmd_u8);
-    cmd_utf16[end_idx] = 0; // null terminate
-
-    if (@intFromEnum(CreateProcessW(null, @as([*:0]u16, @ptrCast(cmd_utf16.ptr)), null, null, @enumFromInt(1), 0, null, null, &si, &pi)) == 0) {
-        return error.ProcessCreateFailed;
-    }
-
-    _ = CloseHandle(pi.hThread);
-    _ = CloseHandle(stdin_read);
-    _ = CloseHandle(stdout_write);
-
-    std.log.info("[guest-pty] Windows pipe pty: cmd.exe /k (UTF-8) pid={d}", .{pi.dwProcessId});
-
-    return PtySession{
-        .master_fd = stdout_read,
-        .child_pid = pi.hProcess,
-        .shell = try allocator.dupe(u8, "cmd.exe /k chcp 65001 >nul & set LANG=en_US.UTF-8"),
-        .stdin_fd = stdin_write,
-    };
-}
-/// Cross-platform child process termination (for pty cleanup).
-fn killChild(pid: std.posix.pid_t) void {
-    switch (builtin.os.tag) {
-        .windows => {
-            const TerminateProcess = @extern(
-                *const fn (std.os.windows.HANDLE, std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL,
-                .{ .name = "TerminateProcess", .library_name = "kernel32" },
-            );
-            _ = TerminateProcess(pid, 1);
-        },
-        .linux, .macos => {
-            _ = kill(pid, SIGKILL);
-            // Reap child to prevent zombie processes.
-            // After SIGKILL the child should exit immediately, so blocking waitpid is fine.
-            _ = std.posix.system.waitpid(pid, null, 0);
-        },
-        else => @compileError("unsupported OS for killChild"),
-    }
-}
-
-/// Close a pty master fd. On Windows the fd is a pipe HANDLE from
-/// CreatePipe — POSIX close() does nothing on it, so we must call
-/// CloseHandle directly.
-fn closePtyFd(fd: std.posix.fd_t) void {
-    if (builtin.os.tag == .windows) {
-        const CloseHandle = @extern(
-            *const fn (std.os.windows.HANDLE) callconv(.winapi) std.os.windows.BOOL,
-            .{ .name = "CloseHandle", .library_name = "kernel32" },
-        );
-        _ = CloseHandle(@ptrCast(fd));
-    } else {
-        _ = close(fd);
-    }
-}
-/// Convert 32-byte SHA256 hash to hex string. Caller owns returned string.
-pub fn hexHash(allocator: std.mem.Allocator, hash: *const [32]u8) ![]const u8 {
-    var hex: [64]u8 = undefined;
-    for (hash, 0..) |b, j| {
-        hex[j * 2] = "0123456789abcdef"[b >> 4];
-        hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
-    }
-    return try allocator.dupe(u8, &hex);
-}
-
-/// Receive a chunked file transfer (upload): create temp file, receive
-/// file_chunk messages and write incrementally, verify SHA256 on file_eof,
-/// rename temp → final, send upload_result.
-fn receiveChunkedFile(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    conn: *netconn.Connection,
-    cmd_id: []const u8,
-    dest_path: []const u8,
-    expected_hash: []const u8,
-) !void {
-    // Create temp file in the same directory as destination.
-    // Use random hex suffix to prevent TOCTOU symlink attacks.
-    const dirname = std.fs.path.dirname(dest_path) orelse ".";
-    var rand_bytes: [8]u8 = undefined;
-    io.random(&rand_bytes);
-    var temp_hex: [16]u8 = undefined;
-    for (rand_bytes, 0..) |b, j| {
-        temp_hex[j * 2] = "0123456789abcdef"[b >> 4];
-        temp_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
-    }
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}/.utmm-{s}", .{ dirname, &temp_hex });
-    defer allocator.free(temp_path);
-
-    std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
-    const temp_file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
-    defer temp_file.close(io);
-    var wb: [65536]u8 = undefined;
-    var writer = temp_file.writer(io, &wb);
-
-    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
-    var received: u32 = 0;
-
-    // Inner loop: receive file_chunk + file_eof
-    var rbuf: [262144]u8 = undefined;
-    while (true) {
-        if (!conn.isAlive()) {
-            return error.TunnelDeadDuringUpload;
-        }
-
-        const n = conn.recv(&rbuf) catch |err| {
-            std.log.err("[guest-mesh] Chunk recv error: {}", .{err});
-            return err;
-        };
-        if (n == 0) {
-            // Yield to give the TCP stack time to deliver more data.
-            // Without this yield the tight recv loop starves the connection
-            // from receiving new data. Large file transfers (>~1MB)
-            // fail with timeout without this yield.
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
-            continue;
-        }
-
-        const msg_type: u8 = rbuf[0];
-        const payload = rbuf[1..n];
-
-        switch (msg_type) {
-            @intFromEnum(tunproto.MsgType.file_chunk) => {
-                const chunk = tunproto.parseFileChunk(payload) orelse {
-                    std.log.err("[guest-mesh] Failed to parse file_chunk", .{});
-                    return error.ParseFailed;
-                };
-                if (!std.mem.eql(u8, chunk.cmd_id, cmd_id)) {
-                    std.log.debug("[guest-mesh] Ignoring file_chunk for other cmd_id: {s}", .{chunk.cmd_id});
-                    continue;
-                }
-
-                _ = writer.interface.write(chunk.data) catch |e| {
-                    std.log.err("[guest-mesh] Write chunk failed: {}", .{e});
-                    return error.WriteFailed;
-                };
-                sha256.update(chunk.data);
-                received += @intCast(chunk.data.len);
-            },
-            @intFromEnum(tunproto.MsgType.file_eof) => {
-                const eof = tunproto.parseFileEof(payload) orelse {
-                    std.log.err("[guest-mesh] Failed to parse file_eof", .{});
-                    return error.ParseFailed;
-                };
-                if (!std.mem.eql(u8, eof.cmd_id, cmd_id)) {
-                    std.log.debug("[guest-mesh] Ignoring file_eof for other cmd_id: {s}", .{eof.cmd_id});
-                    continue;
-                }
-
-                writer.interface.flush() catch |err| {
-                    std.log.err("[guest-mesh] flush temp file failed: {}", .{err});
-                    return error.WriteFailed;
-                };
-
-                // Verify SHA256 (incremental: sha256.update per chunk, final here)
-                var hash: [32]u8 = undefined;
-                sha256.final(&hash);
-                const actual_hex = try hexHash(allocator, &hash);
-                defer allocator.free(actual_hex);
-
-                if (expected_hash.len > 0 and !std.mem.eql(u8, actual_hex, expected_hash)) {
-                    std.log.err("[guest-mesh] Upload hash mismatch: got {s}, expected {s}", .{ actual_hex, expected_hash });
-                    const resp = try tunproto.buildUploadResult(allocator, cmd_id, -1);
-                    defer allocator.free(resp);
-                    _ = conn.sendAndFlush(resp, 0) catch {};
-                    return error.HashMismatch;
-                }
-
-                std.log.debug("[guest-mesh] Upload hash verified: {s}", .{actual_hex});
-
-                // Atomic rename from temp to final path
-                try std.Io.Dir.cwd().rename(temp_path, std.Io.Dir.cwd(), dest_path, io);
-                std.log.info("[guest-mesh] Upload complete: {s} ({d} bytes)", .{ dest_path, received });
-
-                const resp = try tunproto.buildUploadResult(allocator, cmd_id, 0);
-                defer allocator.free(resp);
-                _ = conn.sendAndFlush(resp, 0) catch |e| {
-                    std.log.err("[guest-mesh] upload_result send failed: {}", .{e});
-                };
-                return;
-            },
-            @intFromEnum(tunproto.MsgType.pty_exec_input) => {
-                // pty commands may arrive during file transfer — ignore them;
-                // the Host should serialize file transfers and exec commands.
-                std.log.debug("[guest-mesh] Ignoring pty_exec_input during chunked receive", .{});
-                continue;
-            },
-            else => {
-                std.log.debug("[guest-mesh] Ignoring msg type {d} during chunked receive", .{msg_type});
-                continue;
-            },
-        }
-    }
-}
-
-
-/// Send a file as chunked transfer (download): open file, read MSS-aligned chunks,
-/// send as file_chunk messages with incremental SHA256, finish with file_eof.
-fn sendChunkedFile(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    conn: *netconn.Connection,
-    cmd_id: []const u8,
-    path: []const u8,
-) !void {
-    // Chunk size: tunproto.FILE_CHUNK_DATA_MAX = 1200 bytes.
-    // Each file_chunk maps to one tcpf frame, sent via sendAndFlush().
-    //
-    // Why 1200 bytes per chunk (not larger):
-    //   - Low latency: ACK/interactive traffic can interleave between chunks.
-    //   - Simpler protocol: each tcpf frame = one application chunk.
-    //   - No fragmentation: app chunks don't get re-split by TCP.
-    //
-    // Trade-off vs larger chunks: more sendAndFlush() calls per file.
-    // This is acceptable because files are typically < 100MB in practice.
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
-        std.log.err("[guest-mesh] Download open failed: {}", .{err});
-        if (tunproto.buildFileEof(allocator, cmd_id, -1, 0, "")) |eof| {
-            defer allocator.free(eof);
-            _ = conn.sendAndFlush(eof, 0) catch {};
-        } else |build_err| {
-            std.log.err("[guest-mesh] buildFileEof failed for open error: {}", .{build_err});
-        }
-        return;
-    };
-    defer file.close(io);
-
-    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
-    var total: u32 = 0;
-    var chunk_buf: [tunproto.FILE_CHUNK_DATA_MAX]u8 = undefined;
-    var file_read_buf: [4096]u8 = undefined;  // disk read buffer, larger than chunk for efficiency
-    var file_reader = file.reader(io, &file_read_buf);
-
-    var chunk_count: u32 = 0;
-    while (true) {
-        const n = file_reader.interface.readSliceShort(&chunk_buf) catch |err2| {
-            std.log.err("[guest-mesh] Download read error: {}", .{err2});
-            if (tunproto.buildFileEof(allocator, cmd_id, -1, 0, "")) |eof| {
-                defer allocator.free(eof);
-                _ = conn.sendAndFlush(eof, 0) catch {};
-            } else |build_err| {
-                std.log.err("[guest-mesh] buildFileEof failed for read error: {}", .{build_err});
-            }
-            return err2;
-        };
-        if (n == 0) break; // EOF
-
-        sha256.update(chunk_buf[0..n]);
-
-        const chunk = try tunproto.buildFileChunk(allocator, cmd_id, chunk_buf[0..n]);
-        defer allocator.free(chunk);
-        _ = conn.sendAndFlush(chunk, 0) catch |e| {
-            std.log.err("[guest-mesh] file_chunk send failed: {}", .{e});
-            return e;
-        };
-        total += @intCast(n);
-        chunk_count += 1;
-
-        // Yield every 32 chunks to let the TCP stack process incoming ACKs.
-        // Without this yield, the tight send loop can starve the connection.
-        if (chunk_count % 32 == 0) {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
-        }
-    }
-
-    // Build hash and send file_eof
-    var hash: [32]u8 = undefined;
-    sha256.final(&hash);
-    const hex = try hexHash(allocator, &hash);
-    defer allocator.free(hex);
-
-    std.log.info("[guest-mesh] Download complete: {s} ({d} bytes, sha256={s})", .{ path, total, hex });
-
-    const eof = try tunproto.buildFileEof(allocator, cmd_id, 0, total, hex);
-    defer allocator.free(eof);
-    _ = conn.sendAndFlush(eof, 0) catch |e| {
-        std.log.err("[guest-mesh] file_eof send failed: {}", .{e});
-    };
-}
 
 test "detectShell - returns valid string" {
     const shell = try detectShell(std.testing.allocator);
@@ -1192,23 +660,23 @@ pub fn guestTcpLoop(
     shutdown: ?*std.atomic.Value(bool),
 ) !void {
     // ── LSA/UDP 发现线程 ──
-    var mesh_opt: ?mesh_mod.Mesh = null;
+    var mesh_opt: ?lsa.Mesh = null;
     var mesh_thread: ?std.Thread = null;
     var mesh_socket_opt: ?std.Io.net.Socket = null;
 
     start_mesh: {
         var broadcast_addrs = getSubnetBroadcasts(allocator) catch |err| {
-            std.log.err("[guest-tcp] getSubnetBroadcasts failed: {}", .{err});
+            std.log.err("[guest] getSubnetBroadcasts failed: {}", .{err});
             break :start_mesh;
         };
 
         if (peer_mesh) |pm| {
             if (protocol.parsePeerMeshAddr(pm)) |peer_addr| {
                 broadcast_addrs.append(allocator, peer_addr) catch |err| {
-                    std.log.err("[guest-tcp] append peer-mesh failed: {}", .{err});
+                    std.log.err("[guest] append peer-mesh failed: {}", .{err});
                 };
             } else {
-                std.log.err("[guest-tcp] invalid --peer-mesh '{s}'", .{pm});
+                std.log.err("[guest] invalid --peer-mesh '{s}'", .{pm});
             }
         }
 
@@ -1216,27 +684,27 @@ pub fn guestTcpLoop(
         const mesh_io = mesh_threaded.io();
 
         const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", mesh_port) catch |err| {
-            std.log.err("[guest-tcp] Mesh bind addr parse: {}", .{err});
+            std.log.err("[guest] Mesh bind addr parse: {}", .{err});
             broadcast_addrs.deinit(allocator);
             break :start_mesh;
         };
         const mesh_socket = bind_addr.bind(mesh_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
-            std.log.err("[guest-tcp] Mesh UDP bind :{d}: {}", .{ mesh_port, err });
+            std.log.err("[guest] Mesh UDP bind :{d}: {}", .{ mesh_port, err });
             broadcast_addrs.deinit(allocator);
             break :start_mesh;
         };
         mesh_socket_opt = mesh_socket;
 
         const node_id = if (peer_mesh != null)
-            mesh_mod.deriveNodeId(info.mac, info.hostname) catch |err| {
-                std.log.err("[guest-tcp] deriveNodeId: {}", .{err});
+            lsa.deriveNodeId(info.mac, info.hostname) catch |err| {
+                std.log.err("[guest] deriveNodeId: {}", .{err});
                 mesh_socket.close(mesh_io);
                 broadcast_addrs.deinit(allocator);
                 break :start_mesh;
             }
         else
-            mesh_mod.parseNodeId(info.mac) catch |err| {
-                std.log.err("[guest-tcp] parseNodeId: {}", .{err});
+            lsa.parseNodeId(info.mac) catch |err| {
+                std.log.err("[guest] parseNodeId: {}", .{err});
                 mesh_socket.close(mesh_io);
                 broadcast_addrs.deinit(allocator);
                 break :start_mesh;
@@ -1246,29 +714,29 @@ pub fn guestTcpLoop(
             "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:serving",
             .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
         ) catch |err| {
-            std.log.err("[guest-tcp] node_info alloc: {}", .{err});
+            std.log.err("[guest] node_info alloc: {}", .{err});
             mesh_socket.close(mesh_io);
             broadcast_addrs.deinit(allocator);
             break :start_mesh;
         };
 
-        mesh_opt = mesh_mod.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs, getSubnetBroadcasts, null, null, null) catch |err| {
-            std.log.err("[guest-tcp] Mesh init: {}", .{err});
+        mesh_opt = lsa.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs, getSubnetBroadcasts) catch |err| {
+            std.log.err("[guest] Mesh init: {}", .{err});
             allocator.free(node_info);
             mesh_socket.close(mesh_io);
             broadcast_addrs.deinit(allocator);
             break :start_mesh;
         };
 
-        mesh_thread = std.Thread.spawn(.{}, mesh_mod.Mesh.run, .{&mesh_opt.?}) catch |err| {
-            std.log.err("[guest-tcp] Mesh thread spawn: {}", .{err});
+        mesh_thread = std.Thread.spawn(.{}, lsa.Mesh.run, .{&mesh_opt.?}) catch |err| {
+            std.log.err("[guest] Mesh thread spawn: {}", .{err});
             mesh_opt.?.deinit();
             mesh_socket.close(mesh_io);
             mesh_opt = null;
             break :start_mesh;
         };
 
-        std.log.info("[guest-tcp] LSA mesh started on UDP :{d}", .{mesh_port});
+        std.log.info("[guest] LSA mesh started on UDP :{d}", .{mesh_port});
     }
 
     defer {
@@ -1284,30 +752,30 @@ pub fn guestTcpLoop(
     }
 
     if (mesh_opt == null) {
-        std.log.err("[guest-tcp] Mesh failed to start", .{});
+        std.log.err("[guest] Mesh failed to start", .{});
         return error.MeshInitFailed;
     }
 
     // ── TCP accept 循环 ──
-    var listener = netconn.TcpListener.init(io, mesh_port) catch |err| {
-        std.log.err("[guest-tcp] TCP listen :{d} failed: {}", .{ mesh_port, err });
+    var listener = tcp.TcpListener.init(io, mesh_port) catch |err| {
+        std.log.err("[guest] TCP listen :{d} failed: {}", .{ mesh_port, err });
         return error.TcpBindFailed;
     };
     defer listener.deinit();
 
-    std.log.info("[guest-tcp] TCP server listening on :{d}", .{mesh_port});
+    std.log.info("[guest] TCP server listening on :{d}", .{mesh_port});
 
     while (true) {
         if (shutdown) |s| {
             if (s.load(.acquire)) {
-                std.log.info("[guest-tcp] Shutdown requested", .{});
+                std.log.info("[guest] Shutdown requested", .{});
                 break;
             }
         }
 
         // 检查升级信号
         if (upgrade.needed.load(.acquire)) {
-            std.log.info("[guest-tcp] upgrade signal detected", .{});
+            std.log.info("[guest] upgrade signal detected", .{});
             upgrade.needed.store(false, .release);
             // TODO: TCP 版本自动升级
         }
@@ -1315,136 +783,107 @@ pub fn guestTcpLoop(
         // Accept SOCKS4 连接
         var conn = listener.accept(info.hostname) catch |err| {
             if (err == error.WouldBlock) continue;
-            std.log.err("[guest-tcp] accept failed: {}", .{err});
+            std.log.err("[guest] accept failed: {}", .{err});
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
             continue;
         };
 
         // 处理单条命令
         handleOneCommand(io, allocator, info, &conn, shutdown) catch |err| {
-            std.log.err("[guest-tcp] handleOneCommand: {}", .{err});
+            std.log.err("[guest] handleOneCommand: {}", .{err});
         };
         conn.deinit();
     }
 }
 
 /// 处理一条命令（单个 TCP 连接）。
+/// 每条连接处理一条命令，命令结束即关闭。
 fn handleOneCommand(
     io: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
-    conn: *netconn.Connection,
+    conn: *tcp.Connection,
     shutdown: ?*std.atomic.Value(bool),
 ) !void {
     var rbuf: [262144]u8 = undefined;
 
-    while (true) {
-        if (shutdown) |s| {
-            if (s.load(.acquire)) return;
-        }
-        if (!conn.isAlive()) return;
+    if (shutdown) |s| {
+        if (s.load(.acquire)) return;
+    }
+    if (!conn.isAlive()) return;
 
-        const n = conn.recv(&rbuf) catch |err| {
-            std.log.err("[guest-tcp] recv error: {}", .{err});
-            return;
-        };
-        if (n == 0) {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
-            continue;
-        }
+    const n = conn.recv(&rbuf) catch |err| {
+        std.log.err("[guest] recv error: {}", .{err});
+        return;
+    };
+    if (n == 0) return;
 
-        const msg_type: u8 = rbuf[0];
-        const payload = rbuf[1..n];
+    const msg_type: u8 = rbuf[0];
+    const payload = rbuf[1..n];
 
-        switch (msg_type) {
-            @intFromEnum(tunproto.MsgType.pty_exec_input) => {
-                // 执行命令并返回
-                try handleExecCmd(io, allocator, info, conn, payload);
-                return; // 命令完成，关闭连接
-            },
-            @intFromEnum(tunproto.MsgType.upload_cmd) => {
-                if (tunproto.parseUploadCmd(payload)) |cmd| {
-                    std.log.debug("[guest-tcp] Upload cmd: {s} ({d} bytes)", .{ cmd.path, cmd.file_size });
-                    receiveChunkedFile(io, allocator, conn, cmd.cmd_id, cmd.path, cmd.file_hash) catch |e| {
-                        std.log.err("[guest-tcp] Upload failed: {}", .{e});
-                        const resp = tunproto.buildUploadResult(allocator, cmd.cmd_id, -1) catch continue;
-                        defer allocator.free(resp);
-                        _ = conn.sendAndFlush(resp, 0) catch {};
-                    };
-                }
-                return;
-            },
-            @intFromEnum(tunproto.MsgType.download_cmd) => {
-                if (tunproto.parseDownloadCmd(payload)) |cmd| {
-                    std.log.info("[guest-tcp] Download cmd: {s}", .{cmd.path});
-                    sendChunkedFile(io, allocator, conn, cmd.cmd_id, cmd.path) catch |e| {
-                        std.log.err("[guest-tcp] Download failed: {}", .{e});
-                        const eof = tunproto.buildFileEof(allocator, cmd.cmd_id, -1, 0, "") catch continue;
-                        defer allocator.free(eof);
-                        _ = conn.sendAndFlush(eof, 0) catch {};
-                    };
-                }
-                return;
-            },
-            else => {
-                std.log.info("[guest-tcp] Unknown msg type: {d}", .{msg_type});
-                return;
-            },
-        }
+    switch (msg_type) {
+        @intFromEnum(protocol.MsgType.pty_exec_input) => {
+            try handleExecCmd(io, allocator, info, conn, payload);
+        },
+        @intFromEnum(protocol.MsgType.upload_cmd) => {
+            try handleUpload(io, allocator, conn, payload);
+        },
+        @intFromEnum(protocol.MsgType.download_cmd) => {
+            try handleDownload(io, allocator, conn, payload);
+        },
+        else => {
+            std.log.info("[guest] Unknown msg type: {d}", .{msg_type});
+        },
     }
 }
 
-/// 处理单次 exec 命令：spawn shell → 写入命令 → 流式读取输出 → 发送 exec_done。
+/// 处理 exec 命令：dpipe_shell 创建 shell → 写入命令 → 流式读取输出 → 发送 exec_done。
 fn handleExecCmd(
-    _io: std.Io,
+    io: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
-    conn: *netconn.Connection,
+    conn: *tcp.Connection,
     payload: []const u8,
 ) !void {
-    _ = _io;
-    const input = tunproto.parsePtyExecInput(payload) orelse {
-        std.log.err("[guest-tcp] parsePtyExecInput failed", .{});
+    _ = io;
+    const input = protocol.parsePtyExecInput(payload) orelse {
+        std.log.err("[guest] parsePtyExecInput failed", .{});
         return;
     };
 
-    std.log.info("[guest-tcp] exec cmd_id={s} cmd={s}", .{ input.cmd_id, input.command });
+    std.log.info("[guest] exec cmd_id={s} cmd={s}", .{ input.cmd_id, input.command });
 
     // 生成带 MDELIM 标记的命令
     const cmd_with_marker = try buildCmdWithMarker(allocator, input.command);
     defer allocator.free(cmd_with_marker);
 
-    // Spawn shell（每命令新 shell）
-    const pty = ptySpawn(allocator, info.shell) catch |err| {
-        std.log.err("[guest-tcp] ptySpawn failed: {}", .{err});
-        const done_msg = tunproto.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
+    // 使用 dpipe_shell 创建 shell 管道
+    const shell = dpipe_shell.create(allocator, info.shell) catch |err| {
+        std.log.err("[guest] dpipe_shell.create failed: {}", .{err});
+        const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
         defer allocator.free(done_msg);
         _ = conn.sendAndFlush(done_msg, 0) catch {};
         return;
     };
-    defer {
-        allocator.free(pty.shell);
-        killChild(pty.child_pid);
-        closePtyFd(pty.master_fd);
-    }
+    defer shell.close();
 
-    // 写入命令到 pty
-    ptyWrite(&pty, cmd_with_marker) catch |err| {
-        std.log.err("[guest-tcp] ptyWrite failed: {}", .{err});
-        const done_msg = tunproto.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
+    // 写入命令到 shell
+    shell.write(cmd_with_marker) catch |err| {
+        std.log.err("[guest] shell write failed: {}", .{err});
+        const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
         defer allocator.free(done_msg);
         _ = conn.sendAndFlush(done_msg, 0) catch {};
         return;
     };
 
-    // 流式读取 pty 输出 → 发送 pty_exec_output 帧
+    // 流式读取 shell 输出 → 发送 pty_exec_output 帧
     var output_buf: [4096]u8 = undefined;
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(allocator);
 
     while (true) {
-        const nr = ptyRead(pty.master_fd, &output_buf) catch |err| {
-            std.log.err("[guest-tcp] ptyRead error: {}", .{err});
+        const nr = shell.read(&output_buf) catch |err| {
+            std.log.err("[guest] shell read error: {}", .{err});
             break;
         };
         if (nr == 0) break; // EOF
@@ -1453,29 +892,115 @@ fn handleExecCmd(
 
         // 扫描 MDELIM 标记
         if (scanForMarker(accumulated.items)) |exit_code| {
-            // 发送最后一段输出（去掉标记部分）
             const marker_pos = std.mem.lastIndexOf(u8, accumulated.items, "MDELIM:") orelse accumulated.items.len;
             const clean_output = accumulated.items[0..marker_pos];
             if (clean_output.len > 0) {
-                const output_msg = tunproto.buildPtyExecOutput(allocator, input.cmd_id, clean_output) catch continue;
+                const output_msg = protocol.buildPtyExecOutput(allocator, input.cmd_id, clean_output) catch continue;
                 defer allocator.free(output_msg);
                 _ = conn.sendAndFlush(output_msg, 0) catch {};
             }
 
-            // 发送 exec_done
-            const done_msg = tunproto.buildPtyExecDone(allocator, input.cmd_id, exit_code) catch break;
+            const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, exit_code) catch break;
             defer allocator.free(done_msg);
             _ = conn.sendAndFlush(done_msg, 0) catch {};
-            std.log.info("[guest-tcp] exec done: cmd_id={s} exit={d}", .{ input.cmd_id, exit_code });
+            std.log.info("[guest] exec done: cmd_id={s} exit={d}", .{ input.cmd_id, exit_code });
             return;
         }
     }
 
-    // pty 异常关闭（无 MDELIM 标记）
-    const done_msg = tunproto.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
+    // shell 异常关闭（无 MDELIM 标记）
+    const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
     defer allocator.free(done_msg);
     _ = conn.sendAndFlush(done_msg, 0) catch {};
-    std.log.info("[guest-tcp] exec done (pty closed): cmd_id={s}", .{input.cmd_id});
+    std.log.info("[guest] exec done (shell closed): cmd_id={s}", .{input.cmd_id});
+}
+
+/// 处理 upload：upload_cmd 帧后的原始字节 → dpipe_file.writeFile → upload_result。
+fn handleUpload(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    conn: *tcp.Connection,
+    payload: []const u8,
+) !void {
+    const cmd = protocol.parseUploadCmd(payload) orelse {
+        std.log.err("[guest] parseUploadCmd failed", .{});
+        return;
+    };
+
+    std.log.info("[guest] upload: cmd_id={s} path={s} size={d}", .{ cmd.cmd_id, cmd.path, cmd.file_size });
+
+    // 创建目标管道（写入 temp 文件，验证 SHA256，atomic rename）
+    const file_pipe = dpipe_file.writeFile(allocator, io, cmd.path, cmd.file_hash) catch |err| {
+        std.log.err("[guest] writeFile failed: {}", .{err});
+        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+        defer allocator.free(resp);
+        _ = conn.sendAndFlush(resp, 0) catch {};
+        return;
+    };
+    defer file_pipe.close();
+
+    // 从 TCP 直接读取原始字节（无帧协议）→ 写入 file_pipe
+    var buf: [65536]u8 = undefined;
+    var remaining: u32 = cmd.file_size;
+    while (remaining > 0) {
+        const to_read = @min(buf.len, remaining);
+        const nr = std.posix.system.read(conn.fd, buf[0..to_read].ptr, to_read);
+        if (nr <= 0) {
+            std.log.err("[guest] upload: short read ({d} remaining)", .{remaining});
+            break;
+        }
+        file_pipe.write(buf[0..@intCast(nr)]) catch |err| {
+            std.log.err("[guest] upload: write failed: {}", .{err});
+            break;
+        };
+        remaining -= @intCast(nr);
+    }
+
+    // close 验证 SHA256 + atomic rename
+    file_pipe.close();
+
+    const exit_code: i32 = if (remaining == 0) 0 else -1;
+    std.log.info("[guest] upload result: cmd_id={s} exit={d}", .{ cmd.cmd_id, exit_code });
+    const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, exit_code) catch return;
+    defer allocator.free(resp);
+    _ = conn.sendAndFlush(resp, 0) catch {};
+}
+
+/// 处理 download：dpipe_file.readFile → 原始字节流发送到 TCP。
+fn handleDownload(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    conn: *tcp.Connection,
+    payload: []const u8,
+) !void {
+    const cmd = protocol.parseDownloadCmd(payload) orelse {
+        std.log.err("[guest] parseDownloadCmd failed", .{});
+        return;
+    };
+
+    std.log.info("[guest] download: cmd_id={s} path={s}", .{ cmd.cmd_id, cmd.path });
+
+    // 创建读取管道
+    const file_pipe = dpipe_file.readFile(allocator, io, cmd.path) catch |err| {
+        std.log.err("[guest] readFile failed: {}", .{err});
+        // 发送空文件（0字节）作为错误信号
+        return;
+    };
+    defer file_pipe.close();
+
+    // 从 file_pipe 流式读取 → 写入 TCP（原始字节）
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const nr = file_pipe.read(&buf) catch |err| {
+            std.log.err("[guest] download read error: {}", .{err});
+            break;
+        };
+        if (nr == 0) break; // EOF
+
+        _ = std.posix.system.write(conn.fd, buf[0..nr].ptr, nr);
+    }
+
+    std.log.info("[guest] download complete: {s}", .{cmd.path});
 }
 
 /// 构建带 MDELIM 标记的命令行。

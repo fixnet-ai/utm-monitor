@@ -10,13 +10,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const host_mod = @import("host.zig");
-const broadcast = @import("broadcast.zig");
+const guest = @import("guest.zig");
 const svc = @import("svc.zig");
 const fail = @import("fail.zig");
 const mcp = @import("mcp.zig");
 const shm = @import("shm.zig");
-const cmdchan = @import("cmdchan.zig");
-comptime { _ = cmdchan; }
 
 /// Embedded utmmd binary — compiled at build time, extracted at install time.
 const utmmd_bin = @embedFile("embed/utmmd.bin");
@@ -26,10 +24,9 @@ const utmmd_bin = @embedFile("embed/utmmd.bin");
 const utmmd_sha256_hex: [:0]const u8 = @embedFile("embed/utmmd.sha256");
 
 comptime {
-    _ = @import("hosts_file.zig");
+    _ = @import("lsa.zig");
     _ = @import("config.zig");
-    _ = @import("mesh.zig");
-    _ = @import("tunproto.zig");
+    _ = @import("tcp.zig");
     _ = @import("lock.zig");
     _ = @import("mcp.zig");
     _ = @import("host.zig");
@@ -346,7 +343,7 @@ pub fn main(init: std.process.Init) !void {
         if (cli.is_host) {
             try host_mod.runWithIo(init.io, init.gpa, cli, null);
         } else {
-            try broadcast.guestRunWithIo(init.io, init.gpa, cli, null);
+            try guest.guestRunWithIo(init.io, init.gpa, cli, null);
         }
         // Cleanup — join heartbeat thread on exit
         if (hb_thread) |t| {
