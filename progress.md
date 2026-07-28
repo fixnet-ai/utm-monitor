@@ -10,15 +10,22 @@
 
 ## 会话记录
 
-### 2026-07-29 (最新) — Phase 4 清理收尾
+### 2026-07-29 (最新) — Phase 4 清理收尾 + 代码扫描
 
-**成果**: CLAUDE.md 更新 + dpipe_file 测试修复 + build.zig 去重
+**成果**: CLAUDE.md 更新 + dpipe_file 测试修复 + build.zig 去重 + 代码库遗留问题扫描
 
 | 任务 | 描述 | 状态 |
 |------|------|------|
 | Task 11 | 更新 CLAUDE.md：KCP→TCP 架构、16 文件清单、新协议描述 | ✅ |
 | Task 12 | 修复 dpipe_file hash mismatch 测试（warn→debug）| ✅ |
 | Task 13 | 清理 build.zig standalone_test_modules（去重 tcp/lsa，新增 shm）| ✅ |
+| Task 14 | 代码库遗留问题扫描（TODO、日志、refac.md）| ✅ |
+
+**代码扫描发现**:
+- 3 个 TODO 注释：config.zig:107（功能缺口）、guest.zig:780（TCP 自动升级未闭环）、lsa.zig:496（Zig stdlib 问题）
+- refac.md §3.7 残留过时描述（"install.zig 可独立构建"），已修正
+- 无编译警告、无未使用导入、warn 日志均在生产代码路径中非测试路径
+- 结论：重构阶段可彻底收工，分支可合并 main
 
 **CLAUDE.md 更新详情**:
 - 协议栈图 → 7 层分层模型（应用/拓扑/传输/数据管道/协议/系统服务/基础）

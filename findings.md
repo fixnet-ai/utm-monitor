@@ -176,3 +176,21 @@ tcp.zig 和 lsa.zig 的测试在主测试二进制（通过 main.zig → host.zi
 **不可避免的残留重复**: dpipe.zig 的 5 个测试在 dpipe、dpipe_shell、dpipe_file
 三个独立二进制中各执行一次。这是因为 dpipe_shell 和 dpipe_file 都 import dpipe，
 且每个 standalone 模块编译为独立测试二进制。这个开销很小（10 次额外运行），可接受。
+
+### Finding 177: 代码扫描 — 3 个 TODO，无编译警告
+
+**2026-07-29 代码库扫描结果**:
+
+| 位置 | 内容 | 类型 |
+|------|------|------|
+| `config.zig:107` | `TODO: full config file parsing implementation` | 功能缺口 |
+| `guest.zig:780` | `TODO: TCP 版本自动升级` | 已部分实现 — 升级信号检测+`upgrade_req` 定义均到位，但 Guest 从未实际发送请求，Host 未处理 |
+| `lsa.zig:496` | `net_receive with concurrency=true is an explicit TODO in the stdlib` | Zig 0.16.0 stdlib 问题，非本项目 |
+
+**其他检查项**:
+- `zig build` 零警告
+- 无未使用导入/变量
+- `std.log.warn` 共 28 处，均在非测试代码路径中（不影响 `zig build test`）
+- refac.md §3.7 残留过时描述（"install.zig 可独立构建"），已修正为实际决策
+
+**结论**: 重构阶段可彻底收工。分支可直接合并 main。

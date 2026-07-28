@@ -2,9 +2,9 @@
 
 ## 状态：已完成 ✅
 
-**分支**: `refac/layered-arch` | **文件**: 20 → 16 | **测试**: 通过（1 个预存 dpipe_file hash 失败）
+**分支**: `refac/layered-arch` | **文件**: 20 → 16 | **测试**: 150 执行 / 141 唯一，全部通过
 
-最后更新：Task 9 完成（Platform/genInit → svc.zig）
+最后更新：Phase 4 完成（代码扫描 + refac.md 修正）
 
 ---
 
@@ -317,19 +317,15 @@ pub fn hostDaemon(io, allocator, config) !void {
 
 ### 3.7 系统服务层
 
-`install.zig` 可独立构建：
+`svc.zig` 聚合服务管理、Platform 检测、genInit 和安装锁：
 
-```zig
-// build.zig:
-const installer = b.addExecutable({ .name = "utmm-install", ... });
-installer.root_module.addImport("svc", svc_module);
-const install_test = b.step("installer", "Build standalone install test binary");
-```
-
-整合当前分散的代码：
-- `svc.zig`(1387行) — 服务管理库
+- `svc.zig`(1686行) — 服务管理库：install/uninstall/forceInstall/ensure + Platform/genInit + InstallLock
+- `utmmd.zig`(670行) — 监督进程（utmmd↔utmm 通过 shm IPC）
+- `shm.zig` — 共享内存协议
 - `main.zig` 中的 `extractUtmmd`/`selfCopy`/`canonicalSvcPath`(~200行)
-- `utmmd.zig`(670行) — 监督进程（作为 install 的嵌入或独立）
+
+> Task 9 决策：不做独立 install.zig 构建。Platform/genInit 移至 svc.zig 聚合，
+> 独立构建收益低（发布目标翻倍 8→16，需重复 embed 和 CLI 解析），与单二进制模型冲突。
 
 ---
 

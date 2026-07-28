@@ -46,6 +46,7 @@ DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 | 11 | 更新 CLAUDE.md（KCP→TCP 架构，16 文件清单）| ✅ |
 | 12 | 修复 dpipe_file hash mismatch 测试（warn→debug）| ✅ |
 | 13 | 清理 build.zig standalone_test_modules（去重 tcp/lsa，新增 shm）| ✅ |
+| 14 | 代码库扫描（TODO、日志、refac.md 修正）| ✅ |
 
 ## 删除文件清单（10 个）
 
