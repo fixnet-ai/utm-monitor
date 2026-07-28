@@ -16,8 +16,11 @@
 #   2. mkdir -p /opt/utmm && cp <binary> /opt/utmm/utmm && chmod +x /opt/utmm/utmm
 #   3. sudo /opt/utmm/utmm --host --install              (Host)
 #      sudo /opt/utmm/utmm --install --hostname mybox    (Guest)
+#   Note: --install extracts the utmmd supervisor from the utmm binary and registers
+#   utmmd as the system service. utmmd manages utmm's lifecycle (spawn, monitor, crash
+#   recovery, auto-upgrade).
 #
-# Deploy to existing Host network (v0.11.18+):
+# Deploy to existing Host network (v0.12.0+):
 #   sudo utmm --deploy                # Build + SCP + SSH deploy to all guests
 #   sudo utmm --verify                # Health check: status + ping + exec per guest
 # ==============================================================================
@@ -244,6 +247,9 @@ else
 fi
 
 # ── file placement ───────────────────────────────────────────────────────────
+# The utmm binary contains both the utmmd supervisor and utmm application.
+# --install extracts utmmd to /opt/utmm/utmmd and registers it as the
+# system service (utmmd / com.utmmd / UTM-MonitorD).
 
 echo "Preparing files ..."
 
@@ -254,14 +260,14 @@ cp -f "${ZIP_BINARY}" "${BINARY_NAME}"
 chmod +x "${BINARY_NAME}"
 
 if [ "${MODE}" = "guest" ]; then
-    # Guest: only keep the current-platform binary
+    # Guest: only keep the current-platform binary (utmm contains both utmmd and utmm)
     echo "  Guest mode - removing other platform binaries ..."
     find "${CANONICAL_DIR}" -maxdepth 1 -type f \( -name "utmm-*" -o -name "utmm*.exe" \) ! -name "${ZIP_BINARY}" -delete 2>/dev/null || true
     # Also remove install scripts from Guest (not needed)
     rm -f "${CANONICAL_DIR}/install.sh" "${CANONICAL_DIR}/install.bat" 2>/dev/null || true
-    dim "  Kept: ${ZIP_BINARY} (as utmm)"
+    dim "  Kept: ${ZIP_BINARY} (as utmm, contains utmmd supervisor)"
 else
-    # Host: keep all platform binaries (Guest auto-upgrade needs them via serveUpgradeFile)
+    # Host: keep all platform binaries for Guest auto-upgrade via KCP tunnel
     echo "  Host mode - keeping all platform binaries for Guest auto-upgrade."
     for f in "${CANONICAL_DIR}"/utmm-* "${CANONICAL_DIR}"/utmm*.exe; do
         [ -f "$f" ] && dim "  $(basename "$f")"
@@ -286,19 +292,19 @@ if "${CANONICAL_DIR}/${BINARY_NAME}" ${INSTALL_ARGS}; then
     echo
     green "Done."
     if [ "${MODE}" = "host" ]; then
-        echo "  Host service is running on UDP :2121"
+        echo "  utmmd supervisor is managing the Host service on UDP :2121"
         echo "  Status:  sudo ${CANONICAL_DIR}/${BINARY_NAME} --status"
         echo "  Verify:  sudo ${CANONICAL_DIR}/${BINARY_NAME} --verify"
         echo "  Deploy:  sudo ${CANONICAL_DIR}/${BINARY_NAME} --deploy [<vm>]"
     else
-        echo "  Guest service is running - auto-starts on boot."
+        echo "  utmmd supervisor installed — Guest auto-starts on boot."
         echo "  Check: run 'utmm --status' on the Host machine."
     fi
 else
     EXIT_CODE=$?
     red "'${BINARY_NAME} ${INSTALL_ARGS}' failed with exit code ${EXIT_CODE}."
     echo "Check service logs for details:"
-    echo "  Linux:   journalctl -u utmm-${MODE} -n 50"
-    echo "  macOS:   cat /var/log/utmm-${MODE}-err.log"
+    echo "  Linux:   journalctl -u utmmd -n 50"
+    echo "  macOS:   cat /var/log/utmmd.log"
     exit ${EXIT_CODE}
 fi

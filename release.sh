@@ -7,10 +7,10 @@
 # a GitHub release via `gh` CLI.
 #
 # Usage:
-#   ./release.sh v0.11.18 "Release notes (markdown)"
+#   ./release.sh v0.11.23 "Release notes (markdown)"
 #
 # The tag must already exist and be pushed:
-#   git tag -a v0.11.18 -m "v0.11.18: description"
+#   git tag -a v0.11.23 -m "v0.11.23: description"
 #   git push origin main --tags
 # ==============================================================================
 
@@ -70,7 +70,7 @@ NOTES="${2:-}"
 
 if [ -z "$VERSION" ]; then
     echo "Usage: ./release.sh <version> [notes]"
-    echo "Example: ./release.sh v0.11.18 \"Bug fixes and performance improvements\""
+    echo "Example: ./release.sh v0.11.23 \"Bug fixes and performance improvements\""
     exit 1
 fi
 
@@ -204,8 +204,9 @@ cat <<EOF
 
  7. Release uploaded but auto-upgrade not working
     → Make sure the Host's serve-dir (/opt/utmm/) contains the new binaries.
-    → The Host service auto-serves from its install directory.
-    → Guests detect version mismatch via LSA every 2 seconds.
+    → Host serveUpgradeFile sends binaries to Guests via KCP tunnel.
+    → Guests detect version mismatch via LSA every 2s, download via KCP,
+      then signal utmmd via shared memory to restart with the new binary.
 
 ================================================================================
 EOF

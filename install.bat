@@ -17,8 +17,11 @@ setlocal enabledelayedexpansion
 ::   2. mkdir C:\opt\utmm && copy <binary>.exe C:\opt\utmm\utmm.exe
 ::   3. C:\opt\utmm\utmm.exe --host --install                  (Host)
 ::      C:\opt\utmm\utmm.exe --install --hostname mybox        (Guest)
+::   Note: --install extracts utmmd.exe from utmm.exe and registers utmmd
+::   as the system service. utmmd manages utmm's lifecycle (spawn, monitor,
+::   crash recovery, auto-upgrade).
 ::
-:: Deploy to existing Host network (v0.11.18+):
+:: Deploy to existing Host network (v0.12.0+):
 ::   utmm --deploy                (Build + SCP + SSH deploy to all guests)
 ::   utmm --verify                (Health check: status + ping + exec per guest)
 :: =============================================================================
@@ -278,6 +281,9 @@ del "%ZIP_PATH%" 2>nul
 :extract_done
 
 :: ── file placement ───────────────────────────────────────────────────────────
+:: The utmm binary contains both the utmmd supervisor and utmm application.
+:: --install extracts utmmd.exe to C:\opt\utmm\utmmd.exe and registers it
+:: as the system service (UTM-MonitorD).
 
 echo Preparing files ...
 
@@ -287,7 +293,7 @@ cd /d "%CANONICAL_DIR%"
 copy /y "%ZIP_BINARY%" "%BINARY_NAME%" >nul
 
 if /i "%MODE%"=="guest" (
-    :: Guest: only keep the current-platform binary and the main utmm.exe
+    :: Guest: only keep the current-platform binary (utmm.exe contains both utmmd and utmm)
     echo   Guest mode - removing other platform binaries ...
     for %%f in (utmm-* utmm*.exe) do (
         if /i not "%%f"=="%ZIP_BINARY%" if /i not "%%f"=="%BINARY_NAME%" del /q "%%f" 2>nul
@@ -296,7 +302,7 @@ if /i "%MODE%"=="guest" (
     del /q install.sh install.bat 2>nul
     echo   Kept: %ZIP_BINARY% (as utmm.exe)
 ) else (
-    :: Host: keep all platform binaries for Guest auto-upgrade
+    :: Host: keep all platform binaries for Guest auto-upgrade via KCP tunnel
     echo   Host mode - keeping all platform binaries for Guest auto-upgrade:
     for %%f in (utmm-* utmm*.exe) do (
         if exist "%%f" echo     %%f
@@ -314,7 +320,8 @@ set "INSTALL_ARGS=--install --hostname %HOSTNAME% %MODE_FLAG% %HOST_IP_ARG%"
 if %errorlevel% neq 0 (
     echo.
     echo ERROR: Installation failed (exit code %errorlevel%).
-    echo Check service logs: type C:\opt\utmm\utmm-%MODE%-err.log
+    echo Check Windows Event Viewer for utmmd service logs,
+    echo or: type C:\opt\utmm\utmmd.log
     pause
     exit /b %errorlevel%
 )
@@ -322,12 +329,12 @@ if %errorlevel% neq 0 (
 echo.
 echo Done.
 if /i "%MODE%"=="host" (
-    echo   Host service is running on UDP :2121
+    echo   utmmd supervisor is managing the Host service on UDP :2121
     echo   Status:  %CANONICAL_DIR%\%BINARY_NAME% --status
     echo   Verify:  %CANONICAL_DIR%\%BINARY_NAME% --verify
     echo   Deploy:  %CANONICAL_DIR%\%BINARY_NAME% --deploy [^<vm^>]
 ) else (
-    echo   Guest service is running - auto-starts on boot.
+    echo   utmmd supervisor installed — Guest auto-starts on boot.
     echo   Check: run 'utmm --status' on the Host machine.
 )
 goto :eof
