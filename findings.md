@@ -103,3 +103,34 @@ Zig `\\` 在编译后保留真实换行符，破坏 MCP 换行分隔 JSON 协议
 仅当前项目可用。修复: `--scope user` 使所有项目可用。
 
 </details>
+
+---
+
+## Phase 3: 系统服务 — 研究发现
+
+### Finding 170: lock.zig CWD-相对路径是隐藏 bug
+
+`lock.zig` 的 `LOCK_FILE = "utmm.lock"` 在 CWD 而非固定路径创建锁文件。
+两个管理员从不同目录运行 `sudo utmm --install` 会创建不同锁文件，互不可见。
+
+**解决方案**: 在 svc.zig 内联，使用固定路径 `/var/run/utmm-install.lock` (POSIX) /
+`C:\opt\utmm\utmm-install.lock` (Windows)。
+
+### Finding 171: shm 不能替代 install 锁
+
+shm 由 utmmd 创建，而 `forceInstall`/`ensure` 在 utmmd 不存在时被调用（负责安装和启动 utmmd）。
+两者处于完全不同的生命周期阶段，无法互相替代。
+
+### Finding 172: flock 跨平台不兼容
+
+`flock()` 是 POSIX 专用。Windows 等价物是 `LockFileEx()`（需要 OVERLAPPED 结构，即使用于锁整个文件）。
+条件编译方案：POSIX `open(O_CREAT|O_RDWR) + flock(LOCK_EX)`，Windows `CreateFileW(OPEN_ALWAYS) + LockFileEx(LOCKFILE_EXCLUSIVE_LOCK)`。
+
+### Finding 173: install.zig 独立构建收益低
+
+独立 `utmm-install` 可执行文件需要：
+1. 重复 `@embedFile("embed/utmmd.bin")`（当前在 main.zig 中）
+2. 重复 CLI args 解析
+3. 发布目标翻倍（8 → 16 二进制）
+
+**实际做法**: Platform + genInit 移至 svc.zig 与现有服务管理代码聚合，不做独立构建。

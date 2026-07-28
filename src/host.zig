@@ -28,13 +28,13 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
     // --gen-init
     if (cli.cmd_gen_init) {
         const platform_str = cli.gen_init_platform orelse "linux";
-        const platform: Platform = if (std.mem.eql(u8, platform_str, "macos"))
+        const platform: svc.Platform = if (std.mem.eql(u8, platform_str, "macos"))
             .macos
         else if (std.mem.eql(u8, platform_str, "windows"))
             .windows
         else
             .linux;
-        const script = genInit(platform);
+        const script = svc.genInit(platform);
         std.debug.print("{s}", .{script});
         return;
     }
@@ -1029,144 +1029,6 @@ fn tunnelManager(
     }
 }
 
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Platform detection + init script generation (曾 install.zig)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Supported operating system platforms
-pub const Platform = enum {
-    linux,
-    macos,
-    windows,
-
-    pub fn detect() Platform {
-        return switch (builtin.os.tag) {
-            .linux => .linux,
-            .macos => .macos,
-            .windows => .windows,
-            else => .linux,
-        };
-    }
-
-    pub fn asStr(self: Platform) []const u8 {
-        return switch (self) {
-            .linux => "linux",
-            .macos => "macos",
-            .windows => "windows",
-        };
-    }
-};
-
-/// Generate auto-start script/config template for the given platform.
-pub fn genInit(platform: Platform) []const u8 {
-    return switch (platform) {
-        .macos =>
-        \\<?xml version="1.0" encoding="UTF-8"?>
-        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-        \\  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        \\<plist version="1.0">
-        \\<dict>
-        \\    <key>Label</key>
-        \\    <string>com.utmm.guest</string>
-        \\    <key>ProgramArguments</key>
-        \\    <array>
-        \\        <string>/opt/utmm/utmm</string>
-        \\        <string>--svc</string>
-        \\    </array>
-        \\    <key>EnvironmentVariables</key>
-        \\    <dict>
-        \\        <key>SHELL</key>
-        \\        <string>/bin/zsh</string>
-        \\        <key>HOME</key>
-        \\        <string>/var/root</string>
-        \\    </dict>
-        \\    <key>RunAtLoad</key>
-        \\    <true/>
-        \\    <key>KeepAlive</key>
-        \\    <dict>
-        \\        <key>SuccessfulExit</key>
-        \\        <false/>
-        \\    </dict>
-        \\    <key>ThrottleInterval</key>
-        \\    <integer>5</integer>
-        \\    <key>StandardOutPath</key>
-        \\    <string>/var/log/utmm-guest.log</string>
-        \\</dict>
-        \\</plist>
-        \\
-        \\<!-- Install: sudo cp this file to /Library/LaunchDaemons/com.utmm.guest.plist -->
-        \\<!-- Load:    sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmm.guest.plist -->
-        \\
-        \\<!-- Host mode: replace --svc with --svc --host, change Label/Log to utmm-host -->
-        ,
-        .linux =>
-        \\[Unit]
-        \\Description=UTM Monitor Guest Service
-        \\After=network.target
-        \\
-        \\[Service]
-        \\Type=simple
-        \\Environment=SHELL=/bin/bash
-        \\Environment=HOME=/root
-        \\ExecStart=/opt/utmm/utmm --svc
-        \\WorkingDirectory=/opt/utmm
-        \\Restart=on-failure
-        \\RestartSec=5
-        \\StartLimitBurst=3
-        \\StartLimitIntervalSec=30
-        \\StandardOutput=journal
-        \\
-        \\[Install]
-        \\WantedBy=multi-user.target
-        \\
-        \\<!-- Install: sudo cp this file to /etc/systemd/system/utmm-guest.service -->
-        \\<!-- Enable:  sudo systemctl daemon-reload && sudo systemctl enable utmm-guest -->
-        \\
-        \\<!-- Host mode: add --host to ExecStart, change Description to Host -->
-        ,
-        .windows =>
-        \\:: UTM Monitor Guest auto-start service
-        \\::
-        \\:: Install: sc create "UTM-Monitor-Guest" binPath= "\"C:\opt\utmm\utmm.exe\" --svc" start= auto
-        \\::           sc failure "UTM-Monitor-Guest" reset=30 actions=restart/5000/restart/5000/restart/5000/none/5000
-        \\::           sc start "UTM-Monitor-Guest"
-        \\:: Remove:  sc stop "UTM-Monitor-Guest" & sc delete "UTM-Monitor-Guest"
-        \\
-        \\:: Host mode: replace UTM-Monitor-Guest with UTM-Monitor-Host, add --host to binPath
-        ,
-    };
-}
-
-test "Platform.detect returns valid platform" {
-    const p = Platform.detect();
-    _ = switch (p) {
-        .macos, .linux, .windows => true,
-    };
-}
-
-test "genInit - linux has systemd service" {
-    const script = genInit(.linux);
-    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmm") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "[Unit]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "[Service]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "--svc") != null);
-}
-
-test "genInit - macos has launchd plist" {
-    const script = genInit(.macos);
-    try std.testing.expect(std.mem.indexOf(u8, script, "com.utmm") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "plist") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmm") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "--svc") != null);
-}
-
-test "genInit - windows has sc command" {
-    const script = genInit(.windows);
-    try std.testing.expect(std.mem.indexOf(u8, script, "sc create") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "UTM-Monitor") != null);
-    try std.testing.expect(std.mem.indexOf(u8, script, "C:\\opt\\utmm\\utmm.exe") != null);
-}
 
 test "isValidVersion - valid semver" {
     try std.testing.expect(isValidVersion("0.11.18"));

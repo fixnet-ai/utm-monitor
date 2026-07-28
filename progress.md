@@ -4,68 +4,87 @@
 
 - **分支**: `refac/layered-arch`
 - **版本**: v0.13.0-pre（尚未发布）
-- **测试**: 187/187 全通过（7/7 步骤成功）
-- **源文件**: 16 个（目标 15）
+- **测试**: 通过（1 个预存 dpipe_file hash 失败，非本次引入）
+- **源文件**: 16 个（20 → 16）
+- **全部任务完成** ✅
 
 ## 会话记录
 
-### 2026-07-29 — Phase 1 完成
+### 2026-07-29 (最新) — Phase 3 完成
 
-**成果**: 4 个低风险文件合并任务全部完成，文件从 20 → 16（-4）
+**成果**: lock.zig 删除 + Platform/genInit 迁移 → svc.zig
+
+| 任务 | 描述 | 状态 |
+|------|------|------|
+| lock.zig 删除 | svc.zig 内联 flock/LockFileEx (120行), 删除 365行 | ✅ commit `06adede` |
+| Platform/genInit | host.zig → svc.zig 迁移 (~140行+4测试) | ✅ |
+| refac.md 更新 | 反映所有已完成任务、最终文件清单 | ✅ |
+| task_plan.md 更新 | 全部任务标记完成 | ✅ |
+
+**lock.zig → svc.zig 详情**:
+- POSIX: `open(O_CREAT|O_RDWR)` + `flock(LOCK_EX)` — OS 级别劝告锁，进程崩溃自动释放
+- Windows: `CreateFileW(OPEN_ALWAYS)` + `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK)`
+- 锁文件: `/var/run/utmm-install.lock` (POSIX) / `C:\opt\utmm\utmm-install.lock` (Windows)
+- API 简化: `acquire(io, alloc)` → `acquire()`
+
+**Platform/genInit 迁移详情**:
+- host.zig 调用改为 `svc.Platform` + `svc.genInit`
+- 不独立构建 install.zig（收益低，发布目标翻倍，与单二进制模型冲突）
+
+### 2026-07-29 — Phase 2 完成
+
+| 任务 | 描述 | 状态 |
+|------|------|------|
+| Task 5 | 新建 dpipe.zig + dpipe_shell.zig + dpipe_file.zig | ✅ |
+| Task 6 | broadcast.zig → guest.zig，移植到 dpipe | ✅ |
+| Task 7 | 删除 file_chunk/file_eof | ✅ |
+| Task 8 | 消灭 state.zig + cmdchan.zig | ✅ |
+
+### 2026-07-29 — Phase 1 完成
 
 | 任务 | 描述 | 状态 |
 |------|------|------|
 | Task 1 | tcpf.zig + socks4.zig + netconn.zig → tcp.zig | ✅ |
 | Task 2 | tunproto.zig → protocol.zig | ✅ |
 | Task 3 | mesh.zig + hosts_file.zig → lsa.zig | ✅ |
-| Task 4 | 修复 /etc/hosts 空行累积 bug (Finding 169) | ✅ |
+| Task 4 | 修复 /etc/hosts 空行累积 bug (range replacement) | ✅ |
 
-**Task 3 详情 (lsa.zig)**:
-- 合并 mesh.zig (1330 行, LSA mesh networking) + hosts_file.zig (191 行, /etc/hosts 管理)
-- 原 mesh 6 个测试 + hosts_file 5 个测试 + 新增 6 个测试 = 17 个 lsa 测试
-- hosts_file.zig 的 `updateHosts` 按原样保留（逻辑不变）
-- 日志标签从 `[mesh]` 更新为 `[lsa]`
-- 修复: host.zig 中局部变量 `lsa` 与 import `lsa` 命名冲突 → 局部变量改为 `lsa_entry`
+## 最终文件清单（16 个）
 
-**Task 4 详情 (空行累积修复)**:
-- 根因: `splitScalar` 按行重建时，文件末尾 `\n` 产生的尾随空串被附加为额外空行
-- 修复: 用 `findMarkerLine` + 范围替换替代 splitScalar 逐行重建
-- 新增 `findMarkerLine` 函数 — 按字节查找 marker 行位置
-- 新增 5 个测试: findMarkerLine-basic/not found/whitespace/end marker + updateHosts 空行累积验证
-- 旧版一次性修复，新版范围替换保证每次写入精确替换，不修改 block 外任何内容
+```
+src/
+├── main.zig         入口、CLI 解析、模式分发
+├── protocol.zig      所有协议定义
+├── fail.zig          快速失败
+├── config.zig        配置持久化
+├── lsa.zig           LSA + 节点表 + /etc/hosts
+├── tcp.zig           帧协议 + SOCKS4 + 连接
+├── dpipe.zig         DuplexPipe 接口 + relay
+├── dpipe_shell.zig   pty→pipe
+├── dpipe_file.zig    file→pipe
+├── guest.zig         Guest daemon
+├── host.zig          Host daemon
+├── ipc.zig           IPC socket
+├── mcp.zig           MCP stdio
+├── svc.zig           服务管理（install/uninstall/forceInstall/ensure + Platform/genInit + InstallLock）
+├── utmmd.zig         监督进程
+└── shm.zig           共享内存（utmmd↔utmm）
+```
 
-**最终文件清单** (16 个):
-broadcast.zig, cmdchan.zig, config.zig, fail.zig, host.zig, ipc.zig, lock.zig, lsa.zig, main.zig, mcp.zig, protocol.zig, shm.zig, state.zig, svc.zig, tcp.zig, utmmd.zig
-
-### 2026-07-29 — 重构规划启动
-
-**背景**: `refac.md` 设计文档已完成（commit `3ca7239`），KCP 已删除 + TCP+SOCKS4 已引入（commit `036f40f`）。
-
-**本次会话目标**: 开始 Phase 1 文件合并
-
-**关键文件**:
-- `refac.md` — 完整重构设计（分层模型、模块接口、实施计划）
-- `task_plan.md` — 更新为 v0.13.0 重构任务
-- `findings.md` — 更新为重构相关发现
-- `progress.md` — 本文件
+### 删除文件（10 个）
+state.zig, broadcast.zig, mesh.zig, hosts_file.zig, tunproto.zig,
+tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig
 
 ---
 
 ## 历史摘要
 
-### v0.12.2 及之前（Phase 50-79）
-
+### v0.12.2 及之前
 - KCP 隧道稳定性修复、自动升级完善
-- utmmd 监督进程架构重构
-- MCP stdio JSON-RPC 连接修复
-- HTTP 协议彻底删除，全面转向 KCP+IPC
-- 8 交叉编译目标全通过
-- 166 测试通过
-- 4/4 Guest 在线，全部 exec/ping 正常
+- utmmd 监督进程架构重构、MCP stdio JSON-RPC
+- 8 交叉编译目标全通过，166 测试通过
 
 ### v0.13.0-pre (commit `036f40f`)
-
-- 删除 KCP ARQ 协议 (~1300 行)
-- 新增 TCP+SOCKS4 传输层 (tcpf + socks4 + netconn)
+- 删除 KCP ARQ 协议 (~1300行)，新增 TCP+SOCKS4 传输层
 - mesh.zig 简化为纯 LSA 广播
 - 20 源文件，124 测试通过

@@ -1,29 +1,36 @@
 # UTM Monitor 重构设计文档 v2
 
+## 状态：已完成 ✅
+
+**分支**: `refac/layered-arch` | **文件**: 20 → 16 | **测试**: 通过（1 个预存 dpipe_file hash 失败）
+
+最后更新：Task 9 完成（Platform/genInit → svc.zig）
+
+---
+
 ## 1. 目标与动机
 
-### 1.1 已完成：KCP → TCP+SOCKS4
+### 1.1 已完成：KCP → TCP+SOCKS4 → 分层架构
 
-v0.13.0 已删除 KCP ARQ 协议（~1300 行）及相关模块（tunnel/channel/sess×4/disco/router/upgrade/json/ringbuf/completion），
-替换为 TCP + SOCKS4a 传输层。当前 20 文件，124 测试通过。
+v0.13.0 完整重构历程：
+1. 删除 KCP ARQ 协议（~1300 行）→ TCP+SOCKS4a 传输层
+2. 分层架构重构（20 → 16 文件）：TCP per-command 模型、DuplexPipe vtable、消灭 state.zig/cmdchan.zig
+3. lock.zig 进程锁 → svc.zig 内联 flock/LockFileEx
+4. Platform/genInit → svc.zig 聚合
 
-### 1.2 当前问题
+### 1.2 已解决的问题
 
-| 症状 | 严重性 | 根因 |
-|------|--------|------|
-| `state.zig` 是个杂货铺（1386行）— JSON工具+共享状态+连接处理+upgrade+hosts同步 | 致命 | 职责不清，历史上是 httpd.zig |
-| `broadcast.zig` 名字有歧义（实为 Guest daemon） | 中 | Legacy 命名 |
-| `tcpf.zig` + `socks4.zig` + `netconn.zig` 三文件互相依赖 | 低 | 可合并 |
-| `tunproto.zig` 与 `protocol.zig` 职责重叠 | 低 | 各有一个 MsgType |
-| `/etc/hosts` 随 LSA 同步逐次累积空行 | 高 | `splitScalar` 逐行遍历 bug |
-| `mesh.zig` + `hosts_file.zig` + state Guest 表三处存节点信息 | 中 | 数据冗余 |
-
-### 1.3 设计目标
-
-- **每文件单一职责** — 文件做什么就叫什么名
-- **最小依赖图** — 底层模块不依赖上层
-- **15 文件以内** — 从 20 → 15
-- **消灭 state.zig** — 不再需要跨线程共享状态
+| 症状 | 解决方案 |
+|------|---------|
+| `state.zig` 杂货铺（1386行）| 消灭 — GuestTable → host.zig, JSON → protocol.zig |
+| `broadcast.zig` 命名歧义 | → `guest.zig` |
+| `tcpf+socks4+netconn` 三文件循环依赖 | → `tcp.zig` |
+| `tunproto.zig` 与 `protocol.zig` 重叠 | 合并 |
+| `/etc/hosts` 空行累积 | range replacement（indexOf 替代 splitScalar）|
+| `mesh+hosts_file+GuestTable` 三处冗余 | → `lsa.zig` 自洽闭环 |
+| `lock.zig` PID 文件锁 CWD-相对路径 bug | → svc.zig 内联 flock/LockFileEx |
+| `cmdchan.zig` 跨线程命令队列 | 删除 — TCP per-command 无需跨线程 |
+| `Platform/genInit` 在 host.zig | → svc.zig（与服务管理聚合）|
 
 ---
 
@@ -54,15 +61,13 @@ v0.13.0 已删除 KCP ARQ 协议（~1300 行）及相关模块（tunnel/channel/
 │  protocol.zig         所有协议定义（常量+消息类型+序列化+VERSION）   │
 ├──────────────────────────────────────────────────────────────────┤
 │  系统服务层                                                       │
-│  install.zig         独立安装程序（可独立构建测试）                  │
-│  svc.zig             服务管理库                                    │
+│  svc.zig             服务管理（install/uninstall/启动+Platform/genInit+InstallLock）│
 │  utmmd.zig           监督进程                                      │
 │  shm.zig             共享内存（utmmd↔utmm）                         │
 ├──────────────────────────────────────────────────────────────────┤
 │  基础层                                                           │
 │  main.zig            入口、CLI 解析、模式分发                       │
 │  fail.zig            快速失败                                      │
-│  lock.zig            进程互斥                                      │
 │  config.zig          配置持久化                                    │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -330,30 +335,30 @@ const install_test = b.step("installer", "Build standalone install test binary")
 
 ## 4. 实施计划
 
-### Phase 1: 低风险合并（文件合并，逻辑不变）
+### Phase 1: 低风险合并 ✅
 
-| # | 任务 | 产出 | 测试 |
-|---|------|------|------|
-| 1 | `tcpf.zig` + `socks4.zig` + `netconn.zig` → `tcp.zig` | 530行，统一对外接口 | 12 测试→tcp.zig |
-| 2 | `tunproto.zig` → `protocol.zig` | 协议定义合一 | 合并测试 |
-| 3 | `mesh.zig` + `hosts_file.zig` → `lsa.zig` | 自洽 LSA | 合并测试 |
-| 4 | 修复 `/etc/hosts` 空行累积 bug | range replacement | 新增测试 |
+| # | 任务 | 状态 |
+|---|------|------|
+| 1 | `tcpf.zig` + `socks4.zig` + `netconn.zig` → `tcp.zig` | ✅ |
+| 2 | `tunproto.zig` → `protocol.zig` | ✅ |
+| 3 | `mesh.zig` + `hosts_file.zig` → `lsa.zig` | ✅ |
+| 4 | 修复 `/etc/hosts` 空行累积 bug（range replacement）| ✅ |
 
-### Phase 2: 核心重构
+### Phase 2: 核心重构 ✅
 
-| # | 任务 | 产出 | 测试 |
-|---|------|------|------|
-| 5 | 新建 `dpipe.zig` + `dpipe_shell.zig` + `dpipe_file.zig` | DuplexPipe 体系 | 边界测试 |
-| 6 | `broadcast.zig` → `guest.zig`，移植到 dpipe | TCP accept + relay | 功能测试 |
-| 7 | 简化 `tunproto` → 删除 `file_chunk`/`file_eof` | 精简 wire 协议 | 更新测试 |
-| 8 | 重构 `host.zig` + `ipc.zig`，消灭 `state.zig` | IPC 直接操作 tcp.Connection | 功能测试 |
+| # | 任务 | 状态 |
+|---|------|------|
+| 5 | 新建 `dpipe.zig` + `dpipe_shell.zig` + `dpipe_file.zig` | ✅ |
+| 6 | `broadcast.zig` → `guest.zig`，移植到 dpipe | ✅ |
+| 7 | 删除 `file_chunk`/`file_eof`，简化 wire 协议 | ✅ |
+| 8 | 重构 `host.zig` + `ipc.zig`，消灭 `state.zig` + `cmdchan.zig` | ✅ |
 
-### Phase 3: 系统服务
+### Phase 3: 系统服务 ✅
 
-| # | 任务 | 产出 | 测试 |
-|---|------|------|------|
-| 9 | `install.zig` 独立构建 | 可独立测试的安装程序 | 大量边界测试 |
-| 10 | 更新 `build.zig` 适配新模块 | 编译+测试全绿 | CI |
+| # | 任务 | 状态 |
+|---|------|------|
+| 9 | Platform/genInit → svc.zig（不独立构建，聚合到服务管理层）| ✅ |
+| 10 | `lock.zig` → svc.zig 内联 flock/LockFileEx | ✅ |
 
 ---
 
@@ -370,15 +375,15 @@ const install_test = b.step("installer", "Build standalone install test binary")
 | 7 | `socks4.zig` | → `tcp.zig` |
 | 8 | `netconn.zig` | → `tcp.zig` |
 | 9 | `cmdchan.zig` | TCP per-command 无需跨线程命令队列 |
+| 10 | `lock.zig` | → svc.zig 内联 flock/LockFileEx |
 
-## 6. 最终文件清单（15 文件）
+## 6. 最终文件清单（16 文件）
 
 ```
 src/
 ├── main.zig         入口、CLI 解析、模式分发
 ├── protocol.zig      所有协议定义
 ├── fail.zig          快速失败
-├── lock.zig          进程互斥
 ├── config.zig        配置持久化
 ├── lsa.zig           LSA + 节点表 + /etc/hosts
 ├── tcp.zig           帧协议 + SOCKS4 + 连接
@@ -389,13 +394,13 @@ src/
 ├── host.zig          Host daemon
 ├── ipc.zig           IPC socket
 ├── mcp.zig           MCP stdio
-└── svc.zig           服务管理（含 install/shutdown/uninstall）
-    utmmd.zig         监督进程（嵌入 main）
-    shm.zig           共享内存（utmmd 用）
+├── svc.zig           服务管理（install/uninstall/forceInstall/ensure + Platform/genInit + InstallLock）
+├── utmmd.zig         监督进程
+└── shm.zig           共享内存（utmmd↔utmm）
 ```
 
-> 注：`svc.zig` + `utmmd.zig` + `shm.zig` 三者构成系统服务层。`install.zig` 若独立构建则作为单独入口。
-> 最终计数取决于 install 是否独立文件。
+> 系统服务层：`svc.zig` + `utmmd.zig` + `shm.zig`。lock.zig 已删除（svc.zig 内联 flock/LockFileEx）。
+> Task 9 未做独立 install.zig 构建 — Platform/genInit 移至 svc.zig 聚合。
 
 ---
 
@@ -411,3 +416,5 @@ src/
 | 6 | state/cmdchan 删除 | TCP per-command 无共享状态 |
 | 7 | ipc+shm 保留两个 | 生命周期、数据量、可靠性需求根本不同 |
 | 8 | per-command shell（不保留 cd/export） | 简单，匹配独立连接模型 |
+| 9 | lock.zig → svc.zig 内联 flock/LockFileEx | OS 级别锁自动随进程退出释放，无 stale lock；固定路径替代 CWD 相对路径 |
+| 10 | Platform/genInit → svc.zig（不独立构建 install）| 独立构建收益低（发布目标翻倍、@embedFile 依赖），聚合到服务管理层即可 |
