@@ -12,7 +12,7 @@ pub const DISCOVERY_QUERY = "ARE YOU OK?\r\n";
 pub const DISCOVERY_RESPONSE_PREFIX = "ANNOUNCE\r\n";
 
 // ──────────────────────────────────────────────────────────────────────────
-// Mesh networking protocol (v0.10.0)
+// Mesh networking protocol
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Unified mesh protocol message types (first-byte dispatch on UDP :2121).
@@ -125,7 +125,7 @@ test "deploymentFilename - known targets" {
     try std.testing.expectEqualStrings("utmm-aarch64-windows-" ++ VERSION ++ ".exe", deploymentFilename("aarch64-windows").?);
 }
 
-test "deploymentFilename - legacy glibc targets" {
+test "deploymentFilename - glibc targets" {
     try std.testing.expectEqualStrings("utmm-aarch64-linux-" ++ VERSION, deploymentFilename("aarch64-linux").?);
     try std.testing.expectEqualStrings("utmm-x86_64-linux-" ++ VERSION, deploymentFilename("x86_64-linux").?);
     try std.testing.expectEqualStrings("utmm-x86-linux-" ++ VERSION, deploymentFilename("x86-linux").?);
@@ -136,7 +136,7 @@ test "deploymentFilename - unknown target" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Tunnel protocol — binary message framing (merged from tunproto.zig)
+// Tunnel protocol — binary message framing
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Messages are framed: 1-byte type + type-specific payload.
@@ -478,7 +478,7 @@ pub const GuestInfo = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// JSON helpers (migrated from state.zig)
+// JSON helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Get a string field from a JSON object. Returns null if missing or wrong type.
@@ -572,7 +572,7 @@ pub fn jsonBuildError(allocator: std.mem.Allocator, id: std.json.Value, code: i6
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Shell command helpers (migrated from state.zig)
+// Shell command helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Build command with appropriate MDELIM marker for the guest's shell.
@@ -737,7 +737,7 @@ test "VERSION follows semver" {
     try std.testing.expect(parts.next() == null);
 }
 
-// ── Tunnel protocol tests (from tunproto.zig) ──
+// ── Tunnel protocol tests ──
 
 test "pty_spawn build" {
     const allocator = std.testing.allocator;

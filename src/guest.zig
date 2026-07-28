@@ -644,9 +644,9 @@ test "zigTarget - valid format" {
 // Guest TCP 主循环（替代 meshSessionLoop）
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Guest TCP 服务 — TCP + SOCKS4 + tcpf 替代 KCP tunnel。
+/// Guest TCP 服务 — TCP listener + dpipe relay，每命令独立连接。
 ///
-/// 1. 启动 LSA/UDP 发现线程（mesh.zig）
+/// 1. 启动 LSA/UDP 发现线程（lsa.zig）
 /// 2. TCP 监听端口 2121
 /// 3. accept 循环 → SOCKS4a 握手 → 处理命令
 /// 4. 每命令独立连接，命令结束即关闭

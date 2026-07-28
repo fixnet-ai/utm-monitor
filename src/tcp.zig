@@ -1,6 +1,4 @@
-//! TCP 传输层 — 帧协议 + SOCKS4a + 连接管理。
-//!
-//! 合并自: tcpf.zig (帧协议) + socks4.zig (SOCKS4a) + netconn.zig (连接抽象)
+//! TCP transport: frame protocol + SOCKS4a proxy + connection management
 //!
 //! Guest 和 Host 共享同一套网络层：
 //!   - Guest:  TCP listen → SOCKS4a accept → Connection

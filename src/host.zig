@@ -1,6 +1,6 @@
 //! Host mode — mesh networking daemon on UDP :2121.
 //!
-//! LSA broadcast + TCP/SOCKS4 replace the old HTTP server (v0.11.0) and KCP transport (v0.14.0).
+//! TCP per-command model with LSA broadcast + IPC socket.
 //! Management commands (--status/--exec/--upload/--download) communicate via IPC socket.
 
 const std = @import("std");
@@ -1185,7 +1185,7 @@ test "isValidVersion - valid semver" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GuestTable — minimal guest registry (was state.zig, now inlined)
+// GuestTable — minimal guest registry
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const GuestEntry = struct {
@@ -1417,7 +1417,7 @@ test "isValidVersion - garbage (human verification page)" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GuestTable tests (from state.zig)
+// GuestTable tests
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Helper: create a single-threaded Io for tests (needed by GuestTable mutex).

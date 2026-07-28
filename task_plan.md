@@ -5,13 +5,13 @@
 **最新版本**: v0.13.1 — Windows 跨平台 socket 抽象层修复
 
 - **分支**: `refac/layered-arch`
-- **源文件**: 20 → 16
+- **源文件**: 20 → 17（10 删除 + 1 新增 testlib.zig）
 - **测试**: 150 执行 / 141 唯一测试 + 43 集成测试场景，全部通过
 - **设计文档**: `refac.md`
 
 ## 架构概述
 
-UTM Monitor (`utmm`) 分层架构重构：20 → 16 文件，TCP per-command 连接模型，
+UTM Monitor (`utmm`) 分层架构重构：20 → 17 文件，TCP per-command 连接模型，
 DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 
 ## 实施阶段

@@ -18,7 +18,7 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
 - **Per-command pty**: Each exec opens a fresh pty session via `posix_openpt` (POSIX)
   / `CreatePipe` (Windows). `MDELIM:$?\n` exit-code markers embedded in pty output.
 - **MCP stdio**: AI agents control machines via `utmm --mcp` (stdio JSON-RPC).
-  `vm_status` / `vm_exec` / `vm_upload` / `vm_download` tools. Benefits from
+  `vm_status` / `vm_exec` / `vm_ping` / `vm_upload` / `vm_download` tools. Benefits from
   auto-ensure — if Host service is down, `--mcp` auto-starts it, so the recovery
   flow is never broken.
 - **utmmd supervisor**: Lightweight supervisor daemon manages utmm lifecycle
@@ -452,7 +452,7 @@ download new binary via TCP → signal utmmd via shared memory →
 utmmd performs atomic stop→replace→spawn handoff.
 Host never pushes upgrades — the Guest is fully self-upgrading.
 
-## Project File Structure (16 files)
+## Project File Structure (17 files)
 
 ```
 src/
@@ -471,10 +471,11 @@ src/
 ├── mcp.zig            MCP stdio server: JSON-RPC stdin/stdout, IPC client to Host
 ├── svc.zig            Service management (install/uninstall/forceInstall/ensure + Platform/genInit + InstallLock)
 ├── utmmd.zig          Supervisor daemon: utmm lifecycle, crash recovery, shared memory IPC
-└── shm.zig            Shared memory protocol: utmmd↔utmm IPC, heartbeat, commands
+├── shm.zig            Shared memory protocol: utmmd↔utmm IPC, heartbeat, commands
+└── testlib.zig        Test re-export module (protocol + tcp + dpipe + lsa + host + svc + fail + config)
 ```
 
-> v0.13.0: 20 → 16 files. Deleted: state.zig, broadcast.zig, mesh.zig, hosts_file.zig,
+> v0.13.0: 20 → 17 files (10 deleted, 1 new testlib.zig). Deleted: state.zig, broadcast.zig, mesh.zig, hosts_file.zig,
 > tunproto.zig, tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig.
 
 ## Code of Conduct / Guidelines

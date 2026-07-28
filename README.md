@@ -27,10 +27,10 @@ MCP protocol:
 | Tool | Description |
 |------|-------------|
 | `vm_status` | List all nodes (Host + Guests): hostname, role, IP, OS/arch, version, status, shell type |
-| `vm_exec` | Execute commands. Shell session persists — cd, export survive across calls |
+| `vm_exec` | Execute commands via TCP per-command connection. Each exec opens a fresh pty session |
 | `vm_ping` | Ping a guest over the mesh — test connectivity and measure RTT |
-| `vm_upload` | Upload a file from Host to Guest via KCP tunnel (SHA256 verified) |
-| `vm_download` | Download a file from Guest to Host via KCP tunnel (SHA256 verified) |
+| `vm_upload` | Upload a file from Host to Guest via TCP/SOCKS4 (SHA256 verified) |
+| `vm_download` | Download a file from Guest to Host via TCP/SOCKS4 (SHA256 verified) |
 
 Example prompts your AI agent can handle:
 - "Check the status of all my machines"
@@ -54,9 +54,8 @@ utmm --exec windowsvm "tasklist | findstr myapp"
 utmm --exec linuxvm "gdb -batch -ex 'bt full' -p $(pgrep myapp)"
 utmm --exec macvm "lldb -o 'bt all' -o quit -p $(pgrep myapp)"
 
-# Shell state persists — cd, export, venv survive across calls
-utmm --exec linuxvm "cd /opt/myapp && source venv/bin/activate && pip list"
-utmm --exec linuxvm "pwd"     # /opt/myapp — still there
+# Each exec opens a fresh pty — no state persists across calls
+utmm --exec linuxvm "cd /opt/myapp && source ./venv/bin/activate && pip list"
 
 # Check health across all machines with one command
 utmm --status      # Host + all guests: role, version, status, last seen
@@ -127,42 +126,43 @@ utmm --version                     # Print version
 
 ## How It Works
 
-The Host manages Guests through a **mesh network over UDP port 2121**. Each Guest
-maintains a persistent KCP tunnel to the Host. LSA (Link State Advertisement)
-broadcasts handle topology discovery and version detection. CLI commands and MCP
-talk to the Host through a local IPC socket (`/var/run/utmm.sock` on POSIX,
-named pipe on Windows) — no HTTP.
+The Host manages Guests through **TCP per-command connections** via SOCKS4a proxy
+(UTM network). Each exec, upload, or download opens a fresh TCP connection,
+completes the operation, and closes — no persistent tunnels. LSA (Link State
+Advertisement) broadcasts over UDP port 2121 handle topology discovery and
+version detection. CLI commands and MCP talk to the Host through a local IPC
+socket (`/var/run/utmm.sock` on POSIX, named pipe on Windows) — no HTTP.
 
 ```
-Guest (linuxvm)      ──KCP/Mesh──┐
-Guest (macvm)        ──KCP/Mesh──┤──→ Host ── IPC socket ── CLI (--status, --exec, --ping)
-Guest (windowsvm)    ──KCP/Mesh──┤          ── Binary serve (KCP upgrade_req)
-Guest (raspigw, LAN) ──KCP/Mesh──┘
-                         ┌── LSA broadcast discovery ───┘   (topology + version detection)
+Guest (linuxvm)      ──TCP/SOCKS4──┐
+Guest (macvm)        ──TCP/SOCKS4──┤──→ Host ── IPC socket ── CLI (--status, --exec, --ping)
+Guest (windowsvm)    ──TCP/SOCKS4──┤          ── Binary serve (TCP upgrade_req)
+                         ┌── LSA broadcast (UDP:2121) ──┘  (topology + version detection)
                          │
 AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
 ```
 
-- **Streaming exec**: output flows in real time through KCP tunnel via IPC socket,
+- **Streaming exec**: output flows in real time through TCP connection via IPC socket,
   with exit code sent as binary trailer. No JSON wrapping, no timeout.
-  Upload/download use chunked stream (1200B MSS-aligned blocks, one per KCP
-  segment — no fragmentation).
-- **Self-copy install**: binary extracts utmmd supervisor to `/opt/utmm/utmmd` (POSIX)
-  or `C:\opt\utmm\utmmd.exe` (Windows) and registers it as the system service.
-  utmmd manages utmm's lifecycle (spawn, monitor, crash recovery).
+  Upload/download use direct TCP streaming (no chunking needed — TCP provides
+  reliable ordered delivery).
+- **Self-copy install**: binary copies itself to canonical path `/opt/utmm/utmm` (POSIX)
+  or `C:\opt\utmm\utmm.exe` (Windows). utmmd supervisor manages utmm's lifecycle
+  (spawn, monitor, crash recovery) via shared memory heartbeat.
   `--install` = unconditional force overwrite. Upgrade = scp new binary + `--install`.
   Zero shell commands.
 - **Guest-initiated auto-upgrade** (v0.12.0+): Guest detects Host version change via
-  LSA broadcast, downloads new binary through KCP tunnel, and signals utmmd
+  LSA broadcast, downloads new binary through TCP connection, and signals utmmd
   via shared memory to restart with the new binary. Host never pushes upgrades.
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
-- **Single port**: 2121 for mesh networking (UDP only — LSA + KCP tunnel).
-  MCP and CLI use local IPC socket (stdio/stdin for MCP, Unix domain socket for CLI) — no port needed.
+- **Single UDP port 2121** for LSA mesh networking.
+  MCP and CLI use local IPC socket (stdio for MCP, Unix domain socket for CLI) — no TCP/HTTP ports needed.
 - **Auto IP tracking**: Host syncs Guest IPs to `/etc/hosts` — hostnames always resolve
 - **Cross-platform**: macOS, Linux, Windows — both Host and Guest (aarch64, x86_64, x86)
-- **Persistent shell session**: shell state survives across `--exec` calls (pty model)
-- **Reliable transport**: KCP ARQ protocol matching C reference — sliding window,
-  congestion control, fast retransmit, window probing
+- **Per-command fresh shell**: each exec opens a new pty session — no cd/export
+  persistence across commands. Simpler model matching independent TCP connections.
+- **TCP reliable transport**: frame protocol with 1-byte type + payload over TCP/SOCKS4a.
+  Per-command connections — no persistent tunnels, no cross-thread shared state.
 
 ## Upgrade
 
@@ -180,7 +180,7 @@ curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.
 ```
 
 **Guest auto-upgrade (hands-free):** Guests detect a Host version change via
-LSA broadcast, download the new binary through the KCP tunnel, and signal
+LSA broadcast, download the new binary through TCP, and signal
 utmmd to restart with the new binary. No human intervention needed.
 
 **Offline/manual:** download `utmm.zip` from the

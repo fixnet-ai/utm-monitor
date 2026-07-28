@@ -1,7 +1,6 @@
 //! LSA (Link-State Advertisement) mesh networking and /etc/hosts management.
 //!
-//! Merged from mesh.zig + hosts_file.zig — all mesh topology discovery, link-state
-//! routing (Dijkstra), ping/pong probes, and /etc/hosts marker-block sync in one module.
+//! LSA broadcast + node table + /etc/hosts sync (self-contained)
 //!
 //! Binary protocol on UDP :2121 with first-byte dispatch for message type
 //! identification. LSA carries topology and version info for auto-upgrade.
@@ -1231,7 +1230,7 @@ pub const NodeInfo = struct {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// /etc/hosts marker block management (from hosts_file.zig)
+// /etc/hosts marker block management
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Maintain a block wrapped by marker comments in the hosts file:
@@ -1421,7 +1420,7 @@ fn findMarkerLine(content: []const u8, marker: []const u8) ?usize {
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Tests — mesh (from mesh.zig)
+// Tests — mesh routing
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test "parseNodeId" {
@@ -1500,7 +1499,7 @@ test "nonceChanged" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Tests — hosts file (from hosts_file.zig)
+// Tests — /etc/hosts sync
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test "HostEntry struct basics" {

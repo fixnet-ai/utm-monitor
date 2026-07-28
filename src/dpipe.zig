@@ -54,7 +54,7 @@ pub const DuplexPipe = struct {
 /// 用于 file upload/download：Host 端 relay(TCP, FilePipe) 或
 /// Guest 端 relay(ShellPipe, TCP)。
 ///
-/// 缓冲大小 64KB，与 broadcast.zig 中 rbuf 一致。
+/// 缓冲大小 64KB。
 pub fn relay(a: DuplexPipe, b: DuplexPipe) !void {
     const RelayBufferSize = 65536;
 
