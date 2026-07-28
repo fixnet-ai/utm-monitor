@@ -14,17 +14,6 @@ const common = @import("common");
 const protocol = lib.protocol;
 const tcp = lib.tcp;
 
-const system = std.posix.system;
-
-/// 在 127.0.0.1:0 上创建 TCP 监听 socket。
-fn bindAny(io: std.Io) !struct { fd: std.posix.socket_t, port: u16 } {
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    const sock = try addr.bind(io, .{ .mode = .stream });
-    errdefer sock.close(io);
-    _ = system.listen(sock.handle, 128);
-    return .{ .fd = sock.handle, .port = sock.address.getPort() };
-}
-
 /// Guest 模拟器：接收 exec 帧 → 模拟执行 → 返回输出 + 标记 + exit code。
 fn guestSimulator(
     io: std.Io,
@@ -39,13 +28,10 @@ fn guestSimulator(
     defer done.store(true, .release);
 
     // Accept 客户端连接
-    var addr: std.Io.net.IpAddress = undefined;
-    var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
-    const cli_fd = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
-    if (cli_fd < 0) return;
+    const cli_fd = common.sockAccept(listen_fd) catch return;
     defer {
-        _ = system.shutdown(cli_fd, 2);
-        _ = system.close(cli_fd);
+        common.sockShutdown(cli_fd, 2);
+        common.sockClose(cli_fd);
     }
 
     // 接收 pty_exec_input 帧
@@ -103,12 +89,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("exec: 简单命令 + exit code 0");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -183,12 +169,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("exec: 错误退出码");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -254,12 +240,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("exec: 零输出命令");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -310,12 +296,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("exec: Windows cmd.exe 标记");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);

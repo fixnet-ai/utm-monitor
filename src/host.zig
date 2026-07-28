@@ -771,8 +771,8 @@ fn handleUpgradeConnection(
     serve_dir: []const u8,
 ) void {
     defer {
-        _ = std.posix.system.shutdown(fd, 2);
-        _ = std.posix.system.close(fd);
+        tcp.sockShutdown(fd, 2);
+        tcp.sockClose(fd);
     }
 
     // 接收 upgrade_req 帧（sendFrame 写入 4B BE length + payload）
@@ -821,7 +821,7 @@ fn handleUpgradeConnection(
         };
         if (nr == 0) break; // EOF
 
-        const nw = std.posix.system.write(fd, &rbuf, nr);
+        const nw = tcp.sockWrite(fd, &rbuf, nr);
         if (nw != @as(isize, @intCast(nr))) {
             std.log.err("[host] upgrade: send binary failed", .{});
             return;
@@ -853,18 +853,14 @@ fn upgradeTcpListener(
     std.log.info("[host] upgrade TCP listener on :{d}", .{port});
 
     while (!shutdown.load(.acquire)) {
-        var addr: std.Io.net.IpAddress = undefined;
-        var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
-        const client_fd = std.posix.system.accept(sock.handle, @ptrCast(&addr), &addr_len);
-        if (client_fd < 0) {
-            const e = std.posix.errno(client_fd);
-            if (e == .AGAIN or e == .INTR) {
+        const client_fd = tcp.sockAccept(sock.handle) catch |err| {
+            if (err == error.WouldBlock) {
                 std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
                 continue;
             }
-            std.log.err("[host] upgrade listener: accept failed", .{});
+            std.log.err("[host] upgrade listener: accept failed: {}", .{err});
             continue;
-        }
+        };
 
         // 处理升级连接（阻塞，但连接是独立的且通常很快）
         handleUpgradeConnection(io, allocator, client_fd, serve_dir);
@@ -1026,9 +1022,9 @@ fn startHost(
     if (auto_upgrade) {
         upgrade_thread = std.Thread.spawn(.{}, upgradeTcpListener, .{
             block_io, gpa, mesh_port, sd, &upgrade_shutdown,
-        }) catch |err| {
+        }) catch |err| blk: {
             std.log.err("[host] upgrade listener thread spawn failed: {}", .{err});
-            upgrade_thread = null;
+            break :blk null;
         };
     }
 
@@ -1124,7 +1120,7 @@ fn tunnelManager(
                 if (std.mem.eql(u8, entry.key_ptr, &m.node_id)) continue;
 
                 const info_copy = allocator.dupe(u8, entry.value_ptr.node_info) catch continue;
-                snapshots.append(.{
+                snapshots.append(allocator, .{
                     .node_id = entry.key_ptr.*,
                     .info_copy = info_copy,
                 }) catch {

@@ -14,16 +14,6 @@ const common = @import("common");
 const protocol = lib.protocol;
 const tcp = lib.tcp;
 
-const system = std.posix.system;
-
-fn bindAny(io: std.Io) !struct { fd: std.posix.socket_t, port: u16 } {
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    const sock = try addr.bind(io, .{ .mode = .stream });
-    errdefer sock.close(io);
-    _ = system.listen(sock.handle, 128);
-    return .{ .fd = sock.handle, .port = sock.address.getPort() };
-}
-
 /// Guest 模拟器：接收 download_cmd → 流式发送文件数据 → 发送 pty_exec_done
 fn guestDownloadSimulator(
     io: std.Io,
@@ -37,13 +27,10 @@ fn guestDownloadSimulator(
     _ = io;
     defer done.store(true, .release);
 
-    var addr: std.Io.net.IpAddress = undefined;
-    var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
-    const cli_fd = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
-    if (cli_fd < 0) return;
+    const cli_fd = common.sockAccept(listen_fd) catch return;
     defer {
-        _ = system.shutdown(cli_fd, 2);
-        _ = system.close(cli_fd);
+        common.sockShutdown(cli_fd, 2);
+        common.sockClose(cli_fd);
     }
 
     // 步骤 1: 接收 download_cmd 帧
@@ -55,7 +42,7 @@ fn guestDownloadSimulator(
     const cmd = protocol.parseDownloadCmd(cmd_frame[1..]) orelse return;
 
     // 步骤 2: 流式发送文件数据（原始字节，不用帧封装）
-    _ = system.write(cli_fd, file_data.ptr, file_data.len);
+    _ = common.sockWrite(cli_fd, file_data.ptr, file_data.len);
 
     // 步骤 3: 发送 pty_exec_done 帧（download 完成标记）
     const done_frame = protocol.buildPtyExecDone(allocator, cmd.cmd_id, exit_code) catch return;
@@ -87,12 +74,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("download: 小文件下载");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -131,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
         var rbuf: [65536]u8 = undefined;
         // Read file data — since we don't know the size, read until we'd get a frame
         // For the test we read the expected amount
-        const file_n: usize = @intCast(system.read(fd, &rbuf, test_data.len));
+        const file_n: usize = @intCast(common.sockRead(fd, &rbuf, test_data.len));
         tc.expectEqual(test_data.len, file_n, "收到完整文件数据");
         try received.appendSlice(alloc, rbuf[0..@intCast(file_n)]);
         tc.expectStr(test_data, received.items, "文件内容一致");
@@ -161,12 +148,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("download: 大文件流式下载");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -206,7 +193,7 @@ pub fn main(init: std.process.Init) !void {
         var rbuf: [65536]u8 = undefined;
         while (remaining > 0) {
             const to_read = @min(remaining, rbuf.len);
-            const raw_n = system.read(fd, &rbuf, to_read);
+            const raw_n = common.sockRead(fd, &rbuf, to_read);
             if (raw_n <= 0) break;
             const n: usize = @intCast(raw_n);
             try received.appendSlice(alloc, rbuf[0..n]);
@@ -240,12 +227,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("download: 零字节文件");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -298,12 +285,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("download: 失败退出码");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -333,7 +320,7 @@ pub fn main(init: std.process.Init) !void {
 
         // 跳过文件数据（失败情况下也可能有部分输出）
         var rbuf: [4096]u8 = undefined;
-        _ = system.read(fd, &rbuf, test_data.len);
+        _ = common.sockRead(fd, &rbuf, test_data.len);
 
         // 接收失败的 done
         const done_frame = tcp.recvFrame(alloc, fd) catch |err| {

@@ -13,15 +13,6 @@ const common = @import("common");
 const dpipe = lib.dpipe;
 const tcp = lib.tcp;
 
-const system = std.posix.system;
-
-/// 创建一对已连接的 socket（用于测试 TCP↔DuplexPipe 适配）。
-fn makePair() !struct { a: std.posix.socket_t, b: std.posix.socket_t } {
-    var fds: [2]std.posix.socket_t = undefined;
-    if (std.c.socketpair(1, 1, 0, &fds) != 0) return error.SocketPairFailed;
-    return .{ .a = fds[0], .b = fds[1] };
-}
-
 pub fn main(init: std.process.Init) !void {
     _ = init;
     var threaded: std.Io.Threaded = .init_single_threaded;
@@ -108,14 +99,14 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("TCP socket → DuplexPipe 适配");
 
-        const pair = makePair() catch {
+        const pair = common.makePair() catch {
             tc.skip("socketpair 不可用");
             tc.deinit();
             return;
         };
         defer {
-            _ = system.close(pair.a);
-            _ = system.close(pair.b);
+            common.sockClose(pair.a);
+            common.sockClose(pair.b);
         }
 
         // 将一端包装为 DuplexPipe
@@ -128,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
 
         // 从另一端写入原始数据
         const msg = "hello via tcp duplex pipe";
-        _ = system.write(pair.b, msg, msg.len);
+        _ = common.sockWrite(pair.b, msg, msg.len);
 
         // DuplexPipe 端读取
         var buf: [64]u8 = undefined;

@@ -151,7 +151,8 @@ const InstallLock = struct {
             .OffsetHigh = 0,
             .hEvent = null,
         };
-        if (LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped) == 0) {
+        const result = LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped);
+        if (@intFromEnum(result) == @as(c_int, 0)) {
             _ = CloseHandle(h);
             std.log.err("[svc] install-lock: LockFileEx failed", .{});
             return error.LockFailed;

@@ -15,16 +15,6 @@ const common = @import("common");
 const protocol = lib.protocol;
 const tcp = lib.tcp;
 
-const system = std.posix.system;
-
-fn bindAny(io: std.Io) !struct { fd: std.posix.socket_t, port: u16 } {
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    const sock = try addr.bind(io, .{ .mode = .stream });
-    errdefer sock.close(io);
-    _ = system.listen(sock.handle, 128);
-    return .{ .fd = sock.handle, .port = sock.address.getPort() };
-}
-
 /// Host 模拟器：接收 upgrade_req → 流式发送二进制数据
 fn hostUpgradeSimulator(
     io: std.Io,
@@ -37,13 +27,10 @@ fn hostUpgradeSimulator(
     _ = io;
     defer done.store(true, .release);
 
-    var addr: std.Io.net.IpAddress = undefined;
-    var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
-    const cli_fd = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
-    if (cli_fd < 0) return;
+    const cli_fd = common.sockAccept(listen_fd) catch return;
     defer {
-        _ = system.shutdown(cli_fd, 2);
-        _ = system.close(cli_fd);
+        common.sockShutdown(cli_fd, 2);
+        common.sockClose(cli_fd);
     }
 
     // 步骤 1: 接收 upgrade_req 帧
@@ -55,7 +42,7 @@ fn hostUpgradeSimulator(
     const req = protocol.parseUpgradeReq(req_frame[1..]) orelse return;
 
     // 步骤 2: 流式发送二进制数据（原始字节）
-    _ = system.write(cli_fd, binary_data.ptr, binary_data.len);
+    _ = common.sockWrite(cli_fd, binary_data.ptr, binary_data.len);
 
     // 步骤 3: 发送 pty_exec_done 帧作为完成标记
     const done_frame = protocol.buildPtyExecDone(allocator, req.cmd_id, 0) catch return;
@@ -94,12 +81,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("upgrade: 基本升级流程");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var host_ok = std.atomic.Value(bool).init(false);
         var host_done = std.atomic.Value(bool).init(false);
@@ -138,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
 
         // 先接收固定长度的文件数据
         var rbuf: [65536]u8 = undefined;
-        const file_n: usize = @intCast(system.read(fd, &rbuf, fake_binary.len));
+        const file_n: usize = @intCast(common.sockRead(fd, &rbuf, fake_binary.len));
         tc.expectEqual(fake_binary.len, file_n, "收到完整升级二进制");
         try received.appendSlice(alloc, rbuf[0..@intCast(file_n)]);
 
@@ -166,12 +153,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("upgrade: target 平台标识");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var host_ok = std.atomic.Value(bool).init(false);
         var host_done = std.atomic.Value(bool).init(false);
@@ -202,7 +189,7 @@ pub fn main(init: std.process.Init) !void {
 
         // 接收并验证数据
         var rbuf: [65536]u8 = undefined;
-        const file_n: usize = @intCast(system.read(fd, &rbuf, binary.len));
+        const file_n: usize = @intCast(common.sockRead(fd, &rbuf, binary.len));
         tc.expectEqual(binary.len, file_n, "收到完整二进制");
         tc.expectStr(binary, rbuf[0..@intCast(file_n)], "内容一致");
 
@@ -215,12 +202,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("upgrade: 大二进制流式传输");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var host_ok = std.atomic.Value(bool).init(false);
         var host_done = std.atomic.Value(bool).init(false);
@@ -262,7 +249,7 @@ pub fn main(init: std.process.Init) !void {
 
         while (remaining > 0) {
             const to_read = @min(remaining, rbuf.len);
-            const raw_n = system.read(fd, &rbuf, to_read);
+            const raw_n = common.sockRead(fd, &rbuf, to_read);
             if (raw_n <= 0) break;
             const n: usize = @intCast(raw_n);
             try received.appendSlice(alloc, rbuf[0..n]);

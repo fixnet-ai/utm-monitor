@@ -14,16 +14,6 @@ const common = @import("common");
 const protocol = lib.protocol;
 const tcp = lib.tcp;
 
-const system = std.posix.system;
-
-fn bindAny(io: std.Io) !struct { fd: std.posix.socket_t, port: u16 } {
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    const sock = try addr.bind(io, .{ .mode = .stream });
-    errdefer sock.close(io);
-    _ = system.listen(sock.handle, 128);
-    return .{ .fd = sock.handle, .port = sock.address.getPort() };
-}
-
 /// Guest 模拟器：接收 upload_cmd → 读取文件数据 → 验证 → 返回 upload_result
 fn guestUploadSimulator(
     io: std.Io,
@@ -37,13 +27,10 @@ fn guestUploadSimulator(
     _ = io;
     defer done.store(true, .release);
 
-    var addr: std.Io.net.IpAddress = undefined;
-    var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
-    const cli_fd = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
-    if (cli_fd < 0) return;
+    const cli_fd = common.sockAccept(listen_fd) catch return;
     defer {
-        _ = system.shutdown(cli_fd, 2);
-        _ = system.close(cli_fd);
+        common.sockShutdown(cli_fd, 2);
+        common.sockClose(cli_fd);
     }
 
     // 步骤 1: 接收 upload_cmd 帧
@@ -62,7 +49,7 @@ fn guestUploadSimulator(
     var rbuf: [65536]u8 = undefined;
     while (remaining > 0) {
         const to_read = @min(remaining, rbuf.len);
-        const n = system.read(cli_fd, &rbuf, to_read);
+        const n = common.sockRead(cli_fd, &rbuf, to_read);
         if (n <= 0) return;
         received.appendSlice(allocator, rbuf[0..@intCast(n)]) catch return;
         remaining -= @intCast(n);
@@ -116,12 +103,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("upload: 小文件上传 + SHA256 验证");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -153,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
         try tcp.sendFrame(fd, cmd_frame);
 
         // 直接发送原始文件数据
-        _ = system.write(fd, test_data.ptr, test_data.len);
+        _ = common.sockWrite(fd,test_data.ptr, test_data.len);
 
         // 接收 upload_result
         const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
@@ -181,12 +168,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("upload: 错误退出码回传");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -214,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
         const cmd_frame = try protocol.buildUploadCmd(alloc, "up-2", "/tmp/err.txt", @intCast(test_data.len), &file_hash);
         defer alloc.free(cmd_frame);
         try tcp.sendFrame(fd, cmd_frame);
-        _ = system.write(fd, test_data.ptr, test_data.len);
+        _ = common.sockWrite(fd,test_data.ptr, test_data.len);
 
         const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
@@ -239,12 +226,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("upload: 零字节文件");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -298,12 +285,12 @@ pub fn main(init: std.process.Init) !void {
     {
         var tc = runner.case("upload: 二进制文件");
 
-        const listener = bindAny(io) catch {
+        const listener = common.bindAny(io) catch {
             tc.skip("无法绑定测试端口");
             tc.deinit();
             return;
         };
-        defer _ = system.close(listener.fd);
+        defer common.sockClose(listener.fd);
 
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
@@ -335,7 +322,7 @@ pub fn main(init: std.process.Init) !void {
         const cmd_frame = try protocol.buildUploadCmd(alloc, "up-4", "/tmp/binary.bin", 256, &file_hash);
         defer alloc.free(cmd_frame);
         try tcp.sendFrame(fd, cmd_frame);
-        _ = system.write(fd, &binary_data, binary_data.len);
+        _ = common.sockWrite(fd,&binary_data, binary_data.len);
 
         const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});

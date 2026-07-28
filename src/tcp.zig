@@ -17,6 +17,108 @@ const system = std.posix.system;
 const dpipe = @import("dpipe.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Platform Socket Abstraction
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// socket_t is platform-dependent: c_int on POSIX, *anyopaque on Windows.
+// system.read/write/close operate on c_int fds (POSIX) but NOT on Windows
+// sockets — Winsock2 requires send/recv/closesocket. These inline wrappers
+// branch at comptime so there is zero runtime overhead.
+
+const socket_t = std.posix.socket_t;
+
+/// Write data to a socket. POSIX: write(), Windows: send().
+pub inline fn sockWrite(fd: socket_t, buf: [*]const u8, len: usize) isize {
+    if (builtin.os.tag == .windows) {
+        return system.send(fd, buf, @intCast(len), 0);
+    }
+    return system.write(fd, buf, len);
+}
+
+/// Read data from a socket. POSIX: read(), Windows: recv().
+pub inline fn sockRead(fd: socket_t, buf: [*]u8, len: usize) isize {
+    if (builtin.os.tag == .windows) {
+        return system.recv(fd, buf, @intCast(len), 0);
+    }
+    return system.read(fd, buf, len);
+}
+
+/// Close a socket. POSIX: close(), Windows: closesocket() via ws2_32.
+pub inline fn sockClose(fd: socket_t) void {
+    if (builtin.os.tag == .windows) {
+        _ = ws2_closesocket(fd);
+    } else {
+        _ = system.close(fd);
+    }
+}
+
+/// Shutdown a socket.
+pub inline fn sockShutdown(fd: socket_t, how: i32) void {
+    if (builtin.os.tag == .windows) {
+        _ = ws2_shutdown(fd, how);
+    } else {
+        _ = system.shutdown(fd, how);
+    }
+}
+
+/// Accept a connection on a listening socket. Returns the client socket.
+/// Handles the accept-return-type difference between POSIX (c_int) and
+/// Windows (SOCKET/*anyopaque).
+pub fn sockAccept(listen_fd: socket_t) !socket_t {
+    var addr: std.Io.net.IpAddress = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
+    if (builtin.os.tag == .windows) {
+        const raw = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
+        // On Windows, INVALID_SOCKET = ~0, but system.accept may return c_int
+        // where -1 (0xFFFFFFFF as signed) corresponds to INVALID_SOCKET.
+        if (raw == -1) {
+            return error.AcceptFailed;
+        }
+        // Two-step: c_int -> c_uint (same 32-bit size) -> usize (widen)
+        const u: c_uint = @bitCast(raw);
+        return @ptrFromInt(@as(usize, u));
+    }
+    const fd = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
+    if (fd < 0) {
+        const e = std.posix.errno(fd);
+        if (e == .AGAIN or e == .INTR) return error.WouldBlock;
+        return error.AcceptFailed;
+    }
+    return fd;
+}
+
+// Windows Winsock2 externs (ws2_32 linked by build.zig when target is Windows).
+extern "ws2_32" fn closesocket(s: std.posix.socket_t) c_int;
+const ws2_closesocket = closesocket;
+extern "ws2_32" fn shutdown(s: std.posix.socket_t, how: c_int) c_int;
+const ws2_shutdown = shutdown;
+
+/// Create a pair of connected sockets (for testing).
+/// On Windows, std.c.socketpair doesn't exist — uses TCP loopback instead.
+pub fn makePair() !struct { a: socket_t, b: socket_t } {
+    if (builtin.os.tag == .windows) {
+        // TCP loopback pair for Windows — std.c.socketpair doesn't exist
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        const listener = try addr.bind(io, .{ .mode = .stream });
+        defer listener.close(io);
+        _ = system.listen(listener.handle, 1);
+
+        const listener_port = listener.address.getPort();
+        const client = try std.Io.net.IpAddress.parse("127.0.0.1", listener_port);
+        const client_stream = try client.connect(io, .{ .mode = .stream });
+
+        const server_fd = try sockAccept(listener.handle);
+
+        return .{ .a = client_stream.socket.handle, .b = server_fd };
+    }
+    var fds: [2]socket_t = undefined;
+    if (std.c.socketpair(1, 1, 0, &fds) != 0) return error.SocketPairFailed;
+    return .{ .a = fds[0], .b = fds[1] };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Frame Protocol
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -27,9 +129,9 @@ pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 pub fn sendFrame(fd: std.posix.socket_t, data: []const u8) !void {
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
-    const n1 = system.write(fd, &len_buf, len_buf.len);
+    const n1 = sockWrite(fd, &len_buf, len_buf.len);
     if (n1 != 4) return error.SendFailed;
-    const n2 = system.write(fd, data.ptr, data.len);
+    const n2 = sockWrite(fd, data.ptr, data.len);
     if (n2 != data.len) return error.SendFailed;
 }
 
@@ -53,7 +155,7 @@ pub fn recvFrame(allocator: std.mem.Allocator, fd: std.posix.socket_t) ![]const 
 fn recvExact(fd: std.posix.socket_t, buf: []u8) !usize {
     var total: usize = 0;
     while (total < buf.len) {
-        const n = system.read(fd, buf.ptr + total, buf.len - total);
+        const n = sockRead(fd, buf.ptr + total, buf.len - total);
         if (n < 0) return error.ConnectionClosed; // read error on dead socket
         if (n == 0) return total; // EOF
         total += @intCast(n);
@@ -122,7 +224,7 @@ pub fn socks4Connect(
     pos += 1;
 
     const fd = stream.socket.handle;
-    const w1 = system.write(fd, &req_buf, pos);
+    const w1 = sockWrite(fd, &req_buf, pos);
     if (w1 != pos) {
         stream.close(io);
         return error.Socks4SendFailed;
@@ -132,7 +234,7 @@ pub fn socks4Connect(
     var resp: [8]u8 = undefined;
     var off: usize = 0;
     while (off < 8) {
-        const n = system.read(fd, resp[off..].ptr, resp.len - off);
+        const n = sockRead(fd, resp[off..].ptr, resp.len - off);
         if (n == 0) {
             stream.close(io);
             return error.Socks4ResponseTooShort;
@@ -159,7 +261,7 @@ pub fn socks4Accept(fd: std.posix.socket_t) !Socks4Request {
     var hdr: [8]u8 = undefined;
     var off: usize = 0;
     while (off < 8) {
-        const n = system.read(fd, hdr[off..].ptr, hdr.len - off);
+        const n = sockRead(fd, hdr[off..].ptr, hdr.len - off);
         if (n == 0) return error.Socks4HeaderTooShort;
         off += @intCast(n);
     }
@@ -184,13 +286,13 @@ pub fn socks4Accept(fd: std.posix.socket_t) !Socks4Request {
 /// 发送 SOCKS4 成功响应。
 pub fn socks4ReplyOk(fd: std.posix.socket_t) void {
     const resp = [_]u8{ 0x00, SOCKS_REP_OK, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    _ = system.write(fd, &resp, resp.len);
+    _ = sockWrite(fd, &resp, resp.len);
 }
 
 /// 发送 SOCKS4 拒绝响应。
 pub fn socks4ReplyRejected(fd: std.posix.socket_t) void {
     const resp = [_]u8{ 0x00, SOCKS_REP_REJECTED, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-    _ = system.write(fd, &resp, resp.len);
+    _ = sockWrite(fd, &resp, resp.len);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -204,7 +306,7 @@ fn readUntilNull(fd: std.posix.socket_t) ![]const u8 {
     var pos: usize = 0;
     while (pos < buf.len) {
         var byte: u8 = undefined;
-        const n = system.read(fd, @as([*]u8, @ptrCast(&byte)), 1);
+        const n = sockRead(fd, @as([*]u8, @ptrCast(&byte)), 1);
         if (n == 0) return buf[0..pos];
         if (byte == 0) return buf[0..pos];
         buf[pos] = byte;
@@ -237,7 +339,7 @@ fn socks4SendRequest(fd: std.posix.socket_t, hostname: []const u8, port: u16) !v
     req[pos] = 0;
     pos += 1;
 
-    const n = system.write(fd, &req, pos);
+    const n = sockWrite(fd, &req, pos);
     if (n != pos) return error.Socks4SendFailed;
 }
 
@@ -254,12 +356,12 @@ pub fn socks4Relay(a_fd: std.posix.socket_t, b_fd: std.posix.socket_t) !void {
 fn relayDir(src: std.posix.socket_t, dst: std.posix.socket_t, done: *std.atomic.Value(bool)) void {
     var buf: [65536]u8 = undefined;
     while (true) {
-        const n = system.read(src, &buf, buf.len);
+        const n = sockRead(src, &buf, buf.len);
         if (n == 0) {
             done.store(true, .release);
             return;
         }
-        _ = system.write(dst, &buf, @intCast(n));
+        _ = sockWrite(dst, &buf, @intCast(n));
     }
 }
 
@@ -317,8 +419,8 @@ pub const Connection = struct {
     /// 关闭连接并释放资源。
     pub fn deinit(self: *Connection) void {
         self.alive = false;
-        _ = system.shutdown(self.fd, 2); // SHUT_RDWR
-        _ = system.close(self.fd);
+        sockShutdown(self.fd, 2); // SHUT_RDWR
+        sockClose(self.fd);
     }
 };
 
@@ -333,21 +435,21 @@ const TcpPipeCtx = struct {
 
 fn tcpPipeReadFn(ctx: *anyopaque, buf: []u8) anyerror!usize {
     const self: *TcpPipeCtx = @ptrCast(@alignCast(ctx));
-    const n = system.read(self.fd, buf.ptr, buf.len);
+    const n = sockRead(self.fd, buf.ptr, buf.len);
     if (n < 0) return error.ReadFailed;
     return @intCast(n);
 }
 
 fn tcpPipeWriteFn(ctx: *anyopaque, data: []const u8) anyerror!void {
     const self: *TcpPipeCtx = @ptrCast(@alignCast(ctx));
-    const n = system.write(self.fd, data.ptr, data.len);
+    const n = sockWrite(self.fd, data.ptr, data.len);
     if (n != data.len) return error.WriteFailed;
 }
 
 fn tcpPipeCloseFn(ctx: *anyopaque) void {
     const self: *TcpPipeCtx = @ptrCast(@alignCast(ctx));
-    _ = system.shutdown(self.fd, 2);
-    _ = system.close(self.fd);
+    sockShutdown(self.fd, 2);
+    sockClose(self.fd);
     self.allocator.destroy(self);
 }
 
@@ -395,7 +497,7 @@ pub const TcpListener = struct {
     /// 只有目标是 self_hostname 才接受，否则拒绝并返回错误。
     pub fn accept(self: *TcpListener, self_hostname: []const u8) !Connection {
         while (true) {
-            const fd = acceptOne(self.socket.handle) catch |err| {
+            const fd = sockAccept(self.socket.handle) catch |err| {
                 if (err == error.WouldBlock) {
                     std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
                     continue;
@@ -406,7 +508,7 @@ pub const TcpListener = struct {
             // SOCKS4a 握手
             const req = socks4Accept(fd) catch |err| {
                 std.log.err("[tcp] socks4Accept failed: {}", .{err});
-                _ = system.close(fd);
+                sockClose(fd);
                 continue;
             };
 
@@ -419,22 +521,10 @@ pub const TcpListener = struct {
             // 目标不是自己 — 拒绝
             std.log.info("[tcp] rejected relay target={s} (not self={s})", .{ req.hostname, self_hostname });
             socks4ReplyRejected(fd);
-            _ = system.close(fd);
+            sockClose(fd);
         }
     }
 };
-
-fn acceptOne(listen_fd: std.posix.socket_t) !std.posix.socket_t {
-    var addr: std.Io.net.IpAddress = undefined;
-    var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
-    const fd = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
-    if (fd < 0) {
-        const e = std.posix.errno(fd);
-        if (e == .AGAIN or e == .INTR) return error.WouldBlock;
-        return error.AcceptFailed;
-    }
-    return fd;
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Host 端 — Connector
@@ -464,7 +554,7 @@ pub fn hostConnect(io: std.Io, guest_ip: []const u8, guest_hostname: []const u8,
     var resp: [8]u8 = undefined;
     var off: usize = 0;
     while (off < 8) {
-        const n = system.read(fd, resp[off..].ptr, resp.len - off);
+        const n = sockRead(fd, resp[off..].ptr, resp.len - off);
         if (n == 0) {
             stream.close(io);
             return error.Socks4ResponseTooShort;
@@ -486,21 +576,14 @@ pub fn hostConnect(io: std.Io, guest_ip: []const u8, guest_hostname: []const u8,
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// 创建一对已连接的 socket（用于测试）。
-fn makePair() !struct { a: std.posix.socket_t, b: std.posix.socket_t } {
-    var fds: [2]std.posix.socket_t = undefined;
-    if (std.c.socketpair(1, 1, 0, &fds) != 0) return error.SocketPairFailed;
-    return .{ .a = fds[0], .b = fds[1] };
-}
-
 // ── 帧协议测试 ──
 
 test "sendFrame/recvFrame round-trip" {
     const allocator = std.testing.allocator;
     const pair = try makePair();
     defer {
-        _ = system.close(pair.a);
-        _ = system.close(pair.b);
+        sockClose(pair.a);
+        sockClose(pair.b);
     }
 
     const msg = "hello tcp frame";
@@ -515,11 +598,11 @@ test "recvFrame empty" {
     const allocator = std.testing.allocator;
     const pair = try makePair();
     defer {
-        _ = system.close(pair.a);
-        _ = system.close(pair.b);
+        sockClose(pair.a);
+        sockClose(pair.b);
     }
 
-    _ = system.shutdown(pair.a, 1); // SHUT_WR=1
+    sockShutdown(pair.a, 1); // SHUT_WR=1
     const result = recvFrame(allocator, pair.b);
     try std.testing.expectError(error.ConnectionClosed, result);
 }
@@ -528,8 +611,8 @@ test "recvFrame large payload" {
     const allocator = std.testing.allocator;
     const pair = try makePair();
     defer {
-        _ = system.close(pair.a);
-        _ = system.close(pair.b);
+        sockClose(pair.a);
+        sockClose(pair.b);
     }
 
     const large = try allocator.alloc(u8, 128 * 1024);
@@ -549,8 +632,8 @@ test "recvFrame multiple frames" {
     const allocator = std.testing.allocator;
     const pair = try makePair();
     defer {
-        _ = system.close(pair.a);
-        _ = system.close(pair.b);
+        sockClose(pair.a);
+        sockClose(pair.b);
     }
 
     try sendFrame(pair.a, "first");
@@ -570,8 +653,8 @@ test "recvFrame multiple frames" {
 test "socks4a handshake round-trip" {
     const pair = try makePair();
     defer {
-        _ = system.close(pair.a);
-        _ = system.close(pair.b);
+        sockClose(pair.a);
+        sockClose(pair.b);
     }
 
     // 客户端线程：发送 SOCKS4a 请求 → 验证响应
@@ -584,12 +667,12 @@ test "socks4a handshake round-trip" {
                 0, // USERID = "" (null only)
                 't',  'e',  's',  't',  0, // HOSTNAME
             };
-            _ = system.write(fd, &req, req.len);
+            _ = sockWrite(fd, &req, req.len);
 
             var resp: [8]u8 = [_]u8{0} ** 8;
             var off: usize = 0;
             while (off < 8) {
-                const n = system.read(fd, resp[off..].ptr, resp.len - off);
+                const n = sockRead(fd, resp[off..].ptr, resp.len - off);
                 if (n == 0) break;
                 off += @intCast(n);
             }
@@ -612,8 +695,8 @@ test "socks4a handshake round-trip" {
 test "socks4ReplyRejected" {
     const pair = try makePair();
     defer {
-        _ = system.close(pair.a);
-        _ = system.close(pair.b);
+        sockClose(pair.a);
+        sockClose(pair.b);
     }
 
     socks4ReplyRejected(pair.a);
@@ -621,7 +704,7 @@ test "socks4ReplyRejected" {
     var resp: [8]u8 = [_]u8{0} ** 8;
     var off: usize = 0;
     while (off < 8) {
-        const n = system.read(pair.b, resp[off..].ptr, resp.len - off);
+        const n = sockRead(pair.b, resp[off..].ptr, resp.len - off);
         if (n == 0) break;
         off += @intCast(n);
     }
@@ -633,8 +716,8 @@ test "socks4ReplyRejected" {
 test "Connection send/recv round-trip" {
     const pair = try makePair();
     defer {
-        _ = system.close(pair.a);
-        _ = system.close(pair.b);
+        sockClose(pair.a);
+        sockClose(pair.b);
     }
 
     var conn = Connection{ .fd = pair.a, .alive = true };
@@ -649,12 +732,12 @@ test "Connection send/recv round-trip" {
 test "Connection recv detects close" {
     const pair = try makePair();
     defer {
-        _ = system.close(pair.b);
+        sockClose(pair.b);
     }
 
     var conn = Connection{ .fd = pair.a, .alive = true };
-    _ = system.shutdown(pair.a, 2);
-    _ = system.close(pair.a);
+    sockShutdown(pair.a, 2);
+    sockClose(pair.a);
 
     var rbuf: [256]u8 = undefined;
     if (conn.recv(&rbuf)) |_| {} else |_| {}

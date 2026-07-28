@@ -1,10 +1,106 @@
 //! 测试基础设施 — 共享工具，供所有集成测试使用。
 //!
 //! 提供 TestRunner (统计), TestCase (断言), TempDir (临时目录),
-//! findFreePort (动态端口), isWindows (平台检测)。
+//! findFreePort (动态端口), isWindows (平台检测),
+//! 跨平台 socket I/O 辅助 (sockRead/sockWrite/sockClose 等)。
 
 const std = @import("std");
 const builtin = @import("builtin");
+const system = std.posix.system;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 跨平台 Socket I/O 抽象
+// ═══════════════════════════════════════════════════════════════════════════
+
+const socket_t = std.posix.socket_t;
+
+/// Write data to a socket. POSIX: write(), Windows: send().
+pub inline fn sockWrite(fd: socket_t, buf: [*]const u8, len: usize) isize {
+    if (builtin.os.tag == .windows) {
+        return system.send(fd, buf, @intCast(len), 0);
+    }
+    return system.write(fd, buf, len);
+}
+
+/// Read data from a socket. POSIX: read(), Windows: recv().
+pub inline fn sockRead(fd: socket_t, buf: [*]u8, len: usize) isize {
+    if (builtin.os.tag == .windows) {
+        return system.recv(fd, buf, @intCast(len), 0);
+    }
+    return system.read(fd, buf, len);
+}
+
+/// Close a socket. POSIX: close(), Windows: closesocket() via ws2_32.
+pub inline fn sockClose(fd: socket_t) void {
+    if (builtin.os.tag == .windows) {
+        _ = ws2_closesocket(fd);
+    } else {
+        _ = system.close(fd);
+    }
+}
+
+/// Shutdown a socket.
+pub inline fn sockShutdown(fd: socket_t, how: i32) void {
+    if (builtin.os.tag == .windows) {
+        _ = ws2_shutdown(fd, how);
+    } else {
+        _ = system.shutdown(fd, how);
+    }
+}
+
+/// Accept a connection. Returns socket_t on both platforms.
+pub fn sockAccept(listen_fd: socket_t) !socket_t {
+    var addr: std.Io.net.IpAddress = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
+    if (builtin.os.tag == .windows) {
+        const raw = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
+        if (raw == -1) return error.AcceptFailed;
+        const u: c_uint = @bitCast(raw);
+        return @ptrFromInt(@as(usize, u));
+    }
+    const fd = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
+    if (fd < 0) return error.AcceptFailed;
+    return fd;
+}
+
+// Windows Winsock2 externs (ws2_32 linked by build.zig when target is Windows).
+// callconv(.Unspecified) = default platform C calling convention.
+extern "ws2_32" fn closesocket(s: std.posix.socket_t) c_int;
+const ws2_closesocket = closesocket;
+extern "ws2_32" fn shutdown(s: std.posix.socket_t, how: c_int) c_int;
+const ws2_shutdown = shutdown;
+
+/// 在 127.0.0.1:0 上创建 TCP 监听 socket。返回 socket fd + 实际端口。
+pub fn bindAny(io: std.Io) !struct { fd: socket_t, port: u16 } {
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const sock = try addr.bind(io, .{ .mode = .stream });
+    errdefer sock.close(io);
+    _ = system.listen(sock.handle, 128);
+    return .{ .fd = sock.handle, .port = sock.address.getPort() };
+}
+
+/// 创建一对已连接的 socket（用于测试）。
+/// Windows: TCP loopback 替代 (std.c.socketpair 不存在)。
+pub fn makePair() !struct { a: socket_t, b: socket_t } {
+    if (builtin.os.tag == .windows) {
+        var threaded: std.Io.Threaded = .init_single_threaded;
+        const io = threaded.io();
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        const listener = try addr.bind(io, .{ .mode = .stream });
+        defer listener.close(io);
+        _ = system.listen(listener.handle, 1);
+
+        const listener_port = listener.address.getPort();
+        const client = try std.Io.net.IpAddress.parse("127.0.0.1", listener_port);
+        const client_stream = try client.connect(io, .{ .mode = .stream });
+
+        const server_fd = try sockAccept(listener.handle);
+        return .{ .a = client_stream.socket.handle, .b = server_fd };
+    }
+    var fds: [2]socket_t = undefined;
+    if (std.c.socketpair(1, 1, 0, &fds) != 0) return error.SocketPairFailed;
+    return .{ .a = fds[0], .b = fds[1] };
+}
 
 /// 测试运行器。累积通过/失败/跳过计数，输出结构化结果。
 pub const TestRunner = struct {
