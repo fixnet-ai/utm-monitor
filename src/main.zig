@@ -27,7 +27,6 @@ comptime {
     _ = @import("lsa.zig");
     _ = @import("config.zig");
     _ = @import("tcp.zig");
-    _ = @import("lock.zig");
     _ = @import("mcp.zig");
     _ = @import("host.zig");
     _ = svc;
