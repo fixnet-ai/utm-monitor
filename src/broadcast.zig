@@ -1087,7 +1087,7 @@ pub fn meshSessionLoop(
         };
 
         // Create mesh instance (mesh takes ownership of node_info and broadcast_addrs)
-        mesh_opt = mesh_mod.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs, getSubnetBroadcasts) catch |err| {
+        mesh_opt = mesh_mod.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs, getSubnetBroadcasts, null, null, null) catch |err| {
             std.log.err("[guest-mesh] Mesh init failed: {}", .{err});
             allocator.free(node_info);
             mesh_socket.close(mesh_io);
@@ -1549,7 +1549,14 @@ fn receiveChunkedFile(
             std.log.err("[guest-mesh] Chunk recv error: {}", .{err});
             return err;
         };
-        if (n == 0) continue;
+        if (n == 0) {
+            // Yield to mesh thread — without this sleep the tight recv loop
+            // starves sessions_mutex, preventing kcp.input()/kcp.update()
+            // from delivering ACKs and new data. Large file transfers (>~1MB)
+            // fail with TunnelDeadDuringUpload without this yield.
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+            continue;
+        }
 
         const msg_type: u8 = rbuf[0];
         const payload = rbuf[1..n];
@@ -1849,6 +1856,7 @@ fn sendChunkedFile(
     var file_read_buf: [4096]u8 = undefined;  // disk read buffer, larger than chunk for efficiency
     var file_reader = file.reader(io, &file_read_buf);
 
+    var chunk_count: u32 = 0;
     while (true) {
         const n = file_reader.interface.readSliceShort(&chunk_buf) catch |err2| {
             std.log.err("[guest-mesh] Download read error: {}", .{err2});
@@ -1871,6 +1879,14 @@ fn sendChunkedFile(
             return e;
         };
         total += @intCast(n);
+        chunk_count += 1;
+
+        // Yield every 32 chunks (one KCP send window) to let the mesh thread
+        // process incoming ACKs. Without this yield, the tight send loop
+        // starves kcp.input() → ACKs are never processed → snd_wnd stalls.
+        if (chunk_count % 32 == 0) {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+        }
     }
 
     // Build hash and send file_eof

@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const kcp = @import("kcp.zig");
 const protocol = @import("protocol.zig");
+const cmdchan = @import("cmdchan.zig");
 
 const net = std.Io.net;
 const assert = std.debug.assert;
@@ -360,6 +361,20 @@ pub const Mesh = struct {
     /// Guest-side: NodeId of the Host (from LSA origin). Used to compute expected_conv.
     host_node_id: ?NodeId = null,
 
+    // Command channel (IPC→Mesh). Single producer (IPC thread), single consumer (Mesh thread).
+    // Null until Phase 4 (IPC integration). Mesh thread polls this each event loop iteration.
+    // Once non-null, it stays non-null for the lifetime of the Mesh.
+    cmd_queue: ?*cmdchan.CmdQueue,
+
+    /// Opaque pointer to HostState (set by host.zig). Used by cmd_handler callback
+    /// for tunnel lookup, completion registration, and guest table access.
+    state_ptr: ?*anyopaque,
+
+    /// Command dispatch callback. Called by dispatchCmd for each command popped
+    /// from cmd_queue. Implemented in host.zig to bridge Mesh (KCP sessions)
+    /// with HostState (tunnels, completions, guest table).
+    cmd_handler: ?*const fn (*anyopaque, *Mesh, *const cmdchan.Cmd) void,
+
     // Shutdown
     shutdown: std.atomic.Value(bool),
 
@@ -398,6 +413,9 @@ pub const Mesh = struct {
         upgrade_needed: *std.atomic.Value(bool),
         broadcast_addrs: std.ArrayList(net.IpAddress),
         broadcast_refresh_fn: ?*const fn (std.mem.Allocator) anyerror!std.ArrayList(net.IpAddress),
+        cmd_queue: ?*cmdchan.CmdQueue,
+        state_ptr: ?*anyopaque,
+        cmd_handler: ?*const fn (*anyopaque, *Mesh, *const cmdchan.Cmd) void,
     ) !Mesh {
         const nonce = generateNonce();
 
@@ -434,6 +452,9 @@ pub const Mesh = struct {
             .sessions_mutex = std.Io.Mutex.init,
             .shutdown = std.atomic.Value(bool).init(false),
             .upgrade_needed = upgrade_needed,
+            .cmd_queue = cmd_queue,
+            .state_ptr = state_ptr,
+            .cmd_handler = cmd_handler,
             .nonce = nonce,
             .session_gen = 0,
             .clock_ms = 0,
@@ -521,6 +542,40 @@ pub const Mesh = struct {
         return self.runPosix();
     }
 
+    /// Check for pending IPC commands and dispatch them.
+    /// Called from the event loop each iteration.
+    fn processPendingCommands(self: *Mesh) void {
+        if (self.cmd_queue) |queue| {
+            var cmds: [16]cmdchan.Cmd = undefined;
+            const count = queue.popBatch(&cmds);
+            for (cmds[0..count]) |*cmd| {
+                self.dispatchCmd(cmd);
+            }
+        }
+    }
+
+    /// Dispatch a single command from the IPC thread.
+    /// Calls the registered cmd_handler callback (Phase 3) if set;
+    /// otherwise logs the command as a no-op stub (Phase 2).
+    fn dispatchCmd(self: *Mesh, cmd: *const cmdchan.Cmd) void {
+        if (self.cmd_handler) |handler| {
+            if (self.state_ptr) |sp| {
+                handler(sp, self, cmd);
+                return;
+            } else {
+                std.log.err("[mesh-cmd] cmd_handler set but state_ptr is null", .{});
+            }
+        }
+        // Fallback: log as stub
+        switch (cmd.tag) {
+            .exec => std.log.info("[mesh-cmd] exec {s} on {s}: {s}", .{ cmd.cmdIdStr(), cmd.vmStr(), cmd.arg1Str() }),
+            .upload => std.log.info("[mesh-cmd] upload to {s}: {s} ({d} bytes)", .{ cmd.vmStr(), cmd.arg1Str(), cmd.file_size }),
+            .download => std.log.info("[mesh-cmd] download from {s}: {s}", .{ cmd.vmStr(), cmd.arg1Str() }),
+            .status => std.log.info("[mesh-cmd] status", .{}),
+            .ping => std.log.info("[mesh-cmd] ping {s}", .{ cmd.vmStr() }),
+        }
+    }
+
     /// POSIX: use receiveTimeout with 1-second timeout for periodic tasks.
     fn runPosix(self: *Mesh) !void {
         var buf: [4096]u8 = undefined;
@@ -558,6 +613,7 @@ pub const Mesh = struct {
             }
 
             self.periodicTasks();
+            self.processPendingCommands();
         }
 
         std.log.info("[mesh] Shutting down", .{});
@@ -605,6 +661,7 @@ pub const Mesh = struct {
             }
 
             self.periodicTasks();
+            self.processPendingCommands();
         }
 
         std.log.info("[mesh] Shutting down", .{});

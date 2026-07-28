@@ -15,6 +15,10 @@ const svc = @import("svc.zig");
 const fail = @import("fail.zig");
 const mcp = @import("mcp.zig");
 const shm = @import("shm.zig");
+const ringbuf = @import("ringbuf.zig");
+const cmdchan = @import("cmdchan.zig");
+const completion = @import("completion.zig");
+comptime { _ = ringbuf; _ = cmdchan; _ = completion; }
 
 /// Embedded utmmd binary — compiled at build time, extracted at install time.
 const utmmd_bin = @embedFile("embed/utmmd.bin");

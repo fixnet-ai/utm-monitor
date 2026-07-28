@@ -631,7 +631,6 @@ fn handleExec(
     };
 
     const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
-    const tunproto = @import("tunproto.zig");
 
     // Get guest shell type
     const guest_shell = blk: {
@@ -671,27 +670,30 @@ fn handleExec(
     };
     defer gpa.free(cmd_with_marker);
 
-    // Build pty_exec_input frame
-    const frame = tunproto.buildPtyExecInput(gpa, cmd_id, cmd_with_marker) catch {
-        sendError(conn, "AllocFailed");
-        return;
-    };
-    defer gpa.free(frame);
-
-    // Create operation state and send via KCP tunnel
+    // Create operation state for output collection.
+    // handleMeshGuest writes exec output here; we poll it below.
     state.createOpState(cmd_id) catch {
         sendError(conn, "OpStateFailed");
         return;
     };
 
-    const tun = state.getGuestTunnel(vm) orelse {
-        sendError(conn, "GuestNotConnected");
-        return;
-    };
-    _ = tun.sendAndFlush(frame, tun.session.mesh.clock_ms) catch {
-        sendError(conn, "TunnelSendFailed");
-        return;
-    };
+    // Submit command to Mesh thread via lock-free channel.
+    // The Mesh thread builds the pty_exec_input frame and sends it via KCP —
+    // no KCP calls from this IPC handler thread.
+    {
+        const cmdchan_mod = @import("cmdchan.zig");
+        const cmd = cmdchan_mod.Cmd.exec(cmd_id, vm, cmd_with_marker);
+        const queue = state.cmd_queue orelse {
+            sendError(conn, "CmdQueueNotAvailable");
+            return;
+        };
+        if (!queue.push(cmd)) {
+            sendError(conn, "CmdQueueFull");
+            return;
+        }
+        // Channel push succeeded — Mesh thread will pick up and send via KCP.
+        // No tunnel lookup, no KCP I/O from this thread.
+    }
 
     std.log.info("[ipc-exec] sent {s} to {s}", .{ cmd_id, vm });
 
@@ -835,39 +837,56 @@ fn handleUpload(
         return;
     };
 
-    // Read file data from connection in 8KB chunks and send via KCP.
-    // Use lock()+sendLocked()+flushLocked()+unlock() for batch efficiency
-    // (same pattern as state.zig handleUpload).
+    // Read file data from connection and send via KCP.
+    // Batch with periodic flush to avoid overwhelming KCP send queue.
+    // Each batch: lock → send up to 32 chunks → flush → unlock →
+    // sleep briefly to let mesh thread process ACKs and advance send window.
     var file_buf: [tunproto.FILE_CHUNK_DATA_MAX]u8 = undefined;
     var total_sent: u32 = 0;
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
-    tun.lock() catch {
-        sendError(conn, "TunnelLockFailed");
-        return;
-    };
-    defer tun.unlock();
+    const BATCH_SIZE: u32 = 32; // one KCP send window
     while (total_sent < file_size) {
-        const to_read: usize = @min(file_buf.len, file_size - total_sent);
-        const n = conn.readFull(file_buf[0..to_read]) catch {
-            sendError(conn, "FileReadFailed");
+        tun.lock() catch {
+            sendError(conn, "TunnelLockFailed");
             return;
         };
-        if (n == 0) break;
+        errdefer tun.unlock();
 
-        sha.update(file_buf[0..n]);
+        var batch_count: u32 = 0;
+        while (batch_count < BATCH_SIZE and total_sent < file_size) {
+            const to_read: usize = @min(file_buf.len, file_size - total_sent);
+            const n = conn.readFull(file_buf[0..to_read]) catch {
+                tun.unlock();
+                sendError(conn, "FileReadFailed");
+                return;
+            };
+            if (n == 0) break;
 
-        const chunk = tunproto.buildFileChunk(gpa, cmd_id, file_buf[0..n]) catch {
-            sendError(conn, "AllocFailed");
-            return;
-        };
-        defer gpa.free(chunk);
-        _ = tun.sendLocked(chunk) catch {
-            sendError(conn, "TunnelSendFailed");
-            return;
-        };
-        total_sent += @intCast(n);
+            sha.update(file_buf[0..n]);
+
+            const chunk = tunproto.buildFileChunk(gpa, cmd_id, file_buf[0..n]) catch {
+                tun.unlock();
+                sendError(conn, "AllocFailed");
+                return;
+            };
+            defer gpa.free(chunk);
+            _ = tun.sendLocked(chunk) catch {
+                tun.unlock();
+                sendError(conn, "TunnelSendFailed");
+                return;
+            };
+            total_sent += @intCast(n);
+            batch_count += 1;
+        }
+        tun.flushLocked(clock_ms);
+        tun.unlock();
+        // Yield to mesh thread so it can process ACKs and flush more data.
+        // Without this, the Host's single-threaded Io event loop can't
+        // run the mesh handler, starving ACK delivery and causing dead_link.
+        if (total_sent < file_size) {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
+        }
     }
-    tun.flushLocked(tun.session.mesh.clock_ms);
 
     // Send file_eof
     var final_hash: [32]u8 = undefined;
@@ -877,23 +896,45 @@ fn handleUpload(
         hash_hex[j * 2] = "0123456789abcdef"[b >> 4];
         hash_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
     }
-    const eof = tunproto.buildFileEof(gpa, cmd_id, 0, total_sent, &hash_hex) catch {
-        sendError(conn, "AllocFailed");
-        return;
-    };
-    defer gpa.free(eof);
-    _ = tun.sendLocked(eof) catch {
-        sendError(conn, "TunnelSendFailed");
-        return;
-    };
-    tun.flushLocked(tun.session.mesh.clock_ms);
+    {
+        tun.lock() catch {
+            sendError(conn, "TunnelLockFailed");
+            return;
+        };
+        defer tun.unlock();
+        const eof = tunproto.buildFileEof(gpa, cmd_id, 0, total_sent, &hash_hex) catch {
+            sendError(conn, "AllocFailed");
+            return;
+        };
+        defer gpa.free(eof);
+        _ = tun.sendLocked(eof) catch {
+            sendError(conn, "TunnelSendFailed");
+            return;
+        };
+        tun.flushLocked(clock_ms);
+    }
 
-    // Release tunnel lock and give mesh thread time to deliver EOF.
-    // Same pattern as handleUpload in state.zig — fire-and-forget, no wait for
-    // upload_result. The Guest processes asynchronously.
-    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+    // Wait for KCP send queue to drain. This ensures data is actually
+    // transmitted (not just queued) before reporting success.
+    // Use a generous timeout: 10s per MB + 60s base.
+    {
+        const drain_timeout_s: u64 = 60 + @as(u64, file_size) / (1024 * 1024) * 10;
+        const now_ns: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+        const deadline_s = now_ns / std.time.ns_per_s + drain_timeout_s;
+        while (true) {
+            const waiting = tun.waiting();
+            if (waiting == 0) break;
+            const now_ns2: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+            const now_s = now_ns2 / std.time.ns_per_s;
+            if (now_s >= deadline_s) {
+                sendError(conn, "UploadDrainTimeout");
+                return;
+            }
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+        }
+    }
 
-    // Send OK response (match state.zig handler behavior)
+    // Send OK response
     var ok_buf: [1]u8 = undefined;
     ok_buf[0] = @intFromEnum(Response.ok);
     conn.writeAll( &ok_buf) catch {};
@@ -966,8 +1007,10 @@ fn handleDownload(
 
             if (op.output.items.len > op.sent_pos) {
                 const start = op.sent_pos;
-                op.sent_pos = op.output.items.len;
-                break :blk op.output.items[start..];
+                const available = op.output.items.len - start;
+                const take = @min(available, @as(usize, 65536)); // safety cap — never exceed 64KB per frame
+                op.sent_pos = start + take;
+                break :blk op.output.items[start..(start + take)];
             }
 
             if (op.done) {
@@ -983,12 +1026,13 @@ fn handleDownload(
 
         if (chunk) |data| {
             if (data.len > 0) {
-                var wbuf: [8192]u8 = undefined;
-                var w = std.ArrayList(u8).fromOwnedSlice(&wbuf);
-                w.items.len = 0;
-                w.appendAssumeCapacity(@intFromEnum(Response.download_data));
-                writeBlob(&w, data) catch break;
-                conn.writeAll( w.items) catch break;
+                // Write frame header + data in two calls — avoids needing
+                // a buffer large enough for the entire blob.
+                var fhdr: [5]u8 = undefined;
+                fhdr[0] = @intFromEnum(Response.download_data);
+                std.mem.writeInt(u32, fhdr[1..5], @intCast(data.len), .big);
+                conn.writeAll(&fhdr) catch break;
+                conn.writeAll(data) catch break;
             }
         } else {
             state.wake_event.waitTimeout(io, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(10), .clock = .awake } }) catch break;
@@ -1252,37 +1296,81 @@ pub fn ipcPing(io: std.Io, gpa: std.mem.Allocator, vm: []const u8) ![]const u8 {
 /// `local_path`: path on the Host's filesystem to read.
 /// `remote_path`: destination path on the Guest (e.g., "/opt/utmm/file.txt").
 pub fn ipcUpload(io: std.Io, gpa: std.mem.Allocator, vm: []const u8, local_path: []const u8, remote_path: []const u8) !void {
-    // Read local file
-    const file_data = std.Io.Dir.cwd().readFileAlloc(io, local_path, gpa, @enumFromInt(50 * 1024 * 1024)) catch |err| {
-        std.log.err("[ipc] Cannot read {s}: {}", .{ local_path, err });
+    // Open file and get size
+    const file = std.Io.Dir.cwd().openFile(io, local_path, .{}) catch |err| {
+        std.log.err("[ipc] Cannot open {s}: {}", .{ local_path, err });
         return err;
     };
-    defer gpa.free(file_data);
 
-    // Compute SHA256
+    const stat = file.stat(io) catch |err| {
+        std.log.err("[ipc] Cannot stat {s}: {}", .{ local_path, err });
+        return err;
+    };
+    const file_size: u32 = @intCast(stat.size);
+
+    // First pass: compute SHA256 incrementally via readStreaming (scatter-gather read)
     var sha256: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(file_data, &sha256, .{});
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash_buf: [65536]u8 = undefined;
+    var remaining: usize = file_size;
+    while (remaining > 0) {
+        const to_read: usize = @min(hash_buf.len, remaining);
+        const n = file.readStreaming(io, &.{hash_buf[0..to_read]}) catch |err| {
+            std.log.err("[ipc] Cannot read {s}: {}", .{ local_path, err });
+            return err;
+        };
+        hasher.update(hash_buf[0..n]);
+        remaining -%= n;
+    }
+    hasher.final(&sha256);
+
+    // Close and reopen — readStreaming leaves fd at EOF, reader.seekTo in
+    // positional mode only updates internal pos without seeking the fd.
+    file.close(io);
+
+    // Format SHA256 hex
     var sha256_hex: [64]u8 = undefined;
     for (sha256, 0..) |b, j| {
         sha256_hex[j * 2] = "0123456789abcdef"[b >> 4];
         sha256_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
     }
 
+    // Reopen file for streaming to socket
+    const file2 = std.Io.Dir.cwd().openFile(io, local_path, .{}) catch |err| {
+        std.log.err("[ipc] Cannot reopen {s}: {}", .{ local_path, err });
+        return err;
+    };
+    defer file2.close(io);
+
     const conn = try clientConnect(io);
     defer conn.close();
 
-    // Build request: [0x04][vm\0][path\0][hash\0][file_size u32][raw file data]
+    // Build and send header: [0x04][vm\0][path\0][hash\0][file_size u32]
     const header_size = 1 + (vm.len + 1) + (remote_path.len + 1) + (64 + 1) + 4;
-    var req = try std.ArrayList(u8).initCapacity(gpa, header_size + file_data.len);
+    var req = try std.ArrayList(u8).initCapacity(gpa, header_size);
     defer req.deinit(gpa);
 
     req.appendAssumeCapacity(@intFromEnum(Request.upload));
     try writeString(&req, vm);
     try writeString(&req, remote_path);
     try writeString(&req, &sha256_hex);
-    try writeU32(&req, @intCast(file_data.len));
-    req.appendSliceAssumeCapacity(file_data);
+    try writeU32(&req, file_size);
     try conn.writeAll( req.items);
+
+    // Second pass: stream file data over the socket in 64KB chunks
+    remaining = file_size;
+    while (remaining > 0) {
+        const to_read: usize = @min(hash_buf.len, remaining);
+        const n = file2.readStreaming(io, &.{hash_buf[0..to_read]}) catch |err| {
+            std.log.err("[ipc] Cannot read {s}: {}", .{ local_path, err });
+            return err;
+        };
+        conn.writeAll(hash_buf[0..n]) catch |err| {
+            std.log.err("[ipc] Upload write failed: {}", .{err});
+            return err;
+        };
+        remaining -%= n;
+    }
 
     if (builtin.os.tag != .windows) {
         _ = std.posix.system.shutdown(conn.fd, std.posix.SHUT.WR);
@@ -1317,6 +1405,8 @@ pub fn ipcDownload(
     remote_path: []const u8,
     file_writer: *std.Io.Writer,
 ) !u32 {
+    _ = gpa; // no longer buffering entire response — streaming frame-by-frame
+
     const conn = try clientConnect(io);
     defer conn.close();
 
@@ -1333,28 +1423,43 @@ pub fn ipcDownload(
         _ = std.posix.system.shutdown(conn.fd, std.posix.SHUT.WR);
     }
 
-    // Read response frames
-    var resp: std.ArrayList(u8) = .empty;
-    defer resp.deinit(gpa);
-    try clientReadAll(conn, gpa, &resp);
-
-    var pos: usize = 0;
+    // Stream-parse response frames — avoids buffering the entire response.
+    // Each download_data frame: [0x20][4-byte BE len][data…]
+    // Final download_done frame: [0x21][4-byte BE exit_code][4-byte BE file_size][\0]
+    var rbuf: [65536]u8 = undefined;
     var total_bytes: u32 = 0;
-    while (pos < resp.items.len) {
-        const type_byte = readByte(resp.items, &pos) orelse break;
-        const rtype: Response = @enumFromInt(type_byte);
+
+    while (true) {
+        // Read frame type byte
+        const tn = conn.readFull(rbuf[0..1]) catch return error.IpcProtocolError;
+        if (tn == 0) return error.IpcProtocolError;
+        const rtype: Response = @enumFromInt(rbuf[0]);
 
         switch (rtype) {
             .download_data => {
-                const data = readBlob(resp.items, &pos) orelse break;
-                _ = file_writer.write(data) catch {};
+                // Read 4-byte big-endian length prefix
+                const ln = conn.readFull(rbuf[0..4]) catch return error.IpcProtocolError;
+                if (ln < 4) return error.IpcProtocolError;
+                const data_len = std.mem.readInt(u32, rbuf[0..4], .big);
+
+                // Stream data_len bytes to file_writer
+                var remaining: u32 = data_len;
+                while (remaining > 0) {
+                    const to_read: usize = @min(rbuf.len, remaining);
+                    const nr = conn.readFull(rbuf[0..to_read]) catch return error.IpcProtocolError;
+                    if (nr == 0) return error.IpcProtocolError;
+                    _ = file_writer.write(rbuf[0..nr]) catch {};
+                    remaining -= @intCast(nr);
+                }
                 try file_writer.flush();
-                total_bytes += @intCast(data.len);
+                total_bytes += data_len;
             },
             .download_done => {
-                const exit_code = readI32(resp.items, &pos) orelse break;
-                _ = readU32(resp.items, &pos); // file_size from server
-                _ = readString(resp.items, &pos); // hash from server
+                // Read exit_code (4B BE) + file_size (4B BE) + null-term hash
+                const dn = conn.readFull(rbuf[0..9]) catch return error.IpcProtocolError;
+                if (dn < 9) return error.IpcProtocolError;
+                const exit_code = std.mem.readInt(i32, rbuf[0..4], .big);
+                // rbuf[4..8] = file_size (unused), rbuf[8] = 0 (empty null-term hash)
                 if (exit_code != 0) {
                     std.log.err("[ipc] download failed: exit_code={d}", .{exit_code});
                     return error.IpcDownloadFailed;
@@ -1362,14 +1467,20 @@ pub fn ipcDownload(
                 return total_bytes;
             },
             .err => {
-                const msg = readString(resp.items, &pos) orelse "UnknownError";
-                std.log.err("[ipc] download error: {s}", .{msg});
+                // Read null-terminated error message byte by byte
+                var err_buf: [256]u8 = undefined;
+                var i: usize = 0;
+                while (i < err_buf.len) {
+                    if (conn.readFull(err_buf[i..i+1]) catch break == 0) break;
+                    if (err_buf[i] == 0) break;
+                    i += 1;
+                }
+                std.log.err("[ipc] download error: {s}", .{err_buf[0..i]});
                 return error.IpcError;
             },
             else => return error.IpcProtocolError,
         }
     }
-    return error.IpcProtocolError;
 }
 
 /// Get Host daemon version.

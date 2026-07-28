@@ -80,8 +80,17 @@ pub const Tunnel = struct {
         return data.len;
     }
 
-    /// Acquire sessions_mutex. Use with sendLocked()/flushLocked() for batch
-    /// operations to prevent mesh thread starvation between per-chunk sends.
+    /// Deprecated: direct mutex acquisition for cross-thread KCP access.
+    ///
+    /// In the v2 architecture, all KCP operations run in the Mesh thread via
+    /// CmdQueue + RingBuf channels. Callers on other threads push commands to
+    /// the channel; the Mesh thread processes them without locks.
+    ///
+    /// Still used temporarily by:
+    /// - ipc.zig handleUpload (IPC thread → KCP): pending RingBuf migration
+    /// - state.zig file_chunk/eof handlers (Mesh thread, lock is redundant)
+    ///
+    /// To be removed after upload/download channel migration (Phase 7+).
     /// Always pair with unlock() — prefer defer.
     /// Returns LockFailed if the Io context is canceled.
     pub fn lock(self: *Tunnel) !void {
@@ -89,13 +98,13 @@ pub const Tunnel = struct {
         try self.session.mesh.sessions_mutex.lock(self.io);
     }
 
-    /// Release sessions_mutex acquired by lock().
+    /// Deprecated: paired with lock(). See lock() for migration plan.
     pub fn unlock(self: *Tunnel) void {
         self.session.mesh.sessions_mutex.unlock(self.io);
     }
 
-    /// Send data assuming sessions_mutex is already held (via lock()).
-    /// Does NOT lock/unlock — caller is responsible for synchronization.
+    /// Deprecated: lock-free KCP send, requires sessions_mutex held by caller.
+    /// In v2 architecture, use CmdQueue or call send() directly from Mesh thread.
     pub fn sendLocked(self: *Tunnel, data: []const u8) !usize {
         self.assertAlive();
         try self.session.kcp_inst.send(data);
@@ -172,7 +181,8 @@ pub const Tunnel = struct {
         self.session.kcp_inst.update(current_ms);
     }
 
-    /// Flush assuming sessions_mutex is already held (via lock()).
+    /// Deprecated: lock-free KCP flush, requires sessions_mutex held by caller.
+    /// In v2 architecture, use sendAndFlush() or call flush() directly from Mesh thread.
     pub fn flushLocked(self: *Tunnel, current_ms: u32) void {
         self.assertAlive();
         self.session.kcp_inst.update(current_ms);

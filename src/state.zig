@@ -19,6 +19,7 @@ const hosts_file = @import("hosts_file.zig");
 const tunnel_mod = @import("tunnel.zig");
 const tunproto = @import("tunproto.zig");
 const mesh_mod = @import("mesh.zig");
+const cmdchan = @import("cmdchan.zig");
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -196,6 +197,9 @@ pub const HostState = struct {
     /// Mesh networking instance (v0.10.0+, *mesh.Mesh). Set by host.zig when mesh is active.
     /// Type-erased to avoid circular dependency. Cast with @ptrCast(@alignCast(...)).
     mesh: ?*anyopaque = null,
+    /// IPC→Mesh command queue. Set by host.zig after CmdQueue creation.
+    /// IPC handlers push commands here; Mesh thread pops and dispatches them.
+    cmd_queue: ?*cmdchan.CmdQueue = null,
 
     pub fn init(allocator: std.mem.Allocator) HostState {
         return .{
@@ -518,6 +522,17 @@ pub const HostState = struct {
         return op.done;
     }
 
+    /// Get exit code of a completed operation (thread-safe).
+    /// Returns null if not yet done or op doesn't exist.
+    pub fn getOpExitCode(self: *HostState, cmd_id: []const u8) ?i32 {
+        self.mutex.lock(self.io.?) catch return null;
+        defer self.mutex.unlock(self.io.?);
+
+        const op = self.op_states.getPtr(cmd_id) orelse return null;
+        if (!op.done) return null;
+        return op.exit_code;
+    }
+
     /// Set file metadata on an op state (for download x-file-hash/x-file-size trailers).
     pub fn setOpFileMeta(self: *HostState, cmd_id: []const u8, file_hash: []const u8, file_size_meta: u32) void {
         self.mutex.lock(self.io.?) catch return;
@@ -773,6 +788,7 @@ pub fn handleMeshGuest(
                     continue;
                 }
                 state.appendOpOutput(cmd_id_opt.?, payload_opt.?);
+                state.wake_event.set(state.io.?);
             },
             @intFromEnum(tunproto.MsgType.file_eof) => {
                 const eof = tunproto.parseFileEof(data[1..]) orelse {

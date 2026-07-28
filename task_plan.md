@@ -1,4 +1,4 @@
-# Task Plan: v0.12.1
+# Task Plan: v0.12.2
 
 ## 架构概述
 
@@ -25,12 +25,12 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 
 ## 当前状态
 
-- **版本**: v0.12.1（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入）
+- **版本**: v0.12.2（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入）
 - **`build.zig.zon`**: `0.0.0`（永不再改）
 - **源文件**: 18 个（`src/*.zig`）+ 1 版本文件（`src/ver.txt`）+ 2 skills（`zig`、`deploy`）
 - **测试**: 166/166 通过
-- **部署**: macOS Host v0.12.1 ✅ | linuxvm v0.12.1 ✅ | macvm v0.12.1 ✅ | windowsvm v0.12.1 ✅ | winx64 v0.12.1 ✅
-- **健康检查**: 4/4 Guest 在线，全部 v0.12.1，exec/ping 正常
+- **部署**: macOS Host v0.12.2 ✅ | linuxvm v0.12.2 ✅ | macvm v0.12.2 ✅ | windowsvm v0.12.2 ✅ | winx64 v0.12.2 ✅
+- **健康检查**: 4/4 Guest 在线，全部 v0.12.2，exec/ping 正常
 - **8 交叉编译目标**: aarch64/x86_64/x86 × linux-musl/macos/windows
 
 ## 已完成阶段
@@ -87,6 +87,32 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 - **`src/host.zig:776-783`**: `verifyServeDirBinaries` 失败时不再调用 `svc.uninstall()` → `exit(1)`。改为 `_ = verifyServeDirBinaries(block_io, sd)` — 警告但继续运行
 - **根因**: 从 canonical path 执行 `--install` 时，`selfCopy` 和 `copySiblingBinariesToServeDir` 都检测到 src==dest 并跳过，平台二进制文件永远停留在旧版本。Host 启动时发现版本不匹配 → 自毁
 - **Guest pty 丢失**: Host 重启后旧 Guest 进程保留但 pty 已失效，需重新 `--install` 来重建 KCP 隧道 + pty
+
+## Phase 79: MCP 连接修复 + 文档全面更新 ✅ (2026-07-28)
+
+| # | 任务 | 描述 | 状态 |
+|---|------|------|------|
+| 402 | 诊断 MCP `-32000` 连接失败 | 两层根因：多行 JSON + 旧 `claude mcp add` 注册（`node mcp_server.js` 已删除） | ✅ |
+| 403 | 修复 `src/mcp.zig` JSON 格式 | `SERVER_INFO` + `TOOLS_JSON` 从 Zig `\\` 多行字符串改为单行转义字符串，确保换行分隔传输协议正确 | ✅ |
+| 404 | MCP 文档全面修订 | `mcp.json.example`、`README.md`、`SKILL.md` — 统一为 `claude mcp add --scope user` | ✅ |
+| 405 | MCP 作用域修正 | `--scope local` → `--scope user`（用户级，跨项目可用），`~/.claude.json` 存储 | ✅ |
+| 406 | 功能验证 | `vm_status` 5 节点全部在线 ✅、`vm_exec` 持续输出命令（ping/for 循环）✅ | ✅ |
+
+### 变更摘要
+
+- **`src/mcp.zig:20-28`**: `SERVER_INFO` 和 `TOOLS_JSON` 从 Zig `\\` 多行语法改为单行转义 JSON 字符串。Zig `\\` 在编译后的字符串中保留真实换行符，破坏 MCP stdio 换行分隔 JSON 传输协议
+- **根因 #1 (多行 JSON)**: 编译后的 `SERVER_INFO` 包含 `\n` 换行符 → MCP 客户端解析到半截 JSON → `-32000`
+- **根因 #2 (旧注册)**: `claude mcp add` 的旧注册 `node mcp_server.js` 存储在 `~/.claude.json`，优先级高于 `~/.claude/mcp.json`。旧 `mcp_server.js` 已删除 → `Cannot find module` 错误。`claude mcp list` 显示 `✘ Failed`
+- **修复方法**: `claude mcp remove utm-monitor` → `claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp`
+- **作用域**: `--scope user` 注册到 `~/.claude.json` 用户级别，所有项目可用。默认 `--scope local` 仅当前项目
+
+### 关键发现
+
+| Finding | 描述 |
+|---------|------|
+| 163 | **Zig `\\` 多行字符串在编译后保留真实换行符** — 用于 JSON-RPC 时破坏换行分隔协议。单行 `\"` 转义字符串是正确的 MCP stdio 传输格式 |
+| 164 | **`claude mcp add` 存储在 `~/.claude.json`** — 优先级高于手动编辑的 `~/.claude/mcp.json`。旧注册不自动清理，需 `claude mcp remove` 手动删除 |
+| 165 | **MCP 作用域默认 `--scope local`** — 仅当前项目可用。`--scope user` 注册到用户级别，跨所有项目生效 |
 
 ## Phase 72: 自动升级 rollback 修复 + 全流程部署测试 ✅ (2026-07-28)
 

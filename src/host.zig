@@ -12,6 +12,7 @@ const broadcast = @import("broadcast.zig");
 const mesh_mod = @import("mesh.zig");
 const tunnel_mod = @import("tunnel.zig");
 const tunproto = @import("tunproto.zig");
+const cmdchan = @import("cmdchan.zig");
 const svc = @import("svc.zig");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
@@ -761,6 +762,63 @@ fn verifyServeDirBinaries(io: std.Io, serve_dir: []const u8) bool {
     return true;
 }
 
+/// Command handler callback — bridges Mesh (KCP sessions) with HostState (tunnels, guests).
+/// Called by mesh.dispatchCmd() from the Mesh I/O thread for each command popped from CmdQueue.
+fn hostCmdHandler(state_ptr: *anyopaque, mesh: *mesh_mod.Mesh, cmd: *const cmdchan.Cmd) void {
+    const state: *hst.HostState = @ptrCast(@alignCast(state_ptr));
+    switch (cmd.tag) {
+        .exec => handleCmdExec(state, mesh, cmd),
+        .status => handleCmdStatus(state, mesh, cmd),
+        .ping => handleCmdPing(mesh, cmd),
+        .upload, .download => {
+            // Stub: full implementation in Phase 4 when RingBuf + Completion are integrated.
+            std.log.info("[host-cmd] {s} stub: {s} vm={s}", .{ @tagName(cmd.tag), cmd.arg1Str(), cmd.vmStr() });
+        },
+    }
+}
+
+/// Send a pty_exec_input command to a Guest via KCP tunnel.
+/// OpState is created by the IPC handler BEFORE pushing this command.
+fn handleCmdExec(state: *hst.HostState, mesh: *mesh_mod.Mesh, cmd: *const cmdchan.Cmd) void {
+    const vm_name = cmd.vmStr();
+    const command = cmd.arg1Str();
+    const cmd_id = cmd.cmdIdStr();
+
+    const tun = state.getGuestTunnel(vm_name) orelse {
+        std.log.err("[host-cmd] exec: no tunnel for '{s}'", .{vm_name});
+        return;
+    };
+
+    // Build pty_exec_input frame with the pre-built command (already has MDELIM marker).
+    // IPC handler built the full command string (shell-appropriate marker) and stored it in arg1.
+    const allocator = state.allocator;
+    const frame = tunproto.buildPtyExecInput(allocator, cmd_id, command) catch {
+        std.log.err("[host-cmd] exec: buildPtyExecInput failed for {s}", .{cmd_id});
+        return;
+    };
+    defer allocator.free(frame);
+
+    _ = tun.sendAndFlush(frame, mesh.clock_ms) catch |err| {
+        std.log.err("[host-cmd] exec: send failed: {}", .{err});
+    };
+}
+
+/// Collect guest status from HostState.
+/// Phase 3: log guest list. Phase 4: write to Completion channel.
+fn handleCmdStatus(state: *hst.HostState, _: *mesh_mod.Mesh, _: *const cmdchan.Cmd) void {
+    std.log.info("[host-cmd] status: {d} guests", .{state.guests.items.len});
+    for (state.guests.items) |guest| {
+        std.log.info("[host-cmd]   {s} role={s} status={s} version={s}", .{ guest.hostname, guest.role, guest.status, guest.version });
+    }
+}
+
+/// Send a mesh ping to a Guest.
+/// Phase 3 stub. Phase 4: full mesh ping with RTT measurement.
+fn handleCmdPing(mesh: *mesh_mod.Mesh, cmd: *const cmdchan.Cmd) void {
+    _ = mesh;
+    std.log.info("[host-cmd] ping {s} (stub)", .{cmd.vmStr()});
+}
+
 fn startHost(
     block_io: std.Io,
     gpa: std.mem.Allocator,
@@ -873,8 +931,14 @@ fn startHost(
             break :start_mesh;
         };
 
+        // Create command queue for IPC→Mesh communication.
+        // Stored in both Mesh (for consumption) and HostState (for production).
+        const cmd_queue = try gpa.create(cmdchan.CmdQueue);
+        cmd_queue.* = cmdchan.CmdQueue.init();
+        state.cmd_queue = cmd_queue;
+
         // Create mesh instance (epoch is auto-appended to node_info by init())
-        mesh_opt = mesh_mod.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, &upgrade_signal.needed, bc_addrs, broadcast.getSubnetBroadcasts) catch |err| {
+        mesh_opt = mesh_mod.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, &upgrade_signal.needed, bc_addrs, broadcast.getSubnetBroadcasts, cmd_queue, @ptrCast(&state), hostCmdHandler) catch |err| {
             std.log.err("[host] Mesh init failed: {}", .{err});
             gpa.free(node_info);
             mesh_socket.close(mesh_io);

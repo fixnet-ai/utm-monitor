@@ -1,15 +1,83 @@
-# Progress: v0.12.1
+# Progress: v0.12.2
 
 ## 当前状态
 
 - **分支**: `main`
-- **版本**: v0.12.1（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入；`build.zig.zon` 永为 `0.0.0`）
+- **版本**: v0.12.2（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入；`build.zig.zon` 永为 `0.0.0`）
 - **测试**: 166/166 通过
-- **部署**: macOS Host v0.12.1 ✅ | linuxvm v0.12.1 ✅ | macvm v0.12.1 ✅ | windowsvm v0.12.1 ✅ | winx64 v0.12.1 ✅
-- **健康检查**: 4/4 Guest 在线，全部 v0.12.1，exec/ping 正常
+- **部署**: macOS Host v0.12.2 ✅ | linuxvm v0.12.2 ✅ | macvm v0.12.2 ✅ | windowsvm v0.12.2 ✅ | winx64 v0.12.2 ✅
+- **健康检查**: 4/4 Guest 在线，全部 v0.12.2，exec/ping 正常
 - **跨平台编译**: 8/8 目标全部通过
+- **MCP**: stdio 连接正常（`claude mcp add --scope user`），`vm_status`/`vm_exec`/`vm_ping` 验证通过
 
-## Phase 78: serve-dir 版本不匹配自动 uninstall 修复 + 全节点部署 ✅ (2026-07-28)
+## Phase 79: MCP 连接修复 + 文档全面更新 ✅ (2026-07-28)
+
+### 背景
+
+用户报告 MCP 连接 `utm-monitor` 时报 `Failed to reconnect to utm-monitor: -32000` 错误。
+问题有两层根因，需逐层排查修复。
+
+### Task 402: 诊断 — 两层根因 ✅
+
+**第一层 — 多行 JSON (Finding 163)**:
+- `src/mcp.zig` 中 `SERVER_INFO` 和 `TOOLS_JSON` 使用 Zig `\\` 多行字符串
+- 编译后字符串包含真实换行符 → MCP stdio 换行分隔 JSON 协议被破坏
+- 修复后部署，用户反馈 "还是一样 `-32000`" — 说明这不是唯一根因
+
+**第二层 — 旧 MCP 注册 (Finding 164)**:
+- `claude mcp list` 显示 `node .../mcp_server.js - ✘ Failed`
+- MCP 日志目录 `~/Library/Caches/claude-cli-nodejs/.../mcp-logs-utm-monitor/` 显示 `Cannot find module 'mcp_server.js'`
+- 旧 `mcp_server.js`（Node.js 脚本）已删除，但 `~/.claude.json` 中的注册仍指向它
+- `~/.claude.json` 优先级高于 `~/.claude/mcp.json`，手动编辑后者无效
+- 修复: `claude mcp remove utm-monitor` → `claude mcp add utm-monitor -- sudo -n /opt/utmm/utmm --mcp`
+- 用户确认: "成功了"
+
+### Task 403: 修复 `src/mcp.zig` JSON 格式 ✅
+
+**`src/mcp.zig:20-28`** (commit `a25f684`):
+- `SERVER_INFO`: Zig `\\` 多行 → 单行 `\"` 转义 JSON
+- `TOOLS_JSON`: 同上
+- 确保每条 JSON-RPC 消息严格单行，兼容换行分隔传输协议
+
+### Task 404-405: MCP 文档全面修订 + 作用域修正 ✅
+
+**作用域问题 (Finding 165)**:
+- 初版使用 `claude mcp add utm-monitor -- ...`（默认 `--scope local`，仅当前项目）
+- 用户指出另一个 Claude Code 实例找不到此 MCP
+- 修正: `claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp`
+- `--scope user` → `~/.claude.json` 用户级，所有项目可用
+
+**文档变更** (commits `0bfd716`, `e29f874`):
+- `mcp.json.example`: 全面修订 — 名称 `utmm`→`utm-monitor`、`--scope user`、故障排除表（`-32000`、旧注册、作用域说明）
+- `README.md`: MCP 注册简化为 `claude mcp add --scope user` 一行命令
+- `SKILL.md`: MCP 工具描述更新
+- Memory: `mcp-http-server.md` 标记为 ABANDONED
+
+### Task 406: 功能验证 ✅
+
+**vm_status**: 5 节点全部在线 ✅
+```
+macvm (guest) aarch64-macos — v0.12.2 | status: serving
+linuxvm (guest) aarch64-linux-musl — v0.12.2 | status: serving
+windowsvm (guest) aarch64-windows — v0.12.2 | status: serving
+winx64 (guest) x86_64-windows — v0.12.2 | status: serving
+```
+
+**vm_exec 持续输出命令**:
+- `ping -c 4 127.0.0.1` on linuxvm → 成功
+- `for i in 1 2 3 4 5; do echo "tick $i $(date)"; sleep 2; done` → 5 个 tick 跨越 10s 全部捕获
+- `ping 127.0.0.1` (无 `-c`) → 110 个 icmp_seq 后超时退出 (exit -1)，输出完整
+
+**vm_ping**: linuxvm RTT <1ms，正常
+
+### 关键提交
+
+```
+e29f874 docs: use --scope user for cross-project MCP registration
+0bfd716 docs: update MCP documentation — stdio transport, claude mcp add, troubleshooting
+a25f684 fix: MCP stdio single-line JSON responses for newline-delimited transport
+bded163 v0.12.2: bump version
+```
 
 ### 背景
 
@@ -690,10 +758,10 @@ SKILL.md + MANUAL.md 全面更新至 v0.11.14 代码现状。发布 v0.11.15 后
 ## 最近提交
 
 ```
+e29f874 docs: use --scope user for cross-project MCP registration
+0bfd716 docs: update MCP documentation — stdio transport, claude mcp add, troubleshooting
+a25f684 fix: MCP stdio single-line JSON responses for newline-delimited transport
+bded163 v0.12.2: bump version
+f672594 docs: update planning files with Phase 78 findings and v0.12.1 deployment status
 9716850 fix: remove auto-uninstall on serve-dir version mismatch
-b8b9cdc fix: PID-aware killAllUtmm, wait-for-exit, macOS start retry, exit(42)
-024b256 v0.11.23: fix KCP tunnel instability and download performance (Phase 72-73)
-f70357a release.sh: clean old binaries in zig-out/bin/ before build
-47e33fc v0.11.20: rename httpd.zig to state.zig, version-independent install scripts, fix sendLocked bug
-cb4da8f v0.11.19: versioned deployment filenames, Host startup binary verification
 ```

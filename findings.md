@@ -1,6 +1,60 @@
-# Findings: v0.12.1
+# Findings: v0.12.2
 
 记录重要的技术发现、Bug、设计决策和 Zig 0.16.0 API 笔记。
+
+---
+
+## Phase 79: MCP 连接修复 — 两层根因 (2026-07-28)
+
+### Finding 163: Zig `\\` 多行字符串破坏 MCP stdio JSON-RPC 传输
+
+**现象**: MCP 客户端连接 `utm-monitor` 时报 `-32000` 错误，无法完成 initialize 握手。
+
+**根因**: `src/mcp.zig` 中 `SERVER_INFO` 和 `TOOLS_JSON` 使用 Zig `\\` 多行字符串语法：
+```zig
+const SERVER_INFO =
+    \\{"protocolVersion":"2024-11-05",
+    \\"serverInfo":{"name":"utmm","version":"__VERSION__"},
+    \\"capabilities":{"tools":{}}}
+;
+```
+Zig `\\` 在**编译后的字符串中保留真实换行符**。MCP stdio 使用换行分隔 JSON（newline-delimited JSON），换行符被 MCP 客户端解析为消息边界 → 收到半截 JSON → `-32000` 错误。
+
+**修复** (commit `a25f684`): 改为单行转义 JSON 字符串：
+```zig
+const SERVER_INFO = "{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"utmm\",\"version\":\"__VERSION__\"},\"capabilities\":{\"tools\":{}}}";
+```
+
+**教训**: Zig `\\` 多行字符串仅适用于人类可读文本（帮助信息、日志模板），绝不能用于机器协议（JSON-RPC、HTTP 头等）。
+
+**状态**: ✅ 已修复
+
+### Finding 164: `claude mcp add` 旧注册覆盖手动配置
+
+**现象**: 修复 Finding 163 后重新构建部署，MCP 连接仍报 `-32000`。
+
+**根因**: `claude mcp add` 的注册存储在 `~/.claude.json`，优先级高于手动编辑的 `~/.claude/mcp.json`。旧注册指向已删除的 `mcp_server.js`（Node.js 脚本），MCP 日志目录 `~/Library/Caches/claude-cli-nodejs/.../mcp-logs-utm-monitor/` 显示 `Error: Cannot find module '.../mcp_server.js'`。
+
+**诊断方法**:
+1. `claude mcp list` 显示 `node /Users/.../mcp_server.js - ✘ Failed`
+2. MCP 日志目录中查看最新日志文件，确认 `Cannot find module` 错误
+3. 旧 `mcp_server.js` 已被删除（项目改用 Zig 二进制），但 `claude mcp add` 注册未自动清理
+
+**修复**: `claude mcp remove utm-monitor` → `claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp`
+
+**教训**: `~/.claude.json` 中的 MCP 注册不会自动过期。删除旧的 MCP 服务器文件后，必须手动 `claude mcp remove` 清理。
+
+**状态**: ✅ 已修复
+
+### Finding 165: MCP 作用域默认 `--scope local`
+
+**发现**: `claude mcp add` 默认 `--scope local`（仅当前项目可用），而非全局。另一个 Claude Code 实例找不到 `utm-monitor` MCP 服务器。
+
+**修复**: `claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp`
+
+`--scope user` 注册到 `~/.claude.json` 用户级别，所有项目可用。
+
+**状态**: ✅ 已修复
 
 ---
 
