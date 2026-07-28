@@ -294,7 +294,7 @@ pub fn buildPtyExecOutput(allocator: std.mem.Allocator, cmd_id: []const u8, data
     errdefer buf.deinit(allocator);
     try buf.append(allocator, @intFromEnum(MsgType.pty_exec_output));
     try writeString(&buf, allocator, cmd_id);
-    try buf.appendSlice(allocator, data);
+    try writeBlob(&buf, allocator, data);
     return buf.toOwnedSlice(allocator);
 }
 
@@ -370,7 +370,7 @@ pub fn parsePtyExecInput(data: []const u8) ?PtyExecInputData {
 pub fn parsePtyExecOutput(data: []const u8) ?PtyExecOutputData {
     var pos: usize = 0;
     const cmd_id = readString(data, &pos) orelse return null;
-    const payload = data[pos..];
+    const payload = readBlob(data, &pos) orelse return null;
     return .{ .cmd_id = cmd_id, .data = payload };
 }
 
