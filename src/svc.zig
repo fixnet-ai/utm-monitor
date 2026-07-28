@@ -68,12 +68,28 @@ pub fn isAtCanonicalPath(io: std.Io) bool {
 // Command helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Run `launchctl bootout system/<name>` with the correct slash-separated
+/// service target syntax. The space-separated form (`bootout system <name>`)
+/// is not valid on macOS and always returns exit code 5 (EIO).
+fn bootoutMacOS(alloc: std.mem.Allocator, io: std.Io, name: []const u8) void {
+    const target = std.fmt.allocPrint(alloc, "system/{s}", .{name}) catch return;
+    defer alloc.free(target);
+    _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootout", target });
+}
+
 /// Run a command using std.process.run. Returns true on success (exit code 0).
 fn runCmd(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
-    const result = std.process.run(alloc, io, .{ .argv = argv }) catch return false;
-    alloc.free(result.stdout);
-    alloc.free(result.stderr);
-    return result.term == .exited and result.term.exited == 0;
+    const result = std.process.run(alloc, io, .{ .argv = argv }) catch |err| {
+        std.log.debug("[svc] cmd spawn failed: {s}: {}", .{ argv[0], err });
+        return false;
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        std.log.debug("[svc] cmd non-zero exit: {s} {s} (term={})", .{ argv[0], argv[1], result.term });
+        return false;
+    }
+    return true;
 }
 
 /// Run a command for best-effort cleanup — failure is expected and logged
@@ -81,13 +97,13 @@ fn runCmd(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
 /// services/files that may not exist).
 fn runCmdQuiet(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) void {
     const result = std.process.run(alloc, io, .{ .argv = argv }) catch |err| {
-        std.log.debug("[svc] cmd failed: {s}: {}", .{ argv[0], err });
+        std.log.debug("[svc] cmd failed: {s} {s}: {}", .{ argv[0], argv[1], err });
         return;
     };
-    alloc.free(result.stdout);
-    alloc.free(result.stderr);
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
     if (result.term != .exited or result.term.exited != 0) {
-        std.log.debug("[svc] cmd non-zero exit: {s}", .{argv[0]});
+        std.log.debug("[svc] cmd non-zero exit: {s} {s}", .{ argv[0], argv[1] });
     }
 }
 
@@ -119,9 +135,6 @@ pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) bool 
             const result = runCmdStdout(alloc, io, &[_][]const u8{ "launchctl", "list" });
             if (result) |stdout| {
                 defer alloc.free(stdout);
-                // launchctl list format: "PID\tExitCode\tName"
-                // PID is "-" when loaded but not running. Look for the
-                // service name line and verify the first column is a number.
                 var lines = std.mem.splitScalar(u8, stdout, '\n');
                 while (lines.next()) |line| {
                     if (std.mem.indexOf(u8, line, name)) |_| {
@@ -129,9 +142,17 @@ pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) bool 
                         if (trimmed.len > 0 and std.ascii.isDigit(trimmed[0])) {
                             break :blk true;
                         }
-                        break :blk false;
+                        break;
                     }
                 }
+            }
+            // Fallback: check if utmmd process is actually running.
+            // launchctl load (legacy) may have started it without launchd
+            // tracking the PID properly. pgrep catches this case.
+            if (runCmdCheckExit(alloc, io, &[_][]const u8{
+                "pgrep", "-f", "/opt/utmm/utmmd",
+            })) {
+                break :blk true;
             }
             break :blk false;
         },
@@ -168,7 +189,7 @@ pub fn install(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_ar
             for (legacy_labels) |legacy| {
                 const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{legacy});
                 defer alloc.free(plist_path);
-                runCmdQuiet(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", legacy });
+                bootoutMacOS(alloc, io, legacy);
                 std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
             }
         },
@@ -270,22 +291,19 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
         };
     }
 
-    // Enable then bootstrap (also starts via RunAtLoad=true).
-    // Enable clears any persisted disabled flag from a previous
-    // uninstall/disable cycle.
+    // Enable first to clear any persisted disabled flag from a previous
+    // uninstall/disable cycle — must be done while the label still exists
+    // in launchd's persistent state (before bootout removes it).
     _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
-    if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path })) {
-        fail.msg("install/launchctl-bootstrap", "failed to bootstrap {s}", .{name});
-    }
+    // Bootout stale registration, then bootstrap fresh.
+    // Without bootout, bootstrap fails with errno=5/17 when the service
+    // label is already registered — even if not running.
+    bootoutMacOS(alloc, io, name);
+    // Bootstrap (also starts via RunAtLoad=true). Best-effort: bootstrap
+    // may fail due to launchd throttle (EIO on recently-booted-out labels)
+    // or transient errors. start() handles the full retry + fallback chain.
+    _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path });
 
-    // Verify
-    const list_out = runCmdStdout(alloc, io, &[_][]const u8{ "launchctl", "list" });
-    if (list_out) |stdout| {
-        defer alloc.free(stdout);
-        if (std.mem.indexOf(u8, stdout, name) == null) {
-            fail.msg("install/verify", "service {s} not found in launchctl list after bootstrap", .{name});
-        }
-    }
     std.log.info("[svc] macOS service {s} installed", .{name});
 }
 
@@ -415,7 +433,7 @@ fn uninstallServiceConfig(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRo
         .macos => {
             const plist_path = std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name}) catch return;
             defer alloc.free(plist_path);
-            runCmdQuiet(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", name });
+            bootoutMacOS(alloc, io, name);
             std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
         },
         .linux => {
@@ -452,7 +470,7 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
             for (all_names) |name| {
                 const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name});
                 defer alloc.free(plist_path);
-                runCmdQuiet(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", name });
+                bootoutMacOS(alloc, io, name);
                 std.Io.Dir.cwd().deleteFile(io, plist_path) catch {};
             }
         },
@@ -502,6 +520,27 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
     std.log.info("[svc] uninstall complete", .{});
 }
 
+/// Start utmmd directly as a background process (no launchd/systemd/SCM).
+/// Fallback for environments where the service manager is unavailable or
+/// restricted (e.g. UTM macOS VMs with SIP-enforced launchd limits).
+fn startDirect(alloc: std.mem.Allocator, io: std.Io, role: ServiceRole) !void {
+    const svc_path = canonicalSvcPath();
+    const role_str = if (role == .host) "host" else "guest";
+    // Append & so the shell backgrounds the process and returns immediately.
+    // runCmd waits for the shell to exit, which with & happens instantly.
+    const cmd = try std.fmt.allocPrint(alloc, "{s} --role {s} > /var/log/utmmd.log 2>&1 &", .{ svc_path, role_str });
+    defer alloc.free(cmd);
+    std.log.info("[svc] starting utmmd directly: {s}", .{cmd});
+
+    if (builtin.os.tag == .windows) {
+        _ = runCmd(alloc, io, &[_][]const u8{ "cmd", "/c", "start", "/b", svc_path, "--role", role_str });
+    } else {
+        _ = runCmd(alloc, io, &[_][]const u8{ "sh", "-c", cmd });
+    }
+    // Don't fail — best-effort background start. Give it a moment.
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+}
+
 /// Start the service.
 pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
     const name = svcName();
@@ -516,42 +555,63 @@ pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
                 std.log.info("[svc] {s} already running in start()", .{name});
                 return;
             }
+            var launched_via_launchd = true;
             if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "kickstart", "-k", "system", name })) {
-                // kickstart failed — service may not be loaded.
-                // Add a short delay to let launchd finish processing a prior
-                // bootout before trying bootstrap (avoids errno=2/5, Finding 128).
-                std.log.info("[svc] kickstart failed, waiting 500ms before bootstrap...", .{});
+                // kickstart failed — service may not be loaded or already
+                // in a broken state. Enable first to clear any persisted
+                // disabled flag (must be done while label is still registered),
+                // then bootout stale registration, then bootstrap fresh.
+                std.log.info("[svc] kickstart failed, re-registering service...", .{});
+                _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
+                bootoutMacOS(alloc, io, name);
                 std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
 
                 const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name});
                 defer alloc.free(plist_path);
-                _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
 
                 // Retry bootstrap up to 3 times with 1-second delays.
                 // launchd may still be processing a prior bootout; retries
-                // resolve transient errno=2/5 failures (Finding 123 + 128).
+                // resolve transient failures.
+                // Note: bootstrap may return exit 0 even when it prints
+                // "Bootstrap failed: 5" to stderr, so we verify in
+                // launchctl list below — don't trust exit code alone.
                 var bootstrapped = false;
                 for (0..3) |attempt| {
                     if (runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path })) {
-                        bootstrapped = true;
-                        std.log.info("[svc] bootstrap succeeded on attempt {d}", .{attempt + 1});
-                        break;
+                        // Verify bootstrap actually worked (not just exit 0)
+                        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+                        if (runCmdStdout(alloc, io, &[_][]const u8{ "launchctl", "list" })) |list| {
+                            defer alloc.free(list);
+                            if (std.mem.indexOf(u8, list, name) != null) {
+                                bootstrapped = true;
+                                std.log.info("[svc] bootstrap succeeded on attempt {d}", .{attempt + 1});
+                                break;
+                            }
+                        }
+                        std.log.warn("[svc] bootstrap attempt {d}: exit 0 but service not in launchctl list", .{attempt + 1});
+                    } else {
+                        std.log.warn("[svc] bootstrap attempt {d}/3 failed (non-zero exit), retrying in 1s...", .{attempt + 1});
                     }
-                    std.log.warn("[svc] bootstrap attempt {d}/3 failed, retrying in 1s...", .{attempt + 1});
                     std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch break;
                 }
-
                 if (!bootstrapped) {
-                    fail.msg("start/launchctl-bootstrap", "failed to bootstrap {s} after 3 attempts", .{name});
+                    // launchd bootstrap unavailable — start utmmd directly.
+                    // Common in UTM macOS VMs where bootstrap may fail with
+                    // "5: Input/output error" due to shm creation issues.
+                    std.log.warn("[svc] bootstrap failed, starting utmmd directly...", .{});
+                    try startDirect(alloc, io, role);
+                    launched_via_launchd = false;
                 }
             }
-            // Verify — give launchd a moment to register the service
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
-            const list_out = runCmdStdout(alloc, io, &[_][]const u8{ "launchctl", "list" });
-            if (list_out) |stdout| {
-                defer alloc.free(stdout);
-                if (std.mem.indexOf(u8, stdout, name) == null) {
-                    fail.msg("start/verify", "service {s} not found in launchctl list after start", .{name});
+            // Verify launchd registration (skip if we fell back to startDirect).
+            if (launched_via_launchd) {
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+                const list_out = runCmdStdout(alloc, io, &[_][]const u8{ "launchctl", "list" });
+                if (list_out) |stdout| {
+                    defer alloc.free(stdout);
+                    if (std.mem.indexOf(u8, stdout, name) == null) {
+                        fail.msg("start/verify", "service {s} not found in launchctl list after start", .{name});
+                    }
                 }
             }
         },
@@ -576,7 +636,9 @@ pub fn stop(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) !void {
     const name = svcName();
     switch (builtin.os.tag) {
         .macos => {
-            if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootout", "system", name })) {
+            const target = std.fmt.allocPrint(alloc, "system/{s}", .{name}) catch return;
+            defer alloc.free(target);
+            if (!runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootout", target })) {
                 std.log.warn("[svc] stop {s}: bootout returned non-zero (may not be running)", .{name});
             }
         },

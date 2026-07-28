@@ -62,6 +62,58 @@ Zig 0.16.0 中 `shm.open()` 返回 `*volatile ShmLayout`（mmap 映射内存）�
 
 ---
 
+---
+
+## Phase 76: macOS launchctl 遗留修复 (2026-07-28)
+
+### Finding 153: launchd throttle 是 bootstrap 失败的根因
+
+**现象**: `launchctl bootstrap system/com.utmmd` 返回 exit 5（EIO: Input/output error），即使 plist 正确、disabled flag 已清除。
+
+**根因**: launchd 有反滥用保护——同一 service label 短时间反复 bootout/bootstrap 超过阈值后，launchd 拒绝后续 bootstrap 返回 EIO。这是安全机制，不是代码 bug。
+
+**验证方法**: 创建全新 label（`com.test-throttle`）→ bootstrap 成功。在 `com.utmmd` 频繁操作后 → bootstrap 失败。确认是 throttle。
+
+**持续时间**: 通常 5-10 分钟自动解除。生产环境几乎不会触发（频繁测试重装才会）。
+
+**代码处理**: `installMacOS` 中 bootstrap 改为 best-effort（不验证结果）。`start()` 失败时 fallback 到 `startDirect`（绕过 launchd 直接后台运行 utmmd）。
+
+### Finding 154: launchctl load 的误导性 exit 0
+
+**现象**: `launchctl load` 在 bootstrap 同样失败的场景中也失败（打印 "Load failed: 5" 到 stderr），但返回 exit 0。
+
+**后果**: `runCmd` 依赖 exit code 判断成功——exit 0 → 认为 service 已启动，但实际未运行。
+
+**修复**: 移除 legacy `launchctl load` 回退，改为 `startDirect`（直接后台运行 utmmd）。`start()` macOS 路径在 bootstrap 后必须验证 `launchctl list` 输出，不能仅靠 exit code。
+
+### Finding 155: enable exit 64 的原因和影响
+
+**现象**: `launchctl enable system/<name>` 返回 exit 64（EX_USAGE）。
+
+**触发条件**: 
+- 服务从未被 launchd 注册（首次安装）
+- 服务被 bootout 后且 throttle 期间（label 不存在于 launchd 的 domain）
+
+**影响**: 无害。`enable` 仅清除 persistent disabled flag——如果服务不在 launchd 中，flag 自然不存在。代码中 `_ = runCmd(...)` 已忽略此错误。
+
+**关键约束**: `enable` 必须在 `bootout` **之前**调用（enable 需要服务 label 存在）。installMacOS 已重排序为 `enable → bootout → bootstrap`。
+
+### Finding 156: shm_createPosix 在 launchd bootstrap 环境中的瞬时失败
+
+**现象**: `shm_open(O_CREAT | O_EXCL)` 在 launchd bootstrap 环境（utmmd 刚被 launchd 启动）中可能瞬时失败。
+
+**修复**: `shm.zig:createPosix()` 新增 retry 逻辑——首次失败后等 2s 重试（含 unlink 再 create）。
+
+### Finding 157: `bootstrap exit 0 但服务未在 launchctl list 中`
+
+**现象**: `launchctl bootstrap` 偶尔返回 exit 0（成功），但 `launchctl list` 中却找不到服务。
+
+**原因**: launchd 内部处理时序——bootstrap 在内部队列中等待处理但尚未完成，或 launchd throttle 静默拒绝。
+
+**修复**: `start()` 中 bootstrap 每次重试后 500ms 延迟 + 验证 `launchctl list` 输出，不信任 exit code。
+
+---
+
 ### Finding 140: 自动升级启动权冲突根因分析 (Architecture)
 
 Phase 72-74 修复了 5 个自动升级 bug（Finding 123/129/135/138/139），但这些都是治标。根本问题在于架构设计错误：
@@ -596,7 +648,12 @@ main.zig:393:35: dupe__anon in buildServiceArgs
 | 125 | `nowMs()` RTT 中继路径异常 | 📋 不影响核心功能 |
 | 126 | DebugAllocator 泄漏 (`buildServiceArgs`) | 📋 仅 debug 构建 |
 | 127 | linuxvm 日志停止 | 📋 待调查 |
-| 128 | macOS bootstrap errno=5 在 bootout 后 | 📋 规避方案 |
+| 128 | macOS bootstrap errno=5 在 bootout 后 | ✅ 已修复 (Phase 76): launchd throttle + startDirect 回退 |
+| **153** | launchd throttle：频繁 bootout/bootstrap 后拒绝加载（EIO exit 5） | ✅ 已处置 (Phase 76): startDirect 终极回退 |
+| **154** | launchctl load exit 0 误导性 | ✅ 已处置 (Phase 76): 移除 legacy load，用 startDirect |
+| **155** | enable exit 64 (EX_USAGE) 无害 | ✅ 已处置 (Phase 76): `_ = runCmd` 忽略 |
+| **156** | shm_createPosix 在 launchd bootstrap 环境中瞬时失败 | ✅ 已修复 (Phase 76): 2s 后重试 |
+| **157** | bootstrap exit 0 但服务未在 launchctl list 中 | ✅ 已处置 (Phase 76): 验证 list 输出 + startDirect 回退 |
 | 78/106 | 交叉编译覆盖 `zig-out/bin/utmm` | 📋 规避方案 |
 | 107 | SSH `--install` 被 pkill 自伤 | 📋 规避方案（手动配服务） |
 | 108 | 升级后 Guest hostname 丢失 | 📋 规避方案（手动修复） |

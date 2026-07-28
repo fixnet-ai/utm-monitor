@@ -367,8 +367,11 @@ pub fn main(init: std.process.Init) !void {
     if (cli.cmd_install) {
         const role: svc.ServiceRole = if (cli.is_host) .host else .guest;
         try extractUtmmd(init.io, init.gpa);
-        var extra_args = try buildServiceArgs(init.gpa, cli);
-        defer extra_args.deinit(init.gpa);
+        var extra_args = try buildServiceArgs(init.gpa, cli, role);
+        defer {
+            for (extra_args.items) |item| init.gpa.free(@constCast(item));
+            extra_args.deinit(init.gpa);
+        }
         svc.forceInstall(init.io, init.gpa, role, extra_args.items);
         svc.saveUtmmdMeta(init.io, init.gpa, role, extra_args.items, utmmd_sha256_hex);
         return;
@@ -389,8 +392,11 @@ pub fn main(init: std.process.Init) !void {
         or cli.cmd_deploy;
     if (needs_host) {
         const was_running = svc.isRunning(init.io, init.gpa, .host);
-        var extra_args = try buildServiceArgs(init.gpa, cli);
-        defer extra_args.deinit(init.gpa);
+        var extra_args = try buildServiceArgs(init.gpa, cli, .host);
+        defer {
+            for (extra_args.items) |item| init.gpa.free(@constCast(item));
+            extra_args.deinit(init.gpa);
+        }
 
         if (svc.shouldUpdateUtmmd(init.io, init.gpa, .host, extra_args.items, utmmd_sha256_hex)) {
             // 3a path: utmmd needs update — extract + full forceInstall
@@ -439,8 +445,11 @@ pub fn main(init: std.process.Init) !void {
     // ── 10. Default: ensure Guest service is running ──
     {
         const was_running = svc.isRunning(init.io, init.gpa, .guest);
-        var extra_args_guest = try buildServiceArgs(init.gpa, cli);
-        defer extra_args_guest.deinit(init.gpa);
+        var extra_args_guest = try buildServiceArgs(init.gpa, cli, .guest);
+        defer {
+            for (extra_args_guest.items) |item| init.gpa.free(@constCast(item));
+            extra_args_guest.deinit(init.gpa);
+        }
 
         if (svc.shouldUpdateUtmmd(init.io, init.gpa, .guest, extra_args_guest.items, utmmd_sha256_hex)) {
             // 3a path: utmmd needs update — extract + full forceInstall
@@ -599,10 +608,19 @@ fn heartbeatThread(h: *volatile shm.ShmLayout, io: std.Io) void {
 }
 
 /// Build extra CLI arguments to embed in service config (--hostname, --port, etc.)
-fn buildServiceArgs(alloc: std.mem.Allocator, cli: CliArgs) !std.ArrayListAligned([]const u8, null) {
+fn buildServiceArgs(alloc: std.mem.Allocator, cli: CliArgs, role: svc.ServiceRole) !std.ArrayListAligned([]const u8, null) {
     var args: std.ArrayListAligned([]const u8, null) = .empty;
     errdefer args.deinit(alloc);
 
+    // --host 是模式标识，utmm 需要它来运行 Host 而非 Guest
+    // （utmmd 的 --role 仅告知 utmmd 自身角色，utmm 仍需要 --host 标志）
+    // 使用显式 role 参数而非 cli.is_host，因为 management 命令（--status 等）
+    // 触发 ensure 时 cli.is_host=false，但仍需为 Host 服务写入 --host。
+    if (role == .host) {
+        const arg = try alloc.dupe(u8, "--host");
+        errdefer alloc.free(arg);
+        try args.append(alloc, arg);
+    }
     if (cli.hostname) |h| {
         const arg = try alloc.dupe(u8, "--hostname");
         errdefer alloc.free(arg);

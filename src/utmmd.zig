@@ -92,16 +92,60 @@ const UtmmProcessWin = struct {
     pid: u32,
 };
 
+// Zig 0.16.0 移除了 PROCESS_INFORMATION，需手动声明
+const PROCESS_INFORMATION = extern struct {
+    hProcess: std.os.windows.HANDLE,
+    hThread: std.os.windows.HANDLE,
+    dwProcessId: u32,
+    dwThreadId: u32,
+};
+
+// Zig 0.16.0 移除了这些 kernel32 函数和常量，需手动声明
+const WAIT_TIMEOUT: u32 = 0x00000102;
+extern "kernel32" fn TerminateProcess(hProcess: std.os.windows.HANDLE, uExitCode: u32) callconv(.winapi) i32;
+extern "kernel32" fn WaitForSingleObject(hHandle: std.os.windows.HANDLE, dwMilliseconds: u32) callconv(.winapi) u32;
+extern "kernel32" fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) callconv(.winapi) ?std.os.windows.HANDLE;
+
+// Zig 0.16.0 移除了 CreateProcessW，声明 CreateProcessA（UTF-8 路径即可）
+// 使用 i32 替代 BOOL 避免 Zig 0.16.0 的 BOOL enum 类型不匹配
+extern "kernel32" fn CreateProcessA(
+    lpApplicationName: ?[*:0]const u8,
+    lpCommandLine: ?[*:0]u8,
+    lpProcessAttributes: ?*anyopaque,
+    lpThreadAttributes: ?*anyopaque,
+    bInheritHandles: i32,
+    dwCreationFlags: u32,
+    lpEnvironment: ?*anyopaque,
+    lpCurrentDirectory: ?[*:0]const u8,
+    lpStartupInfo: *std.os.windows.STARTUPINFOW,
+    lpProcessInformation: *PROCESS_INFORMATION,
+) callconv(.winapi) i32;
+
 /// 启动 utmm 子进程。
 fn startUtmm(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmLayout, args: []const []const u8) !ProcessRef {
     if (builtin.os.tag == .windows) return startUtmmWin(io, alloc, shm_ptr, args);
     return startUtmmPosix(io, alloc, shm_ptr, args);
 }
 
+/// 通过 PID 杀 utmm（用于 shutdown 时 proc 变量不在作用域的场景）。
+fn killUtmmByPid(pid: u32) void {
+    if (pid == 0) return;
+    if (builtin.os.tag == .windows) {
+        // Windows: 通过 PID 获取句柄再杀
+        const h = OpenProcess(1, 0, pid) orelse return;
+        _ = TerminateProcess(h, 1);
+        _ = std.os.windows.CloseHandle(h);
+        std.log.info("[utmmd] utmm killed by pid, pid={d}", .{pid});
+    } else {
+        std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
+        std.log.info("[utmmd] utmm killed by pid, pid={d}", .{pid});
+    }
+}
+
 /// 强杀 utmm 进程。
 fn killProcess(proc: ProcessRef) void {
     if (builtin.os.tag == .windows) {
-        _ = std.os.windows.TerminateProcess(proc.handle, 1);
+        _ = TerminateProcess(proc.handle, 1);
         _ = std.os.windows.CloseHandle(proc.handle);
         std.log.info("[utmmd] utmm killed, pid={d}", .{proc.pid});
     } else {
@@ -114,8 +158,8 @@ fn killProcess(proc: ProcessRef) void {
 /// 检查进程是否存活。
 fn isProcessAlive(proc: ProcessRef) bool {
     if (builtin.os.tag == .windows) {
-        const rc = std.os.windows.WaitForSingleObject(proc.handle, 0);
-        return rc == std.os.windows.WAIT_TIMEOUT;
+        const rc = WaitForSingleObject(proc.handle, 0);
+        return rc == WAIT_TIMEOUT;
     }
     if (proc == 0) return false;
     const result = std.c.waitpid(@intCast(proc), null, WNOHANG);
@@ -137,27 +181,36 @@ fn startUtmmPosix(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.S
     const path_z = try alloc.dupeZ(u8, path);
     defer alloc.free(path_z);
 
-    // 构建 argv: [utmm_path, args..., null]
-    var argv_z = try std.ArrayListAligned([*:0]const u8, null).initCapacity(alloc, args.len + 2);
-    defer argv_z.deinit(alloc);
+    // 构建 argv: [utmm_path, "--svc", args..., null]
+    // --svc 是必需的：utmm 必须运行在 daemon 模式才能连接 shm 并运行心跳
+    // 使用 allocSentinel 确保 NULL 终止符（POSIX execve 要求）
+    const svc_arg = try alloc.dupeZ(u8, "--svc");
+    const argv_count: usize = 2 + args.len; // path_z + svc_arg + args
+    const argv_z = try alloc.allocSentinel(?[*:0]const u8, argv_count, null);
+    defer alloc.free(argv_z);
 
-    try argv_z.append(alloc, path_z.ptr);
-    for (args) |a| {
+    argv_z[0] = path_z.ptr;
+    argv_z[1] = svc_arg.ptr;
+    for (args, 0..) |a, j| {
         const az = try alloc.dupeZ(u8, a);
-        try argv_z.append(alloc, az.ptr);
+        argv_z[2 + j] = az.ptr;
     }
+    // argv_z[argv_count] = null (set by allocSentinel)
 
     const pid = fork();
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
         // 子进程
         _ = std.c.chdir(@ptrCast(utmmDir()));
-        _ = std.c.execve(path_z, @ptrCast(argv_z.items.ptr), std.c.environ);
+        _ = std.c.execve(path_z, argv_z.ptr, std.c.environ);
         std.process.exit(1); // execve 失败
     }
 
-    // 父进程：释放 argv 中的 dupeZ 字符串
-    for (argv_z.items[1..]) |az| alloc.free(std.mem.span(az));
+    // 父进程：释放 dupeZ 字符串（svc_arg 和 args）
+    alloc.free(svc_arg);
+    for (args, 0..) |_, j| {
+        if (argv_z[2 + j]) |az| alloc.free(std.mem.span(az));
+    }
 
     shm_ptr.utmm_pid = @intCast(pid);
     shm_ptr.svc_heartbeat = shm.nowMs(io);
@@ -174,12 +227,15 @@ fn startUtmmWin(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.Shm
     const path = utmmPath();
     const w = std.os.windows;
 
-    // 构建命令行
+    // 构建命令行: utmm.exe --svc args...
+    // --svc 是必需的：utmm 必须运行在 daemon 模式才能连接 shm 并运行心跳
     var cmd_line: std.ArrayListAligned(u8, null) = .empty;
     defer cmd_line.deinit(alloc);
     try cmd_line.append(alloc, '"');
     try cmd_line.appendSlice(alloc, path);
     try cmd_line.append(alloc, '"');
+    try cmd_line.append(alloc, ' ');
+    try cmd_line.appendSlice(alloc, "--svc");
     for (args) |a| {
         try cmd_line.append(alloc, ' ');
         try cmd_line.appendSlice(alloc, a);
@@ -188,9 +244,9 @@ fn startUtmmWin(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.Shm
 
     var si: w.STARTUPINFOW = std.mem.zeroes(w.STARTUPINFOW);
     si.cb = @sizeOf(w.STARTUPINFOW);
-    var pi: w.PROCESS_INFORMATION = undefined;
+    var pi: PROCESS_INFORMATION = undefined;
 
-    if (w.CreateProcessW(null, @constCast(@ptrCast(cmd_line.items.ptr)), null, null, w.FALSE, 0, null, @ptrCast(@constCast(utmmDir())), &si, &pi) == 0) {
+    if (CreateProcessA(null, @constCast(@ptrCast(cmd_line.items.ptr)), null, null, 0, 0, null, @constCast(@ptrCast(utmmDir())), &si, &pi) == 0) {
         std.log.err("[utmmd] CreateProcess failed: {d}", .{@intFromEnum(w.GetLastError())});
         return error.ProcessStartFailed;
     }
@@ -359,6 +415,8 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
         if (sigterm_received.load(.acquire)) {
             std.log.info("[utmmd] SIGTERM, shutting down", .{});
             shm_ptr.svc_state = @intFromEnum(shm.SvcState.stopping);
+            // 杀掉 utmm 子进程防止变孤儿进程
+            killUtmmByPid(shm_ptr.utmm_pid);
             return;
         }
 

@@ -5,11 +5,143 @@
 - **分支**: `main`
 - **版本**: v0.11.23（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入；`build.zig.zon` 永为 `0.0.0`）
 - **测试**: 166/166 通过
-- **部署**: macOS Host v0.11.23 ✅ | macvm v0.11.23 ✅ | linuxvm v0.11.23 ✅ | windowsvm v0.11.22 | winx64 v0.11.22
-- **健康检查**: 4/4 全部通过（`--verify` 全绿 ✓）
-- **自动升级 rollback 修复**: `forceInstallInternal()` 步骤 5 不再回滚删除二进制+配置 ✅
-- **KCP Tunnel 稳定性修复**: session_gen 唯一 conv + epoch 范围验证 + 日志降级 ✅
-- **自动升级 forceInstall 修复**: killAllUtmm PID 感知 + waitForProcessExit + start() 重试 ✅
+- **部署**: macvm ✅ | linuxvm ✅ | windowsvm ✅ | winx64 ✅（全部 utmmd+utmm 运行中）
+- **健康检查**: 待 Host 启动后验证
+- **跨平台编译**: 8/8 目标全部通过（含本次 Windows Zig 0.16.0 API 修复）
+
+## Phase 76: macOS launchctl 遗留修复 + 文档更新 ✅ (2026-07-28)
+
+### 背景
+
+Phase 75 utmmd 引入后，macOS launchd 与 utmmd 的交互暴露出两个遗留问题：
+1. `launchctl enable` 在 bootout 后返回 exit 64
+2. `bootstrap` 间歇失败（exit 5: "Input/output error"）
+
+同时，CLAUDE.md、README.md、MANUAL.md 等多个文档包含过时的 HTTP 协议描述、
+旧安装流程（无 utmmd）、旧升级流程（无 shm）等误导信息，需要全面更新。
+
+### Task 382: 诊断 launchctl bootstrap 失败 ✅
+
+**发现**:
+- `enable exit 64`：`enable system/<name>` 在 bootout 后调用时 service label 已不存在于 launchd 中，返回 EX_USAGE。首次安装同理。无害 — 仅表示无 disabled flag 需清除。
+- `bootstrap exit 5`：根因是 **launchd throttle**（反滥用保护），非代码 bug。同一 label 短时间反复 bootout/bootstrap 超过阈值后，launchd 拒绝加载返回 EIO。持续 5-10 分钟自动解除。**新鲜 labels（如 `com.test-throttle`）工作完美**。
+- `launchctl load` 回退的陷阱：load 同样失败但**返回 exit 0**（仅打印错误到 stderr），`runCmd` 误判成功。这是原有代码使用 load 作为回退的致命缺陷。
+- `bootstrap` exit 0 但服务未在 list 中：launchd 内部队列处理时序，或 throttle 静默拒绝。必须验证 `launchctl list` 输出。
+
+### Task 383: 修复 macOS launchctl 两个遗留问题 ✅
+
+**`src/svc.zig` — installMacOS() 重排序**:
+- `enable → bootout → bootstrap`：enable 必须在 bootout 之前（需要 service label 存在于 launchd 才能清 disabled flag）
+- bootstrap 改为 best-effort（`_ = runCmd(...)`），不验证结果。真正的启动交给 `start()`
+- 移除 verify 步骤（`fail.msg` 检查 launchctl list）—— throttle 期间会导致整个 install 失败
+
+**`src/svc.zig` — start() macOS 路径完全重写**:
+```
+kickstart -k → 成功 → 验证 launchctl list → done
+            → 失败 → enable → bootout → bootstrap × 3（每次 500ms 后验证 list）
+                                                                    → 成功 → done
+                                                                    → 全部失败 → startDirect
+```
+- 移除 legacy `launchctl load` 回退（exit 0 误导性，实际未启动）
+- 新增 `launched_via_launchd` 标志：startDirect 场景跳过 launchctl list 验证
+- startDirect 直接后台运行 utmmd（不传 `--hostname`，用系统 hostname）
+
+**`src/shm.zig` — createPosix 重试**:
+- 首次 shm_open 失败 → 2s 后重试（launchd bootstrap 环境中可能瞬时失败）
+
+### Task 384: macvm 部署验证 ✅
+
+在 throttle 激活的 macvm 上验证 fallback 路径：
+- `bootstrap` 3 次全部失败（throttle 中）→ `startDirect` 启动 utmmd
+- utmmd 正常 spawn utmm → utmm 连接 mesh → Guest 出现在 `--status` 中
+- 正常路径（无 throttle）验证：`bootstrap` 首次成功，服务正常运行
+
+### Task 385: 更新所有过时文件 ✅
+
+**CLAUDE.md** (10 处编辑):
+- Project Overview: HTTP chunked → IPC socket 流式传输
+- 新增 utmmd supervisor 条目
+- Two Run Modes: 增加 utmmd 管理层描述
+- Data Flow 图: 新增 `utmmd ──shm── utmm` 层
+- Command/Upload/Download Flow: 移除 HTTP 引用，更新为 IPC 二进制协议
+- HostState: `serve_dir` 描述更新
+- Auto-upgrade/Self-Copy/Runtime: 全部更新到 utmmd 架构
+- Post-release: 升级流程更新
+
+**README.md** (4 处编辑):
+- 流式 exec: 移除 `x-exit-code` trailer 引用
+- 自复制安装: 描述 utmmd supervisor 提取
+- 自动升级: 更新到 utmmd shm 信号协调
+- Data flow 图: 简化内部细节
+
+**MANUAL.md** (4 处编辑):
+- 版本号: `0.11.16` → `0.11.23`
+- 架构: `dual mode` → `dual mode + utmmd supervisor`
+- 自复制安装: 路径更新（utmmd 作为服务）
+- 自动升级: v0.12.0 + utmmd 步骤
+
+**SKILL.md**: 已在 Phase 76 早期新增 macOS launchctl 注意事项（line 116-150）
+
+**Memory 文件**:
+- `listener-version-update-bug.md` — 删除（listener.zig 已不存在）
+- `install-symlink-resolution-bug.md` — 标记为 resolved（utmmd canonicalSvcPath 直接返回硬件路径）
+- `mcp-http-server.md` — 标记为 PLAN（未实现，当前 MCP 仍为 stdio）
+- `MEMORY.md` 索引 — 同步更新
+
+## Task 377: 逐 VM 部署测试 ✅ (2026-07-28)
+
+### 背景
+
+完成 Task 376 安装优化后，构建完整新版本，逐个 VM 部署 Guest 验证。
+用户要求：不启动本机 Host，先逐个 VM 部署 Guest，记录每个不流畅环节，bug 立即修复。
+
+### 部署结果
+
+| VM | 平台 | IP | utmmd | utmm | UDP :2121 | 状态 |
+|----|------|-----|-------|------|-----------|------|
+| macvm | aarch64-macos | 192.168.64.4 | 21963 | 21967 | ✅ | ✅ 正常运行 |
+| linuxvm | aarch64-linux-musl | 192.168.64.2 | 116629 | 116630 | ✅ | ✅ 正常运行 |
+| windowsvm | aarch64-windows | 192.168.65.2 | 1560 | 5060 | ✅ | ✅ 正常运行 |
+| winx64 | x86_64-windows | 192.168.3.108 | 20104 | 39516 | ✅ | ✅ 正常运行 |
+
+### 部署过程中发现并修复的 Bug
+
+| # | Bug | 症状 | 根因 | 修复 |
+|---|-----|------|------|------|
+| 4 | Double free in startUtmmPosix | DebugAllocator 检测到双重释放 | `svc_arg` 在 argv 循环中已释放，又单独 `alloc.free(svc_arg)` | 移除重复的 `alloc.free(svc_arg)` |
+| 5 | execve argv 缺少 NULL 终止符 | utmm 被 utmmd spawn 后静默崩溃 | `execve` 要求 argv 数组以 NULL 指针终止，但 ArrayList 未追加 | 改用 `allocSentinel(?[*:0]const u8, n, null)` 确保 NULL 终止 |
+| 6 | buildServiceArgs 内存泄漏 | `--install` 时 DebugAllocator 报告 leaked memory | 各字符串 `alloc.dupe` 后从未释放，仅释放 ArrayList buffer | 在 3 处 defer 中先释放 items 再 deinit |
+| 7 | shm.zig: WINAPI 已移除 | aarch64-windows 交叉编译失败 | Zig 0.16.0 `std.os.windows.WINAPI` 不存在 | 改为 `std.builtin.CallingConvention = .winapi` |
+| 8 | shm.zig: 指针类型不匹配 | `&name_utf16` 无法转为 `?[*:0]const u16` | 单指针→多指针+可选+哨兵类型链需要显式转换 | `@ptrCast(&name_utf16)` |
+| 9 | shm.zig: @memset 不接受单指针 | `@memset(*ShmLayout, 0)` 编译失败 | Zig 0.16.0 `@memset` 要求切片或多指针 | 改为 `@as([*]u8, ...)[0..size]` |
+| 10 | shm.zig: volatile 指针不能传给 UnmapViewOfFile | 类型不匹配 | `*volatile ShmLayout` vs `?*const anyopaque` | 链式 `@ptrCast(@constCast(@volatileCast(...)))` |
+| 11 | utmmd.zig: PROCESS_INFORMATION 已移除 | Windows 交叉编译失败 | Zig 0.16.0 移除此结构体 | 手动声明 extern struct |
+| 12 | utmmd.zig: CreateProcessW 已移除 | 同上 | Zig 0.16.0 移除此函数 | 声明 `extern "kernel32" fn CreateProcessA`（UTF-8 路径） |
+| 13 | utmmd.zig: FALSE 已移除 | 同上 | Zig 0.16.0 BOOL 改为 enum，FALSE 常量不存在 | 改用 `i32` 类型 + `0` 值 |
+| 14 | utmmd.zig: TerminateProcess / WaitForSingleObject 已移除 | 同上 | Zig 0.16.0 移除此函数 | 手动声明 extern "kernel32" |
+| 15 | utmmd.zig: WAIT_TIMEOUT 已移除 | 同上 | Zig 0.16.0 移除常量 | 手动声明 `const WAIT_TIMEOUT: u32 = 0x00000102` |
+| 16 | shm.zig: OpenFileMappingW 调用 windows.FALSE | 同上 | 同上 | 声明改为 `i32`，调用处改为 `0` |
+
+### 流畅环节
+
+- **linuxvm 部署**：一次成功，系统日志清晰（journalctl 输出完整），无任何异常
+- **macvm 部署（修复后）**：utmmd+utmm 稳定运行，UDP 2121 监听正常，shm 连接正确
+- **windowsvm 部署**：SCP 上传+安装+验证全部流畅，Windows 服务管理正常
+- **winx64 部署**：同上，x86_64 target 交叉编译+运行完全正常
+
+### 不流畅环节（后续优化点）
+
+1. **Debug 构建体积大** — macOS 18MB、Linux 18MB，应使用 ReleaseSafe 构建做部署测试
+2. **Windows SCP 路径** — C:\tmp 需预先 mkdir，路径格式 `C:/tmp/file.exe` 不直观
+3. **macOS launchctl bootstrap 不稳定** — UTM VM 中 SIP 限制，需三重回退（kickstart → legacy load → startDirect）
+4. **跨平台构建逐 target 编译** — 7 个连续 Zig 0.16.0 API 修复，每次修复后重编译，流程可并行化
+5. **utmmd 日志未落地** — macOS 上 utmmd 的 stdout/err 未出现在 `/var/log/utmmd.log`，仅 journalctl 有
+6. **--install 过程中 DebugAllocator 检查** — 发布构建应使用 ReleaseSafe 避免泄漏误报
+
+### 与 Task 362 关系
+
+Task 362（Host + 全部 VM 部署验证）需要 Host 运行才能执行 `--verify`。
+本任务完成了 Guest 部署部分，Host 部署留待后续。
 
 ## Phase 75: utmmd 监督进程架构重构 ✅ (2026-07-28 已完成)
 

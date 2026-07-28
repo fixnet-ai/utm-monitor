@@ -27,7 +27,7 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 
 - **版本**: v0.11.23（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入）
 - **`build.zig.zon`**: `0.0.0`（永不再改）
-- **源文件**: 16 个（`src/*.zig`）+ 1 版本文件（`src/ver.txt`）+ 2 skills（`zig`、`deploy`）
+- **源文件**: 18 个（`src/*.zig`）+ 1 版本文件（`src/ver.txt`）+ 2 skills（`zig`、`deploy`）
 - **测试**: 166/166 通过
 - **部署**: macOS Host v0.11.23 ✅ | linuxvm v0.11.23 ✅ | macvm v0.11.23 ✅ | windowsvm v0.11.22 | winx64 v0.11.22
 - **健康检查**: 4/4 全部通过（status ✓ ping ✓ exec ✓）
@@ -64,6 +64,8 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 72 | 2026-07-28 | 自动升级 rollback 修复 + 全流程部署测试 |
 | 73 | 2026-07-28 | KCP Tunnel 稳定性 + 下载性能修复（Finding 129 + 138） |
 | 74 | 2026-07-28 | 自动升级 forceInstall 修复（Finding 123 + 135 + 139） |
+| 75 | 2026-07-28 | utmmd 监督进程架构重构（shm + utmmd + svc 简化 + 安装优化） |
+| 76 | 2026-07-28 | macOS launchctl 遗留修复 + 文档全面更新（Task 382-385） |
 
 ## Phase 72: 自动升级 rollback 修复 + 全流程部署测试 ✅ (2026-07-28)
 
@@ -397,10 +399,44 @@ src/
 | 136 | 🔴 | winx64 自动升级信号未检测到（网络隔离，待调查） |
 | 137 | 🟡 | windowsvm 自动升级 install 失败，优雅回退 |
 | 123 | ✅ 已修复 (Phase 74) | macOS 自动升级：killAllUtmm PID 感知 + start() 重试 + exit(42) |
+| 128 | ✅ 已修复 (Phase 76) | macOS bootstrap errno=5：识别为 launchd throttle → startDirect 回退 |
 | 135 | ✅ 已修复 (Phase 74) | linuxvm selfCopy：waitForProcessExit 等进程退出后再覆盖 |
 | 139 | ✅ 已修复 (Phase 74) | Host 自 kill：killAllUtmm 排除自身 PID |
 | 129 | ✅ 已修复 (Phase 73) | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
 | 138 | ✅ 已修复 (Phase 73) | KCP 自动升级下载性能瓶颈（~15KB/s，mesh 日志刷屏） |
+
+## Phase 76: macOS launchctl 遗留修复 + 文档更新 ✅ (2026-07-28)
+
+| # | 任务 | 描述 | 状态 |
+|---|------|------|------|
+| 382 | 诊断 launchctl bootstrap 失败 | 识别 launchd throttle 为根因（Finding 153），非代码 bug | ✅ |
+| 383 | 修复 macOS launchctl 两个遗留问题 | enable 前置（bootout 前清 disabled flag）+ bootstrap 验证改用 launchctl list（不信任 exit code）+ 移除 legacy load 回退 | ✅ |
+| 384 | macvm 部署验证 | 确认 fallback 路径正确工作：bootstrap 失败 → startDirect | ✅ |
+| 385 | 更新所有过时文件 | CLAUDE.md（10 处）、README.md（4 处）、MANUAL.md（4 处）、SKILL.md（launchctl 注意事项）、memory 文件（删除 1 个、更新 3 个） | ✅ |
+
+### 变更摘要
+
+**`src/svc.zig` — installMacOS() 重排序**:
+- `enable → bootout → bootstrap`：enable 必须在 bootout 之前（需要服务 label 存在于 launchd）
+- bootstrap 改为 best-effort（不验证结果），真正的启动验证交给 `start()`
+
+**`src/svc.zig` — start() macOS 路径重写**:
+- kickstart 失败后：enable → bootout → bootstrap × 3（每次验证 launchctl list）
+- bootstrap 全部失败 → startDirect（绕过 launchd，直接后台运行 utmmd）
+- `launched_via_launchd` 标志：startDirect 场景跳过 launchctl list 验证
+- 移除 legacy `launchctl load` 回退（exit 0 误导性）
+
+**`src/shm.zig` — createPosix 重试**:
+- 新增 retry 逻辑：首次 shm_open 失败后等 2s 重试
+- launchd bootstrap 环境中 shm_open 可能瞬时失败
+
+### 关键发现
+
+| Finding | 描述 |
+|---------|------|
+| 153 | **launchd throttle**：同一 label 短时间反复 bootout/bootstrap 超阈值后，launchd 拒绝加载返回 EIO（exit 5），持续 5-10 分钟。新鲜 labels 工作完美 |
+| 154 | **launchctl load exit 0 误导性**：load 失败打印 "Load failed: 5" 但返回 exit 0，`runCmd` 误判成功。代码已移除 legacy load 回退，改为 startDirect |
+| 155 | **enable exit 64 无害**：首次安装（service 从未存在）或 throttle 期间 bootout 后，`enable system/<name>` 返回 exit 64（EX_USAGE）。仅表示无 disabled flag 需清除 |
 
 ## Phase 71: 版本号单文件管理 + GitHub 新版本检测 ✅ (2026-07-28)
 

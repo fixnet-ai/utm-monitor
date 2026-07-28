@@ -107,9 +107,9 @@ extern "c" fn getpid() c_int;
 extern "c" fn mmap(addr: ?*anyopaque, length: usize, prot: c_int, flags: c_int, fd: c_int, offset: isize) *anyopaque;
 extern "c" fn munmap(addr: ?*anyopaque, length: usize) c_int;
 
-// fcntl.h 原始常量 — 跨平台通用
-const O_CREAT: c_int = 0o100;
-const O_EXCL: c_int = 0o200;
+// fcntl.h 原始常量 — macOS 与 Linux 值不同，按平台区分
+const O_CREAT: c_int = if (builtin.os.tag == .macos) 0x0200 else 0o100;
+const O_EXCL: c_int = if (builtin.os.tag == .macos) 0x0800 else 0o200;
 const O_RDWR: c_int = 0o2;
 
 const MAP_FAILED: *anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
@@ -118,14 +118,25 @@ const PROT_WRITE: c_int = 0x2;
 const MAP_SHARED: c_int = 0x0001;
 
 /// POSIX: 创建共享内存区域（由 utmmd 调用）。
+/// 在 launchd bootstrap 环境中首次 shm_open 可能失败，添加重试逻辑。
 fn createPosix(io: std.Io, name: [:0]const u8) !*volatile ShmLayout {
     const fd: c_int = fd: {
         const f = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0o600);
         if (f >= 0) break :fd f;
+        // shm 已存在（上次未清理）→ unlink 后重新创建
         _ = shm_unlink(name);
         const f2 = shm_open(name, O_CREAT | O_RDWR, 0o600);
-        if (f2 < 0) return error.ShmCreateFailed;
-        break :fd f2;
+        if (f2 >= 0) break :fd f2;
+        // 首次失败（常见于 launchd bootstrap 环境），等待后重试
+        std.log.warn("[shm] first create attempt failed, retrying...", .{});
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(2000), .awake) catch {};
+        _ = shm_unlink(name);
+        const f3 = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0o600);
+        if (f3 >= 0) break :fd f3;
+        _ = shm_unlink(name);
+        const f4 = shm_open(name, O_CREAT | O_RDWR, 0o600);
+        if (f4 < 0) return error.ShmCreateFailed;
+        break :fd f4;
     };
 
     if (ftruncate(fd, @intCast(@sizeOf(ShmLayout))) != 0) {
@@ -186,7 +197,7 @@ fn detachPosix(shm_ptr: *volatile ShmLayout) void {
 // ═══════════════════════════════════════════════════════════════════════════
 
 const windows = std.os.windows;
-const WINAPI = std.os.windows.WINAPI;
+const WINAPI: std.builtin.CallingConvention = .winapi;
 
 const PAGE_READWRITE: u32 = 0x04;
 const FILE_MAP_ALL_ACCESS: u32 = 0x000F001F;
@@ -203,7 +214,7 @@ extern "kernel32" fn CreateFileMappingW(
 
 extern "kernel32" fn OpenFileMappingW(
     dwDesiredAccess: u32,
-    bInheritHandle: windows.BOOL,
+    bInheritHandle: i32,
     lpName: [*:0]const u16,
 ) callconv(WINAPI) ?windows.HANDLE;
 
@@ -247,7 +258,7 @@ fn createWindows(io: std.Io) !*volatile ShmLayout {
         PAGE_READWRITE,
         0,
         @sizeOf(ShmLayout),
-        &name_utf16,
+        @ptrCast(&name_utf16),
     ) orelse return error.ShmCreateFailed;
 
     const ptr = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, @sizeOf(ShmLayout)) orelse {
@@ -258,7 +269,7 @@ fn createWindows(io: std.Io) !*volatile ShmLayout {
     _ = windows.CloseHandle(h);
 
     const shm: *volatile ShmLayout = @ptrCast(@alignCast(ptr));
-    @memset(@constCast(@as(*ShmLayout, @ptrCast(@alignCast(ptr)))), 0);
+    @memset(@as([*]u8, @ptrCast(@alignCast(ptr)))[0..@sizeOf(ShmLayout)], 0);
     shm.magic = MAGIC;
     shm.version = VERSION;
     shm.svc_pid = windows.GetCurrentProcessId();
@@ -271,7 +282,7 @@ fn createWindows(io: std.Io) !*volatile ShmLayout {
 fn openWindows() !*volatile ShmLayout {
     const name_utf16 = winShmNameUtf16();
 
-    const h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, windows.FALSE, &name_utf16) orelse
+    const h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, @ptrCast(&name_utf16)) orelse
         return error.ShmOpenFailed;
 
     const ptr = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, @sizeOf(ShmLayout)) orelse {
@@ -290,7 +301,7 @@ fn openWindows() !*volatile ShmLayout {
 
 /// Windows: 关闭共享内存（utmmd 退出时调用）。
 fn closeWindows(shm: *volatile ShmLayout) void {
-    _ = UnmapViewOfFile(shm);
+    _ = UnmapViewOfFile(@ptrCast(@constCast(@volatileCast(shm))));
 }
 
 /// Windows: 取消映射（utmm 退出时调用）。

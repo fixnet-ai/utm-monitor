@@ -9,9 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 UTM Monitor (`utmm`) — remote debugging sidekick for VMs and physical machines.
 Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabilities:
 
-- **Streaming exec**: HTTP chunked response with `x-exit-code` trailer — real-time
-  output, no JSON wrapping, no timeout. Upload/download use raw binary body with
-  custom headers (`x-vm`, `x-path`).
+- **Streaming exec**: IPC socket streaming with binary framing — real-time output,
+  no JSON wrapping, no timeout. Exit code sent as binary trailer after command
+  completes. Upload/download use IPC binary protocol with vm+path fields.
 - **Self-copy install**: Binary copies itself to canonical path `/opt/utmm/utmm`
   (POSIX) / `C:\opt\utmm\utmm.exe` (Windows). `--install` = unconditional force
   overwrite. Upgrade = scp new binary + `--install`. Zero shell commands.
@@ -21,6 +21,10 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
 - **MCP stdio**: AI agents control machines via `utmm --mcp` (stdio JSON-RPC).
   `vm_status` / `vm_exec` tools. Benefits from auto-ensure — if Host service is
   down, `--mcp` auto-starts it, so the recovery flow is never broken.
+- **utmmd supervisor**: Lightweight supervisor daemon manages utmm lifecycle
+  via shared memory (heartbeat, crash recovery with exponential backoff).
+  System service managers just keep utmmd alive; all restart/upgrade logic
+  lives in utmmd.
 - **Single port**: 2121 for mesh networking (UDP only — LSA + KCP tunnel).
   CLI and MCP use local IPC socket — no TCP or HTTP on any port.
   MCP uses stdio — see `mcp.json.example`.
@@ -65,13 +69,16 @@ UDP port 2121 first-byte dispatch:
 
 ### Two Run Modes (Same Binary)
 
-- **Guest mode (default)**: `--svc`: daemon mode (mesh LSA broadcast + KCP tunnel + pty shell).
-  `--install --hostname <name>`: force install as system auto-start service.
+- **Guest mode (default)**: `utmmd --role guest` spawns `utmm --svc` (mesh LSA
+  broadcast + KCP tunnel + pty shell). utmmd monitors utmm via shared memory
+  (`/utmmd-shm`), handles crash recovery (exponential backoff 2s→60s, 5 retries),
+  and coordinates auto-upgrade. `--install --hostname <name>`: force install as
+  system auto-start service (single `utmmd` service per machine).
   `--version`: print version. No foreground mode — service model only.
-- **Host mode (`--host`)**: Mesh networking on UDP port 2121 — guest registration
-  via LSA broadcast, KCP tunnel management, /etc/hosts sync, and IPC socket
-  for CLI/MCP communication. Guest auto-upgrade binary serving via KCP
-  (`serveUpgradeFile`). All on one port.
+- **Host mode (`--host`)**: `utmmd --role host` spawns `utmm --host --svc`.
+  Mesh networking on UDP port 2121 — guest registration via LSA broadcast,
+  KCP tunnel management, /etc/hosts sync, and IPC socket for CLI/MCP communication.
+  Guest auto-upgrade binary serving via KCP (`serveUpgradeFile`). All on one port.
 - **MCP mode (`--mcp`)**: stdio JSON-RPC server for AI agents. Talks to Host
   daemon via IPC socket (`/var/run/utmm.sock`); auto-ensures Host on first use.
 
@@ -85,6 +92,9 @@ Guest (windows)  ──KCP/Mesh──┘                      ├── KCP upgr
                          │   (LSA discovery)         └── /etc/hosts sync
                          │
 Guest ←── LSA broadcast (UDP) ──┘  (topology discovery + version detection)
+
+Each side:
+  utmmd ──shm── utmm    (utmmd spawns & monitors utmm, crash recovery, upgrade coord)
 ```
 
 ### How a Command Flows
@@ -98,8 +108,8 @@ Guest ←── LSA broadcast (UDP) ──┘  (topology discovery + version det
 5. Shell executes → output flows through pty → ptyReadLoop sends
    pty_output frames back to Host via KCP
 6. Host handleMeshGuest: appendOpOutput + scanForMarker
-7. Host IPC: streams output as it arrives
-8. When MDELIM:N\n found: strip marker, set exit_code=N, send x-exit-code trailer
+7. Host IPC: streams output to CLI via binary frame protocol (exec_data → exec_done with exit_code)
+8. When MDELIM:N\n found: strip marker, set exit_code=N, send exec_done frame
 ```
 
 ### How Upload/Download Flows
@@ -107,20 +117,19 @@ Guest ←── LSA broadcast (UDP) ──┘  (topology discovery + version det
 ```
 Upload (Host→Guest):
 1. CLI: utmm --upload file.txt linuxvm
-2. IPC /upload with headers: x-vm: linuxvm, x-path: file.txt
-   Body: raw file bytes (application/octet-stream)
-3. handleUpload: stream-read body → tunproto file_chunk × N → file_eof
+2. IPC /upload: binary header (vm + dest_path + hash + file_size) followed by raw file bytes
+3. handleUpload: parse header → tunproto file_chunk × N → file_eof
 4. Guest receiveChunkedFile: temp file → sha256 per chunk → verify → rename
-5. IPC response: plain text "OK" or error
+5. IPC response: binary status frame (OK or error with exit_code)
 
 Download (Guest→Host):
 1. CLI: utmm --download linuxvm file.txt ./local.txt
-2. IPC /download with headers: x-vm: linuxvm, x-path: file.txt
+2. IPC /download: binary header (vm + remote_path)
 3. handleDownload: tunproto download_cmd → Guest sendChunkedFile
 4. Guest: read file → file_chunk × N → file_eof (sha256)
 5. Host: appendOpOutput per chunk → file_eof marks completion
-6. IPC response: streamed file bytes + x-exit-code trailer
-7. CLI: body_reader.stream(file_iface) → write to local file
+6. IPC response: streamed file data frames + exec_done frame with exit_code
+7. CLI: write streamed bytes to local file
 ```
 
 ### Tunnel Protocol (tunproto.zig)
@@ -168,7 +177,7 @@ All handlers share one `HostState` instance, mutex-protected:
 - `op_states`: StringHashMap of `OpState` by cmd_id (output buffer, exit_code, done flag)
 - `transfers`: StringHashMap of `TransferState` (file transfer progress tracking)
 - `wake_event`: Io.Event signaled on op completion (wakes polling IPC handlers)
-- `serve_dir`: static file serve directory (default: `/opt/utmm`)
+- `serve_dir`: binary serve directory for Guest auto-upgrade (default: `/opt/utmm`)
 - `mesh`: opaque pointer to `*mesh.Mesh` instance
 
 ### Self-Copy Install Model
@@ -178,37 +187,43 @@ All handlers share one `HostState` instance, mutex-protected:
 ```
 forceInstall():
   1. stop  → stop existing service (ignore errors)
-  2. kill  → kill leftover processes
+  1.5. wait → wait up to 5s for old processes to exit (prevents "Text file busy")
+  2. kill  → kill leftover processes (PID-aware, skips self)
   3. copy  → self-copy to canonical path (tmp + rename, EXDEV → copy+delete fallback)
-  4. install → overwrite system service config
-  5. start → start service
+  3.5. copy-platform → Host mode only: copy cross-platform binaries to serve-dir
+  4. install → overwrite system service config (best-effort bootstrap on macOS)
+  5. start → start service (full retry + fallback chain on macOS: kickstart → bootstrap × 3 → startDirect)
 
 ensure():
   service running → skip
   service not running → forceInstall()
 ```
 
-**Service names**:
+**Service names** (single utmmd service per machine, role via `--role guest|host`):
 
-| Platform | Guest | Host |
-|----------|-------|------|
-| macOS | `com.utmm.guest` | `com.utmm.host` |
-| Linux | `utmm-guest` | `utmm-host` |
-| Windows | `UTM-Monitor-Guest` | `UTM-Monitor-Host` |
+| Platform | Service Name | Notes |
+|----------|-------------|-------|
+| macOS | `com.utmmd` | Legacy per-role names (`com.utmm.guest`/`com.utmm.host`) auto-cleaned |
+| Linux | `utmmd` | Legacy per-role names (`utmm-guest`/`utmm-host`) auto-cleaned |
+| Windows | `UTM-MonitorD` | Legacy per-role names (`UTM-Monitor-Guest`/`UTM-Monitor-Host`) auto-cleaned |
 
-**3-retry keep-alive**: Linux `StartLimitBurst=3`, Windows `sc failure`, macOS counter file.
+**utmmd crash recovery**: utmmd handles all retry logic internally — `MAX_FAILURE_COUNT=5`,
+exponential backoff 2s→4s→8s→16s→32s→60s(max). After 5 consecutive failures, utmmd exits.
+System service managers are configured to restart utmmd on exit (macOS `RunAtLoad`,
+Linux `Restart=on-failure`, Windows `start=auto`).
 **All paths require root** (except `--version` and `--help`). No privilege elevation code.
 **Fast-fail**: errors print function name + system error code + message, then exit(1).
 
 **Upgrade (manual)**: scp new binary to VM + `sudo ./utmm-new --install`. forceInstall handles
 stop→kill→copy→install→start.
 
-**Upgrade (automatic, v0.11.14+)**: Guest-initiated atomic operation:
+**Upgrade (automatic, v0.12.0+)**: Guest-initiated atomic operation:
 1. Guest detects Host version mismatch via mesh LSA
-2. Guest exits command loop, sends `upgrade_req` (0x19) via KCP tunnel
-3. Host responds with `file_chunk × N + file_eof` (binary download)
-4. Guest saves to temp dir, `chmod +x`, runs `--install --hostname <name>`
-5. `forceInstall` completes the deployment (stop→kill→copy→install→start)
+2. Guest exits command loop, signals upgrade intent to utmmd via shared memory
+3. Guest sends `upgrade_req` (0x19) via KCP tunnel
+4. Host responds with `file_chunk × N + file_eof` (binary download)
+5. Guest saves to temp dir, `chmod +x`, signals utmmd to restart with new binary
+6. utmmd stops old utmm, replaces binary, spawns new utmm — zero-downtime handoff
 Host never pushes upgrades — the Guest is fully self-upgrading.
 
 ### Key Design Decisions
@@ -222,9 +237,10 @@ Host never pushes upgrades — the Guest is fully self-upgrading.
 - **Self-copy install model** (v0.12.0) — replaces utmm-old 10+ step KCP download
   upgrade (fork→mesh→connect→download→verify→replace→restart) with 4 steps
   (stop→kill→copy→start). Network-independent. No bat scripts for Windows.
-- **Guest-initiated auto-upgrade** (v0.11.14) — Guest detects version mismatch via
+- **Guest-initiated auto-upgrade** (v0.12.0) — Guest detects version mismatch via
   LSA, downloads new binary via KCP tunnel (`upgrade_req` → `file_chunk` × N →
-  `file_eof`), saves to temp, runs `--install --hostname <name>`. Host never pushes
+  `file_eof`), saves to temp, signals utmmd via shared memory to restart with new
+  binary. utmmd handles the atomic stop→replace→spawn handoff. Host never pushes
   upgrades — fully atomic on Guest side. Upgrade check runs in both the outer
   mesh session loop and the inner command loop to ensure idle Guests detect the
   signal promptly.
@@ -243,7 +259,7 @@ Host never pushes upgrades — the Guest is fully self-upgrading.
   against `protocol.VERSION`, sets `upgrade.needed` on mismatch, triggering
   Guest-initiated auto-upgrade (see above).
   The upgrade check runs both between command sessions and inside the command loop
-  (v0.11.14+), ensuring idle Guests detect the signal promptly.
+  (v0.12.0+), ensuring idle Guests detect the signal promptly.
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
 
 ## Build & Run
@@ -272,25 +288,25 @@ zig build test
 
 ### Guest Runtime
 ```bash
-utmm --hostname myvm --port 2121    # Ensure Guest service (auto-installs if needed)
-utmm --svc                           # Daemon mode (internal, set by service manager)
+utmm --hostname myvm --port 2121    # Ensure Guest service (auto-installs utmmd if needed)
+utmm --svc                           # Daemon mode (internal, spawned by utmmd supervisor)
 utmm --host-ip IP                    # Override Host IP (default: auto-detect via gateway)
 utmm --log-file PATH                 # Log file path
 utmm --version                       # Print version and exit (no root needed)
-utmm --install --hostname myvm       # Force install as system service
+utmm --install --hostname myvm       # Force install utmmd as system service
 utmm --uninstall                     # Remove system service and binary
 ```
 
 ### Host Runtime
 ```bash
-sudo utmm --host                     # Ensure Host service (auto-installs if needed)
-utmm --host --port 2122              # Custom port
-utmm --host --serve-dir PATH         # Static file serve directory (default: exe dir)
+sudo utmm --host                     # Ensure Host service (auto-installs utmmd if needed)
+utmm --host --port 2122              # Custom mesh port
+utmm --host --serve-dir PATH         # Binary serve directory for Guest upgrade (default: exe dir)
 utmm --host --hosts-file PATH        # hosts file path (default /etc/hosts)
 utmm --host --marker TAG             # hosts marker comment text
 utmm --host --config PATH            # Config file path
 utmm --host --log-file PATH          # Log file path
-utmm --host --install                # Force install as system service (Host mode)
+utmm --host --install                # Force install utmmd as system service (Host mode)
 utmm --host --uninstall              # Remove system service
 utmm --host --save-config            # Save current parameters to config file
 
@@ -370,14 +386,15 @@ Open the release URL printed by the script and confirm:
 ### Post-release
 After release, the Host's serve-dir auto-serves new binaries. Guests detect
 version mismatch via LSA broadcast and trigger Guest-initiated auto-upgrade
-(v0.11.14+): download new binary via KCP tunnel → `--install --hostname <name>`.
+(v0.12.0+): download new binary via KCP tunnel → signal utmmd via shared memory
+→ utmmd performs atomic stop→replace→spawn handoff.
 Host never pushes upgrades — the Guest is fully self-upgrading.
 
 ## Project File Structure
 
 ```
 src/
-├── main.zig           # Entry point, CLI parsing, mode dispatch (+ priv.zig isAdmin)
+├── main.zig           # Entry point, CLI parsing, mode dispatch
 ├── protocol.zig       # Protocol constants, VERSION via @embedFile("ver.txt"), deployment filename mapping
 ├── tunproto.zig       # Tunnel protocol over KCP: 10+ msg types, build/parse, chunked file transfer
 ├── kcp.zig            # KCP reliable ARQ protocol (matches C reference skywind3000/kcp)
@@ -387,15 +404,18 @@ src/
 ├── mcp.zig            # MCP stdio server: JSON-RPC stdin/stdout, IPC client to Host
 ├── lock.zig           # Process singleton lock (utmm.lock PID file)
 ├── host.zig           # Host orchestration: cmd dispatch + mesh start + IPC socket
-├── broadcast.zig      # Guest core: system info, ptySpawn, ptyReadLoop, meshSessionLoop (+ guest.zig)
-├── svc.zig            # Unified cross-platform service management (+ install.zig detectServiceEnv)
+├── broadcast.zig      # Guest core: system info, ptySpawn, ptyReadLoop, meshSessionLoop
+├── svc.zig            # Unified cross-platform service management (install/start/stop/uninstall)
+├── utmmd.zig          # Supervisor daemon: utmm lifecycle, crash recovery, shared memory IPC
+├── shm.zig            # Shared memory protocol: utmmd↔utmm IPC, heartbeat, commands
 ├── hosts_file.zig     # /etc/hosts marked block read/write
+├── ipc.zig            # Host IPC socket server: CLI/MCP request handling
 ├── config.zig         # Config persistence + file logger
 └── fail.zig           # Fast-fail helpers (err, msg — noreturn)
 ```
 
-> v0.11.10 consolidated from 19 to 13 source files; Phase 53 added mcp.zig + lock.zig; Phase 60 added ipc.zig = 16 files.
-> Merged: ver.zig→protocol.zig, priv.zig→main.zig, install.zig→svc.zig+host.zig,
+> v0.12.0: 18 source files — added shm.zig, utmmd.zig, ipc.zig.
+> Legacy merges: ver.zig→protocol.zig, priv.zig→main.zig, install.zig→svc.zig,
 > guest.zig→broadcast.zig, host_http.zig→state.zig.
 
 ## Code of Conduct / Guidelines

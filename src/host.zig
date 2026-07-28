@@ -899,7 +899,7 @@ fn startHost(
         // Register Host itself in the guest table so --status shows it alongside guests
         _ = state.upsertGuest(
             host_info.hostname, host_info.ip, host_info.target,
-            "00:00:00:00:00:00", protocol.VERSION, host_info.shell,
+            host_info.mac, protocol.VERSION, host_info.shell,
             "serving", "host",
         );
 

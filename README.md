@@ -140,22 +140,25 @@ named pipe on Windows) — no HTTP.
 ```
 Guest (linuxvm)      ──KCP/Mesh──┐
 Guest (macvm)        ──KCP/Mesh──┤──→ Host ── IPC socket ── CLI (--status, --exec, --ping)
-Guest (windowsvm)    ──KCP/Mesh──┤          ── Static files (/bin/ via KCP upgrade_req)
+Guest (windowsvm)    ──KCP/Mesh──┤          ── Binary serve (KCP upgrade_req)
 Guest (raspigw, LAN) ──KCP/Mesh──┘
                          ┌── LSA broadcast discovery ───┘   (topology + version detection)
                          │
 AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
 ```
 
-- **Streaming exec**: output flows in real time through KCP tunnel with `x-exit-code`
-  trailer. No JSON wrapping, no timeout. Upload/download use chunked stream
-  (1200B MSS-aligned blocks, one per KCP segment — no fragmentation).
-- **Self-copy install**: binary copies itself to `/opt/utmm/utmm` (POSIX) or
-  `C:\opt\utmm\utmm.exe` (Windows). `--install` = unconditional force overwrite.
-  Upgrade = scp new binary + `--install`. Zero shell commands.
-- **Guest-initiated auto-upgrade** (v0.11.14+): Guest detects Host version change via
-  LSA broadcast, downloads new binary through KCP tunnel, and runs `--install
-  --hostname <name>` to complete deployment. Host never pushes upgrades.
+- **Streaming exec**: output flows in real time through KCP tunnel via IPC socket,
+  with exit code sent as binary trailer. No JSON wrapping, no timeout.
+  Upload/download use chunked stream (1200B MSS-aligned blocks, one per KCP
+  segment — no fragmentation).
+- **Self-copy install**: binary extracts utmmd supervisor to `/opt/utmm/utmmd` (POSIX)
+  or `C:\opt\utmm\utmmd.exe` (Windows) and registers it as the system service.
+  utmmd manages utmm's lifecycle (spawn, monitor, crash recovery).
+  `--install` = unconditional force overwrite. Upgrade = scp new binary + `--install`.
+  Zero shell commands.
+- **Guest-initiated auto-upgrade** (v0.12.0+): Guest detects Host version change via
+  LSA broadcast, downloads new binary through KCP tunnel, and signals utmmd
+  via shared memory to restart with the new binary. Host never pushes upgrades.
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
 - **Single port**: 2121 for mesh networking (UDP only — LSA + KCP tunnel).
   MCP and CLI use local IPC socket (stdio/stdin for MCP, Unix domain socket for CLI) — no port needed.
@@ -181,8 +184,8 @@ curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.
 ```
 
 **Guest auto-upgrade (hands-free):** Guests detect a Host version change via
-LSA broadcast, download the new binary through the KCP tunnel, and run
-`--install --hostname <name>` automatically. No human intervention needed.
+LSA broadcast, download the new binary through the KCP tunnel, and signal
+utmmd to restart with the new binary. No human intervention needed.
 
 **Offline/manual:** download `utmm.zip` from the
 [latest release](https://github.com/fixnet-ai/utm-monitor/releases/latest),
