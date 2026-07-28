@@ -15,19 +15,18 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
 - **Self-copy install**: Binary copies itself to canonical path `/opt/utmm/utmm`
   (POSIX) / `C:\opt\utmm\utmm.exe` (Windows). `--install` = unconditional force
   overwrite. Upgrade = scp new binary + `--install`. Zero shell commands.
-- **Persistent pty per connection**: `posix_openpt` (POSIX) / `CreatePipe` (Windows).
-  Commands share one shell session — `cd`, `export`, shell history survive across calls.
-  `MDELIM:$?\n` exit-code markers embedded in pty output.
+- **Per-command pty**: Each exec opens a fresh pty session via `posix_openpt` (POSIX)
+  / `CreatePipe` (Windows). `MDELIM:$?\n` exit-code markers embedded in pty output.
 - **MCP stdio**: AI agents control machines via `utmm --mcp` (stdio JSON-RPC).
-  `vm_status` / `vm_exec` tools. Benefits from auto-ensure — if Host service is
-  down, `--mcp` auto-starts it, so the recovery flow is never broken.
+  `vm_status` / `vm_exec` / `vm_upload` / `vm_download` tools. Benefits from
+  auto-ensure — if Host service is down, `--mcp` auto-starts it, so the recovery
+  flow is never broken.
 - **utmmd supervisor**: Lightweight supervisor daemon manages utmm lifecycle
   via shared memory (heartbeat, crash recovery with exponential backoff).
   System service managers just keep utmmd alive; all restart/upgrade logic
   lives in utmmd.
-- **Single port**: 2121 for mesh networking (UDP only — LSA + KCP tunnel).
-  CLI and MCP use local IPC socket — no TCP or HTTP on any port.
-  MCP uses stdio — see `mcp.json.example`.
+- **Single UDP port 2121** for LSA mesh networking. CLI and MCP use local IPC
+  socket — no TCP or HTTP on any port. MCP uses stdio — see `mcp.json.example`.
 - **8 cross-compilation targets**: aarch64/x86_64/x86 × linux-musl/macos/windows.
 - **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
 
@@ -41,44 +40,108 @@ Current configuration — four VM targets tracked:
 
 ## Architecture
 
-### Protocol Stack
+### Layered Model (v0.13.0+)
 
 ```
-┌──────────────────────────────────────┐
-│     Application Layer                 │
-│  tunproto.zig: pty_exec, upload,     │
-│  download, file_chunk, file_eof      │
-│  (1-byte type + null-term + BE ints) │
-├──────────────────────────────────────┤
-│     Transport Layer                   │
-│  tunnel.zig: send/recv (阻塞流)       │
-│  kcp.zig: reliable UDP ARQ           │
-├──────────────────────────────────────┤
-│     Network Layer                     │
-│  mesh.zig: LSA routing, KCP relay    │
-├──────────────────────────────────────┤
-│     Physical                          │
-│  UDP :2121 (first-byte dispatch)     │
-└──────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Application Layer                                                │
+│  guest.zig           Guest daemon: TCP listen + dpipe relay       │
+│  host.zig            Host daemon: LSA + IPC + command dispatch    │
+│  ipc.zig             IPC socket server (CLI/MCP entry)            │
+│  mcp.zig             MCP stdio JSON-RPC                           │
+├──────────────────────────────────────────────────────────────────┤
+│  Topology Layer                                                   │
+│  lsa.zig             LSA broadcast + node table + /etc/hosts      │
+├──────────────────────────────────────────────────────────────────┤
+│  Transport Layer                                                  │
+│  tcp.zig             Frame protocol + SOCKS4 + connection mgmt    │
+├──────────────────────────────────────────────────────────────────┤
+│  Data Pipe Layer                                                  │
+│  dpipe.zig           DuplexPipe interface + relay engine          │
+│  dpipe_shell.zig     pty ↔ DuplexPipe                            │
+│  dpipe_file.zig      file ↔ DuplexPipe + SHA256                  │
+├──────────────────────────────────────────────────────────────────┤
+│  Protocol Layer                                                   │
+│  protocol.zig        All protocol definitions (constants, types, │
+│                       serialization, VERSION, buildCmdWithMarker) │
+├──────────────────────────────────────────────────────────────────┤
+│  System Service Layer                                             │
+│  svc.zig             Service mgmt (install/uninstall/start +      │
+│                       Platform/genInit + InstallLock)             │
+│  utmmd.zig           Supervisor daemon                            │
+│  shm.zig             Shared memory (utmmd↔utmm)                   │
+├──────────────────────────────────────────────────────────────────┤
+│  Foundation Layer                                                 │
+│  main.zig            Entry point, CLI parsing, mode dispatch      │
+│  fail.zig            Fast-fail helpers                            │
+│  config.zig          Config persistence + file logger             │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-UDP port 2121 first-byte dispatch:
+### Dependency Graph
+
+```
+               ┌─────────────┐
+               │ protocol.zig │  ← zero dependencies
+               └──────┬──────┘
+      ┌───────────────┼───────────────┐
+      ↓               ↓               ↓
+ ┌─────────┐    ┌─────────┐    ┌──────────┐
+ │ fail.zig │    │ tcp.zig │    │ lsa.zig  │
+ └─────────┘    └────┬─────┘    └──────────┘
+                     ↓
+                ┌─────────┐
+                │ dpipe   │ ← dpipe_shell / dpipe_file
+                └────┬────┘
+       ┌─────────────┼─────────────┐
+       ↓             ↓             ↓
+  ┌────────┐   ┌────────┐   ┌────────┐
+  │ guest  │   │ host   │   │  ipc   │
+  └────────┘   └───┬────┘   └───┬────┘
+                   │             │
+                   └──────┬──────┘
+                          ↓
+                     ┌────────┐
+                     │  main  │
+                     └────────┘
+```
+
+### TCP Per-Command Model (v0.13.0+)
+
+Each exec/upload/download opens a fresh TCP connection. No persistent tunnels,
+no cross-thread shared state.
+
+```
+exec:     cli → ipc → tcp.connect(vm) → send(pty_exec_input) → stream recv → close
+upload:   cli → ipc → tcp.connect(vm) → send(upload_cmd) → stream file bytes → recv result → close
+download: cli → ipc → tcp.connect(vm) → send(download_cmd) → stream recv file bytes → close
+
+Guest side:
+accept → recv first frame → switch type:
+  exec     → dpipe.relay(conn, dpipe_shell.create())
+  upload   → dpipe.relay(conn, dpipe_file.writeFile())
+  download → dpipe.relay(conn, dpipe_file.readFile())
+```
+
+Per-command independent connection = no cross-thread shared state = no state.zig needed.
+
+### UDP Port 2121 First-Byte Dispatch
+
 - `0x01` LSA (Link State Advertisement)
-- `0x02` KCP_DATA (KCP tunnel data)
 - `0x03` MESH_PING / `0x04` MESH_PONG (reachability probe)
 
 ### Two Run Modes (Same Binary)
 
-- **Guest mode (default)**: `utmmd --role guest` spawns `utmm --svc` (mesh LSA
-  broadcast + KCP tunnel + pty shell). utmmd monitors utmm via shared memory
+- **Guest mode (default)**: `utmmd --role guest` spawns `utmm --svc` (LSA broadcast
+  + TCP listener + dpipe shell). utmmd monitors utmm via shared memory
   (`/utmmd-shm`), handles crash recovery (exponential backoff 2s→60s, 5 retries),
   and coordinates auto-upgrade. `--install --hostname <name>`: force install as
   system auto-start service (single `utmmd` service per machine).
   `--version`: print version. No foreground mode — service model only.
 - **Host mode (`--host`)**: `utmmd --role host` spawns `utmm --host --svc`.
-  Mesh networking on UDP port 2121 — guest registration via LSA broadcast,
-  KCP tunnel management, /etc/hosts sync, and IPC socket for CLI/MCP communication.
-  Guest auto-upgrade binary serving via KCP (`serveUpgradeFile`). All on one port.
+  UDP port 2121 mesh networking — guest registration via LSA broadcast,
+  /etc/hosts sync, and IPC socket for CLI/MCP communication.
+  Guest auto-upgrade binary serving via TCP (`serveUpgradeFile`). All on one port.
 - **MCP mode (`--mcp`)**: stdio JSON-RPC server for AI agents. Talks to Host
   daemon via IPC socket (`/var/run/utmm.sock`); auto-ensures Host on first use.
 
@@ -86,10 +149,10 @@ UDP port 2121 first-byte dispatch:
 
 ```
                          ┌── MCP stdio ← AI Agent (utmm --mcp → auto-ensure → IPC socket)
-Guest (macvm)    ──KCP/Mesh──┐
-Guest (linuxvm)  ──KCP/Mesh──┤──→ Host UDP :2121 ──┼── IPC socket (CLI/MCP)
-Guest (windows)  ──KCP/Mesh──┘                      ├── KCP upgrade_req (binary serve)
-                         │   (LSA discovery)         └── /etc/hosts sync
+Guest (macvm)    ──TCP──┐
+Guest (linuxvm)  ──TCP──┤──→ Host IPC socket ──┼── CLI/MCP
+Guest (windows)  ──TCP──┘                      ├── TCP upgrade_req (binary serve)
+                         │   (LSA discovery)    └── /etc/hosts sync
                          │
 Guest ←── LSA broadcast (UDP) ──┘  (topology discovery + version detection)
 
@@ -101,15 +164,13 @@ Each side:
 
 ```
 1. CLI: utmm --exec linuxvm "ls -la"
-2. Host IPC /exec → looks up guest tunnel → builds pty_exec_input frame
+2. Host IPC /exec → tcp.connect(linuxvm) → sends pty_exec_input frame
    with "ls -la; echo MDELIM:$?\n" appended
-3. Host sends pty_exec_input via KCP tunnel (tunproto message)
-4. Guest meshSessionLoop: reads pty_exec_input from KCP → writes to pty master fd
-5. Shell executes → output flows through pty → ptyReadLoop sends
-   pty_output frames back to Host via KCP
-6. Host handleMeshGuest: appendOpOutput + scanForMarker
-7. Host IPC: streams output to CLI via binary frame protocol (exec_data → exec_done with exit_code)
-8. When MDELIM:N\n found: strip marker, set exit_code=N, send exec_done frame
+3. Guest accept → recv pty_exec_input → dpipe_shell.create()
+4. dpipe.relay(conn, shell): write command to pty → read output → send back via TCP
+5. Host: stream recv pty_exec_output → forward to CLI via IPC binary frames
+   (exec_data → exec_done with exit_code)
+6. When MDELIM:N\n found: strip marker, set exit_code=N, send exec_done frame
 ```
 
 ### How Upload/Download Flows
@@ -117,26 +178,24 @@ Each side:
 ```
 Upload (Host→Guest):
 1. CLI: utmm --upload file.txt linuxvm
-2. IPC /upload: binary header (vm + dest_path + hash + file_size) followed by raw file bytes
-3. handleUpload: parse header → tunproto file_chunk × N → file_eof
-4. Guest receiveChunkedFile: temp file → sha256 per chunk → verify → rename
+2. IPC /upload: binary header (vm + dest_path + hash + file_size) → tcp.connect(vm)
+3. Host streams: send upload_cmd + raw file bytes via TCP
+4. Guest: dpipe_file.writeFile → temp file → SHA256 per write → verify → atomic rename
 5. IPC response: binary status frame (OK or error with exit_code)
 
 Download (Guest→Host):
 1. CLI: utmm --download linuxvm file.txt ./local.txt
-2. IPC /download: binary header (vm + remote_path)
-3. handleDownload: tunproto download_cmd → Guest sendChunkedFile
-4. Guest: read file → file_chunk × N → file_eof (sha256)
-5. Host: appendOpOutput per chunk → file_eof marks completion
-6. IPC response: streamed file data frames + exec_done frame with exit_code
-7. CLI: write streamed bytes to local file
+2. IPC /download: binary header (vm + remote_path) → tcp.connect(vm)
+3. Host sends download_cmd → Guest: dpipe_file.readFile → streams raw bytes via TCP
+4. Host: forwards streamed bytes to CLI via IPC binary frames
+5. IPC response: streamed file data frames + exec_done frame with exit_code
 ```
 
-### Tunnel Protocol (tunproto.zig)
+### Wire Protocol (protocol.zig)
 
-Messages over KCP tunnel. All frames: 1-byte type + type-specific payload.
+All frames over TCP: 1-byte type + type-specific payload.
 Strings null-terminated, blobs 4-byte BE length prefix, integers 4-byte BE.
-File transfers use chunked protocol: command → file_chunk × N → file_eof.
+File transfers use raw TCP streaming (no chunking — TCP provides reliable delivery).
 
 | Type | Value | Direction | Purpose |
 |------|-------|-----------|---------|
@@ -147,38 +206,38 @@ File transfers use chunked protocol: command → file_chunk × N → file_eof.
 | download_cmd | 0x14 | host→guest | Download request (cmd_id + path) |
 | upload_cmd | 0x1b | host→guest | Upload request (cmd_id + path + file_size + hash) |
 | upload_result | 0x17 | guest→host | Upload result (cmd_id + exit_code) |
-| file_chunk | 0x1c | bidirectional | 1200B file chunk (cmd_id + data, MSS-aligned) |
-| file_eof | 0x1d | bidirectional | End of file (cmd_id + exit_code + size + hash) |
 | upgrade_req | 0x19 | guest→host | Request upgrade binary (cmd_id + target) |
 
-### KCP Reliable Transport (kcp.zig)
+> `file_chunk` (0x1c) and `file_eof` (0x1d) removed in v0.13.0 — TCP reliable
+> streaming eliminates the need for chunk-level verification.
 
-Full ARQ protocol matching C reference (skywind3000/kcp):
-- Sliding window with SN-based bounds: `snd_nxt < snd_una + cwnd`
-- Congestion control: slow start + congestion avoidance
-- Fast retransmit: triggered on `fastack >= fastresend`
-- RTO with jitter: `resendts = current + rto + rtomin` (nodelay=0)
-- Window probe: `rmt_wnd == 0` triggers IKCP_ASK_SEND
-- Stream mode: segment merging in snd_queue
-- Rate-limited flush: `ts_flush + interval` in update()
+### DuplexPipe Abstraction (dpipe.zig)
 
-Key constants: `IKCP_MTU_DEFAULT=1300`, `IKCP_WND_SND=32`, `IKCP_WND_RCV=128`
+Vtable-based bidirectional I/O interface:
 
-**Thread safety**: `kcp.update()` only called by `mesh.run()` thread. `tunnel.send()`
-only appends to snd_queue, `tunnel.recv()` only consumes rcv_queue — neither calls
-update. KCP internal queues designed as single-producer/single-consumer.
-**Keepalive**: 5s idle → probe → 3 failures → dead.
+```zig
+const VTable = struct {
+    readFn:  *const fn (*anyopaque, []u8) anyerror!usize,
+    writeFn: *const fn (*anyopaque, []const u8) anyerror!void,
+    closeFn: *const fn (*anyopaque) void,
+};
 
-### HostState — Central Shared State (state.zig)
+pub const DuplexPipe = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+    pub fn read(self, buf: []u8) !usize;
+    pub fn write(self, data: []const u8) !void;
+    pub fn close(self) void;
+};
 
-All handlers share one `HostState` instance, mutex-protected:
-- `guests`: ArrayList of `GuestEntry` (hostname, IP, target, MAC, version, shell)
-- `guest_tunnels`: StringHashMap of per-guest `*Tunnel` (KCP tunnel for exec/upload/download)
-- `op_states`: StringHashMap of `OpState` by cmd_id (output buffer, exit_code, done flag)
-- `transfers`: StringHashMap of `TransferState` (file transfer progress tracking)
-- `wake_event`: Io.Event signaled on op completion (wakes polling IPC handlers)
-- `serve_dir`: binary serve directory for Guest auto-upgrade (default: `/opt/utmm`)
-- `mesh`: opaque pointer to `*mesh.Mesh` instance
+/// Bidirectional relay: a→b + b→a, dual-threaded, exits when either side closes.
+pub fn relay(io: std.Io, a: DuplexPipe, b: DuplexPipe) !void;
+```
+
+Implementations:
+- `dpipe_shell.zig`: pty master ↔ DuplexPipe (posix_openpt/fork/execve or CreatePipe/CreateProcessW)
+- `dpipe_file.zig`: file read/write ↔ DuplexPipe with incremental SHA256
+- `tcp.Connection.duplex()`: TCP connection ↔ DuplexPipe (adapter)
 
 ### Self-Copy Install Model
 
@@ -186,13 +245,14 @@ All handlers share one `HostState` instance, mutex-protected:
 
 ```
 forceInstall():
-  1. stop  → stop existing service (ignore errors)
-  1.5. wait → wait up to 5s for old processes to exit (prevents "Text file busy")
-  2. kill  → kill leftover processes (PID-aware, skips self)
-  3. copy  → self-copy to canonical path (tmp + rename, EXDEV → copy+delete fallback)
-  3.5. copy-platform → Host mode only: copy cross-platform binaries to serve-dir
-  4. install → overwrite system service config (best-effort bootstrap on macOS)
-  5. start → start service (full retry + fallback chain on macOS: kickstart → bootstrap × 3 → startDirect)
+  1. lock   → InstallLock.acquire() (flock/LockFileEx, fixed paths)
+  2. stop   → stop existing service (ignore errors)
+  3. wait   → wait up to 5s for old processes to exit (prevents "Text file busy")
+  4. kill   → kill leftover processes (PID-aware, skips self)
+  5. copy   → self-copy to canonical path (tmp + rename, EXDEV → copy+delete fallback)
+  6. copy-platform → Host mode only: copy cross-platform binaries to serve-dir
+  7. install → overwrite system service config (best-effort bootstrap on macOS)
+  8. start  → start service (full retry + fallback chain on macOS: kickstart → bootstrap × 3 → startDirect)
 
 ensure():
   service running → skip
@@ -215,58 +275,54 @@ Linux `Restart=on-failure`, Windows `start=auto`).
 **Fast-fail**: errors print function name + system error code + message, then exit(1).
 
 **Upgrade (manual)**: scp new binary to VM + `sudo ./utmm-new --install`. forceInstall handles
-stop→kill→copy→install→start.
+lock→stop→kill→copy→install→start.
 
 **Upgrade (automatic, v0.12.0+)**: Guest-initiated atomic operation:
-1. Guest detects Host version mismatch via mesh LSA
-2. Guest exits command loop, signals upgrade intent to utmmd via shared memory
-3. Guest sends `upgrade_req` (0x19) via KCP tunnel
-4. Host responds with `file_chunk × N + file_eof` (binary download)
+1. Guest detects Host version mismatch via LSA broadcast
+2. Guest signals upgrade intent to utmmd via shared memory
+3. Guest sends `upgrade_req` (0x19) via TCP
+4. Host responds with raw binary stream via TCP
 5. Guest saves to temp dir, `chmod +x`, signals utmmd to restart with new binary
 6. utmmd stops old utmm, replaces binary, spawns new utmm — zero-downtime handoff
 Host never pushes upgrades — the Guest is fully self-upgrading.
 
 ### Key Design Decisions
 
-- Single binary, dual mode — reduced maintenance
-- **Mesh + KCP tunnel** replaces WebSocket (v0.11.0) — LSA for topology discovery,
-  KCP for reliable ordered delivery. WebSocket and KCP were both reliable bidirectional
-  streams (functional overlap); WebSocket 64KB frame limit blocked large file uploads;
-  wsproto.zig + wsclient.zig ~1000 lines of maintenance burden; TCP+UDP dual
-  connection increased network complexity.
-- **Self-copy install model** (v0.12.0) — replaces utmm-old 10+ step KCP download
-  upgrade (fork→mesh→connect→download→verify→replace→restart) with 4 steps
-  (stop→kill→copy→start). Network-independent. No bat scripts for Windows.
-- **Guest-initiated auto-upgrade** (v0.12.0) — Guest detects version mismatch via
-  LSA, downloads new binary via KCP tunnel (`upgrade_req` → `file_chunk` × N →
-  `file_eof`), saves to temp, signals utmmd via shared memory to restart with new
-  binary. utmmd handles the atomic stop→replace→spawn handoff. Host never pushes
-  upgrades — fully atomic on Guest side. Upgrade check runs in both the outer
-  mesh session loop and the inner command loop to ensure idle Guests detect the
-  signal promptly.
-- Single port 2121 for mesh UDP (LSA + KCP tunnel)
-- **Persistent pty per mesh session**: POSIX `posix_openpt` + fork + setsid + execve,
-  Windows `CreatePipe` + `CreateProcessW("cmd.exe /k chcp 65001 ...")` + `SetConsoleOutputCP(65001)` — UTF-8 forced
+- **TCP per-command model** (v0.13.0) — eliminates cross-thread shared state. Each
+  exec/upload/download opens a fresh TCP connection, completes the operation, and closes.
+  No persistent tunnels, no guest_tunnels HashMap, no op_states polling, no cmdchan.
+  state.zig + cmdchan.zig deleted (~1750 lines removed).
+- **DuplexPipe vtable abstraction** (v0.13.0) — dpipe.zig defines a common interface for
+  bidirectional byte streams. Implementations: dpipe_shell (pty), dpipe_file (file I/O),
+  tcp.Connection (network). dpipe.relay() bridges any two DuplexPipes — dual-threaded
+  bidirectional forwarding. Zig-idiomatic, extensible, testable.
+- **lsa.zig self-contained** (v0.13.0) — LSA broadcast + node table + /etc/hosts sync
+  merged into one module. mesh.zig + hosts_file.zig → lsa.zig. Internal auto-sync:
+  LSA rx → update node table → trigger hosts sync (range replacement, no splitScalar bug).
+- **protocol.zig merged** (v0.13.0) — tunproto.zig merged into protocol.zig. Single source
+  for all protocol definitions: MsgType, constants, serialization, VERSION, buildCmdWithMarker.
+- **Single binary, dual mode** — reduced maintenance
+- **Self-copy install model** (v0.12.0) — replaces KCP-era 10+ step download upgrade
+  with 4 steps (stop→kill→copy→start). Network-independent. No bat scripts for Windows.
+- **InstallLock in svc.zig** (v0.13.0) — flock (POSIX) / LockFileEx (Windows) with fixed
+  paths (`/var/run/utmm-install.lock` / `C:\opt\utmm\utmm-install.lock`). Replaces
+  lock.zig PID-file lock with CWD-relative path bug. OS-level advisory locks auto-release
+  on process exit.
+- **Per-command shell** (v0.13.0) — each exec spawns a fresh pty. No cd/export persistence
+  across commands. Simpler model that matches independent TCP connections.
+- Single UDP port 2121 for LSA mesh (LSA broadcast only — no KCP data)
 - **MDELIM markers**: `; echo MDELIM:$?\n` appended to each command. Host-side
   `scanForMarker` uses `lastIndexOf` — handles echoed command text on macOS/BSD
   (where pty master doesn't support tcsetattr ECHO disable)
-- Connection = Shell Session: mesh disconnect → pty killed → guest reconnects
-  with fresh shell
-- **Chunked file transfer**: upload/download use `cmd → file_chunk × N → file_eof`
-  protocol instead of blob-in-message. 1200B MSS-aligned chunks (one per KCP segment),
-  incremental SHA256, 256KB fixed buffer. Supports >1GB files with constant memory.
+- **Chunked file transfer → direct TCP streaming** (v0.13.0): TCP provides reliable
+  ordered delivery — application-level chunking and SHA256-per-chunk are unnecessary.
+  dpipe_file handles incremental SHA256 for end-to-end integrity verification.
 - **LSA version broadcast**: Host broadcasts version in LSA every 2s. Guest compares
-  against `protocol.VERSION`, sets `upgrade.needed` on mismatch, triggering
-  Guest-initiated auto-upgrade (see above).
-  The upgrade check runs both between command sessions and inside the command loop
-  (v0.12.0+), ensuring idle Guests detect the signal promptly.
+  against `protocol.VERSION`, triggers Guest-initiated auto-upgrade on mismatch.
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
 - **No auto-uninstall on version mismatch** (v0.12.1+) — `verifyServeDirBinaries`
   only warns when platform binaries don't match the Host version. Auto-uninstalling
-  (v0.12.0 behavior) leaves the machine unreachable with zero recovery path — far
-  worse than degraded Guest auto-upgrade (which is self-limiting anyway). Host
-  continues serving exec/upload/download commands. Guest auto-upgrade is temporarily
-  unavailable until matching platform binaries are provided.
+  leaves the machine unreachable with zero recovery path.
 
 ## Build & Run
 
@@ -318,7 +374,7 @@ utmm --host --save-config            # Save current parameters to config file
 
 # Management Commands (auto-start Host if not running)
 utmm --status                        # All guest status
-utmm --exec linuxvm "uname -a"       # Remote exec (pty, env/cd persist)
+utmm --exec linuxvm "uname -a"       # Remote exec (pty)
 utmm --upload file.txt linuxvm       # Upload file
 utmm --download linuxvm f.txt ./f.txt  # Download file
 utmm --gen-init linux                # Generate auto-start script (linux/macos/windows)
@@ -391,38 +447,35 @@ Open the release URL printed by the script and confirm:
 
 ### Post-release
 After release, the Host's serve-dir auto-serves new binaries. Guests detect
-version mismatch via LSA broadcast and trigger Guest-initiated auto-upgrade
-(v0.12.0+): download new binary via KCP tunnel → signal utmmd via shared memory
-→ utmmd performs atomic stop→replace→spawn handoff.
+version mismatch via LSA broadcast and trigger Guest-initiated auto-upgrade:
+download new binary via TCP → signal utmmd via shared memory →
+utmmd performs atomic stop→replace→spawn handoff.
 Host never pushes upgrades — the Guest is fully self-upgrading.
 
-## Project File Structure
+## Project File Structure (16 files)
 
 ```
 src/
-├── main.zig           # Entry point, CLI parsing, mode dispatch
-├── protocol.zig       # Protocol constants, VERSION via @embedFile("ver.txt"), deployment filename mapping
-├── tunproto.zig       # Tunnel protocol over KCP: 10+ msg types, build/parse, chunked file transfer
-├── kcp.zig            # KCP reliable ARQ protocol (matches C reference skywind3000/kcp)
-├── mesh.zig           # LSA mesh networking: UDP broadcast, KCP session mgmt, relay
-├── tunnel.zig         # TCP-like stream wrapper over KCP sessions (send/recv/flush)
-├── state.zig          # Host shared state: guest table, tunnels, ops, JSON helpers
-├── mcp.zig            # MCP stdio server: JSON-RPC stdin/stdout, IPC client to Host
-├── lock.zig           # Process singleton lock (utmm.lock PID file)
-├── host.zig           # Host orchestration: cmd dispatch + mesh start + IPC socket
-├── broadcast.zig      # Guest core: system info, ptySpawn, ptyReadLoop, meshSessionLoop
-├── svc.zig            # Unified cross-platform service management (install/start/stop/uninstall)
-├── utmmd.zig          # Supervisor daemon: utmm lifecycle, crash recovery, shared memory IPC
-├── shm.zig            # Shared memory protocol: utmmd↔utmm IPC, heartbeat, commands
-├── hosts_file.zig     # /etc/hosts marked block read/write
-├── ipc.zig            # Host IPC socket server: CLI/MCP request handling
-├── config.zig         # Config persistence + file logger
-└── fail.zig           # Fast-fail helpers (err, msg — noreturn)
+├── main.zig           Entry point, CLI parsing, mode dispatch
+├── protocol.zig       All protocol definitions (types, serialization, VERSION, buildCmdWithMarker)
+├── fail.zig           Fast-fail helpers (err, msg — noreturn)
+├── config.zig         Config persistence + file logger
+├── lsa.zig            LSA broadcast + node table + /etc/hosts sync (self-contained)
+├── tcp.zig            Frame protocol + SOCKS4 + connection management
+├── dpipe.zig          DuplexPipe interface + relay engine
+├── dpipe_shell.zig    pty ↔ DuplexPipe (posix_openpt/CreatePipe)
+├── dpipe_file.zig     file ↔ DuplexPipe + SHA256 verification
+├── guest.zig          Guest daemon: TCP listener + dpipe relay
+├── host.zig           Host daemon: LSA + IPC + command dispatch
+├── ipc.zig            IPC socket server: CLI/MCP request handling
+├── mcp.zig            MCP stdio server: JSON-RPC stdin/stdout, IPC client to Host
+├── svc.zig            Service management (install/uninstall/forceInstall/ensure + Platform/genInit + InstallLock)
+├── utmmd.zig          Supervisor daemon: utmm lifecycle, crash recovery, shared memory IPC
+└── shm.zig            Shared memory protocol: utmmd↔utmm IPC, heartbeat, commands
 ```
 
-> v0.12.0: 18 source files — added shm.zig, utmmd.zig, ipc.zig.
-> Legacy merges: ver.zig→protocol.zig, priv.zig→main.zig, install.zig→svc.zig,
-> guest.zig→broadcast.zig, host_http.zig→state.zig.
+> v0.13.0: 20 → 16 files. Deleted: state.zig, broadcast.zig, mesh.zig, hosts_file.zig,
+> tunproto.zig, tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig.
 
 ## Code of Conduct / Guidelines
 
@@ -469,60 +522,56 @@ No HTTP server — Host daemon uses IPC socket for CLI/MCP, UDP mesh for Guest-H
 - **Raw body read**: `request.head.content_length` + `body_reader.streamExact(&writer, content_length)`.
   Use `std.Io.Limit.limited(n)` for streaming reads.
 
-### KCP Patterns
+### TCP Frame Protocol Patterns
 
-KCP matches the C reference implementation (skywind3000/kcp). Key behaviors:
+- **Frame format**: 1-byte type + 4-byte BE length + payload. Length = payload bytes only.
+  `tcp.zig` handles frame serialization via `sendFrame`/`recvFrame`.
+- **SOCKS4a**: Built into tcp.zig (~120 lines). Host connects to Guests via SOCKS4a
+  proxy (UTM network). Destination hostname embedded in SOCKS4a request after userid.
+- **Per-command connections**: Every exec/upload/download opens `tcp.connect()`,
+  completes one operation, and closes. No connection pooling or keep-alive.
 
-- **cwnd starts at 0**: flush() ensures `cwnd >= 1` for the send window calculation
-  so the first send doesn't deadlock. Set congestion control minimum at 1 segment.
-- **rmt_wnd tracked from every segment**: input() reads `seg.wnd` from every header
-  and stores in `self.rmt_wnd` — used in flush() send window and window probe.
-- **shrinkBuf after parseUna/parseAck**: snd_una is updated from snd_buf[0].sn
-  (or snd_nxt if empty). Must be called after every UNA or ACK processing.
-- **fastack aggregated per packet**: input() tracks maxack/latest_ts across all
-  segments in one datagram, calls parseFastack once. Don't call per-segment.
-- **flush rate-limited by interval**: update() checks `ts_flush + interval` —
-  won't flush on every call. Use `tunnel.flush(ms)` for urgent data.
-- **acklist format**: `ArrayList([2]u32)` stores (sn, ts) pairs. ackPush
-  deduplicates by sn. flush() sends all ACKs unconditionally (no guard).
-- **xmit starts at 0**: segments created in send() have xmit=0. First send in
-  flush() increments to 1. This matches C behavior for RTO calculation.
-- **batch encoding**: flush() uses `encodeSeg()` + `outputData()` to pack
-  multiple segments into MTU-sized UDP datagrams via the `buffer` scratch space.
+### LSA Patterns
 
-### Mesh LSA Patterns
+- **LSA carries version**: Host node_info includes version string. Guest's
+  LSA handler compares against `protocol.VERSION`. Mismatch triggers auto-upgrade.
+- **Self-contained closed loop**: LSA rx → update node table → trigger hosts sync
+  via range replacement (not splitScalar). No external state dependency.
+- **2s broadcast interval**: Host broadcasts LSA every 2 seconds. Nodes timeout
+  after 6 seconds (3 missed broadcasts).
 
-- **LSA carries version**: Host node_info includes `version:0.11.x`. Guest's
-  LSA handler compares against `protocol.VERSION`. Mismatch logged as info.
-- **conv based on MAC+nonce**: KCP conversation ID includes host nonce to prevent
-  stale session reuse after Host restart.
-- **DeriveNodeId for local testing**: when `peer_mesh` is set, use
-  `deriveNodeId(MAC, hostname)` instead of `parseNodeId(MAC)` to get unique node IDs.
+### DuplexPipe Patterns
 
-### Windows Mesh Patterns
+- **Vtable not generics**: `DuplexPipe` uses a vtable pointer — no comptime generics,
+  fast compilation. Each implementation (shell, file, tcp) has its own vtable instance.
+- **relay() threading**: `dpipe.relay()` spawns two threads (a→b and b→a). Either side
+  closing triggers the other to close. Uses `std.Io.Event` for coordination.
+- **guest.zig uses individual read/write, not relay()**: The guest command handler uses
+  manual read/write loops with `scanForMarker` for protocol-aware processing — the
+  relay() engine is used by higher-level orchestration.
 
-- **Blocking receive + timer thread**: Always uses `global_single_threaded.io()` with
-  blocking `socket.receive()` and a dedicated timer thread. Zig 0.16.0 `receiveTimeout`
-  with service Io silently fails on ARM64 Windows — UDP packets arrive but KCP
-  data never reaches the application layer. The timer thread uses raw Win32 `Sleep()`
-  to avoid Io dependency.
-- **No receiveTimeout**: The two-tier approach (try receiveTimeout, fall back to
-  blocking) was removed. The service Io may succeed at `receiveTimeout` but KCP
-  data is silently lost. Blocking receive on `global_single_threaded` is the only
-  reliable approach.
+### File Transfer Patterns (TCP Streaming)
 
-### Chunked File Transfer Patterns
-
-- **1200B MSS-aligned chunks**: each `file_chunk` fits in exactly one KCP segment
-  (frg=0 in message mode, no KCP-layer fragmentation). `peekSize()` returns
-  immediately; each `recv()` returns exactly one message.
-- **Incremental SHA256**: `Sha256.init({})` → `.update(chunk)` per chunk →
-  `.final(&hash)`. No full-file buffering needed.
-- **256KB fixed buffer**: `var rbuf: [262144]u8 = undefined` — large enough for
-  any single message, small enough to stack-allocate.
+- **Direct TCP streaming**: File data flows directly over TCP without chunking —
+  TCP provides reliable ordered delivery, eliminating the need for application-level
+  chunk/fragment management (file_chunk/file_eof removed in v0.13.0).
+- **Incremental SHA256 in dpipe_file**: `Sha256.init({})` → `.update(data)` per write →
+  `.final(&hash)` at close. Hash verified against expected value before atomic rename.
+  No full-file buffering needed.
+- **Atomic write**: dpipe_file.writeFile writes to temp file (`.utmm-<random>`), verifies
+  SHA256, then `rename(temp, dest)`. Hash mismatch → temp deleted, dest not created.
+- **256KB stack buffer**: `var rbuf: [262144]u8 = undefined` — large enough for
+  any single frame, small enough to stack-allocate.
 
 ### Development Principles
 1. **Think before coding** — state assumptions, present trade-offs
 2. **Simplicity first** — minimum code, no speculative features
 3. **Precise changes** — only change what's necessary, match existing style
 4. **Goal-driven** — define criteria, verify with `zig build test`
+
+### Deployment Gating Rule
+**Code changes must pass integration tests before deployment to real devices.**
+- `zig build test` and `zig build test-integration` must both pass (all scenarios, 0 failures)
+- This catches protocol regressions (double MDELIM, frame format mismatches, etc.)
+  before they reach physical VMs where debugging is slow and recovery difficult
+- No exceptions for "trivial" changes — protocol bugs often come from one-line edits

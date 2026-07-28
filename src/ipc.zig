@@ -126,7 +126,7 @@ pub const Response = enum(u8) {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Serialization helpers (duplicated from tunproto.zig to keep IPC isolated)
+// Serialization helpers (duplicated from ptcl.zig to keep IPC isolated)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const MAX_BLOB_LEN: u32 = 1024 * 1024; // 1 MB
@@ -487,7 +487,7 @@ fn handleConnection(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Server-side handlers (call into HostState)
+// Server-side handlers (per-command TCP model)
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn sendError(conn: Connection, msg: []const u8) void {
@@ -496,21 +496,15 @@ fn sendError(conn: Connection, msg: []const u8) void {
     w.items.len = 0;
     w.appendAssumeCapacity(@intFromEnum(Response.err));
     writeString(&w, msg) catch return;
-    conn.writeAll( w.items) catch {};
+    conn.writeAll(w.items) catch {};
 }
 
 fn handleStatus(io: std.Io, gpa: std.mem.Allocator, state_ptr: *anyopaque, conn: Connection, _: []const u8) void {
-    // state_ptr is *state.HostState — build JSON guest list via its public API
-    const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
+    _ = io;
+    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
 
-    // Lock and collect guest info
-    state.mutex.lock(io) catch {
-        sendError(conn, "LockFailed");
-        return;
-    };
-    defer state.mutex.unlock(io);
-
-    // Build JSON manually from HostState guest table
+    // Build JSON from GuestTable (no mutex — per-command TCP model
+    // has no concurrent writers during read)
     var json: std.ArrayList(u8) = .empty;
     defer json.deinit(gpa);
 
@@ -531,11 +525,11 @@ fn handleStatus(io: std.Io, gpa: std.mem.Allocator, state_ptr: *anyopaque, conn:
     w.items.len = 0;
     w.appendAssumeCapacity(@intFromEnum(Response.status));
     writeBlob(&w, json.items) catch return;
-    conn.writeAll( w.items) catch {};
+    conn.writeAll(w.items) catch {};
 }
 
 fn handlePing(
-    io: std.Io,
+    _: std.Io,
     gpa: std.mem.Allocator,
     state_ptr: *anyopaque,
     mesh_ptr: *anyopaque,
@@ -543,29 +537,17 @@ fn handlePing(
     payload: []const u8,
 ) void {
     _ = gpa;
-    _ = mesh_ptr; // Use state.mesh instead (same pattern as mesh handlers)
     var pos: usize = 0;
     const target = readString(payload, &pos) orelse {
         sendError(conn, "InvalidRequest: missing vm");
         return;
     };
 
-    const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
+    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
+    const mesh = @as(*@import("lsa.zig").Mesh, @ptrCast(@alignCast(mesh_ptr)));
 
-    // Get mesh pointer from state (same pattern as state.zig handlers)
-    const mesh_mod2 = @import("mesh.zig");
-    const mesh_ptr2 = state.mesh orelse {
-        sendError(conn, "MeshNotAvailable");
-        return;
-    };
-    const mesh = @as(*mesh_mod2.Mesh, @ptrCast(@alignCast(mesh_ptr2)));
-
+    // Find guest mesh_mac
     const node_id: ?[6]u8 = blk: {
-        state.mutex.lock(io) catch {
-            sendError(conn, "LockFailed");
-            return;
-        };
-        defer state.mutex.unlock(io);
         for (state.guests.items) |g| {
             if (std.mem.eql(u8, g.hostname, target)) {
                 break :blk g.mesh_mac;
@@ -575,30 +557,27 @@ fn handlePing(
     };
 
     const nid = node_id orelse {
-        // Guest not found — return JSON error
         var buf: [256]u8 = undefined;
-        var w = std.ArrayList(u8).fromOwnedSlice(&buf);
-        w.items.len = 0;
-        w.appendAssumeCapacity(@intFromEnum(Response.ping));
+        var w2 = std.ArrayList(u8).fromOwnedSlice(&buf);
+        w2.items.len = 0;
+        w2.appendAssumeCapacity(@intFromEnum(Response.ping));
         var err_buf: [128]u8 = undefined;
         const err_json = std.fmt.bufPrint(&err_buf, "{{\"error\":\"GuestNotFound\",\"hostname\":\"{s}\"}}", .{target}) catch {
             sendError(conn, "ResponseTooLarge");
             return;
         };
-        writeBlob(&w, err_json) catch return;
-        conn.writeAll( w.items) catch {};
+        writeBlob(&w2, err_json) catch return;
+        conn.writeAll(w2.items) catch {};
         return;
     };
 
-    // Ping via mesh (node_id is already [6]u8, no parsing needed)
+    // Ping via mesh
     const rtt = mesh.pingAndWait(nid);
     const rtt_ms = rtt orelse 0;
 
-    // Build JSON in a SEPARATE buffer from the response buffer
-    // (json_buf and response_buf must not alias — appendAssumeCapacity
-    //  overwrites buf[0] which would corrupt json if they share memory)
+    const lsa_mod = @import("lsa.zig");
     var mac_buf: [18]u8 = undefined;
-    const mac_str = mesh_mod2.formatNodeIdBuf(nid, &mac_buf);
+    const mac_str = lsa_mod.formatNodeIdBuf(nid, &mac_buf);
     var json_buf: [256]u8 = undefined;
     const json = std.fmt.bufPrint(&json_buf, "{{\"hostname\":\"{s}\",\"mac\":\"{s}\",\"rtt_ms\":{d}}}", .{ target, mac_str, rtt_ms }) catch {
         sendError(conn, "ResponseTooLarge");
@@ -610,7 +589,7 @@ fn handlePing(
     w.items.len = 0;
     w.appendAssumeCapacity(@intFromEnum(Response.ping));
     writeBlob(&w, json) catch return;
-    conn.writeAll( w.items) catch {};
+    conn.writeAll(w.items) catch {};
 }
 
 fn handleExec(
@@ -630,314 +609,215 @@ fn handleExec(
         return;
     };
 
-    const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
+    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
+    const tcp_mod = @import("tcp.zig");
+    const ptcl = @import("protocol.zig");
 
-    // Get guest shell type
-    const guest_shell = blk: {
-        state.mutex.lock(io) catch {
-            sendError(conn, "LockFailed");
-            return;
-        };
-        defer state.mutex.unlock(io);
-        for (state.guests.items) |g| {
-            if (std.mem.eql(u8, g.hostname, vm)) {
-                break :blk gpa.dupe(u8, g.shell) catch {
-                    sendError(conn, "AllocFailed");
-                    return;
-                };
-            }
-        }
-        // Guest not found
+    // Look up guest IP
+    const guest = state.findByHostname(vm) orelse {
         sendError(conn, "GuestNotFound");
         return;
     };
-    defer gpa.free(guest_shell);
 
-    // Generate unique cmd_id
-    const cmd_id = blk: {
-        const ts = std.Io.Timestamp.now(io, .real).nanoseconds;
-        break :blk std.fmt.allocPrint(gpa, "exec_{d}", .{ts}) catch {
-            sendError(conn, "AllocFailed");
-            return;
-        };
+    // Per-command TCP connection
+    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
+        std.log.err("[ipc-exec] TCP connect to {s} failed: {}", .{ vm, err });
+        sendError(conn, "GuestNotConnected");
+        return;
+    };
+    defer tcp_conn.deinit();
+
+    // Generate cmd_id
+    const cmd_id = std.fmt.allocPrint(gpa, "exec_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds}) catch {
+        sendError(conn, "AllocFailed");
+        return;
     };
     defer gpa.free(cmd_id);
 
-    // Build command with marker (shell-appropriate exit code capture)
-    const cmd_with_marker = buildCmdWithMarker(gpa, guest_shell, command) catch {
+    // Build command with marker
+    const cmd_with_marker = ptcl.buildCmdWithMarker(gpa, guest.shell, command) catch {
         sendError(conn, "AllocFailed");
         return;
     };
     defer gpa.free(cmd_with_marker);
 
-    // Create operation state for output collection.
-    // handleMeshGuest writes exec output here; we poll it below.
-    state.createOpState(cmd_id) catch {
-        sendError(conn, "OpStateFailed");
+    // Build and send pty_exec_input frame
+    const frame = ptcl.buildPtyExecInput(gpa, cmd_id, cmd_with_marker) catch {
+        sendError(conn, "AllocFailed");
+        return;
+    };
+    defer gpa.free(frame);
+    tcp_conn.sendAndFlush(frame, 0) catch {
+        sendError(conn, "TunnelSendFailed");
         return;
     };
 
-    // Submit command to Mesh thread via lock-free channel.
-    // The Mesh thread builds the pty_exec_input frame and sends it via KCP —
-    // no KCP calls from this IPC handler thread.
-    {
-        const cmdchan_mod = @import("cmdchan.zig");
-        const cmd = cmdchan_mod.Cmd.exec(cmd_id, vm, cmd_with_marker);
-        const queue = state.cmd_queue orelse {
-            sendError(conn, "CmdQueueNotAvailable");
-            return;
-        };
-        if (!queue.push(cmd)) {
-            sendError(conn, "CmdQueueFull");
-            return;
-        }
-        // Channel push succeeded — Mesh thread will pick up and send via KCP.
-        // No tunnel lookup, no KCP I/O from this thread.
-    }
-
     std.log.info("[ipc-exec] sent {s} to {s}", .{ cmd_id, vm });
 
-    // Stream output: poll op_states, write RSP_EXEC_DATA frames, then RSP_EXEC_DONE
+    // Receive loop: pty_exec_output → stream to IPC, pty_exec_done → exit
+    var rbuf: [65536]u8 = undefined;
     while (true) {
-        const chunk = blk: {
-            state.mutex.lock(io) catch break :blk @as(?[]const u8, null);
-            defer state.mutex.unlock(io);
-
-            const op = state.op_states.getPtr(cmd_id) orelse break :blk @as(?[]const u8, null);
-
-            if (op.output.items.len > op.sent_pos) {
-                const start = op.sent_pos;
-                op.sent_pos = op.output.items.len;
-                break :blk op.output.items[start..];
-            }
-
-            if (op.done) break :blk @as(?[]const u8, &.{}); // done signal
-            break :blk @as(?[]const u8, null);
+        const nr = tcp_conn.recv(&rbuf) catch |err| {
+            if (err == error.ConnectionClosed) break;
+            std.log.err("[ipc-exec] recv error: {}", .{err});
+            break;
         };
+        if (nr == 0) break;
 
-        if (chunk) |data| {
-            if (data.len > 0) {
-                var wbuf: [8192]u8 = undefined;
+        const msg_type: ptcl.MsgType = @enumFromInt(rbuf[0]);
+
+        switch (msg_type) {
+            .pty_exec_output => {
+                // Parse: type + cmd_id(null-term) + data_blob(4-byte BE len)
+                var mpos: usize = 1;
+                _ = readString(rbuf[0..nr], &mpos); // skip cmd_id
+                const data = readBlob(rbuf[0..nr], &mpos) orelse continue;
+                if (data.len > 0) {
+                    var wbuf: [8192]u8 = undefined;
+                    var w = std.ArrayList(u8).fromOwnedSlice(&wbuf);
+                    w.items.len = 0;
+                    w.appendAssumeCapacity(@intFromEnum(Response.exec_data));
+                    writeBlob(&w, data) catch break;
+                    conn.writeAll(w.items) catch break;
+                }
+            },
+            .pty_exec_done => {
+                var mpos: usize = 1;
+                _ = readString(rbuf[0..nr], &mpos); // skip cmd_id
+                const exit_code = readI32(rbuf[0..nr], &mpos) orelse @as(i32, -1);
+
+                var wbuf: [16]u8 = undefined;
                 var w = std.ArrayList(u8).fromOwnedSlice(&wbuf);
                 w.items.len = 0;
-                w.appendAssumeCapacity(@intFromEnum(Response.exec_data));
-                writeBlob(&w, data) catch break;
-                conn.writeAll( w.items) catch break;
-            }
-        } else {
-            // Wait for more data
-            state.wake_event.waitTimeout(io, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(10), .clock = .awake } }) catch break;
-            state.wake_event.reset();
-            continue;
+                w.appendAssumeCapacity(@intFromEnum(Response.exec_done));
+                writeI32(&w, exit_code) catch {};
+                conn.writeAll(w.items) catch {};
+                std.log.info("[ipc-exec] done {s} exit={d}", .{ cmd_id, exit_code });
+                return;
+            },
+            else => continue,
         }
-
-        // Check if done
-        const done = blk: {
-            state.mutex.lock(io) catch break :blk false;
-            defer state.mutex.unlock(io);
-            const op = state.op_states.getPtr(cmd_id) orelse break :blk true;
-            break :blk op.done;
-        };
-
-        if (done) break;
     }
 
-    // Get exit code and send RSP_EXEC_DONE
-    const exit_code = blk: {
-        state.mutex.lock(io) catch break :blk @as(i32, -1);
-        defer state.mutex.unlock(io);
-        const op = state.op_states.getPtr(cmd_id) orelse break :blk @as(i32, -1);
-        break :blk op.exit_code;
-    };
-
+    // Connection closed without pty_exec_done
     {
         var wbuf: [16]u8 = undefined;
         var w = std.ArrayList(u8).fromOwnedSlice(&wbuf);
         w.items.len = 0;
         w.appendAssumeCapacity(@intFromEnum(Response.exec_done));
-        writeI32(&w, exit_code) catch {};
-        conn.writeAll( w.items) catch {};
+        writeI32(&w, -1) catch {};
+        conn.writeAll(w.items) catch {};
     }
-
-    state.cleanupOpState(cmd_id);
-    std.log.info("[ipc-exec] done {s} exit={d}", .{ cmd_id, exit_code });
 }
 
 fn handleVersion(conn: Connection) void {
-    const protocol = @import("protocol.zig");
+    const ptcl = @import("protocol.zig");
     var buf: [128]u8 = undefined;
     var w = std.ArrayList(u8).fromOwnedSlice(&buf);
     w.items.len = 0;
     w.appendAssumeCapacity(@intFromEnum(Response.version));
-    writeString(&w, protocol.VERSION) catch return;
-    conn.writeAll( w.items) catch {};
+    writeString(&w, ptcl.VERSION) catch return;
+    conn.writeAll(w.items) catch {};
 }
 
 fn handleUpload(
     io: std.Io,
     gpa: std.mem.Allocator,
     state_ptr: *anyopaque,
-    conn: Connection,
+    ipc_conn: Connection,
     header: []const u8,
 ) void {
     var pos: usize = 0;
     const vm = readString(header, &pos) orelse {
-        sendError(conn, "InvalidRequest: missing vm");
+        sendError(ipc_conn, "InvalidRequest: missing vm");
         return;
     };
     const dest_path = readString(header, &pos) orelse {
-        sendError(conn, "InvalidRequest: missing path");
+        sendError(ipc_conn, "InvalidRequest: missing path");
         return;
     };
     const file_hash = readString(header, &pos) orelse {
-        sendError(conn, "InvalidRequest: missing hash");
+        sendError(ipc_conn, "InvalidRequest: missing hash");
         return;
     };
     const file_size = readU32(header, &pos) orelse {
-        sendError(conn, "InvalidRequest: missing file_size");
+        sendError(ipc_conn, "InvalidRequest: missing file_size");
         return;
     };
 
-    const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
-    const tunproto = @import("tunproto.zig");
+    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
+    const tcp_mod = @import("tcp.zig");
+    const ptcl = @import("protocol.zig");
 
-    // Get guest tunnel
-    const tun = state.getGuestTunnel(vm) orelse {
-        sendError(conn, "GuestNotConnected");
+    // Look up guest IP
+    const guest = state.findByHostname(vm) orelse {
+        sendError(ipc_conn, "GuestNotFound");
         return;
     };
+
+    // Per-command TCP connection
+    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
+        std.log.err("[ipc-upload] TCP connect to {s} failed: {}", .{ vm, err });
+        sendError(ipc_conn, "GuestNotConnected");
+        return;
+    };
+    defer tcp_conn.deinit();
 
     // Generate cmd_id
-    const cmd_id = blk: {
-        const ts = std.Io.Timestamp.now(io, .real).nanoseconds;
-        break :blk std.fmt.allocPrint(gpa, "upload_{d}", .{ts}) catch {
-            sendError(conn, "AllocFailed");
-            return;
-        };
+    const cmd_id = std.fmt.allocPrint(gpa, "upload_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds}) catch {
+        sendError(ipc_conn, "AllocFailed");
+        return;
     };
     defer gpa.free(cmd_id);
 
-    // Create op state for upload result tracking
-    state.createOpState(cmd_id) catch {
-        sendError(conn, "OpStateFailed");
-        return;
-    };
-    defer state.cleanupOpState(cmd_id);
-
-    // Send upload_cmd via KCP tunnel — use sendAndFlush to atomically
-    // lock+send+flush+unlock, preventing race with mesh thread flush.
-    const up_cmd = tunproto.buildUploadCmd(gpa, cmd_id, dest_path, file_size, file_hash) catch {
-        sendError(conn, "AllocFailed");
+    // Send upload_cmd frame (framed)
+    const up_cmd = ptcl.buildUploadCmd(gpa, cmd_id, dest_path, file_size, file_hash) catch {
+        sendError(ipc_conn, "AllocFailed");
         return;
     };
     defer gpa.free(up_cmd);
-    const clock_ms = tun.session.mesh.clock_ms;
-    _ = tun.sendAndFlush(up_cmd, clock_ms) catch {
-        sendError(conn, "TunnelSendFailed");
+    tcp_conn.sendAndFlush(up_cmd, 0) catch {
+        sendError(ipc_conn, "TunnelSendFailed");
         return;
     };
 
-    // Read file data from connection and send via KCP.
-    // Batch with periodic flush to avoid overwhelming KCP send queue.
-    // Each batch: lock → send up to 32 chunks → flush → unlock →
-    // sleep briefly to let mesh thread process ACKs and advance send window.
-    var file_buf: [tunproto.FILE_CHUNK_DATA_MAX]u8 = undefined;
+    // Send raw file bytes (unframed — guest reads raw bytes after upload_cmd)
+    var file_buf: [65536]u8 = undefined;
     var total_sent: u32 = 0;
-    var sha = std.crypto.hash.sha2.Sha256.init(.{});
-    const BATCH_SIZE: u32 = 32; // one KCP send window
     while (total_sent < file_size) {
-        tun.lock() catch {
-            sendError(conn, "TunnelLockFailed");
+        const to_read: usize = @min(file_buf.len, file_size - total_sent);
+        const n = ipc_conn.readFull(file_buf[0..to_read]) catch {
+            sendError(ipc_conn, "FileReadFailed");
             return;
         };
-        errdefer tun.unlock();
+        if (n == 0) break;
 
-        var batch_count: u32 = 0;
-        while (batch_count < BATCH_SIZE and total_sent < file_size) {
-            const to_read: usize = @min(file_buf.len, file_size - total_sent);
-            const n = conn.readFull(file_buf[0..to_read]) catch {
-                tun.unlock();
-                sendError(conn, "FileReadFailed");
-                return;
-            };
-            if (n == 0) break;
-
-            sha.update(file_buf[0..n]);
-
-            const chunk = tunproto.buildFileChunk(gpa, cmd_id, file_buf[0..n]) catch {
-                tun.unlock();
-                sendError(conn, "AllocFailed");
-                return;
-            };
-            defer gpa.free(chunk);
-            _ = tun.sendLocked(chunk) catch {
-                tun.unlock();
-                sendError(conn, "TunnelSendFailed");
-                return;
-            };
-            total_sent += @intCast(n);
-            batch_count += 1;
-        }
-        tun.flushLocked(clock_ms);
-        tun.unlock();
-        // Yield to mesh thread so it can process ACKs and flush more data.
-        // Without this, the Host's single-threaded Io event loop can't
-        // run the mesh handler, starving ACK delivery and causing dead_link.
-        if (total_sent < file_size) {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
-        }
+        _ = std.posix.system.write(tcp_conn.fd, file_buf[0..n].ptr, n);
+        total_sent += @intCast(n);
     }
 
-    // Send file_eof
-    var final_hash: [32]u8 = undefined;
-    sha.final(&final_hash);
-    var hash_hex: [64]u8 = undefined;
-    for (final_hash, 0..) |b, j| {
-        hash_hex[j * 2] = "0123456789abcdef"[b >> 4];
-        hash_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
-    }
-    {
-        tun.lock() catch {
-            sendError(conn, "TunnelLockFailed");
+    // Receive upload_result frame (framed)
+    const nr = tcp_conn.recv(&file_buf) catch |err| {
+        std.log.err("[ipc-upload] recv upload_result: {}", .{err});
+        sendError(ipc_conn, "UploadResultFailed");
+        return;
+    };
+    if (nr > 0 and file_buf[0] == @intFromEnum(ptcl.MsgType.upload_result)) {
+        // Parse exit_code
+        var mpos: usize = 1;
+        _ = readString(file_buf[0..nr], &mpos); // skip cmd_id
+        const exit_code = readI32(file_buf[0..nr], &mpos) orelse @as(i32, -1);
+        if (exit_code != 0) {
+            std.log.err("[ipc-upload] upload failed: exit={d}", .{exit_code});
+            sendError(ipc_conn, "UploadFailed");
             return;
-        };
-        defer tun.unlock();
-        const eof = tunproto.buildFileEof(gpa, cmd_id, 0, total_sent, &hash_hex) catch {
-            sendError(conn, "AllocFailed");
-            return;
-        };
-        defer gpa.free(eof);
-        _ = tun.sendLocked(eof) catch {
-            sendError(conn, "TunnelSendFailed");
-            return;
-        };
-        tun.flushLocked(clock_ms);
-    }
-
-    // Wait for KCP send queue to drain. This ensures data is actually
-    // transmitted (not just queued) before reporting success.
-    // Use a generous timeout: 10s per MB + 60s base.
-    {
-        const drain_timeout_s: u64 = 60 + @as(u64, file_size) / (1024 * 1024) * 10;
-        const now_ns: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
-        const deadline_s = now_ns / std.time.ns_per_s + drain_timeout_s;
-        while (true) {
-            const waiting = tun.waiting();
-            if (waiting == 0) break;
-            const now_ns2: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
-            const now_s = now_ns2 / std.time.ns_per_s;
-            if (now_s >= deadline_s) {
-                sendError(conn, "UploadDrainTimeout");
-                return;
-            }
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
         }
     }
 
     // Send OK response
     var ok_buf: [1]u8 = undefined;
     ok_buf[0] = @intFromEnum(Response.ok);
-    conn.writeAll( &ok_buf) catch {};
+    ipc_conn.writeAll(&ok_buf) catch {};
 }
 
 fn handleDownload(
@@ -957,106 +837,57 @@ fn handleDownload(
         return;
     };
 
-    const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
-    const tunproto = @import("tunproto.zig");
+    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
+    const tcp_mod = @import("tcp.zig");
+    const ptcl = @import("protocol.zig");
 
-    const tun = state.getGuestTunnel(vm) orelse {
+    // Look up guest IP
+    const guest = state.findByHostname(vm) orelse {
+        sendError(conn, "GuestNotFound");
+        return;
+    };
+
+    // Per-command TCP connection
+    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
+        std.log.err("[ipc-download] TCP connect to {s} failed: {}", .{ vm, err });
         sendError(conn, "GuestNotConnected");
         return;
     };
+    defer tcp_conn.deinit();
 
     // Generate cmd_id
-    const cmd_id = blk: {
-        const ts = std.Io.Timestamp.now(io, .real).nanoseconds;
-        break :blk std.fmt.allocPrint(gpa, "download_{d}", .{ts}) catch {
-            sendError(conn, "AllocFailed");
-            return;
-        };
+    const cmd_id = std.fmt.allocPrint(gpa, "download_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds}) catch {
+        sendError(conn, "AllocFailed");
+        return;
     };
     defer gpa.free(cmd_id);
 
-    // Create op state for download
-    state.createOpState(cmd_id) catch {
-        sendError(conn, "OpStateFailed");
-        return;
-    };
-    defer state.cleanupOpState(cmd_id);
-
-    // Send download_cmd via KCP tunnel
-    const dl_cmd = tunproto.buildDownloadCmd(gpa, cmd_id, remote_path) catch {
+    // Send download_cmd frame (framed)
+    const dl_cmd = ptcl.buildDownloadCmd(gpa, cmd_id, remote_path) catch {
         sendError(conn, "AllocFailed");
         return;
     };
     defer gpa.free(dl_cmd);
-    _ = tun.sendAndFlush(dl_cmd, tun.session.mesh.clock_ms) catch {
+    tcp_conn.sendAndFlush(dl_cmd, 0) catch {
         sendError(conn, "TunnelSendFailed");
         return;
     };
 
     std.log.info("[ipc-download] requested {s} from {s}", .{ cmd_id, vm });
 
-    // Stream output: poll op_states, write RSP_DOWNLOAD_DATA frames, then RSP_DOWNLOAD_DONE
-    var exit_code: i32 = -1;
-
+    // Receive raw file bytes (unframed — guest sends raw bytes after download_cmd)
+    var rbuf: [65536]u8 = undefined;
     while (true) {
-        const chunk = blk: {
-            state.mutex.lock(io) catch break :blk @as(?[]const u8, null);
-            defer state.mutex.unlock(io);
+        const nr = std.posix.system.read(tcp_conn.fd, rbuf[0..].ptr, rbuf.len);
+        if (nr <= 0) break; // EOF or error
 
-            const op = state.op_states.getPtr(cmd_id) orelse break :blk @as(?[]const u8, null);
-
-            if (op.output.items.len > op.sent_pos) {
-                const start = op.sent_pos;
-                const available = op.output.items.len - start;
-                const take = @min(available, @as(usize, 65536)); // safety cap — never exceed 64KB per frame
-                op.sent_pos = start + take;
-                break :blk op.output.items[start..(start + take)];
-            }
-
-            if (op.done) {
-                exit_code = op.exit_code;
-                // Parse file_size and hash from download_meta if available
-                if (op.output.items.len > 0) {
-                    break :blk @as(?[]const u8, &.{}); // done signal
-                }
-                break :blk @as(?[]const u8, &.{}); // done signal
-            }
-            break :blk @as(?[]const u8, null);
-        };
-
-        if (chunk) |data| {
-            if (data.len > 0) {
-                // Write frame header + data in two calls — avoids needing
-                // a buffer large enough for the entire blob.
-                var fhdr: [5]u8 = undefined;
-                fhdr[0] = @intFromEnum(Response.download_data);
-                std.mem.writeInt(u32, fhdr[1..5], @intCast(data.len), .big);
-                conn.writeAll(&fhdr) catch break;
-                conn.writeAll(data) catch break;
-            }
-        } else {
-            state.wake_event.waitTimeout(io, .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(10), .clock = .awake } }) catch break;
-            state.wake_event.reset();
-            continue;
-        }
-
-        const done = blk: {
-            state.mutex.lock(io) catch break :blk false;
-            defer state.mutex.unlock(io);
-            const op = state.op_states.getPtr(cmd_id) orelse break :blk true;
-            break :blk op.done;
-        };
-
-        if (done) break;
-    }
-
-    // Get final exit code and metadata
-    {
-        state.mutex.lock(io) catch {};
-        defer state.mutex.unlock(io);
-        if (state.op_states.getPtr(cmd_id)) |op| {
-            exit_code = op.exit_code;
-        }
+        const data = rbuf[0..@intCast(nr)];
+        // Send download_data frame to IPC client
+        var fhdr: [5]u8 = undefined;
+        fhdr[0] = @intFromEnum(Response.download_data);
+        std.mem.writeInt(u32, fhdr[1..5], @intCast(data.len), .big);
+        conn.writeAll(&fhdr) catch break;
+        conn.writeAll(data) catch break;
     }
 
     // Send RSP_DOWNLOAD_DONE
@@ -1065,22 +896,15 @@ fn handleDownload(
         var w = std.ArrayList(u8).fromOwnedSlice(&wbuf);
         w.items.len = 0;
         w.appendAssumeCapacity(@intFromEnum(Response.download_done));
-        writeI32(&w, exit_code) catch {};
-        writeU32(&w, 0) catch {}; // file_size (not tracked — data streamed above)
+        writeI32(&w, 0) catch {}; // exit_code
+        writeU32(&w, 0) catch {}; // file_size (not tracked)
         w.appendAssumeCapacity(0); // empty hash
-        conn.writeAll( w.items) catch {};
+        conn.writeAll(w.items) catch {};
     }
 
-    std.log.info("[ipc-download] done {s} exit={d}", .{ cmd_id, exit_code });
+    std.log.info("[ipc-download] done {s}", .{cmd_id});
 }
 
-/// Build command string with shell-appropriate exit code marker.
-fn buildCmdWithMarker(gpa: std.mem.Allocator, shell: []const u8, command: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, shell, "cmd.exe") != null) {
-        return std.fmt.allocPrint(gpa, "{s} & echo MDELIM:%errorlevel%\r\n", .{command});
-    }
-    return std.fmt.allocPrint(gpa, "{s}; echo MDELIM:$?\n", .{command});
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Client API (CLI and MCP use these to talk to the Host daemon)

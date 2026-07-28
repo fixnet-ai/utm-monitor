@@ -1,0 +1,167 @@
+//! 测试基础设施 — 共享工具，供所有集成测试使用。
+//!
+//! 提供 TestRunner (统计), TestCase (断言), TempDir (临时目录),
+//! findFreePort (动态端口), isWindows (平台检测)。
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+/// 测试运行器。累积通过/失败/跳过计数，输出结构化结果。
+pub const TestRunner = struct {
+    pass: usize = 0,
+    fail: usize = 0,
+    skip: usize = 0,
+    current_name: []const u8 = "",
+
+    /// 开始一个命名测试用例。打印 "  RUN: <name>"。
+    pub fn case(self: *TestRunner, name: []const u8) TestCase {
+        self.current_name = name;
+        std.debug.print("  RUN: {s}\n", .{name});
+        return TestCase{ .runner = self };
+    }
+
+    /// 打印汇总并返回是否全部通过。
+    pub fn summary(self: *TestRunner) bool {
+        const total = self.pass + self.fail + self.skip;
+        std.debug.print("\nResults: {d} passed, {d} failed, {d} skipped (total: {d})\n", .{ self.pass, self.fail, self.skip, total });
+        return self.fail == 0;
+    }
+};
+
+/// 单个测试用例作用域。defer deinit() 时自动记录通过/失败。
+pub const TestCase = struct {
+    runner: *TestRunner,
+    failed: bool = false,
+    skipped: bool = false,
+
+    /// 断言条件为真。失败时记录消息。
+    pub fn expect(self: *TestCase, ok: bool, comptime fmt: []const u8, args: anytype) void {
+        if (!ok) {
+            self.failed = true;
+            std.debug.print("  FAIL: {s} — ", .{self.runner.current_name});
+            std.debug.print(fmt, args);
+            std.debug.print("\n", .{});
+        }
+    }
+
+    /// 断言值为 true。
+    pub fn expectTrue(self: *TestCase, actual: bool, comptime msg: []const u8) void {
+        self.expect(actual, "{s} (expected true, got false)", .{msg});
+    }
+
+    /// 断言两个值相等。使用 == 操作符。
+    pub fn expectEqual(self: *TestCase, expected: anytype, actual: @TypeOf(expected), comptime msg: []const u8) void {
+        const ok = expected == actual;
+        if (!ok) {
+            self.failed = true;
+            std.debug.print("  FAIL: {s} — {s}: expected {any}, got {any}\n", .{ self.runner.current_name, msg, expected, actual });
+        }
+    }
+
+    /// 断言两个字符串相等。
+    pub fn expectStr(self: *TestCase, expected: []const u8, actual: []const u8, comptime msg: []const u8) void {
+        if (!std.mem.eql(u8, expected, actual)) {
+            self.failed = true;
+            std.debug.print("  FAIL: {s} — {s}: expected \"{s}\", got \"{s}\"\n", .{ self.runner.current_name, msg, expected, actual });
+        }
+    }
+
+    /// 断言错误。
+    pub fn expectError(self: *TestCase, expected_err: anyerror, actual: anyerror!void, comptime msg: []const u8) void {
+        if (actual) {
+            self.failed = true;
+            std.debug.print("  FAIL: {s} — {s}: expected error.{s}, got success\n", .{ self.runner.current_name, msg, @errorName(expected_err) });
+        } else |err| {
+            if (err != expected_err) {
+                self.failed = true;
+                std.debug.print("  FAIL: {s} — {s}: expected error.{s}, got error.{s}\n", .{ self.runner.current_name, msg, @errorName(expected_err), @errorName(err) });
+            }
+        }
+    }
+
+    /// 标记测试为跳过（平台不支持等）。
+    pub fn skip(self: *TestCase, comptime reason: []const u8) void {
+        self.skipped = true;
+        std.debug.print("  SKIP: {s} — {s}\n", .{ self.runner.current_name, reason });
+    }
+
+    /// defer deinit() 时调用：根据 failed/skipped 更新统计并打印结果。
+    pub fn deinit(self: *TestCase) void {
+        if (self.skipped) {
+            self.runner.skip += 1;
+        } else if (self.failed) {
+            self.runner.fail += 1;
+        } else {
+            self.runner.pass += 1;
+            std.debug.print("  PASS: {s}\n", .{self.runner.current_name});
+        }
+    }
+};
+
+/// 临时目录 — 创建在 /tmp (或 %TEMP%) 下，deinit 时自动清理。
+pub const TempDir = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+
+    /// 创建临时目录。prefix 用于标识（如 "utmm-test-"）。
+    pub fn create(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8) !TempDir {
+        var rand_bytes: [8]u8 = undefined;
+        io.random(&rand_bytes);
+        var hex: [16]u8 = undefined;
+        _ = std.fmt.bufPrint(&hex, "{x}{x}", .{ std.mem.readInt(u64, &rand_bytes, .little), @as(u64, 0) }) catch unreachable;
+        // 只用前 12 个 hex 字符
+        const path = try std.fmt.allocPrint(allocator, "/tmp/{s}{s}", .{ prefix, hex[0..12] });
+        errdefer allocator.free(path);
+        try std.Io.Dir.cwd().createDir(io, path, .{ .permissions = @enumFromInt(0o755) });
+        return TempDir{ .io = io, .allocator = allocator, .path = path };
+    }
+
+    /// 拼接路径。
+    pub fn join(self: *TempDir, name: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.path, name });
+    }
+
+    /// 清理临时目录及其全部内容。
+    pub fn deinit(self: *TempDir) void {
+        // 先删除目录内文件
+        self.deleteTree(self.path) catch {};
+        self.allocator.free(self.path);
+    }
+
+    fn deleteTree(self: *TempDir, dir_path: []const u8) !void {
+        var dir = try std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true });
+        defer dir.close(self.io);
+
+        var iter = dir.iterate(self.io);
+        while (try iter.next()) |entry| {
+            const full = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name });
+            defer self.allocator.free(full);
+            if (entry.kind == .directory) {
+                try self.deleteTree(full);
+            } else {
+                dir.deleteFile(self.io, entry.name) catch {};
+            }
+        }
+        std.Io.Dir.cwd().deleteDir(self.io, dir_path) catch {};
+    }
+};
+
+/// 查找一个空闲 TCP 端口（绑定 :0 后读取实际端口号）。
+/// Zig 0.16.0: Socket.address 包含绑定的实际地址（含临时端口）。
+pub fn findFreePort(io: std.Io) !u16 {
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    const socket = try addr.bind(io, .{ .mode = .stream });
+    defer socket.close(io);
+    return socket.address.getPort();
+}
+
+/// 是否 Windows 平台。
+pub fn isWindows() bool {
+    return builtin.os.tag == .windows;
+}
+
+/// 是否 macOS 平台。
+pub fn isMacOS() bool {
+    return builtin.os.tag == .macos;
+}

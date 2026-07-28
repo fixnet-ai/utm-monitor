@@ -1,63 +1,73 @@
-//! Mesh networking layer: UDP broadcast discovery via LSA, KCP reliable transport,
-//! link-state routing (Dijkstra), and KCP relay for multi-hop tunnels.
+//! LSA (Link-State Advertisement) mesh networking and /etc/hosts management.
 //!
-//! Replaces the legacy "ARE YOU OK?" / "ANNOUNCE" text protocol with a unified
-//! binary protocol on UDP :2121. First-byte dispatch identifies message type.
+//! Merged from mesh.zig + hosts_file.zig — all mesh topology discovery, link-state
+//! routing (Dijkstra), ping/pong probes, and /etc/hosts marker-block sync in one module.
+//!
+//! Binary protocol on UDP :2121 with first-byte dispatch for message type
+//! identification. LSA carries topology and version info for auto-upgrade.
+//!
+//! /etc/hosts marker block:
+//!   # UTM-MONITOR-BEGIN
+//!   192.168.64.5  macvm
+//!   192.168.64.8  linuxvm
+//!   # UTM-MONITOR-END
 
 const std = @import("std");
 const builtin = @import("builtin");
-const kcp = @import("kcp.zig");
 const protocol = @import("protocol.zig");
-const cmdchan = @import("cmdchan.zig");
 
 const net = std.Io.net;
 const assert = std.debug.assert;
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Types
+// NodeId — types & helpers
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Node identifier (MAC address, 6 bytes)
 pub const NodeId = [6]u8;
 
-/// Parse "aa:bb:cc:dd:ee:ff" → NodeId. Returns error on malformed input.
+/// Parse a colon-separated MAC address string (aa:bb:cc:dd:ee:ff).
 pub fn parseNodeId(text: []const u8) !NodeId {
     if (text.len != 17) return error.InvalidFormat;
     var id: NodeId = undefined;
     var i: usize = 0;
-    var it = std.mem.splitScalar(u8, text, ':');
-    while (it.next()) |byte_str| {
-        if (i >= 6) return error.InvalidFormat;
-        id[i] = try std.fmt.parseInt(u8, byte_str, 16);
-        i += 1;
+    while (i < 6) : (i += 1) {
+        const pos = i * 3;
+        if (i < 5 and text[pos + 2] != ':') return error.InvalidFormat;
+        id[i] = try std.fmt.parseInt(u8, text[pos .. pos + 2], 16);
     }
-    if (i != 6) return error.InvalidFormat;
     return id;
 }
 
-/// Derive a unique NodeId by hashing MAC + suffix together.
-/// Used when multiple mesh nodes share a physical MAC (e.g. local testing
-/// with Host + Guest on the same machine using --peer-mesh).
-pub fn deriveNodeId(mac_text: []const u8, suffix: []const u8) !NodeId {
-    const mac_id = try parseNodeId(mac_text);
-    var hasher = std.hash.Wyhash.init(0);
-    hasher.update(&mac_id);
-    hasher.update(suffix);
-    const h: u64 = hasher.final();
-    const h_bytes: [8]u8 = @bitCast(h);
+/// Derive a NodeId for a registered MAC that may be longer than 6 bytes
+/// (virtual MAC from UTM). Uses first 4 bytes of hostname hash with last
+/// 2 bytes of MAC.
+pub fn deriveNodeId(mac: []const u8, hostname: []const u8) !NodeId {
+    if (mac.len < 6) return error.InvalidFormat;
     var id: NodeId = undefined;
-    @memcpy(&id, h_bytes[0..6]);
+    // Use a rolling hash over the hostname
+    var h: u32 = 5381;
+    for (hostname) |c| {
+        h = ((h << 5) + h) + c;
+    }
+    id[0] = @truncate(h >> 24);
+    id[1] = @truncate(h >> 16);
+    id[2] = @truncate(h >> 8);
+    id[3] = @truncate(h);
+    // Last 2 bytes from MAC to reduce collision probability
+    id[4] = mac[mac.len - 2];
+    id[5] = mac[mac.len - 1];
     return id;
 }
 
-/// Format NodeId → "aa:bb:cc:dd:ee:ff"
+/// Format a NodeId to an allocator-allocated string (aa:bb:cc:dd:ee:ff).
 pub fn formatNodeId(id: NodeId, allocator: std.mem.Allocator) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
         id[0], id[1], id[2], id[3], id[4], id[5],
     });
 }
 
-/// Format NodeId into a caller-provided buffer (17 bytes needed: 12 hex + 5 colons).
+/// Format a NodeId into a pre-allocated buffer (18 bytes recommended).
 /// Returns the formatted slice, or "??:??:??:??:??:??" on overflow.
 pub fn formatNodeIdBuf(id: NodeId, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
@@ -65,24 +75,14 @@ pub fn formatNodeIdBuf(id: NodeId, buf: []u8) []const u8 {
     }) catch "??:??:??:??:??:??";
 }
 
-/// Compute KCP conversation ID from two NodeIds (XOR of MACs → u32).
-pub fn computeConv(a: NodeId, b: NodeId, nonce: u32) u32 {
-    var conv: u32 = nonce;
-    for (0..6) |i| {
-        const shift: u5 = @intCast((i % 4) * 8);
-        conv ^= @as(u32, @intCast(a[i] ^ b[i])) << shift;
-    }
-    return conv;
-}
+
 
 /// Generate a process-unique nonce from ASLR-entropy (stack address) and PID.
-/// Changes on every process start, ensuring KCP conversation IDs are unique
-/// across Host restarts — stale sessions are naturally abandoned.
+/// Changes on every process start, ensuring LSA restart detection works
+/// across process restarts.
 fn generateNonce() u32 {
-    // Stack variable address provides ASLR entropy (randomized per-process).
     var dummy: u8 = undefined;
     const stack_addr: u32 = @truncate(@intFromPtr(&dummy));
-    // PID adds uniqueness across rapid restarts where stack layout might be similar.
     const pid: u32 = if (builtin.os.tag == .windows)
         std.os.windows.GetCurrentProcessId()
     else
@@ -115,12 +115,6 @@ fn nonceChanged(a: []const u8, b: []const u8) bool {
     return !std.mem.eql(u8, a, b);
 }
 
-/// Read the KCP conversation ID from a KCP packet embedded in mesh KCP data.
-/// The KCP header starts at offset 13 (after 1-byte TTL + 6-byte src + 6-byte dst).
-/// KCP conv is u32 big-endian at byte 0 of the KCP header.
-pub fn readKcpConv(data: []const u8) u32 {
-    return std.mem.readInt(u32, data[13..17], .big);
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LSA (Link-State Advertisement)
@@ -164,12 +158,12 @@ pub fn encodeLsa(
 ) usize {
     const needed = 15 + node_info.len + 1 + neighbors.len * 7;
     if (buf.len < needed) {
-        std.log.warn("[mesh] encodeLsa: buffer too small (need {d}, have {d})", .{ needed, buf.len });
+        std.log.warn("[lsa] encodeLsa: buffer too small (need {d}, have {d})", .{ needed, buf.len });
         // Guard: if buffer can't even hold the header, encode with zero neighbors
         // to avoid infinite recursion (buf.len -| X saturating to 0 → 0 neighbors → try again).
         const min_header = 16 + node_info.len;
         if (buf.len < min_header) {
-            std.log.err("[mesh] encodeLsa: buffer too small for header (need {d}, have {d})", .{ min_header, buf.len });
+            std.log.err("[lsa] encodeLsa: buffer too small for header (need {d}, have {d})", .{ min_header, buf.len });
             return encodeLsa(buf, origin, seq, ttl, flags, node_info, &[0]NeighborEntry{});
         }
         // Try to fit as many neighbors as possible
@@ -271,37 +265,6 @@ pub const Route = struct {
     cost: u32,
 };
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// MeshSession — KCP tunnel to a remote node
-// ═══════════════════════════════════════════════════════════════════════════════
-
-pub const MeshSession = struct {
-    kcp_inst: *kcp.Kcp,
-    mesh: *Mesh,
-    remote: NodeId,
-    conv: u32,
-    next_hop: NodeId,
-    allocator: std.mem.Allocator,
-
-    /// KCP keepalive — TCP-style idle probe.
-    /// After 1s idle, send a 1-byte probe through KCP. Each probe expects
-    /// the peer's KCP ACK response — if no ACK arrives, KCP retransmits.
-    /// After 3 unanswered probes (~3s total), the session is declared dead.
-    last_recv_ms: u32 = 0,
-    keepalive_probes: u8 = 0,
-    /// Next keepalive probe timestamp (clock_ms). 0 = no probe scheduled —
-    /// first probe goes out after 1s idle.
-    keepalive_next_ms: u32 = 0,
-
-    /// Set true by the mesh thread when keepalive declares dead.
-    /// Checked by Tunnel.isAlive() and the Guest command loop.
-    dead: bool = false,
-
-    pub fn deinit(self: *MeshSession) void {
-        self.kcp_inst.release();
-        self.* = undefined;
-    }
-};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Mesh — central mesh networking instance
@@ -334,52 +297,17 @@ pub const Mesh = struct {
     routes: std.ArrayList(Route),
     routes_mutex: std.Io.Mutex,
 
-    // KCP sessions (keyed by conv)
-    sessions: std.AutoHashMap(u32, *MeshSession),
-    sessions_mutex: std.Io.Mutex,
-
-    /// Per-process nonce, changes on every restart. Embedded in the KCP conv
-    /// to isolate sessions across Host restarts — stale old-process KCP packets
-    /// carry a different conv and are immediately rejected (Finding 93 / Task #254).
+    /// Per-process nonce for LSA restart detection.
+    /// Changes on every process start — remote nodes detect restart
+    /// by comparing this value across LSA entries.
     nonce: u32,
-
-    /// Monotonically increasing counter appended to conv in connect() to make
-    /// each call produce a unique conv. Prevents KCP SN mismatch when a new
-    /// session reuses the same (host_id, guest_id, nonce) tuple while the peer
-    /// still holds state for the old session (Finding 129).
-    session_gen: u32 = 0,
-
-    /// Guest-side: Host epoch (the Host's per-process nonce from LSA node_info).
-    /// null until the first Host LSA arrives (bootstrap mode — accept any conv).
-    host_epoch: ?u32 = null,
-
-    /// Guest-side: expected base KCP conv from the Host (without generation counter).
-    /// null during bootstrap. handleKcpData() accepts any conv in [base, base+256)
-    /// to allow the Host's connect() to increment session_gen for reconnections.
-    host_expected_conv: ?u32 = null,
-
-    /// Guest-side: NodeId of the Host (from LSA origin). Used to compute expected_conv.
-    host_node_id: ?NodeId = null,
-
-    // Command channel (IPC→Mesh). Single producer (IPC thread), single consumer (Mesh thread).
-    // Null until Phase 4 (IPC integration). Mesh thread polls this each event loop iteration.
-    // Once non-null, it stays non-null for the lifetime of the Mesh.
-    cmd_queue: ?*cmdchan.CmdQueue,
-
-    /// Opaque pointer to HostState (set by host.zig). Used by cmd_handler callback
-    /// for tunnel lookup, completion registration, and guest table access.
-    state_ptr: ?*anyopaque,
-
-    /// Command dispatch callback. Called by dispatchCmd for each command popped
-    /// from cmd_queue. Implemented in host.zig to bridge Mesh (KCP sessions)
-    /// with HostState (tunnels, completions, guest table).
-    cmd_handler: ?*const fn (*anyopaque, *Mesh, *const cmdchan.Cmd) void,
 
     // Shutdown
     shutdown: std.atomic.Value(bool),
 
-    // Upgrade signal (set when version mismatch detected via LSA)
-    upgrade_needed: *std.atomic.Value(bool),
+    // Upgrade signal (set when version mismatch detected via LSA).
+    // null when auto-upgrade is disabled.
+    upgrade_needed: ?*std.atomic.Value(bool),
 
     // (was host_gateway_ip — removed. IP gating on version-mismatch check
     //  was unreliable on multihomed hosts where the Host's primary IP ≠
@@ -410,12 +338,9 @@ pub const Mesh = struct {
         node_info: []const u8,
         socket: net.Socket,
         io: std.Io,
-        upgrade_needed: *std.atomic.Value(bool),
+        upgrade_needed: ?*std.atomic.Value(bool),
         broadcast_addrs: std.ArrayList(net.IpAddress),
         broadcast_refresh_fn: ?*const fn (std.mem.Allocator) anyerror!std.ArrayList(net.IpAddress),
-        cmd_queue: ?*cmdchan.CmdQueue,
-        state_ptr: ?*anyopaque,
-        cmd_handler: ?*const fn (*anyopaque, *Mesh, *const cmdchan.Cmd) void,
     ) !Mesh {
         const nonce = generateNonce();
 
@@ -448,24 +373,18 @@ pub const Mesh = struct {
             .lsas_mutex = std.Io.Mutex.init,
             .routes = .empty,
             .routes_mutex = std.Io.Mutex.init,
-            .sessions = std.AutoHashMap(u32, *MeshSession).init(allocator),
-            .sessions_mutex = std.Io.Mutex.init,
             .shutdown = std.atomic.Value(bool).init(false),
             .upgrade_needed = upgrade_needed,
-            .cmd_queue = cmd_queue,
-            .state_ptr = state_ptr,
-            .cmd_handler = cmd_handler,
             .nonce = nonce,
-            .session_gen = 0,
             .clock_ms = 0,
         };
     }
 
     /// Real monotonic millisecond timestamp for ping/pong RTT measurement.
-    /// Separate from clock_ms — clock_ms is a coarse event counter (stepped by
-    /// 10 or 1000 per event) used by KCP update, keepalive timers, and LSA
-    /// expiry, where 10ms/1000ms granularity is acceptable.  Ping/pong RTT
-    /// needs sub-ms precision, so we read the system monotonic clock directly.
+    /// Separate from clock_ms — clock_ms is a coarse event counter used by
+    /// LSA expiry and periodic timers, where 10ms/1000ms granularity is
+    /// acceptable.  Ping/pong RTT needs sub-ms precision, so we read the
+    /// system monotonic clock directly.
     fn nowMs(self: *Mesh) u32 {
         return @truncate(@as(u64, @intCast(std.Io.Timestamp.now(self.io, .awake).toMilliseconds())));
     }
@@ -488,14 +407,6 @@ pub const Mesh = struct {
             lsa.deinit(self.allocator);
         }
         self.lsas.deinit();
-
-        // Free sessions
-        var s_iter = self.sessions.iterator();
-        while (s_iter.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            self.allocator.destroy(entry.value_ptr.*);
-        }
-        self.sessions.deinit();
 
         self.routes.deinit(self.allocator);
         self.* = undefined;
@@ -542,40 +453,6 @@ pub const Mesh = struct {
         return self.runPosix();
     }
 
-    /// Check for pending IPC commands and dispatch them.
-    /// Called from the event loop each iteration.
-    fn processPendingCommands(self: *Mesh) void {
-        if (self.cmd_queue) |queue| {
-            var cmds: [16]cmdchan.Cmd = undefined;
-            const count = queue.popBatch(&cmds);
-            for (cmds[0..count]) |*cmd| {
-                self.dispatchCmd(cmd);
-            }
-        }
-    }
-
-    /// Dispatch a single command from the IPC thread.
-    /// Calls the registered cmd_handler callback (Phase 3) if set;
-    /// otherwise logs the command as a no-op stub (Phase 2).
-    fn dispatchCmd(self: *Mesh, cmd: *const cmdchan.Cmd) void {
-        if (self.cmd_handler) |handler| {
-            if (self.state_ptr) |sp| {
-                handler(sp, self, cmd);
-                return;
-            } else {
-                std.log.err("[mesh-cmd] cmd_handler set but state_ptr is null", .{});
-            }
-        }
-        // Fallback: log as stub
-        switch (cmd.tag) {
-            .exec => std.log.info("[mesh-cmd] exec {s} on {s}: {s}", .{ cmd.cmdIdStr(), cmd.vmStr(), cmd.arg1Str() }),
-            .upload => std.log.info("[mesh-cmd] upload to {s}: {s} ({d} bytes)", .{ cmd.vmStr(), cmd.arg1Str(), cmd.file_size }),
-            .download => std.log.info("[mesh-cmd] download from {s}: {s}", .{ cmd.vmStr(), cmd.arg1Str() }),
-            .status => std.log.info("[mesh-cmd] status", .{}),
-            .ping => std.log.info("[mesh-cmd] ping {s}", .{ cmd.vmStr() }),
-        }
-    }
-
     /// POSIX: use receiveTimeout with 1-second timeout for periodic tasks.
     fn runPosix(self: *Mesh) !void {
         var buf: [4096]u8 = undefined;
@@ -590,7 +467,7 @@ pub const Mesh = struct {
                         continue;
                     },
                     else => {
-                        std.log.err("[mesh] receive error: {}", .{err});
+                        std.log.err("[lsa] receive error: {}", .{err});
                         continue;
                     },
                 }
@@ -602,10 +479,7 @@ pub const Mesh = struct {
 
             switch (msg.data[0]) {
                 protocol.MESH_TYPE_LSA => self.handleLsa(msg.data[1..], msg.from) catch |err| {
-                    std.log.err("[mesh] handleLsa failed: {}", .{err});
-                },
-                protocol.MESH_TYPE_KCP => self.handleKcpData(msg.data[1..], msg.from) catch |err| {
-                    std.log.err("[mesh] handleKcpData failed: {}", .{err});
+                    std.log.err("[lsa] handleLsa failed: {}", .{err});
                 },
                 protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
                 protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
@@ -613,10 +487,9 @@ pub const Mesh = struct {
             }
 
             self.periodicTasks();
-            self.processPendingCommands();
         }
 
-        std.log.info("[mesh] Shutting down", .{});
+        std.log.info("[lsa] Shutting down", .{});
     }
 
     /// Windows: blocking receive on mesh Io with a separate timer thread.
@@ -629,9 +502,9 @@ pub const Mesh = struct {
     fn runWindows(self: *Mesh) !void {
         var buf: [4096]u8 = undefined;
 
-        // Periodic timer thread: wake every 1s to drive KCP flush + keepalive.
+        // Periodic timer thread: wake every 1s to drive keepalive.
         const timer_thread = std.Thread.spawn(.{}, runWindowsTimer, .{self}) catch |err| {
-            std.log.err("[mesh] Failed to spawn timer thread: {}", .{err});
+            std.log.err("[lsa] Failed to spawn timer thread: {}", .{err});
             return err;
         };
         timer_thread.detach();
@@ -639,7 +512,7 @@ pub const Mesh = struct {
         while (!self.shutdown.load(.acquire)) {
             const msg = self.socket.receive(self.io, &buf) catch |err| {
                 if (self.shutdown.load(.acquire)) break;
-                std.log.err("[mesh] receive error: {}", .{err});
+                std.log.err("[lsa] receive error: {}", .{err});
                 std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
                 continue;
             };
@@ -650,10 +523,7 @@ pub const Mesh = struct {
 
             switch (msg.data[0]) {
                 protocol.MESH_TYPE_LSA => self.handleLsa(msg.data[1..], msg.from) catch |err| {
-                    std.log.err("[mesh] handleLsa failed: {}", .{err});
-                },
-                protocol.MESH_TYPE_KCP => self.handleKcpData(msg.data[1..], msg.from) catch |err| {
-                    std.log.err("[mesh] handleKcpData failed: {}", .{err});
+                    std.log.err("[lsa] handleLsa failed: {}", .{err});
                 },
                 protocol.MESH_TYPE_PING => self.handlePing(msg.data[1..], msg.from),
                 protocol.MESH_TYPE_PONG => self.handlePong(msg.data[1..]),
@@ -661,14 +531,13 @@ pub const Mesh = struct {
             }
 
             self.periodicTasks();
-            self.processPendingCommands();
         }
 
-        std.log.info("[mesh] Shutting down", .{});
+        std.log.info("[lsa] Shutting down", .{});
     }
 
     /// Periodic timer for Windows blocking receive fallback.
-    /// Drives KCP flush, keepalive, and LSA broadcasts every 1 second.
+    /// Drives LSA broadcasts and periodic maintenance every 1 second.
     /// Uses raw Windows Sleep() to avoid any Io dependency — timer must
     /// run regardless of Io.Threaded configuration.
     /// On shutdown, sends a dummy 1-byte UDP packet to the mesh socket
@@ -725,7 +594,7 @@ pub const Mesh = struct {
 
         for (self.broadcast_addrs.items) |*addr| {
             self.socket.send(self.io, addr, lsa_buf[0..len]) catch |err| {
-                std.log.err("[mesh] initial broadcast LSA to {any} failed: {}", .{ addr, err });
+                std.log.err("[lsa] initial broadcast LSA to {any} failed: {}", .{ addr, err });
             };
         }
     }
@@ -748,7 +617,7 @@ pub const Mesh = struct {
             if (self.clock_ms >= self.broadcast_refresh_next_ms) {
                 self.broadcast_refresh_next_ms = self.clock_ms + 30_000;
                 const new_addrs = refresh_fn(self.allocator) catch |err| {
-                    std.log.err("[mesh] broadcast address refresh failed: {}", .{err});
+                    std.log.err("[lsa] broadcast address refresh failed: {}", .{err});
                     self.broadcast_refresh_next_ms = self.clock_ms + 30_000;
                     return;
                 };
@@ -789,88 +658,6 @@ pub const Mesh = struct {
             self.expireStale();
         }
 
-        // Update all KCP sessions + keepalive (lock to prevent concurrent modification)
-        self.sessions_mutex.lock(self.io) catch {
-            // If the Io context is canceled, skip this periodicTasks cycle.
-            // Do NOT proceed without the lock — shared data would be
-            // accessed unsynchronized and the deferred unlock would corrupt
-            // the mutex state.
-            return;
-        };
-        defer self.sessions_mutex.unlock(self.io);
-
-        var s_iter = self.sessions.iterator();
-        while (s_iter.next()) |entry| {
-            const conv = entry.key_ptr.*;
-            const sess = entry.value_ptr.*;
-
-            // Once keepalive has declared a session dead, stop calling
-            // kcp.update() — retransmissions would trigger meshKcpOutput
-            // which tries to find a neighbor that's already been removed.
-            if (sess.dead) continue;
-
-            sess.kcp_inst.update(self.clock_ms);
-
-            // ── KCP keepalive ──
-            // Check if data has arrived (proves peer is alive)
-            if (sess.kcp_inst.peekSize() >= 0) {
-                sess.last_recv_ms = self.clock_ms;
-                sess.keepalive_probes = 0;
-                sess.keepalive_next_ms = 0;
-            }
-
-            const idle = self.clock_ms -| sess.last_recv_ms;
-
-            if (idle < 1000) {
-                // Link is active — nothing to do
-            } else if (sess.keepalive_probes >= 3) {
-                // Dead: 3 probes sent, no response (~3s total). Set flag only —
-                // the tunnel owner (handleMeshGuest / command loop)
-                // checks isAlive() and does the actual closeSession cleanup.
-                std.log.info("[mesh] keepalive dead conv={d} idle={d:.1}s", .{ conv, @as(f64, @floatFromInt(idle)) / 1000.0 });
-                sess.dead = true;
-            } else if (sess.keepalive_next_ms == 0) {
-                // First probe after 1s idle
-                sess.keepalive_probes = 1;
-                sess.keepalive_next_ms = self.clock_ms + 1000;
-                _ = sess.kcp_inst.send(&[_]u8{0xFF}) catch {};
-            } else if (self.clock_ms >= sess.keepalive_next_ms) {
-                // Next probe interval elapsed → send another
-                sess.keepalive_probes += 1;
-                sess.keepalive_next_ms = self.clock_ms + 1000;
-                _ = sess.kcp_inst.send(&[_]u8{0xFF}) catch {};
-            }
-        }
-
-        // ── Dead session cleanup (safety net) ──
-        // Sessions marked dead by keepalive are normally cleaned up when the
-        // owning Tunnel calls closeSession() via tunnel.deinit(). This is a
-        // safety net for orphaned sessions whose owning Tunnel was never
-        // properly deinitialized. Only cleans up sessions idle > 60s to give
-        // Tunnel owners ample time to call closeSession() themselves.
-        // Collect-then-remove avoids iterator invalidation during hashmap mutation.
-        {
-            var to_cleanup: std.ArrayList(u32) = .empty;
-            defer to_cleanup.deinit(self.allocator);
-            var s_iter2 = self.sessions.iterator();
-            while (s_iter2.next()) |entry2| {
-                const s = entry2.value_ptr.*;
-                if (s.dead) {
-                    const idle = self.clock_ms -| s.last_recv_ms;
-                    if (idle > 60_000) {
-                        to_cleanup.append(self.allocator, entry2.key_ptr.*) catch {};
-                    }
-                }
-            }
-            for (to_cleanup.items) |conv| {
-                if (self.sessions.get(conv)) |s| {
-                    std.log.info("[mesh] cleaning up orphaned dead session conv={d}", .{conv});
-                    _ = self.sessions.remove(conv);
-                    s.deinit();
-                    self.allocator.destroy(s);
-                }
-            }
-        }
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -908,7 +695,7 @@ pub const Mesh = struct {
         // Send to every broadcast address (subnet-directed + 255.255.255.255)
         for (self.broadcast_addrs.items) |*addr| {
             self.socket.send(self.io, addr, lsa_buf[0..len]) catch |err| {
-                std.log.err("[mesh] broadcast LSA to {any} failed: {}", .{ addr, err });
+                std.log.err("[lsa] broadcast LSA to {any} failed: {}", .{ addr, err });
             };
         }
     }
@@ -936,7 +723,7 @@ pub const Mesh = struct {
                 const diff: i32 = @bitCast(decoded.seq -% existing.seq);
                 if (diff <= 0) {
                     if (nonceChanged(decoded.node_info, existing.node_info)) {
-                        std.log.info("[mesh] LSA restart detected: nonce changed, accepting lower seq", .{});
+                        std.log.info("[lsa] LSA restart detected: nonce changed, accepting lower seq", .{});
                         existing.deinit(self.allocator);
                         lsa_restart = true;
                     } else {
@@ -948,7 +735,7 @@ pub const Mesh = struct {
                     // Keep the current (lower-seq, newer-process) entry —
                     // replacing it would let the next genuine LSA trigger a
                     // spurious second restart (Finding 93 / Task #254).
-                    std.log.info("[mesh] Ignoring stale high-seq LSA from {any} (nonce differs)", .{decoded.origin});
+                    std.log.info("[lsa] Ignoring stale high-seq LSA from {any} (nonce differs)", .{decoded.origin});
                     return;
                 } else {
                     existing.deinit(self.allocator);
@@ -995,74 +782,22 @@ pub const Mesh = struct {
         }
         // ── neighbors_mutex released here ──
 
-        // ── Guest-side: Track Host epoch for KCP conv validation ──
-        // Extract the Host's epoch (per-process nonce) from LSA node_info.
-        // Only track "role:host" LSAs when we are a Guest (our own LSA
-        // has "role:guest" or no role field — NOT "role:host").
-        // All nodes carry epoch:{nonce} in their node_info, but:
-        // - Only the Host's epoch matters for conv validation (Host initiates KCP).
-        // - Self-role check prevents a multi-Host scenario where Host A
-        //   sets expected_conv from Host B's LSA.
-        if (std.mem.indexOf(u8, self.node_info, "role:host") == null and std.mem.indexOf(u8, decoded.node_info, "role:host") != null) {
-            if (parseEpoch(decoded.node_info)) |epoch| {
-                const epoch_changed = self.host_epoch == null or self.host_epoch.? != epoch;
-                if (epoch_changed) {
-                    std.log.info("[mesh] Host epoch changed: {?d} -> {d}, updating expected conv", .{ self.host_epoch, epoch });
-                    self.host_epoch = epoch;
-                    self.host_node_id = decoded.origin;
-                    self.host_expected_conv = computeConv(decoded.origin, self.node_id, epoch);
-
-                    // Mark sessions outside the generation window as dead.
-                    // Handles the bootstrap race: KCP data arrives before LSA,
-                    // creating a session with an old conv. Now that we know
-                    // the correct base conv, sessions from a different epoch
-                    // (outside the 256-gen window) must die.
-                    self.sessions_mutex.lock(self.io) catch {};
-                    defer self.sessions_mutex.unlock(self.io);
-                    var s_it = self.sessions.iterator();
-                    while (s_it.next()) |s_entry| {
-                        const diff = s_entry.key_ptr.* -% self.host_expected_conv.?;
-                        if (diff >= 256) {
-                            std.log.info("[mesh] marking session conv={d} dead (outside gen window, base={d})", .{ s_entry.key_ptr.*, self.host_expected_conv.? });
-                            s_entry.value_ptr.*.dead = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // When a remote node restarts (detected via LSA node_info change),
-        // immediately mark all KCP sessions to that node as dead. This lets
-        // the tunnel owner (handleMeshGuest / Guest command loop) break out
-        // of the dead session and call waitForHostTunnel, which will pick up
-        // the fresh m.connect() session with actual data. Without this, the
-        // caller stalls for ~15 s until KCP keepalive timeout (Finding 93).
-        if (lsa_restart) {
-            self.sessions_mutex.lock(self.io) catch {};
-            defer self.sessions_mutex.unlock(self.io);
-            var s_it = self.sessions.iterator();
-            while (s_it.next()) |s_entry| {
-                if (std.mem.eql(u8, &s_entry.value_ptr.*.remote, &decoded.origin)) {
-                    std.log.info("[mesh] marking session conv={d} dead (LSA restart for origin)", .{s_entry.key_ptr.*});
-                    s_entry.value_ptr.*.dead = true;
-                }
-            }
-        }
-
         // Check for version mismatch (upgrade signal).
         // Only compare against the Host's LSA (role:host). Other Guests may
         // still be running an older version during a rolling upgrade — their
         // version does NOT indicate that this Guest needs upgrading. The
-        // upgrade binary always comes from the Host via KCP tunnel.
-        if (!self.upgrade_needed.load(.acquire)) {
-            if (std.mem.indexOf(u8, decoded.node_info, "role:host") != null) {
-                if (std.mem.indexOf(u8, decoded.node_info, "version:")) |v_start| {
-                    const v_line = decoded.node_info[v_start + "version:".len ..];
-                    const v_end = std.mem.indexOfScalar(u8, v_line, '\n') orelse v_line.len;
-                    const remote_version = v_line[0..v_end];
-                    if (!std.mem.eql(u8, remote_version, protocol.VERSION)) {
-                        std.log.info("[mesh] LSA version mismatch: remote={s} local={s} — signalling upgrade", .{ remote_version, protocol.VERSION });
-                        self.upgrade_needed.store(true, .release);
+        // upgrade binary always comes from the Host via TCP.
+        if (self.upgrade_needed) |upgrade_needed| {
+            if (!upgrade_needed.load(.acquire)) {
+                if (std.mem.indexOf(u8, decoded.node_info, "role:host") != null) {
+                    if (std.mem.indexOf(u8, decoded.node_info, "version:")) |v_start| {
+                        const v_line = decoded.node_info[v_start + "version:".len ..];
+                        const v_end = std.mem.indexOfScalar(u8, v_line, '\n') orelse v_line.len;
+                        const remote_version = v_line[0..v_end];
+                        if (!std.mem.eql(u8, remote_version, protocol.VERSION)) {
+                            std.log.info("[lsa] LSA version mismatch: remote={s} local={s} — signalling upgrade", .{ remote_version, protocol.VERSION });
+                            upgrade_needed.store(true, .release);
+                        }
                     }
                 }
             }
@@ -1074,7 +809,7 @@ pub const Mesh = struct {
         // ── relay section: lock, iterate, send, unlock ──
         if (decoded.ttl > 2) {
             if (data.len > 1279) {
-                std.log.warn("[mesh] LSA relay dropped: data too large ({d} bytes)", .{data.len});
+                std.log.warn("[lsa] LSA relay dropped: data too large ({d} bytes)", .{data.len});
                 return;
             }
             var relay_buf: [1280]u8 = undefined;
@@ -1093,179 +828,7 @@ pub const Mesh = struct {
         }
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // KCP data handling
-    // ──────────────────────────────────────────────────────────────────────────
 
-    /// Process an incoming KCP_DATA packet (data does NOT include the type byte).
-    /// Format: ttl(1) src_mac(6) dst_mac(6) kcp_segment(variable)
-    fn handleKcpData(self: *Mesh, data: []const u8, from: net.IpAddress) !void {
-        if (data.len < 13 + kcp.IKCP_OVERHEAD) return;
-
-        const ttl = data[0];
-        if (ttl <= 1) return;
-
-        const src_mac: NodeId = data[1..7].*;
-        const dst_mac: NodeId = data[7..13].*;
-
-        // Read KCP conversation ID directly from the KCP header.
-        const kcp_conv = readKcpConv(data);
-
-        // Are we the destination?
-        if (std.mem.eql(u8, &dst_mac, &self.node_id)) {
-            // ── Conv epoch validation (Guest-side) ──
-            // Once we've received the Host's LSA and know its epoch base,
-            // accept any conv in [base, base+256). The Host's m.connect()
-            // increments a generation counter to produce unique convs for
-            // reconnections — range validation accommodates this while still
-            // rejecting stale packets from a previous Host process (Finding 93).
-            if (self.host_expected_conv) |expected| {
-                const diff = kcp_conv -% expected;
-                if (diff >= 256) {
-                    std.log.info("[mesh] Rejecting KCP packet from {any} conv={d} (outside gen window, base={d})", .{ from, kcp_conv, expected });
-                    return;
-                }
-            }
-
-            std.log.debug("[mesh-kcp] recv UDP {d}B from {any} conv={d}", .{ data.len, from, kcp_conv });
-            // Deliver to our KCP session (keyed by conv from packet header)
-            self.sessions_mutex.lock(self.io) catch {
-            // If the Io context is canceled, skip this periodicTasks cycle.
-            // Do NOT proceed without the lock — shared data would be
-            // accessed unsynchronized and the deferred unlock would corrupt
-            // the mutex state.
-            return;
-        };
-            defer self.sessions_mutex.unlock(self.io);
-            const existing = self.sessions.get(kcp_conv);
-            if (existing) |sess| {
-                const prev_peek = sess.kcp_inst.peekSize();
-                sess.kcp_inst.input(data[13..]) catch |err| {
-                    std.log.err("[mesh] KCP input error: {}", .{err});
-                };
-                const new_peek = sess.kcp_inst.peekSize();
-                if (prev_peek != new_peek) {
-                    const first_sn = sess.kcp_inst.firstRcvBufSn();
-                    std.log.debug("[mesh-kcp] conv={d} peek {}→{} rcvQ={d} rcvB={d} rcvNxt={d} firstBufSn={any}", .{
-                        kcp_conv, prev_peek, new_peek,
-                        sess.kcp_inst.rcvQueueLen(),
-                        sess.kcp_inst.rcvBufLen(),
-                        sess.kcp_inst.rcvNxt(),
-                        first_sn,
-                    });
-                } else if (sess.kcp_inst.rcvBufLen() > 0) {
-                    // Data arrives in rcv_buf but peekSize unchanged (gap exists)
-                    const first_sn = sess.kcp_inst.firstRcvBufSn();
-                    std.log.debug("[mesh-kcp-stall] conv={d} rcvQ={d} rcvB={d} rcvNxt={d} firstBufSn={any} peek={}", .{
-                        kcp_conv,
-                        sess.kcp_inst.rcvQueueLen(),
-                        sess.kcp_inst.rcvBufLen(),
-                        sess.kcp_inst.rcvNxt(),
-                        first_sn,
-                        new_peek,
-                    });
-                }
-                sess.last_recv_ms = self.clock_ms;
-                sess.keepalive_probes = 0;
-                // Keep neighbor alive (sessions_mutex → neighbors_mutex lock order)
-                self.neighbors_mutex.lock(self.io) catch {};
-                if (self.neighbors.getPtr(src_mac)) |neighbor| {
-                    neighbor.last_seen_ms = self.clock_ms;
-                    neighbor.addr = from;
-                }
-                self.neighbors_mutex.unlock(self.io);
-            } else {
-                std.log.info("[mesh] New KCP session from {any} conv={d}", .{ from, kcp_conv });
-                // New incoming session — create KCP instance and store.
-                const new_sess = try self.allocator.create(MeshSession);
-                errdefer self.allocator.destroy(new_sess);
-                new_sess.* = .{
-                    .kcp_inst = try kcp.Kcp.create(self.allocator, kcp_conv, new_sess),
-                    .mesh = self,
-                    .remote = src_mac,
-                    .conv = kcp_conv,
-                    .next_hop = src_mac,
-                    .allocator = self.allocator,
-                    .last_recv_ms = self.clock_ms,
-                };
-                new_sess.kcp_inst.setOutput(meshKcpOutput);
-                // CRITICAL: feed the first packet's data to kcp.input() —
-                // it contains the KCP SYN/data that initializes the connection.
-                new_sess.kcp_inst.input(data[13..]) catch |err| {
-                    std.log.err("[mesh] KCP input error (new session): {}", .{err});
-                };
-                try self.sessions.put(kcp_conv, new_sess);
-                errdefer {
-                    _ = self.sessions.remove(kcp_conv);
-                    self.allocator.destroy(new_sess);
-                }
-
-                // Auto-add the source as a neighbor so we can send KCP
-                // ACKs/output back (sessions_mutex → neighbors_mutex lock order).
-                self.neighbors_mutex.lock(self.io) catch {};
-                {
-                    const n_result = try self.neighbors.getOrPut(src_mac);
-                    n_result.value_ptr.* = .{
-                        .id = src_mac,
-                        .addr = from,
-                        .last_seen_ms = self.clock_ms,
-                        .cost = 1,
-                    };
-                }
-                self.neighbors_mutex.unlock(self.io);
-            }
-        } else {
-            // Relay: forward to next hop toward dst
-            // Guard against UDP amplification: 1 (type) + data.len must not exceed 1280.
-            if (data.len > 1279) {
-                std.log.warn("[mesh] KCP relay dropped: data too large ({d} bytes)", .{data.len});
-                return;
-            }
-            if (self.routeTo(dst_mac)) |next_hop| {
-                self.neighbors_mutex.lock(self.io) catch return;
-                defer self.neighbors_mutex.unlock(self.io);
-                if (self.neighbors.get(next_hop)) |neighbor| {
-                    var relay_buf: [1280]u8 = undefined;
-                    relay_buf[0] = protocol.MESH_TYPE_KCP;
-                    relay_buf[1] = ttl - 1;
-                    @memcpy(relay_buf[2..][0..data.len-1], data[1..][0..data.len - 1]); // copy src+dst+kcp
-                    _ = self.socket.send(self.io, &neighbor.addr, relay_buf[0 .. 1 + data.len]) catch {};
-                }
-            }
-        }
-    }
-
-    /// KCP output callback: when a session has data to send, encapsulate as KCP_DATA and send.
-    fn meshKcpOutput(conv: u32, data: []const u8, user: ?*anyopaque) void {
-        const user_ptr = user orelse {
-            std.log.err("[mesh] kcp_output: user is null", .{});
-            return;
-        };
-        const sess: *MeshSession = @ptrCast(@alignCast(user_ptr));
-        const mesh = sess.mesh;
-        // Look up next-hop neighbor for sending
-        mesh.neighbors_mutex.lock(mesh.io) catch return;
-        defer mesh.neighbors_mutex.unlock(mesh.io);
-        if (mesh.neighbors.get(sess.next_hop)) |neighbor| {
-            std.log.debug("[mesh] kcp_output: conv={d} len={d} to={} next_hop={any}", .{ conv, data.len, neighbor.addr, sess.next_hop });
-            var buf: [4096]u8 = undefined;
-            buf[0] = protocol.MESH_TYPE_KCP;
-            buf[1] = protocol.MESH_MAX_TTL;
-            @memcpy(buf[2..8], &mesh.node_id);
-            @memcpy(buf[8..14], &sess.remote);
-            const header_len: usize = 14;
-            if (header_len + data.len > buf.len) {
-                std.log.err("[mesh] kcp_output: buffer overflow conv={d} len={d}", .{ conv, data.len });
-                return;
-            }
-            @memcpy(buf[header_len..][0..data.len], data);
-            mesh.socket.send(mesh.io, &neighbor.addr, buf[0 .. header_len + data.len]) catch |err| {
-                std.log.err("[mesh] kcp_output: send failed conv={d} addr={} len={d} err={}", .{ conv, neighbor.addr, header_len + data.len, err });
-            };
-        } else {
-            std.log.err("[mesh] kcp_output: neighbor not found for next_hop conv={d}", .{conv});
-        }
-    }
 
     // ──────────────────────────────────────────────────────────────────────────
     // Ping/Pong handling (supports both direct and relayed ping)
@@ -1290,7 +853,7 @@ pub const Mesh = struct {
             if (std.mem.eql(u8, &dst_mac, &self.node_id)) {
                 // Yes — respond with pong (direct reply to relay source)
                 var src_buf: [18]u8 = undefined;
-                std.log.info("[mesh] relayed ping reached target from {s}", .{formatNodeIdBuf(src_mac, &src_buf)});
+                std.log.info("[lsa] relayed ping reached target from {s}", .{formatNodeIdBuf(src_mac, &src_buf)});
                 var pong: [11]u8 = undefined;
                 pong[0] = protocol.MESH_TYPE_PONG;
                 @memcpy(pong[1..7], &self.node_id);
@@ -1315,7 +878,7 @@ pub const Mesh = struct {
                         var src_buf: [18]u8 = undefined;
                         var dst_buf: [18]u8 = undefined;
                         var hop_buf: [18]u8 = undefined;
-                        std.log.info("[mesh] ping relay fwd: {s} → {s} via {s} ttl={d}", .{
+                        std.log.info("[lsa] ping relay fwd: {s} → {s} via {s} ttl={d}", .{
                             formatNodeIdBuf(src_mac, &src_buf),
                             formatNodeIdBuf(dst_mac, &dst_buf),
                             formatNodeIdBuf(next_hop, &hop_buf),
@@ -1344,7 +907,7 @@ pub const Mesh = struct {
         const send_ts = std.mem.readInt(u32, data[6..10], .big);
         const rtt = self.nowMs() -% send_ts;
         var mac_buf: [18]u8 = undefined;
-        std.log.info("[mesh] pong from {s} rtt={d}ms", .{ formatNodeIdBuf(src_mac, &mac_buf), rtt });
+        std.log.info("[lsa] pong from {s} rtt={d}ms", .{ formatNodeIdBuf(src_mac, &mac_buf), rtt });
 
         // Store for --ping command (lock-free read: worst case is stale data)
         self.last_pong_mutex.lock(self.io) catch return;
@@ -1388,7 +951,7 @@ pub const Mesh = struct {
     pub fn sendPing(self: *Mesh, dest_id: NodeId) void {
         const next_hop = self.routeTo(dest_id) orelse {
             var mac_buf: [18]u8 = undefined;
-            std.log.info("[mesh] ping: no route to {s}", .{formatNodeIdBuf(dest_id, &mac_buf)});
+            std.log.info("[lsa] ping: no route to {s}", .{formatNodeIdBuf(dest_id, &mac_buf)});
             return;
         };
 
@@ -1403,7 +966,7 @@ pub const Mesh = struct {
                 std.mem.writeInt(u32, ping[7..11], self.nowMs(), .big);
                 self.socket.send(self.io, &neighbor.addr, &ping) catch {};
                 var dst_buf: [18]u8 = undefined;
-                std.log.info("[mesh] ping direct: → {s} addr={any}", .{ formatNodeIdBuf(dest_id, &dst_buf), neighbor.addr });
+                std.log.info("[lsa] ping direct: → {s} addr={any}", .{ formatNodeIdBuf(dest_id, &dst_buf), neighbor.addr });
             }
             return;
         }
@@ -1422,7 +985,7 @@ pub const Mesh = struct {
             var src_buf: [18]u8 = undefined;
             var dst_buf: [18]u8 = undefined;
             var hop_buf: [18]u8 = undefined;
-            std.log.info("[mesh] ping relay: {s} → {s} via {s}", .{
+            std.log.info("[lsa] ping relay: {s} → {s} via {s}", .{
                 formatNodeIdBuf(self.node_id, &src_buf),
                 formatNodeIdBuf(dest_id, &dst_buf),
                 formatNodeIdBuf(next_hop, &hop_buf),
@@ -1547,64 +1110,7 @@ pub const Mesh = struct {
         self.routes = new_routes;
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Session management
-    // ──────────────────────────────────────────────────────────────────────────
 
-    /// Create a new KCP session to a remote node. Always creates a fresh KCP
-    /// instance with a unique conv (base conv + generation counter). Does NOT
-    /// destroy old sessions for the same destination — they expire naturally
-    /// via keepalive timeout and are cleaned up by the owning Tunnel's deinit.
-    /// Thread-safe: locks sessions_mutex to protect against concurrent mesh.run() access.
-    pub fn connect(self: *Mesh, dest: NodeId) !*MeshSession {
-        self.sessions_mutex.lock(self.io) catch {
-            return error.Canceled;
-        };
-        defer self.sessions_mutex.unlock(self.io);
-
-        // KCP conv = deterministic base + monotonic generation counter.
-        // Host restart → new nonce → new base conv → stale old-process KCP
-        // packets are immediately rejected at the conv level (Finding 93).
-        // The generation counter ensures each connect() call produces a unique
-        // conv even without Host restart, preventing KCP SN mismatch when the
-        // peer still holds state for a previous session (Finding 129).
-        const base_conv = computeConv(self.node_id, dest, self.nonce);
-        const conv = base_conv +% self.session_gen;
-        self.session_gen +%= 1;
-
-        const sess = try self.allocator.create(MeshSession);
-        errdefer self.allocator.destroy(sess);
-
-        const next_hop = self.routeTo(dest) orelse dest;
-        sess.* = .{
-            .kcp_inst = try kcp.Kcp.create(self.allocator, conv, sess),
-            .mesh = self,
-            .remote = dest,
-            .conv = conv,
-            .next_hop = next_hop,
-            .allocator = self.allocator,
-            .last_recv_ms = self.clock_ms,
-        };
-        sess.kcp_inst.setOutput(meshKcpOutput);
-
-        try self.sessions.put(conv, sess);
-        return sess;
-    }
-
-    /// Close and free a session.
-    pub fn closeSession(self: *Mesh, sess: *MeshSession) void {
-        self.sessions_mutex.lock(self.io) catch {
-            // If the Io context is canceled, skip this periodicTasks cycle.
-            // Do NOT proceed without the lock — shared data would be
-            // accessed unsynchronized and the deferred unlock would corrupt
-            // the mutex state.
-            return;
-        };
-        defer self.sessions_mutex.unlock(self.io);
-        _ = self.sessions.remove(sess.conv);
-        sess.deinit();
-        self.allocator.destroy(sess);
-    }
 
     // ──────────────────────────────────────────────────────────────────────────
     // Maintenance
@@ -1723,8 +1229,199 @@ pub const NodeInfo = struct {
     }
 };
 
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// Tests
+// /etc/hosts marker block management (from hosts_file.zig)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Maintain a block wrapped by marker comments in the hosts file:
+//   # UTM-MONITOR-BEGIN
+//   192.168.64.5  macvm
+//   192.168.64.8  linuxvm
+//   # UTM-MONITOR-END
+//
+// Update logic: read file → replace marker block → write back (write to temp file then rename)
+
+/// A single hosts entry
+pub const HostEntry = struct {
+    ip: []const u8,
+    name: []const u8,
+};
+
+/// Update the marker block in the hosts file.
+/// Uses range-based replacement: finds marker boundaries in the original content
+/// and only replaces the block itself — everything outside is preserved byte-for-byte.
+/// This avoids the empty-line accumulation bug (Finding 169) caused by the old
+/// splitScalar + rebuild method, which added a spurious trailing newline on every
+/// write when the file ends with \n (as all well-formed text files do).
+///
+/// If the marker block does not exist, appends it to the end of the file.
+/// Uses temp file + atomic rename for safety.
+pub fn updateHosts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    entries: []const HostEntry,
+) !void {
+    // Read existing file content
+    const original = readFile(io, allocator, file_path) catch |err| switch (err) {
+        error.FileNotFound => {
+            return writeNewHosts(io, allocator, file_path, entries);
+        },
+        else => return err,
+    };
+    defer allocator.free(original);
+
+    const begin_line = protocol.HOSTS_MARKER_BEGIN;
+    const end_line = protocol.HOSTS_MARKER_END;
+
+    // Build new content via range replacement
+    var new_content: std.ArrayList(u8) = .empty;
+    defer new_content.deinit(allocator);
+    try new_content.ensureTotalCapacity(allocator, original.len + 512);
+
+    // Find marker block boundaries in the original content.
+    // We look for lines that match the begin/end markers (after trimming whitespace).
+    const begin_pos = findMarkerLine(original, begin_line);
+    const end_pos = if (begin_pos != null)
+        findMarkerLine(original[begin_pos.? + begin_line.len ..], end_line)
+    else
+        null;
+
+    if (begin_pos != null and end_pos != null) {
+        const block_start = begin_pos.?;
+        const block_end = block_start + begin_line.len + end_pos.? + end_line.len;
+
+        // Find end of the END-marker line (skip past trailing \r\n)
+        var actual_end = block_end;
+        while (actual_end < original.len and (original[actual_end] == '\r' or original[actual_end] == '\n')) {
+            actual_end += 1;
+        }
+
+        // Copy content before the marker block
+        try new_content.appendSlice(allocator, original[0..block_start]);
+
+        // Write new block
+        try new_content.appendSlice(allocator, begin_line);
+        try new_content.append(allocator, '\n');
+        for (entries) |entry| {
+            try new_content.print(allocator, "{s}  {s}\n", .{ entry.ip, entry.name });
+        }
+        try new_content.appendSlice(allocator, end_line);
+        try new_content.append(allocator, '\n');
+
+        // Copy content after the marker block
+        if (actual_end < original.len) {
+            try new_content.appendSlice(allocator, original[actual_end..]);
+        }
+    } else {
+        // No marker block exists — copy original and append new block
+        try new_content.appendSlice(allocator, original);
+
+        // Ensure trailing newline before appending block
+        if (new_content.items.len > 0 and new_content.items[new_content.items.len - 1] != '\n') {
+            try new_content.append(allocator, '\n');
+        }
+        try new_content.appendSlice(allocator, begin_line);
+        try new_content.append(allocator, '\n');
+        for (entries) |entry| {
+            try new_content.print(allocator, "{s}  {s}\n", .{ entry.ip, entry.name });
+        }
+        try new_content.appendSlice(allocator, end_line);
+        try new_content.append(allocator, '\n');
+    }
+
+    // Write to temp file
+    const tmp_path = try std.mem.concat(allocator, u8, &.{ file_path, ".tmp" });
+    defer allocator.free(tmp_path);
+
+    try writeFile(io, tmp_path, new_content.items);
+
+    // Atomic rename using the file's parent directory (not cwd, which may change).
+    // For absolute paths like /etc/hosts, this opens /etc as the dir handle.
+    const parent_dir_path = std.fs.path.dirname(file_path) orelse "/";
+    const parent_dir = try std.Io.Dir.cwd().openDir(io, parent_dir_path, .{});
+    defer parent_dir.close(io);
+    const file_basename = std.fs.path.basename(file_path);
+    try parent_dir.rename(tmp_path, parent_dir, file_basename, io);
+}
+
+/// Read entire file content
+fn readFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+
+    const size = try file.length(io);
+    const buf = try allocator.alloc(u8, @intCast(size));
+    errdefer allocator.free(buf);
+
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    try reader.interface.readSliceAll(buf);
+    return buf;
+}
+
+/// Write entire file content
+fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = @enumFromInt(0o644) });
+    defer file.close(io);
+
+    var write_buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &write_buf);
+    try writer.interface.writeAll(content);
+    try writer.interface.flush();
+}
+
+/// Create a new hosts file (with marker block)
+fn writeNewHosts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    entries: []const HostEntry,
+) !void {
+    _ = allocator;
+    const file = try std.Io.Dir.cwd().createFile(io, file_path, .{ .permissions = @enumFromInt(0o644) });
+    defer file.close(io);
+
+    var write_buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &write_buf);
+
+    try writer.interface.print("{s}\n", .{protocol.HOSTS_MARKER_BEGIN});
+    for (entries) |entry| {
+        try writer.interface.print("{s}  {s}\n", .{ entry.ip, entry.name });
+    }
+    try writer.interface.print("{s}\n", .{protocol.HOSTS_MARKER_END});
+    try writer.interface.flush();
+}
+
+/// Find the byte offset of a marker line within content.
+/// The marker must appear at the start of a line (after optional leading whitespace).
+/// Returns the byte position of the FIRST character of the marker, or null if not found.
+fn findMarkerLine(content: []const u8, marker: []const u8) ?usize {
+    var pos: usize = 0;
+    while (pos < content.len) {
+        // Skip leading whitespace on this line
+        var line_start = pos;
+        while (line_start < content.len and (content[line_start] == ' ' or content[line_start] == '\t' or content[line_start] == '\r')) {
+            line_start += 1;
+        }
+        // Check if this line starts with the marker
+        if (line_start + marker.len <= content.len and std.mem.eql(u8, content[line_start..][0..marker.len], marker)) {
+            // Verify it's at the start of a line or preceded by \n
+            if (pos == 0 or content[pos - 1] == '\n') {
+                return line_start;
+            }
+        }
+        // Advance to next line
+        while (pos < content.len and content[pos] != '\n') : (pos += 1) {}
+        if (pos < content.len) pos += 1; // skip the \n
+    }
+    return null;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests — mesh (from mesh.zig)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test "parseNodeId" {
@@ -1743,46 +1440,6 @@ test "formatNodeId" {
     const text = try formatNodeId(id, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", text);
-}
-
-test "computeConv" {
-    const a: NodeId = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
-    const b: NodeId = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
-    // Same MACs with nonce=0 → conv = 0 (all XOR pairs cancel)
-    try std.testing.expectEqual(@as(u32, 0), computeConv(a, b, 0));
-    // Same MACs with nonce=42 → conv = 42
-    try std.testing.expectEqual(@as(u32, 42), computeConv(a, b, 42));
-
-    const a2: NodeId = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
-    const b2: NodeId = .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
-    _ = computeConv(a2, b2, 0); // just verify non-zero and deterministic
-    try std.testing.expectEqual(computeConv(a2, b2, 0), computeConv(a2, b2, 0));
-    // Verify nonce changes conv
-    try std.testing.expect(computeConv(a2, b2, 0) != computeConv(a2, b2, 1));
-}
-
-test "readKcpConv" {
-    var buf: [64]u8 = [_]u8{0} ** 64;
-    // Write a KCP conv at offset 13 (big-endian, matching KCP wire format)
-    std.mem.writeInt(u32, buf[13..17], 0x12345678, .big);
-    try std.testing.expectEqual(@as(u32, 0x12345678), readKcpConv(&buf));
-}
-
-test "computeConv symmetry: Host and Guest produce same conv" {
-    const host: NodeId = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
-    const guest: NodeId = .{ 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f };
-    const nonce: u32 = 0xDEADBEEF;
-    // Host: conv = computeConv(host, guest, host_nonce)
-    // Guest: conv = computeConv(host, guest, host_nonce) — same args
-    try std.testing.expectEqual(
-        computeConv(host, guest, nonce),
-        computeConv(host, guest, nonce),
-    );
-    // Verify different nonce → different conv (epoch isolation)
-    try std.testing.expect(computeConv(host, guest, nonce) != computeConv(host, guest, nonce ^ 1));
-    // Verify different guest → different conv
-    const guest2: NodeId = .{ 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
-    try std.testing.expect(computeConv(host, guest, nonce) != computeConv(host, guest2, nonce));
 }
 
 test "parseEpoch" {
@@ -1819,4 +1476,169 @@ test "encodeLsa + decodeLsa round-trip" {
     try std.testing.expectEqual(@as(usize, 1), parsed.items.len);
     try std.testing.expect(std.mem.eql(u8, &parsed.items[0].mac, &neighbors[0].mac));
     try std.testing.expectEqual(@as(u8, 1), parsed.items[0].cost);
+}
+
+test "nonceChanged" {
+    const a = "hostname:test\nnonce:42";
+    const b = "hostname:test\nnonce:99";
+    const c = "hostname:test\nnonce:42";
+    const d = "hostname:test\n"; // no nonce
+    const e = ""; // no nonce
+
+    // Same nonce → false
+    try std.testing.expect(!nonceChanged(a, c));
+    // Different nonce → true
+    try std.testing.expect(nonceChanged(a, b));
+    // Same string (no nonce) → false
+    try std.testing.expect(!nonceChanged(a, a));
+    // Different strings, both no nonce → fallback to full comparison
+    try std.testing.expect(nonceChanged(d, e));
+    // One with nonce, one without → fallback to full comparison (different strings)
+    try std.testing.expect(nonceChanged(a, d));
+    // One with nonce, one without but same non-nonce content → fallback (different strings)
+    try std.testing.expect(nonceChanged(a, "hostname:test\n"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests — hosts file (from hosts_file.zig)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test "HostEntry struct basics" {
+    const e = HostEntry{ .ip = "10.0.0.1", .name = "testvm" };
+    try std.testing.expectEqualStrings("10.0.0.1", e.ip);
+    try std.testing.expectEqualStrings("testvm", e.name);
+}
+
+test "HostEntry with FQDN" {
+    const e = HostEntry{ .ip = "192.168.1.100", .name = "linuxvm.aarch64-linux-musl.utm" };
+    try std.testing.expectEqualStrings("192.168.1.100", e.ip);
+    try std.testing.expectEqualStrings("linuxvm.aarch64-linux-musl.utm", e.name);
+}
+
+test "HostEntry with IPv6 address" {
+    const e = HostEntry{ .ip = "fe80::1", .name = "ipv6host" };
+    try std.testing.expectEqualStrings("fe80::1", e.ip);
+    try std.testing.expectEqualStrings("ipv6host", e.name);
+}
+
+test "HostEntry with empty name" {
+    const e = HostEntry{ .ip = "1.2.3.4", .name = "" };
+    try std.testing.expectEqualStrings("1.2.3.4", e.ip);
+    try std.testing.expectEqualStrings("", e.name);
+}
+
+test "multiple entries with different IPs" {
+    const entries = [_]HostEntry{
+        .{ .ip = "10.0.0.1", .name = "vm1" },
+        .{ .ip = "10.0.0.2", .name = "vm2" },
+        .{ .ip = "10.0.0.3", .name = "vm3" },
+    };
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings("10.0.0.1", entries[0].ip);
+    try std.testing.expectEqualStrings("vm2", entries[1].name);
+    try std.testing.expectEqualStrings("10.0.0.3", entries[2].ip);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests — hosts file range replacement (Finding 169 fix)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test "findMarkerLine - basic" {
+    const content = "127.0.0.1 localhost\n# UTM-MONITOR-BEGIN\n1.2.3.4 vm\n# UTM-MONITOR-END\n";
+    const pos = findMarkerLine(content, "# UTM-MONITOR-BEGIN").?;
+    // "127.0.0.1 localhost\n" = 20 bytes, so '#' is at offset 20
+    try std.testing.expectEqual(@as(usize, 20), pos);
+}
+
+test "findMarkerLine - not found" {
+    const content = "127.0.0.1 localhost\nno markers here\n";
+    try std.testing.expectEqual(@as(?usize, null), findMarkerLine(content, "# UTM-MONITOR-BEGIN"));
+}
+
+test "findMarkerLine - with leading whitespace" {
+    const content = "127.0.0.1 localhost\n  # UTM-MONITOR-BEGIN\n1.2.3.4 vm\n# UTM-MONITOR-END\n";
+    const pos = findMarkerLine(content, "# UTM-MONITOR-BEGIN");
+    try std.testing.expect(pos != null);
+}
+
+test "findMarkerLine - end marker" {
+    const content = "127.0.0.1 localhost\n# UTM-MONITOR-BEGIN\n1.2.3.4 vm\n# UTM-MONITOR-END\n";
+    const begin = findMarkerLine(content, "# UTM-MONITOR-BEGIN").?;
+    const after = content[begin + "# UTM-MONITOR-BEGIN".len ..];
+    const end = findMarkerLine(after, "# UTM-MONITOR-END").?;
+    // end offset is the position within `after`
+    try std.testing.expect(end < after.len);
+}
+
+test "updateHosts range replacement - no empty line accumulation" {
+    // Simulate the range replacement logic: write a file with marker block,
+    // then "update" it twice and verify no trailing empty lines accumulate.
+
+    const allocator = std.testing.allocator;
+    const begin_line = "# UTM-MONITOR-BEGIN";
+    const end_line = "# UTM-MONITOR-END";
+
+    // Build a file that ends with newline (normal well-formed text file)
+    const original = "127.0.0.1 localhost\n\n# UTM-MONITOR-BEGIN\n192.168.64.5 macvm\n# UTM-MONITOR-END\n";
+    const entries = [_]HostEntry{
+        .{ .ip = "10.0.0.1", .name = "vm1" },
+        .{ .ip = "10.0.0.2", .name = "vm2" },
+    };
+
+    // Run the range-replacement logic 3 times, simulating repeated updateHosts calls
+    var content = try allocator.dupe(u8, original);
+
+    for (0..3) |_| {
+        const begin_pos = findMarkerLine(content, begin_line);
+        const end_pos = if (begin_pos != null)
+            findMarkerLine(content[begin_pos.? + begin_line.len ..], end_line)
+        else
+            null;
+
+        var new_content: std.ArrayList(u8) = .empty;
+        try new_content.ensureTotalCapacity(allocator, content.len + 128);
+
+        if (begin_pos != null and end_pos != null) {
+            const block_start = begin_pos.?;
+            const block_end = block_start + begin_line.len + end_pos.? + end_line.len;
+            var actual_end = block_end;
+            while (actual_end < content.len and (content[actual_end] == '\r' or content[actual_end] == '\n')) {
+                actual_end += 1;
+            }
+            try new_content.appendSlice(allocator, content[0..block_start]);
+            try new_content.appendSlice(allocator, begin_line);
+            try new_content.append(allocator, '\n');
+            for (entries) |entry| {
+                try new_content.print(allocator, "{s}  {s}\n", .{ entry.ip, entry.name });
+            }
+            try new_content.appendSlice(allocator, end_line);
+            try new_content.append(allocator, '\n');
+            if (actual_end < content.len) {
+                try new_content.appendSlice(allocator, content[actual_end..]);
+            }
+        }
+
+        // Replace old content with new
+        const new_slice = try new_content.toOwnedSlice(allocator);
+        allocator.free(content);
+        content = new_slice;
+    }
+
+    // After 3 iterations, verify:
+    // 1. No duplicate empty lines
+    // 2. The file doesn't grow unboundedly
+    // 3. Content before the block is preserved
+    try std.testing.expect(std.mem.startsWith(u8, content, "127.0.0.1 localhost\n\n"));
+    try std.testing.expect(std.mem.indexOf(u8, content, "# UTM-MONITOR-BEGIN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "10.0.0.1  vm1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "10.0.0.2  vm2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "# UTM-MONITOR-END") != null);
+
+    // The content should end with the END marker + newline — no extra trailing empty lines
+    try std.testing.expect(std.mem.endsWith(u8, content, "# UTM-MONITOR-END\n"));
+
+    // Verify no trailing empty lines after the end marker (no \n\n at end)
+    try std.testing.expect(!std.mem.endsWith(u8, content, "\n\n"));
+
+    allocator.free(content);
 }

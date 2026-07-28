@@ -1,6 +1,6 @@
 //! UTM Monitor — Automatic VM IP sync tool
 //!
-//! Guest mode (default): mesh LSA + KCP tunnel to Host
+//! Guest mode (default): mesh LSA + TCP/SOCKS4 connection to Host
 //! Host mode (--host): ensures Host service is running
 //!
 //! Self-copy model: binary copies itself to canonical path /opt/utmm/utmm[.exe].
@@ -10,15 +10,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const host_mod = @import("host.zig");
-const broadcast = @import("broadcast.zig");
+const guest = @import("guest.zig");
 const svc = @import("svc.zig");
 const fail = @import("fail.zig");
 const mcp = @import("mcp.zig");
 const shm = @import("shm.zig");
-const ringbuf = @import("ringbuf.zig");
-const cmdchan = @import("cmdchan.zig");
-const completion = @import("completion.zig");
-comptime { _ = ringbuf; _ = cmdchan; _ = completion; }
 
 /// Embedded utmmd binary — compiled at build time, extracted at install time.
 const utmmd_bin = @embedFile("embed/utmmd.bin");
@@ -28,13 +24,9 @@ const utmmd_bin = @embedFile("embed/utmmd.bin");
 const utmmd_sha256_hex: [:0]const u8 = @embedFile("embed/utmmd.sha256");
 
 comptime {
-    _ = @import("hosts_file.zig");
+    _ = @import("lsa.zig");
     _ = @import("config.zig");
-    _ = @import("kcp.zig");
-    _ = @import("mesh.zig");
-    _ = @import("tunnel.zig");
-    _ = @import("tunproto.zig");
-    _ = @import("lock.zig");
+    _ = @import("tcp.zig");
     _ = @import("mcp.zig");
     _ = @import("host.zig");
     _ = svc;
@@ -47,7 +39,7 @@ pub const CliArgs = struct {
     is_host: bool = false,
     /// Mesh UDP port (Host mode)
     port: u16 = protocol.DEFAULT_PORT,
-    /// Mesh UDP port for LSA + KCP
+    /// Mesh UDP port for LSA broadcast
     mesh_port: u16 = protocol.DEFAULT_PORT,
     /// Direct peer mesh address for local testing
     peer_mesh: ?[]const u8 = null,
@@ -70,6 +62,8 @@ pub const CliArgs = struct {
     serve_dir: ?[]const u8 = null,
     /// Whether to save config
     save_config: bool = false,
+    /// Enable automatic upgrade (Guest→Host version matching via LSA)
+    auto_upgrade: bool = false,
     /// Run as daemon via service manager (--svc, set by service configs)
     is_svc: bool = false,
 
@@ -189,6 +183,8 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             }
         } else if (std.mem.eql(u8, arg, "--save-config")) {
             cli.save_config = true;
+        } else if (std.mem.eql(u8, arg, "--auto-upgrade")) {
+            cli.auto_upgrade = true;
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (i + 1 < args.len) {
                 i += 1;
@@ -270,6 +266,7 @@ pub fn printHelp() void {
         \\  --config PATH       Config file path
         \\  --log-file PATH     Log file path
         \\  --save-config       Save current parameters to config file
+        \\  --auto-upgrade      Enable automatic Guest→Host version matching via LSA
         \\
         \\Management commands (require Host service running):
         \\  --status            Query all online guest status
@@ -350,7 +347,7 @@ pub fn main(init: std.process.Init) !void {
         if (cli.is_host) {
             try host_mod.runWithIo(init.io, init.gpa, cli, null);
         } else {
-            try broadcast.guestRunWithIo(init.io, init.gpa, cli, null);
+            try guest.guestRunWithIo(init.io, init.gpa, cli, null);
         }
         // Cleanup — join heartbeat thread on exit
         if (hb_thread) |t| {
@@ -607,7 +604,10 @@ fn heartbeatThread(h: *volatile shm.ShmLayout, io: std.Io) void {
     while (true) {
         const now = shm.nowMs(io);
         h.utmm_heartbeat = now;
-        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch break;
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {
+            std.log.err("[main] heartbeat sleep failed, exiting heartbeat thread", .{});
+            break;
+        };
     }
 }
 

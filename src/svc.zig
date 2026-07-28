@@ -11,7 +11,168 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const fail = @import("fail.zig");
-const lock = @import("lock.zig");
+/// Install-time singleton lock to serialize install/uninstall operations.
+/// Uses OS-level advisory locks automatically released on process exit.
+const InstallLock = struct {
+    const path_posix = "/var/run/utmm-install.lock";
+    const path_win = "C:\\opt\\utmm\\utmm-install.lock";
+
+    var _locked: bool = false;
+
+    pub fn acquire() !void {
+        if (builtin.os.tag == .windows) {
+            return acquireWindows();
+        }
+        return acquirePosix();
+    }
+
+    pub fn release() void {
+        if (!_locked) return;
+        if (builtin.os.tag == .windows) {
+            releaseWindows();
+        } else {
+            releasePosix();
+        }
+        _locked = false;
+    }
+
+    // ──────────── POSIX: flock ────────────
+    const O_CREAT: c_int = if (builtin.os.tag == .macos) 0x0200 else 0o100;
+    const O_RDWR: c_int = if (builtin.os.tag == .macos) 0x0002 else 0o2;
+    const LOCK_EX: c_int = 2;
+    const LOCK_UN: c_int = 8;
+
+    extern "c" fn open(path: [*:0]const u8, oflag: c_int, mode: c_uint) c_int;
+    extern "c" fn flock(fd: c_int, operation: c_int) c_int;
+    extern "c" fn close(fd: c_int) c_int;
+
+    var posix_fd: c_int = -1;
+
+    fn acquirePosix() !void {
+        const fd = open(path_posix, O_CREAT | O_RDWR, 0o644);
+        if (fd < 0) {
+            std.log.err("[svc] install-lock: open failed", .{});
+            return error.LockFailed;
+        }
+        if (flock(fd, LOCK_EX) != 0) {
+            _ = close(fd);
+            std.log.err("[svc] install-lock: flock failed", .{});
+            return error.LockFailed;
+        }
+        posix_fd = fd;
+        _locked = true;
+    }
+
+    fn releasePosix() void {
+        _ = flock(posix_fd, LOCK_UN);
+        _ = close(posix_fd);
+        posix_fd = -1;
+    }
+
+    // ──────────── Windows: LockFileEx ────────────
+    const w = std.os.windows;
+    const DWORD = w.DWORD;
+    const BOOL = w.BOOL;
+    const HANDLE = w.HANDLE;
+    const INVALID_HANDLE_VALUE = w.INVALID_HANDLE_VALUE;
+    const GENERIC_READ: DWORD = 0x80000000;
+    const GENERIC_WRITE: DWORD = 0x40000000;
+    const FILE_ATTRIBUTE_NORMAL: DWORD = 128;
+    const OPEN_ALWAYS: DWORD = 4;
+    const LOCKFILE_EXCLUSIVE_LOCK: DWORD = 0x00000002;
+
+    const OVERLAPPED = extern struct {
+        Internal: usize,
+        InternalHigh: usize,
+        Offset: DWORD,
+        OffsetHigh: DWORD,
+        hEvent: ?HANDLE,
+    };
+
+    extern "kernel32" fn CreateFileW(
+        lpFileName: [*:0]const u16,
+        dwDesiredAccess: DWORD,
+        dwShareMode: DWORD,
+        lpSecurityAttributes: ?*anyopaque,
+        dwCreationDisposition: DWORD,
+        dwFlagsAndAttributes: DWORD,
+        hTemplateFile: ?HANDLE,
+    ) callconv(.winapi) HANDLE;
+
+    extern "kernel32" fn LockFileEx(
+        hFile: HANDLE,
+        dwFlags: DWORD,
+        dwReserved: DWORD,
+        nNumberOfBytesToLockLow: DWORD,
+        nNumberOfBytesToLockHigh: DWORD,
+        lpOverlapped: *OVERLAPPED,
+    ) callconv(.winapi) BOOL;
+
+    extern "kernel32" fn UnlockFileEx(
+        hFile: HANDLE,
+        dwReserved: DWORD,
+        nNumberOfBytesToUnlockLow: DWORD,
+        nNumberOfBytesToUnlockHigh: DWORD,
+        lpOverlapped: *OVERLAPPED,
+    ) callconv(.winapi) BOOL;
+
+    extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+
+    var win_handle: HANDLE = undefined;
+
+    fn acquireWindows() !void {
+        // Convert path to UTF-16 (stack-allocated, path is short)
+        var path_utf16: [128]u16 = [_]u16{0} ** 128;
+        var i: usize = 0;
+        for (path_win) |c| {
+            path_utf16[i] = @intCast(c);
+            i += 1;
+        }
+        path_utf16[i] = 0;
+
+        const h = CreateFileW(
+            @ptrCast(&path_utf16),
+            GENERIC_READ | GENERIC_WRITE,
+            0, // exclusive access
+            null,
+            OPEN_ALWAYS, // create if not exists
+            FILE_ATTRIBUTE_NORMAL,
+            null,
+        );
+        if (h == INVALID_HANDLE_VALUE) {
+            std.log.err("[svc] install-lock: CreateFileW failed", .{});
+            return error.LockFailed;
+        }
+
+        var overlapped: OVERLAPPED = .{
+            .Internal = 0,
+            .InternalHigh = 0,
+            .Offset = 0,
+            .OffsetHigh = 0,
+            .hEvent = null,
+        };
+        if (LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped) == 0) {
+            _ = CloseHandle(h);
+            std.log.err("[svc] install-lock: LockFileEx failed", .{});
+            return error.LockFailed;
+        }
+
+        win_handle = h;
+        _locked = true;
+    }
+
+    fn releaseWindows() void {
+        var overlapped: OVERLAPPED = .{
+            .Internal = 0,
+            .InternalHigh = 0,
+            .Offset = 0,
+            .OffsetHigh = 0,
+            .hEvent = null,
+        };
+        _ = UnlockFileEx(win_handle, 0, 1, 0, &overlapped);
+        _ = CloseHandle(win_handle);
+    }
+};
 const protocol = @import("protocol.zig");
 
 /// Canonical install path for utmm (the managed process).
@@ -458,10 +619,10 @@ fn uninstallServiceConfig(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRo
 
 /// Uninstall service: acquire lock, stop, remove config, delete binary.
 pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
-    lock.acquire(io, alloc) catch |err| {
+    InstallLock.acquire() catch |err| {
         fail.err("uninstall/lock", err);
     };
-    defer lock.release(io);
+    defer InstallLock.release();
 
     // Stop and remove all service names (current + legacy)
     switch (builtin.os.tag) {
@@ -1049,10 +1210,10 @@ fn copySiblingBinariesToServeDir(io: std.Io, alloc: std.mem.Allocator, src_dir: 
 /// Force-install the service (public entry point, acquires singleton lock).
 /// Called from main.zig --install path.
 pub fn forceInstall(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) void {
-    lock.acquire(io, alloc) catch |err| {
+    InstallLock.acquire() catch |err| {
         fail.err("forceInstall/lock", err);
     };
-    defer lock.release(io);
+    defer InstallLock.release();
     forceInstallInternal(io, alloc, role, extra_args);
 }
 
@@ -1130,10 +1291,10 @@ pub fn ensure(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_arg
         return;
     }
     std.log.info("[svc] {s} service not running — acquiring lock...", .{name});
-    lock.acquire(io, alloc) catch |err| {
+    InstallLock.acquire() catch |err| {
         fail.err("ensure/lock", err);
     };
-    defer lock.release(io);
+    defer InstallLock.release();
     forceInstallInternal(io, alloc, role, extra_args);
 }
 
@@ -1328,6 +1489,145 @@ pub fn saveUtmmdMeta(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, ex
     };
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Platform detection + init script generation (moved from host.zig, Task 9)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Supported operating system platforms for init script generation.
+pub const Platform = enum {
+    linux,
+    macos,
+    windows,
+
+    pub fn detect() Platform {
+        return switch (builtin.os.tag) {
+            .linux => .linux,
+            .macos => .macos,
+            .windows => .windows,
+            else => .linux,
+        };
+    }
+
+    pub fn asStr(self: Platform) []const u8 {
+        return switch (self) {
+            .linux => "linux",
+            .macos => "macos",
+            .windows => "windows",
+        };
+    }
+};
+
+/// Generate auto-start script/config template for the given platform.
+pub fn genInit(platform: Platform) []const u8 {
+    return switch (platform) {
+        .macos =>
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+        \\  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>Label</key>
+        \\    <string>com.utmmd</string>
+        \\    <key>ProgramArguments</key>
+        \\    <array>
+        \\        <string>/opt/utmm/utmmd</string>
+        \\        <string>--role</string>
+        \\        <string>guest</string>
+        \\    </array>
+        \\    <key>EnvironmentVariables</key>
+        \\    <dict>
+        \\        <key>SHELL</key>
+        \\        <string>/bin/zsh</string>
+        \\        <key>HOME</key>
+        \\        <string>/var/root</string>
+        \\    </dict>
+        \\    <key>RunAtLoad</key>
+        \\    <true/>
+        \\    <key>KeepAlive</key>
+        \\    <dict>
+        \\        <key>SuccessfulExit</key>
+        \\        <false/>
+        \\    </dict>
+        \\    <key>ThrottleInterval</key>
+        \\    <integer>5</integer>
+        \\    <key>StandardOutPath</key>
+        \\    <string>/var/log/utmmd.log</string>
+        \\</dict>
+        \\</plist>
+        \\
+        \\<!-- Install: sudo cp this file to /Library/LaunchDaemons/com.utmmd.plist -->
+        \\<!-- Load:    sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmmd.plist -->
+        \\
+        \\<!-- Host mode: change --role guest to --role host -->
+        ,
+        .linux =>
+        \\[Unit]
+        \\Description=UTM Monitor Service (utmmd)
+        \\After=network.target
+        \\
+        \\[Service]
+        \\Type=simple
+        \\Environment=SHELL=/bin/bash
+        \\Environment=HOME=/root
+        \\ExecStart=/opt/utmm/utmmd --role guest
+        \\WorkingDirectory=/opt/utmm
+        \\Restart=on-failure
+        \\RestartSec=5
+        \\StartLimitBurst=3
+        \\StartLimitIntervalSec=30
+        \\StandardOutput=journal
+        \\
+        \\[Install]
+        \\WantedBy=multi-user.target
+        \\
+        \\<!-- Install: sudo cp this file to /etc/systemd/system/utmmd.service -->
+        \\<!-- Enable:  sudo systemctl daemon-reload && sudo systemctl enable utmmd -->
+        \\
+        \\<!-- Host mode: change --role guest to --role host in ExecStart -->
+        ,
+        .windows =>
+        \\:: UTM Monitor auto-start service (utmmd)
+        \\::
+        \\:: Install: sc create "UTM-MonitorD" binPath= "\"C:\opt\utmm\utmmd.exe\" --role guest" start= auto
+        \\::           sc failure "UTM-MonitorD" reset=30 actions=restart/5000/restart/5000/restart/5000/none/5000
+        \\::           sc start "UTM-MonitorD"
+        \\:: Remove:  sc stop "UTM-MonitorD" & sc delete "UTM-MonitorD"
+        \\
+        \\:: Host mode: change --role guest to --role host in binPath
+        ,
+    };
+}
+
+test "Platform.detect returns valid platform" {
+    const p = Platform.detect();
+    _ = switch (p) {
+        .macos, .linux, .windows => true,
+    };
+}
+
+test "genInit - linux has systemd service" {
+    const script = genInit(.linux);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmmd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "[Unit]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "[Service]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--role guest") != null);
+}
+
+test "genInit - macos has launchd plist" {
+    const script = genInit(.macos);
+    try std.testing.expect(std.mem.indexOf(u8, script, "com.utmmd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "plist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "/opt/utmm/utmmd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "--role") != null);
+}
+
+test "genInit - windows has sc command" {
+    const script = genInit(.windows);
+    try std.testing.expect(std.mem.indexOf(u8, script, "sc create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "UTM-MonitorD") != null);
+    try std.testing.expect(std.mem.indexOf(u8, script, "C:\\opt\\utmm\\utmmd.exe") != null);
+}
 
 // ========== Tests ==========
 
