@@ -261,6 +261,12 @@ Host never pushes upgrades — the Guest is fully self-upgrading.
   The upgrade check runs both between command sessions and inside the command loop
   (v0.12.0+), ensuring idle Guests detect the signal promptly.
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
+- **No auto-uninstall on version mismatch** (v0.12.1+) — `verifyServeDirBinaries`
+  only warns when platform binaries don't match the Host version. Auto-uninstalling
+  (v0.12.0 behavior) leaves the machine unreachable with zero recovery path — far
+  worse than degraded Guest auto-upgrade (which is self-limiting anyway). Host
+  continues serving exec/upload/download commands. Guest auto-upgrade is temporarily
+  unavailable until matching platform binaries are provided.
 
 ## Build & Run
 

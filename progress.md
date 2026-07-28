@@ -1,13 +1,85 @@
-# Progress: v0.12.0
+# Progress: v0.12.1
 
 ## 当前状态
 
 - **分支**: `main`
-- **版本**: v0.12.0（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入；`build.zig.zon` 永为 `0.0.0`）
+- **版本**: v0.12.1（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入；`build.zig.zon` 永为 `0.0.0`）
 - **测试**: 166/166 通过
-- **部署**: macOS Host v0.12.0 ✅ | linuxvm v0.11.23 | macvm v0.11.23 | windowsvm v0.12.0 ✅ | winx64 v0.11.23
-- **健康检查**: 4/4 Guest 在线，windowsvm 已升级到 v0.12.0
+- **部署**: macOS Host v0.12.1 ✅ | linuxvm v0.12.1 ✅ | macvm v0.12.1 ✅ | windowsvm v0.12.1 ✅ | winx64 v0.12.1 ✅
+- **健康检查**: 4/4 Guest 在线，全部 v0.12.1，exec/ping 正常
 - **跨平台编译**: 8/8 目标全部通过
+
+## Phase 78: serve-dir 版本不匹配自动 uninstall 修复 + 全节点部署 ✅ (2026-07-28)
+
+### 背景
+
+v0.12.1 发布后，用户报告所有 VM 的 KCP 隧道断开（Status 和 Ping 正常但 Exec 全挂）。排查过程发现两个连锁问题：
+
+1. **Host 升级 v0.12.0→v0.12.1 时二进制被 SIGKILL** — 安装显示成功但 1 秒内 utmm+utmmd+plist 全部消失
+2. **v0.11.23 Guest 跨版本自动升级不兼容** — 升级流程阻塞命令通道，所有 exec 返回 exit=-1
+
+### v0.11.23 Guest 跨版本兼容问题
+
+v0.11.23 Guest 的 `applyUpgradeAndRestart` 与 v0.12.0 的 utmmd shm 信令机制不兼容：
+- **linuxvm**: 旧 utmmd (v0.11.23) 不调用 `waitpid` → 数百个僵尸进程泄漏 → 系统接近冻结
+- **macvm**: 旧二进制顽固存活（ignore SIGTERM），kill 后 launchd throttle，走 startDirect 回退
+- **winx64**: 旧 utmm.exe 被进程锁定，需上传到不同文件名再替换
+- **Host 升级到 v0.12.1** 后出现重复 LSA 条目（新旧 hostname 同 MAC/IP）导致隧道 flapping
+
+### Binary SIGKILL / 自毁排查
+
+二进制 `/opt/utmm/utmm`（v0.12.1，SHA256 正确，Mach-O arm64，ad-hoc signed）运行 `--version` 立即 SIGKILL (exit 137)：
+- `xattr`: 无 quarantine 属性
+- launchd plist: 消失（连同二进制）
+- 无 `/utmmd-shm`、无锁文件、无系统日志 kill 记录
+- 旧 utmm 进程杀掉后仍 SIGKILL → 排除旧进程干扰
+
+**关键发现**: 手动运行 utmmd 捕获到真实输出：
+```
+error: [host] No platform binaries found in serve-dir '/opt/utmm'
+error: [host] Host version is 0.12.1 but no matching binaries exist.
+[host] ERROR: Serve-dir version mismatch. Uninstalling service.
+```
+→ `svc.uninstall()` 删除了 `/opt/utmm/utmm` + `/opt/utmm/utmmd` + `/Library/LaunchDaemons/com.utmmd.plist`
+
+### Bug 根因
+
+1. `--install` 从 canonical path 执行时，`selfCopy` 检测到 src==dest → 跳过（正确）
+2. `copySiblingBinariesToServeDir` 检测到 src==dest → 跳过，平台文件从未更新
+3. Host 启动时 `verifyServeDirBinaries` 检查 `/opt/utmm/` 下是否有匹配 v0.12.1 的平台文件 → 找不到（只有 v0.12.0）→ 调用 `svc.uninstall()` → `exit(1)`
+
+### Task 393: 代码修复 ✅
+
+**`src/host.zig:776-783`** (commit `9716850`):
+```
+// 旧：
+if (!verifyServeDirBinaries(block_io, sd)) {
+    std.debug.print("[host] ERROR: Serve-dir version mismatch. Uninstalling service.\n", .{});
+    svc.uninstall(block_io, gpa) catch {};
+    std.process.exit(1);
+}
+
+// 新：
+// 警告但继续运行 — 自毁比升级降级糟糕得多
+_ = verifyServeDirBinaries(block_io, sd);
+```
+
+### Task 396-399: 全节点升级到 v0.12.1 ✅
+
+所有 Guest 手动升级（SSH + `--install` 或 SCP 二进制 + reinstall）:
+- **linuxvm**: kill 僵尸进程 → `--install` → pty 重建 → exec 恢复 ✅
+- **winx64**: PowerShell `Stop-Process -Force` → `--install` → exec 恢复 ✅
+- **macvm**: killAllUtmm 杀僵死 PID 23939 → `--install` → exec 恢复 ✅
+- **windowsvm**: SCP `utmm-aarch64-windows-0.12.1.exe` → 替换 + `--install` → exec 恢复 ✅
+
+### Task 400: serve-dir 平台文件 ✅
+
+8 个 v0.12.1 平台二进制文件从 `zig-out/bin/` 复制到 `/opt/utmm/`，消除版本不匹配警告。
+
+### Host 自注册 + 重复条目
+
+- Host (`Dasis-MacBook-Air.local`) 自注册到 guest table — 显示在 `--status` 中
+- windowsvm 存在重复条目：`WIN-Q0JNGDDBE28` (v0.12.0, 旧 COMPUTERNAME) + `windowsvm` (v0.12.1, 新 hostname) — 旧条目将随时间过期
 
 ## Phase 77: 安装脚本测试 + Bug 修复 ✅ (2026-07-28)
 
@@ -618,10 +690,10 @@ SKILL.md + MANUAL.md 全面更新至 v0.11.14 代码现状。发布 v0.11.15 后
 ## 最近提交
 
 ```
-14896a9 v0.11.17: fix serveUpgradeFile @memcpy alias crash, deployment test findings
-54c3376 docs: fix outdated architecture references and clean up planning files
-3c6d7d4 feat: RTT real ms, macOS codesign re-sign, multi-NIC broadcast refresh
-b5bc849 docs: mark Phase 66 complete, update planning files
-3006806 fix: replace host_gateway_ip with self-role check in epoch tracking
-a94b6a7 v0.11.16: install.sh + install.bat, fix auto-upgrade IP gating bug
+9716850 fix: remove auto-uninstall on serve-dir version mismatch
+b8b9cdc fix: PID-aware killAllUtmm, wait-for-exit, macOS start retry, exit(42)
+024b256 v0.11.23: fix KCP tunnel instability and download performance (Phase 72-73)
+f70357a release.sh: clean old binaries in zig-out/bin/ before build
+47e33fc v0.11.20: rename httpd.zig to state.zig, version-independent install scripts, fix sendLocked bug
+cb4da8f v0.11.19: versioned deployment filenames, Host startup binary verification
 ```

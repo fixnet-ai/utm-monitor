@@ -1,6 +1,41 @@
-# Findings: v0.12.0
+# Findings: v0.12.1
 
 记录重要的技术发现、Bug、设计决策和 Zig 0.16.0 API 笔记。
+
+---
+
+## Phase 78: serve-dir 版本不匹配自动 uninstall 自毁 (2026-07-28)
+
+### Finding 161 (CRITICAL): `verifyServeDirBinaries` 版本不匹配触发 `svc.uninstall()` 自毁
+
+**现象**: Host 升级到 v0.12.1 后，`--install` 成功完成并显示 "installed and running"，但 1 秒内 `/opt/utmm/utmm`、`/opt/utmm/utmmd`、`/Library/LaunchDaemons/com.utmmd.plist` 全部消失，Host 进程完全死亡。
+
+**根因**: `src/host.zig:776-783` — `startHost` 调用 `verifyServeDirBinaries` 检查 `/opt/utmm/` 下是否有匹配当前版本（v0.12.1）的平台二进制文件。serve-dir 中只有 v0.12.0 的平台文件 → 检测失败 → 调用 `svc.uninstall()` 删除所有文件 → `exit(1)`。
+
+**触发条件**（三重组合）:
+1. 从 canonical path 执行 `--install`：`selfCopy`（第 884-887 行）检测到 src==dest → 跳过复制
+2. `copySiblingBinariesToServeDir`（第 998 行）检测到 src==dest → 跳过复制，平台二进制文件永远停留在旧版本
+3. Host 启动 → `verifyServeDirBinaries` 查不到匹配版本 → **自毁**
+
+**修复** (commit `9716850`):
+- `src/host.zig`: 将 `if (!verifyServeDirBinaries(...)) { svc.uninstall(); exit(1); }` 改为 `_ = verifyServeDirBinaries(block_io, sd);`
+- 原理：Host 即使不能提供平台文件（Guest 自动升级降级），仍然可以提供 exec/upload/download 等核心管理功能。自毁让机器完全失联，远比升级降级糟糕
+
+**状态**: ✅ 已修复
+
+### Finding 162: `copySiblingBinariesToServeDir` 在 src==dest 时跳过 — 平台文件永不更新
+
+**现象**: 从 `/opt/utmm/utmm` 执行 `--install --host` 时，日志显示 "Platform binaries already in serve-dir, skipping copy."，但 serve-dir 中的平台二进制文件是旧版本（v0.12.0），新版本（v0.12.1）从未被放入。
+
+**根因**: `src/svc.zig:998` — `copySiblingBinariesToServeDir` 比较 `src_dir` 和 `dst_dir`，当两者相同时返回。从 canonical path 执行安装时，`src_dir` = `dst_dir` = `/opt/utmm/` → 函数认为平台文件已就绪，不做任何检查。
+
+**影响**: 当新版本仅替换了 `/opt/utmm/utmm`（未重新构建完整 release zip）时，平台二进制文件永远无法更新到匹配的版本。这本身是可接受的（Guest 自动升级暂时降级），但与 Finding 161 结合后致命。
+
+**建议修复**（非紧急，Finding 161 修复后不再致命）:
+- 检查文件名中的版本号是否匹配当前版本，而非仅检查文件是否存在
+- 或：`--install --host` 时总是从 `selfCopy` 源目录复制平台文件，即使 src==dest 也要进行版本校验
+
+**状态**: 📋 已知（Finding 161 修复后降级为非致命）
 
 ---
 
@@ -711,6 +746,8 @@ main.zig:393:35: dupe__anon in buildServiceArgs
 | **158** | install.bat 在 `--install` 前自我删除（Windows cmd 逐行读取） | ✅ 已修复 (Phase 77): 移动删除到安装成功后 |
 | **159** | install.bat LF 换行导致标签解析失败 | ✅ 已修复 (Phase 77): CRLF renormalize |
 | **160** | install.bat SSH 管道输入不可靠 | 📋 测试环境限制（非代码 bug） |
+| **161** | `verifyServeDirBinaries` 版本不匹配触发 `svc.uninstall()` 自毁 | ✅ 已修复 (Phase 78): 改为 warn + continue |
+| **162** | `copySiblingBinariesToServeDir` src==dest 跳过 → 平台文件永不更新 | 📋 已知（Finding 161 修复后非致命） |
 | 78/106 | 交叉编译覆盖 `zig-out/bin/utmm` | 📋 规避方案 |
 | 107 | SSH `--install` 被 pkill 自伤 | 📋 规避方案（手动配服务） |
 | 108 | 升级后 Guest hostname 丢失 | 📋 规避方案（手动修复） |

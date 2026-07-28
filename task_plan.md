@@ -1,4 +1,4 @@
-# Task Plan: v0.11.23
+# Task Plan: v0.12.1
 
 ## 架构概述
 
@@ -25,15 +25,13 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 
 ## 当前状态
 
-- **版本**: v0.12.0（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入）
+- **版本**: v0.12.1（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入）
 - **`build.zig.zon`**: `0.0.0`（永不再改）
 - **源文件**: 18 个（`src/*.zig`）+ 1 版本文件（`src/ver.txt`）+ 2 skills（`zig`、`deploy`）
 - **测试**: 166/166 通过
-- **部署**: macOS Host v0.12.0 ✅ | linuxvm v0.11.23 ✅ | macvm v0.11.23 ✅ | windowsvm v0.12.0 ✅ | winx64 v0.11.23 ✅
-- **健康检查**: 4/4 Guest 在线，windowsvm 已升级到 v0.12.0，其余 v0.11.23（跨版本自动升级有兼容问题）
+- **部署**: macOS Host v0.12.1 ✅ | linuxvm v0.12.1 ✅ | macvm v0.12.1 ✅ | windowsvm v0.12.1 ✅ | winx64 v0.12.1 ✅
+- **健康检查**: 4/4 Guest 在线，全部 v0.12.1，exec/ping 正常
 - **8 交叉编译目标**: aarch64/x86_64/x86 × linux-musl/macos/windows
-- **GitHub 版本检查**: Host 启动时 fire-and-forget OS 线程，支持 302 重定向，格式校验防污染
-- **自动升级 rollback 修复**: `forceInstallInternal()` 步骤 5 不再回滚删除二进制+配置 ✅
 
 ## 已完成阶段
 
@@ -67,6 +65,28 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 75 | 2026-07-28 | utmmd 监督进程架构重构（shm + utmmd + svc 简化 + 安装优化） |
 | 76 | 2026-07-28 | macOS launchctl 遗留修复 + 文档全面更新（Task 382-385） |
 | 77 | 2026-07-28 | 安装脚本测试 + install.bat 双 bug 修复 + install.sh 同步修复（Task 386-391） |
+| 78 | 2026-07-28 | **紧急修复**: serve-dir 版本不匹配自动 uninstall 自毁 + 全节点升级 v0.12.1 |
+
+## Phase 78: serve-dir 版本不匹配自动 uninstall 修复 + 全节点部署 ✅ (2026-07-28)
+
+| # | 任务 | 描述 | 状态 |
+|---|------|------|------|
+| 392 | 排查 Host 二进制 SIGKILL | 旧 utmmd 被杀后新二进制立即被 SIGKILL，1 秒内三文件全部消失 | ✅ |
+| 393 | 定位根因 | `verifyServeDirBinaries` 版本不匹配 → `svc.uninstall()` 自毁 | ✅ |
+| 394 | 代码修复 | `src/host.zig`: 移除 `svc.uninstall()`+`exit(1)`，改为 warn + continue | ✅ |
+| 395 | 次要发现 | `copySiblingBinariesToServeDir` 在 src==dest 时跳过，平台文件永不更新 | ✅ |
+| 396 | linuxvm 升级 | SSH 手动 `--install` → v0.12.1，exec 恢复正常 | ✅ |
+| 397 | winx64 升级 | SSH PowerShell kill + reinstall → v0.12.1，exec 恢复正常 | ✅ |
+| 398 | macvm 升级 | SSH `--install`（killAllUtmm 杀僵死进程）→ v0.12.1，exec 恢复正常 | ✅ |
+| 399 | windowsvm 升级 | SCP 新二进制 + reinstall → v0.12.1，exec 恢复正常 | ✅ |
+| 400 | serve-dir 平台文件 | 8 个 v0.12.1 平台二进制文件复制到 `/opt/utmm/` | ✅ |
+| 401 | 文档更新 | task_plan.md + findings.md + progress.md + CLAUDE.md | ✅ |
+
+### 变更摘要
+
+- **`src/host.zig:776-783`**: `verifyServeDirBinaries` 失败时不再调用 `svc.uninstall()` → `exit(1)`。改为 `_ = verifyServeDirBinaries(block_io, sd)` — 警告但继续运行
+- **根因**: 从 canonical path 执行 `--install` 时，`selfCopy` 和 `copySiblingBinariesToServeDir` 都检测到 src==dest 并跳过，平台二进制文件永远停留在旧版本。Host 启动时发现版本不匹配 → 自毁
+- **Guest pty 丢失**: Host 重启后旧 Guest 进程保留但 pty 已失效，需重新 `--install` 来重建 KCP 隧道 + pty
 
 ## Phase 72: 自动升级 rollback 修复 + 全流程部署测试 ✅ (2026-07-28)
 
