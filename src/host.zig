@@ -774,13 +774,13 @@ fn startHost(
     std.debug.print("[host] Serve dir: {s}\n", .{sd});
 
     // Verify serve-dir platform binaries match running Host version.
-    // If no matching binaries exist, uninstall and exit to prevent
-    // infinite Guest upgrade loops (serving old binaries).
-    if (!verifyServeDirBinaries(block_io, sd)) {
-        std.debug.print("[host] ERROR: Serve-dir version mismatch. Uninstalling service.\n", .{});
-        svc.uninstall(block_io, gpa) catch {};
-        std.process.exit(1);
-    }
+    // Missing binaries are logged as warnings; the Host continues running
+    // so Guests can still be managed (exec/upload/download). Guest
+    // auto-upgrade is degraded until matching binaries are provided.
+    // Auto-uninstall was removed: self-destructing on version mismatch
+    // leaves the machine unreachable with zero recovery path — far worse
+    // than an upgrade loop (which is self-limiting anyway).
+    _ = verifyServeDirBinaries(block_io, sd);
 
     // Spawn fire-and-forget GitHub version check thread.
     // OS thread, detach immediately, runs once — no join needed.
