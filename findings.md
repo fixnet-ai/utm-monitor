@@ -1,6 +1,60 @@
-# Findings: v0.11.23
+# Findings: v0.12.0
 
 记录重要的技术发现、Bug、设计决策和 Zig 0.16.0 API 笔记。
+
+---
+
+## Phase 77: 安装脚本测试 — Bug 发现 (2026-07-28)
+
+### Finding 158 (CRITICAL): install.bat 在 `--install` 前自我删除
+
+**现象**: Windows Guest 运行 `install.bat` 时，在 "Preparing files ..." 阶段后直接报 "The batch file cannot be found."，`utmm --install` 命令从未执行。
+
+**根因**: `install.bat` 第 302 行 Guest 模式分支中 `del /q install.sh install.bat 2>nul` 在 Guest cleanup 阶段执行。该行位于第 295-303 行的 `if /i "%MODE%"=="guest"` 块中，**早于**第 317 行的 `"%CANONICAL_DIR%\%BINARY_NAME%" %INSTALL_ARGS%` 安装命令。Windows cmd 删除正在运行的 .bat 文件后无法读取后续行 → 安装静默失败。
+
+**与 bash 的区别**: `install.sh` 有同样问题（第 267 行），但 bash 将脚本读入内存或保持 fd 打开，删除自身后仍可继续执行。Windows cmd 逐行读取，删除 = 执行终止。
+
+**修复** (commit `f1bfac3`):
+- `install.bat`: 将 `del /q install.sh install.bat` 从第 302 行（Guest cleanup）移到第 338 行（安装成功后 Guest 完成消息后）
+- `install.sh`: 同步将 `rm -f install.sh install.bat` 从第 267 行移到第 298 行（安装成功后）
+
+**状态**: ✅ 已修复
+
+### Finding 159 (CRITICAL): install.bat LF 换行导致 `:resolve_binary` 标签无法解析
+
+**现象**: 修复 Finding 158 后重新测试，安装流程在启动阶段即报错 "The system cannot find the batch label specified - resolve_binary"。`ZIP_BINARY` 为空，导致后续 Guest cleanup 删除所有二进制文件。
+
+**根因**: `install.bat` 文件使用 LF (`\n`) 换行，而非 Windows cmd 期望的 CRLF (`\r\n`)。`.gitattributes` 已配置 `install.bat text eol=crlf`，但 git 未实际转换（文件在 git index 中仍为 LF）。Windows cmd 用 LF 可以执行简单命令，但 `call :label` 和 `goto :label` 的标签解析依赖 CRLF 行边界 → 子程序调用静默失败。
+
+**ZIP_BINARY 为空的连锁反应**:
+1. `:resolve_binary` 失败 → `ZIP_BINARY` 保持空字符串
+2. Guest cleanup `for %%f in (utmm-* utmm*.exe) do if /i not "%%f"=="" del ...` — `""` 不匹配任何文件 → **删除所有二进制**
+3. `copy /y "" utmm.exe` → 复制失败
+4. `utmm.exe --install` → 文件已不存在
+
+**修复** (commit `f1bfac3`): `git add --renormalize install.bat` 强制按 `.gitattributes` 转换行尾为 CRLF。
+
+**教训**: .gitattributes 的 `text eol=crlf` 不自动转换已在 index 中的文件。需 `--renormalize` 或在首次添加时即为 CRLF。
+
+**状态**: ✅ 已修复
+
+### Finding 160: install.bat SSH 管道输入不可靠（测试环境限制）
+
+**现象**: SSH 到 Windows VM 执行 `(echo. && echo G && echo.) | install.bat` 时，`set /p` 的交互式输入解析不可靠。`echo.` 产生的「空行」在不同 Windows 版本/SSH 组合中可能被解析为空格或 ECHO 状态消息。
+
+**影响**: 仅影响自动化测试（SSH + pipe），不影响真实用户在交互式终端中运行 install.bat。
+
+**规避方案**: 测试中直接调用 `utmm.exe --install --hostname <name>` 绕过交互式脚本，验证核心安装功能。
+
+**状态**: 📋 测试环境限制（非代码 bug）
+
+### 测试环境发现
+
+**v0.11.23 → v0.12.0 跨版本自动升级兼容问题**:
+- `linuxvm` + `macvm`: 升级请求已发送，二进制已通过 KCP 传输完成，但 Guest 端升级未完成。macvm 恢复 serving 但保持 v0.11.23
+- `windowsvm` + `winx64`: 未发起升级请求（v0.11.23 Guest 的升级检测可能因 Host restart 而被跳过）
+- 可能原因：v0.11.23 Guest 的升级流程（`applyUpgradeAndRestart`）与 v0.12.0 的 utmmd shm 信令机制不兼容
+- 手动通过 SSH 部署 v0.12.0 → windowsvm 升级成功 ✅
 
 ---
 
@@ -654,6 +708,9 @@ main.zig:393:35: dupe__anon in buildServiceArgs
 | **155** | enable exit 64 (EX_USAGE) 无害 | ✅ 已处置 (Phase 76): `_ = runCmd` 忽略 |
 | **156** | shm_createPosix 在 launchd bootstrap 环境中瞬时失败 | ✅ 已修复 (Phase 76): 2s 后重试 |
 | **157** | bootstrap exit 0 但服务未在 launchctl list 中 | ✅ 已处置 (Phase 76): 验证 list 输出 + startDirect 回退 |
+| **158** | install.bat 在 `--install` 前自我删除（Windows cmd 逐行读取） | ✅ 已修复 (Phase 77): 移动删除到安装成功后 |
+| **159** | install.bat LF 换行导致标签解析失败 | ✅ 已修复 (Phase 77): CRLF renormalize |
+| **160** | install.bat SSH 管道输入不可靠 | 📋 测试环境限制（非代码 bug） |
 | 78/106 | 交叉编译覆盖 `zig-out/bin/utmm` | 📋 规避方案 |
 | 107 | SSH `--install` 被 pkill 自伤 | 📋 规避方案（手动配服务） |
 | 108 | 升级后 Guest hostname 丢失 | 📋 规避方案（手动修复） |

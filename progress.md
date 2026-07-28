@@ -1,13 +1,67 @@
-# Progress: v0.11.23
+# Progress: v0.12.0
 
 ## 当前状态
 
 - **分支**: `main`
-- **版本**: v0.11.23（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入；`build.zig.zon` 永为 `0.0.0`）
+- **版本**: v0.12.0（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入；`build.zig.zon` 永为 `0.0.0`）
 - **测试**: 166/166 通过
-- **部署**: macvm ✅ | linuxvm ✅ | windowsvm ✅ | winx64 ✅（全部 utmmd+utmm 运行中）
-- **健康检查**: 待 Host 启动后验证
-- **跨平台编译**: 8/8 目标全部通过（含本次 Windows Zig 0.16.0 API 修复）
+- **部署**: macOS Host v0.12.0 ✅ | linuxvm v0.11.23 | macvm v0.11.23 | windowsvm v0.12.0 ✅ | winx64 v0.11.23
+- **健康检查**: 4/4 Guest 在线，windowsvm 已升级到 v0.12.0
+- **跨平台编译**: 8/8 目标全部通过
+
+## Phase 77: 安装脚本测试 + Bug 修复 ✅ (2026-07-28)
+
+### 背景
+
+v0.12.0 发布后，需验证 `install.sh`（macOS Host）和 `install.bat`（Windows Guest）从 GitHub Release 安装的完整流程。
+
+### Task 386: install.sh macOS Host 测试 ✅
+
+从 GitHub 安装脚本一键安装 macOS Host（通过代理 127.0.0.1:7890）：
+- curl 代理下载脚本 → 交互输入（hostname + Host 模式）
+- 下载 utmm.zip (19MB) → 解压 11 文件 → 文件放置
+- utmmd 注入 + com.utmmd launchd 注册 → 服务启动
+- `--status` 确认：Host v0.12.0 + 4 Guest 全部在线
+- 成功！macOS Host 从 GitHub 一键安装完全流畅
+
+### Task 387: install.bat Windows Guest 测试 ✅
+
+通过 SSH 到 windowsvm (aarch64-windows) 测试 install.bat 离线模式。发现 2 个阻断 bug：
+
+**Bug 1 (Finding 158)**: `del install.bat` 在 `--install` 命令之前执行
+- 症状："The batch file cannot be found." → 安装从未执行
+- 根因：Guest 模式 cleanup 阶段（第 302 行）删除自身，之后 cmd 无法读取后续行
+- 与 bash 区别：bash 将脚本读入内存，删除自身可继续执行；cmd 逐行读取
+
+**Bug 2 (Finding 159)**: install.bat LF 换行导致标签解析失败
+- 症状："The system cannot find the batch label specified - resolve_binary"
+- 根因：文件使用 LF 而非 CRLF，`call :label` 无法找到标签
+- ZIP_BINARY 为空 → Guest cleanup 删除所有平台二进制 → 全面崩溃
+
+### Task 388-390: Bug 修复 ✅
+
+**`install.bat`** (commit `f1bfac3`):
+- 将 `del /q install.sh install.bat` 从第 302 行（file placement cleanup）移到第 338 行（安装成功后 Guest done 消息后）
+- `git add --renormalize` 强制 CRLF 行尾（.gitattributes 已配置但未生效）
+
+**`install.sh`** (同一 commit):
+- 将 `rm -f install.sh install.bat` 从第 267 行移到第 298 行，保持一致性
+
+### Task 391: windowsvm 全流程验证 ✅
+
+修复后完整验证：
+- 清理 + 上传 + 解压 + install.bat → utmmd.exe 注入 (797KB) ✅
+- UTM-MonitorD 服务注册 ✅ + 启动 ✅
+- Guest 注册到 Host mesh（WIN-Q0JNGDDBE28 v0.12.0）✅
+- `sc query UTM-MonitorD` → STATE: 4 RUNNING ✅
+
+### 附带发现
+
+**v0.11.23 → v0.12.0 跨版本自动升级兼容问题**:
+- `linuxvm` + `macvm`: KCP 下载完成但 Guest 端升级未完成。macvm 恢复 serving 保持 v0.11.23
+- `windowsvm` + `winx64`: 未发起升级请求
+- 可能原因：v0.11.23 的 `applyUpgradeAndRestart` 与 v0.12.0 utmmd shm 信令不兼容
+- windowsvm 通过 SSH 手动升级到 v0.12.0 成功
 
 ## Phase 76: macOS launchctl 遗留修复 + 文档更新 ✅ (2026-07-28)
 

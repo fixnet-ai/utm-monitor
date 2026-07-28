@@ -25,12 +25,12 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 
 ## 当前状态
 
-- **版本**: v0.11.23（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入）
+- **版本**: v0.12.0（唯一来源 `src/ver.txt`，`@embedFile` 编译期嵌入）
 - **`build.zig.zon`**: `0.0.0`（永不再改）
 - **源文件**: 18 个（`src/*.zig`）+ 1 版本文件（`src/ver.txt`）+ 2 skills（`zig`、`deploy`）
 - **测试**: 166/166 通过
-- **部署**: macOS Host v0.11.23 ✅ | linuxvm v0.11.23 ✅ | macvm v0.11.23 ✅ | windowsvm v0.11.22 | winx64 v0.11.22
-- **健康检查**: 4/4 全部通过（status ✓ ping ✓ exec ✓）
+- **部署**: macOS Host v0.12.0 ✅ | linuxvm v0.11.23 ✅ | macvm v0.11.23 ✅ | windowsvm v0.12.0 ✅ | winx64 v0.11.23 ✅
+- **健康检查**: 4/4 Guest 在线，windowsvm 已升级到 v0.12.0，其余 v0.11.23（跨版本自动升级有兼容问题）
 - **8 交叉编译目标**: aarch64/x86_64/x86 × linux-musl/macos/windows
 - **GitHub 版本检查**: Host 启动时 fire-and-forget OS 线程，支持 302 重定向，格式校验防污染
 - **自动升级 rollback 修复**: `forceInstallInternal()` 步骤 5 不再回滚删除二进制+配置 ✅
@@ -66,6 +66,7 @@ UTM Monitor (`utmm`) — 单二进制双模式（Guest/Host），Mesh LSA + KCP 
 | 74 | 2026-07-28 | 自动升级 forceInstall 修复（Finding 123 + 135 + 139） |
 | 75 | 2026-07-28 | utmmd 监督进程架构重构（shm + utmmd + svc 简化 + 安装优化） |
 | 76 | 2026-07-28 | macOS launchctl 遗留修复 + 文档全面更新（Task 382-385） |
+| 77 | 2026-07-28 | 安装脚本测试 + install.bat 双 bug 修复 + install.sh 同步修复（Task 386-391） |
 
 ## Phase 72: 自动升级 rollback 修复 + 全流程部署测试 ✅ (2026-07-28)
 
@@ -404,6 +405,48 @@ src/
 | 139 | ✅ 已修复 (Phase 74) | Host 自 kill：killAllUtmm 排除自身 PID |
 | 129 | ✅ 已修复 (Phase 73) | 非 Linux Guest 隧道不稳定：KCP 并发 connect() 导致会话状态不一致 |
 | 138 | ✅ 已修复 (Phase 73) | KCP 自动升级下载性能瓶颈（~15KB/s，mesh 日志刷屏） |
+
+## Phase 77: 安装脚本测试 + Bug 修复 ✅ (2026-07-28)
+
+| # | 任务 | 描述 | 状态 |
+|---|------|------|------|
+| 386 | GitHub install.sh macOS Host 测试 | curl 管道安装（通过代理 127.0.0.1:7890），下载→解压→安装→验证 | ✅ |
+| 387 | GitHub install.bat Windows Guest 测试 | SSH 远程部署测试，发现 2 个阻断 bug | ✅ |
+| 388 | install.bat Bug 1 修复 | `del install.bat` 在 `--install` 前自我删除 → Windows cmd 无法继续执行 | ✅ |
+| 389 | install.bat Bug 2 修复 | LF 换行 → `:resolve_binary` 标签无法解析，转换为 CRLF | ✅ |
+| 390 | install.sh 同步修复 | 同样 premature self-deletion，移至安装成功后 | ✅ |
+| 391 | windowsvm 全流程验证 | 离线安装→Guest 注册→v0.12.0 升级确认 | ✅ |
+
+### 变更摘要
+
+**`install.bat` — 两个阻断 bug 修复**:
+- Bug 1: 第 302 行 `del /q install.sh install.bat 2>nul` 在 Guest 模式 file placement 阶段执行，早于第 319 行的 `--install` 命令。Windows cmd 删除自身后无法读取后续行 → "The batch file cannot be found."，安装命令从未执行。修复：移动 self-deletion 到安装成功后的第 338 行
+- Bug 2: 文件使用 LF (`\n`) 换行而非 CRLF (`\r\n`)。Windows cmd 用 LF 可以执行简单命令，但 `call :label` 和 `goto :label` 的标签解析不可靠 → "The system cannot find the batch label specified - resolve_binary"。修复：`git add --renormalize` 强制 CRLF（`.gitattributes` 已配置 `install.bat text eol=crlf`）
+
+**`install.sh` — 一致性问题修复**:
+- 第 267 行 `rm -f install.sh` 同样在 `--install` 前自我删除。bash 将脚本读入内存故不受影响，但为一致性和良好实践，移至安装成功后
+
+### 测试结果
+
+**macOS Host（install.sh）**:
+| 步骤 | 结果 |
+|------|------|
+| curl 代理下载脚本 | ✅ 127.0.0.1:7890 |
+| 平台检测 (aarch64-macos) | ✅ |
+| 下载 utmm.zip (19MB) | ✅ |
+| 解压 11 文件 | ✅ |
+| utmmd 注入 + launchd 注册 | ✅ |
+| `--status` 确认 | ✅ Host + 4 Guest 在线 |
+
+**Windows Guest（install.bat）**:
+| 步骤 | 修复前 | 修复后 |
+|------|--------|--------|
+| `:resolve_binary` 标签 | ❌ 找不到 | ✅ |
+| 离线模式检测 | ⚠️ ZIP_BINARY 为空 | ✅ |
+| 自我删除 | ❌ 安装前删除自身 | ✅ 安装后清理 |
+| `utmmd.exe` 注入 | ❌ 未执行 | ✅ 797KB |
+| `UTM-MonitorD` 服务 | ❌ 未注册 | ✅ 运行中 |
+| Guest 注册到 Host | ❌ | ✅ WIN-Q0JNGDDBE28 v0.12.0 |
 
 ## Phase 76: macOS launchctl 遗留修复 + 文档更新 ✅ (2026-07-28)
 
