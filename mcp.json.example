@@ -9,65 +9,66 @@
 # 1. utmm binary must be installed and executable:
 #       which utmm   # should print /opt/utmm/utmm (or C:\opt\utmm\utmm.exe)
 #
-# 2. Root/Administrator access for the auto-ensure flow:
-#       sudo utmm --version   # verify it works
+# 2. Passwordless sudo for the utmm binary:
+#       sudo -n /opt/utmm/utmm --version   # must succeed without password prompt
 #
-# QUICK INSTALL (Claude Code / Claude Desktop)
+# QUICK INSTALL (Claude Code)
 # -----------------------------------------------------------------------------
 # Option A — claude CLI (recommended):
-#   claude mcp add utmm -- sudo /opt/utmm/utmm --mcp
+#   claude mcp add utm-monitor -- sudo -n /opt/utmm/utmm --mcp
 #
-#   Or with custom port:
-#   claude mcp add utmm -- sudo /opt/utmm/utmm --mcp --port 2122
+#   This stores the config in ~/.claude.json (project-scoped), which takes
+#   precedence over ~/.claude/mcp.json. Use `claude mcp list` to verify.
 #
-# Option B — manual, copy this file:
-#   cp mcp.json.example ~/.claude/mcp.json
+#   To update an existing registration:
+#     claude mcp remove utm-monitor
+#     claude mcp add utm-monitor -- sudo -n /opt/utmm/utmm --mcp
 #
-#   If you already have other MCP servers in ~/.claude/mcp.json, merge just
-#   the "utmm" entry below into your existing "mcpServers" block instead.
+# Option B — manual JSON config (if not using claude CLI):
+#   Copy the JSON below into your MCP config. Note: if the same server name
+#   was registered via `claude mcp add`, the CLI registration in ~/.claude.json
+#   takes precedence over this file.
 #
-# Option C — Claude Desktop (VS Code / JetBrains plugin):
-#   Copy the JSON below into your Claude Desktop config file:
-#     macOS:   ~/Library/Application Support/Claude/claude_desktop_config.json
-#     Windows: %APPDATA%\Claude\claude_desktop_config.json
+#   Config locations:
+#     Claude Code:     ~/.claude/mcp.json  (user)  or  .mcp.json (project)
+#     Claude Desktop:  ~/Library/Application Support/Claude/claude_desktop_config.json
 #
 # VERIFY
 # -----------------------------------------------------------------------------
-# After installation, ask Claude:
-#   "Run vm_status to check which VMs are online"
+# After installation, verify the connection:
+#   claude mcp list                    # should show "utm-monitor: ... - Connected"
 #
-# If Claude says the tool is not available, check:
-#   - utmm binary is at /opt/utmm/utmm and executable
-#   - sudo /opt/utmm/utmm --version works
-#   - Try manually: echo '{"jsonrpc":"2.0","id":1,"method":"initialize"}' | sudo /opt/utmm/utmm --mcp
+# Or test manually:
+#   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | sudo -n /opt/utmm/utmm --mcp
 #
 # HOW IT WORKS
 # -----------------------------------------------------------------------------
 # utmm --mcp starts a stdio MCP server. On first use:
 #   1. Checks if Host service is running → if not, auto-installs + auto-starts
-#   2. Reads JSON-RPC from stdin, writes responses to stdout
-#   3. Tool calls (vm_status, vm_exec) talk to Host service at 127.0.0.1:2121
-#
-# Key benefit over old HTTP MCP: if the Host service is down, the AI agent can
-# still complete the critical auto-install/recovery flow because utmm --mcp
-# benefits from Phase 52 auto-ensure just like utmm --exec does.
+#   2. Reads JSON-RPC from stdin, writes responses to stdout (newline-delimited)
+#   3. Tool calls talk to the Host daemon via local IPC socket (/var/run/utmm.sock)
 #
 # TROUBLESHOOTING
 # -----------------------------------------------------------------------------
 # | Symptom                              | Fix                                |
 # |--------------------------------------|------------------------------------|
 # | "No VMs online"                      | Boot the VMs, start utmm inside each |
-# | "Connection refused"                 | Host auto-ensure may have failed;   |
-# |                                      | try sudo utmm --host first          |
-# | MCP tools not showing in Claude      | Reload MCP config (restart Claude)  |
+# | "Failed to reconnect: -32000"        | Check `claude mcp list` — may have  |
+# |                                      | stale registration. Remove & re-add:|
+# |                                      | `claude mcp remove utm-monitor`     |
+# |                                      | `claude mcp add utm-monitor -- ...` |
+# | MCP tools not showing in Claude      | Restart Claude Code after config    |
+# |                                      | change; verify with `claude mcp list`|
 # | utmm --mcp hangs                     | Ensure stdin is not a TTY (piped)   |
+# | "Root privileges required"           | Must run via sudo; add -n flag for  |
+# |                                      | non-interactive (passwordless) mode |
 # =============================================================================
 
 {
   "mcpServers": {
-    "utmm": {
+    "utm-monitor": {
       "command": "sudo",
-      "args": ["/opt/utmm/utmm", "--mcp"]
+      "args": ["-n", "/opt/utmm/utmm", "--mcp"]
     }
   }
 }

@@ -98,20 +98,15 @@ extract to the target machine, then run the bundled `install.sh` or `install.bat
 **Manual install** (no automation): see the comments at the top of
 [install.sh](install.sh) for the few manual commands needed.
 
-**Register with AI Agent** — add to your MCP config (`~/.claude/mcp.json` or `.mcp.json`):
+**Register with AI Agent** — use the Claude Code CLI (recommended):
 
-```json
-{
-  "mcpServers": {
-    "utmm": {
-      "command": "sudo",
-      "args": ["/opt/utmm/utmm", "--mcp"]
-    }
-  }
-}
+```bash
+claude mcp add utm-monitor -- sudo -n /opt/utmm/utmm --mcp
 ```
 
-Or use the CLI: `claude mcp add utmm -- sudo /opt/utmm/utmm --mcp`
+> **Note:** `claude mcp add` stores config in `~/.claude.json` (project-scoped) and
+> takes precedence over manual `mcp.json` edits. Use `claude mcp list` to verify.
+> See [mcp.json.example](mcp.json.example) for manual config and troubleshooting.
 
 ## CLI Reference
 
