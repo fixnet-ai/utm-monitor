@@ -133,16 +133,18 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
 
-    // Tests — refac/layered-arch new modules (P0-P5) + TCP/SOCKS4
-    const refac_modules = [_][]const u8{
-        "tcp.zig",
-        "lsa.zig",
+    // Standalone test binaries for modules whose tests are not transitively
+    // compiled into the main binary through main.zig's @import chain.
+    // tcp.zig and lsa.zig tests are already in the main binary (via host.zig),
+    // so they are NOT included here to avoid test duplication.
+    const standalone_test_modules = [_][]const u8{
         "dpipe.zig",
         "dpipe_shell.zig",
         "dpipe_file.zig",
         "guest.zig",
+        "shm.zig",
     };
-    for (refac_modules) |mod_src| {
+    for (standalone_test_modules) |mod_src| {
         const mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("src/{s}", .{mod_src})),
             .target = target,

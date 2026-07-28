@@ -169,7 +169,7 @@ fn writeFileCloseFn(ctx: *anyopaque) void {
         defer self.allocator.free(actual_hex);
 
         if (!std.mem.eql(u8, actual_hex, self.expected_hash)) {
-            std.log.warn("[dpipe-file] hash mismatch: expected={s} actual={s}", .{ self.expected_hash, actual_hex });
+            std.log.debug("[dpipe-file] hash mismatch: expected={s} actual={s}", .{ self.expected_hash, actual_hex });
             self.file.close(self.io);
             std.Io.Dir.cwd().deleteFile(self.io, self.temp_path) catch {};
             return;

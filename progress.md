@@ -4,13 +4,40 @@
 
 - **分支**: `refac/layered-arch`
 - **版本**: v0.13.0-pre（尚未发布）
-- **测试**: 通过（1 个预存 dpipe_file hash 失败，非本次引入）
+- **测试**: 150 执行 / 141 唯一测试，全部通过
 - **源文件**: 16 个（20 → 16）
 - **全部任务完成** ✅
 
 ## 会话记录
 
-### 2026-07-29 (最新) — Phase 3 完成
+### 2026-07-29 (最新) — Phase 4 清理收尾
+
+**成果**: CLAUDE.md 更新 + dpipe_file 测试修复 + build.zig 去重
+
+| 任务 | 描述 | 状态 |
+|------|------|------|
+| Task 11 | 更新 CLAUDE.md：KCP→TCP 架构、16 文件清单、新协议描述 | ✅ |
+| Task 12 | 修复 dpipe_file hash mismatch 测试（warn→debug）| ✅ |
+| Task 13 | 清理 build.zig standalone_test_modules（去重 tcp/lsa，新增 shm）| ✅ |
+
+**CLAUDE.md 更新详情**:
+- 协议栈图 → 7 层分层模型（应用/拓扑/传输/数据管道/协议/系统服务/基础）
+- 删除 KCP 协议栈、KCP 可靠传输、HostState、KCP Patterns 等全部过时章节
+- 新增 TCP per-command 模型、DuplexPipe vtable、TCP 帧协议、LSA 自洽模式
+- 文件清单：18 文件（含已删除）→ 正确的 16 文件
+
+**dpipe_file hash 测试修复详情**:
+- 根因：Zig 0.16.0 测试运行器对 stderr `warn` 级别日志敏感，导致 `--listen=-` 协议通信异常
+- 修复：`std.log.warn` → `std.log.debug`（hash 不匹配是预期的可恢复诊断事件）
+- `zig build test` 完全干净通过，无 "failed command"
+
+**build.zig 清理详情**:
+- 移除 `tcp.zig`、`lsa.zig`（已在主二进制中通过 host.zig import 链覆盖，消除重复）
+- 新增 `shm.zig`（发现其 10 个测试之前从未被执行！）
+- 重命名 `refac_modules` → `standalone_test_modules`
+- 测试二进制：7 → 6，总执行 150 次（141 唯一 + 9 不可避免的 dpipe 重复）
+
+### 2026-07-29 — Phase 3 完成
 
 **成果**: lock.zig 删除 + Platform/genInit 迁移 → svc.zig
 

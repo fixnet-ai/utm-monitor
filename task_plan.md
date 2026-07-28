@@ -3,9 +3,8 @@
 ## 状态：全部完成 ✅
 
 - **分支**: `refac/layered-arch`
-- **提交**: `036f40f` (KCP→TCP) → `3ca7239` (refac.md 更新) → `06adede` (lock.zig 删除) → 待 commit (Platform/genInit 迁移)
 - **源文件**: 20 → 16
-- **测试**: 通过（1 个预存 dpipe_file hash 失败，非本次引入）
+- **测试**: 150 执行 / 141 唯一测试，全部通过
 - **设计文档**: `refac.md`
 
 ## 架构概述
@@ -39,6 +38,14 @@ DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 |---|------|------|
 | 9 | Platform/genInit → svc.zig（不独立构建 install）| ✅ |
 | 10 | `lock.zig` → svc.zig 内联 flock/LockFileEx | ✅ |
+
+### Phase 4: 清理收尾 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 11 | 更新 CLAUDE.md（KCP→TCP 架构，16 文件清单）| ✅ |
+| 12 | 修复 dpipe_file hash mismatch 测试（warn→debug）| ✅ |
+| 13 | 清理 build.zig standalone_test_modules（去重 tcp/lsa，新增 shm）| ✅ |
 
 ## 删除文件清单（10 个）
 
@@ -90,9 +97,5 @@ src/
 | 7 | per-command shell | 匹配独立连接模型 |
 | 8 | lock.zig → svc.zig 内联 flock/LockFileEx | OS 级别锁自动释放，无 stale lock；固定路径替代 CWD |
 | 9 | Platform/genInit → svc.zig（不独立构建）| 独立构建收益低，聚合到服务管理层即可 |
-
-## 预存问题
-
-| # | 问题 | 状态 |
-|---|------|------|
-| 1 | dpipe_file hash mismatch 测试 | 预存，非本次引入 |
+| 10 | dpipe_file hash mismatch: warn→debug | Zig 0.16.0 测试运行器对 stderr warn 日志敏感 |
+| 11 | build.zig 去重 tcp/lsa，新增 shm | tcp/lsa 已在主二进制中；shm 10 个测试之前从未运行 |

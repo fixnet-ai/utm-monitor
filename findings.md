@@ -134,3 +134,45 @@ shm 由 utmmd 创建，而 `forceInstall`/`ensure` 在 utmmd 不存在时被调�
 3. 发布目标翻倍（8 → 16 二进制）
 
 **实际做法**: Platform + genInit 移至 svc.zig 与现有服务管理代码聚合，不做独立构建。
+
+---
+
+## Phase 4: 清理收尾 — 研究发现
+
+### Finding 174: Zig 0.16.0 测试运行器对 stderr warn 日志敏感
+
+当测试二进制以 `--listen=-` 协议模式运行时（`zig build test` 内部机制），
+测试代码中的 `std.log.warn` 输出到 stderr 会导致父进程（build_runner）报告
+"failed command"，并使整体测试步骤标记为失败。
+
+**根因**: Zig 0.16.0 测试运行器的 `test_runner.zig` 自定义了 `std_options.logFn`，
+在 `--listen=-` 协议模式下，stderr 输出可能干扰协议通信或触发测试框架的失败检测。
+
+**修复**: dpipe_file.zig `writeFileCloseFn` 中的 hash mismatch 日志从 `warn` 改为
+`debug`。hash 不匹配是可恢复的诊断事件（temp 文件删除，操作优雅失败），非系统级警告。
+测试中的 `std.log.debug` 在测试运行器的默认 `.warn` 日志级别下不输出，避免干扰。
+
+### Finding 175: shm.zig 的 10 个测试之前从未运行
+
+shm.zig 定义了 10 个测试（ShmLayout size、magic、version、cmd、Cmd 枚举、
+SvcState 枚举、UtmmState 枚举、CmdStatus 枚举、MAGIC 常量、SHM_NAME），
+但从未被包含在任何测试二进制中。
+
+**根因**: shm.zig 被 main.zig 通过 `@import("shm.zig")` 导入，但其测试
+未出现在主测试二进制中。原因可能是 Zig 0.16.0 的测试收集行为与模块导入链
+不完全一致 — 某些被导入模块的测试块未被主测试二进制发现。
+
+**修复**: 将 shm.zig 加入 `standalone_test_modules` 列表，确保其测试独立编译运行。
+
+### Finding 176: build.zig test 去重 — tcp/lsa 在主二进制和 standalone 中双重运行
+
+tcp.zig 和 lsa.zig 的测试在主测试二进制（通过 main.zig → host.zig import 链）
+和独立 refac_modules 测试二进制中均被执行，导致每次 `zig build test` 重复运行
+约 23 个测试。
+
+**修复**: 从 standalone_test_modules 中移除 tcp.zig 和 lsa.zig，仅保留主二进制
+中无法被测试收集到的模块（dpipe、dpipe_shell、dpipe_file、guest、shm）。
+
+**不可避免的残留重复**: dpipe.zig 的 5 个测试在 dpipe、dpipe_shell、dpipe_file
+三个独立二进制中各执行一次。这是因为 dpipe_shell 和 dpipe_file 都 import dpipe，
+且每个 standalone 模块编译为独立测试二进制。这个开销很小（10 次额外运行），可接受。
