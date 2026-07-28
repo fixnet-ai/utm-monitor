@@ -1,16 +1,54 @@
-# Progress: v0.13.0 分层架构重构
+# Progress: v0.13.1 分层架构重构
 
 ## 当前状态
 
 - **分支**: `refac/layered-arch`
-- **版本**: v0.13.0-pre（尚未发布）
+- **版本**: v0.13.1（已发布）
 - **测试**: 150 执行 / 141 唯一测试 + 43 集成测试场景，全部通过
 - **源文件**: 16 个（20 → 16）
 - **全部任务完成** ✅
+- **8 交叉编译目标全部通过** ✅
 
 ## 会话记录
 
-### 2026-07-29 (最新) — Phase 5-7：集成测试补充 + 代码审查修复 + 部署门禁
+### 2026-07-29 (最新) — Phase 8：Windows 跨平台 Socket 抽象层修复
+
+**成果**: 新增跨平台 socket I/O 抽象层（7 个 wrapper 函数），修复 x86-windows-gnu Winsock2 链接，
+8 交叉编译目标全部通过，部署 3 台真机验证通过。
+
+| 任务 | 描述 | 状态 |
+|------|------|------|
+| Phase 8 | tcp.zig + tests/common.zig 跨平台 socket 抽象层 + 6 个测试文件迁移 | ✅ |
+
+**核心修复**:
+- `tcp.zig` 新增 ~130 行：`sockWrite`、`sockRead`、`sockClose`、`sockShutdown`、`sockAccept`、`sockListen`、`makePair`
+- `tests/common.zig` 新增相同 7 个 wrapper + 6 个 Winsock2 extern
+- 所有 POSIX `system.read/write/close/shutdown/accept/listen` 调用统一迁移至 wrapper
+- `host.zig` line 852: `system.listen` → `tcp.sockListen`
+- 6 个测试文件全部迁移至 `common.zig` 辅助函数
+- `svc.zig` LockFileEx Bool 比较修复：`== 0` → `@intFromEnum(result) == @as(c_int, 0)`
+
+**x86-windows-gnu 链接修复**（6 个未定义符号）:
+- 根因：`extern "ws2_32"` 默认 cdecl，32 位 Windows stdcall 需要 `@n` 名称修饰（如 `_send@16` 而非 `_send`）
+- 修复：所有 6 个 Winsock2 extern 添加 `callconv(.winapi)` — 32 位解析为 `.Stdcall`，64 位为 `.C`（无操作）
+- 额外修复：`accept` 的 `addrlen` 类型从 `?*c_int` 改为 `?*std.posix.socklen_t`（Zig 的 Windows socklen_t 是 `u32`）
+
+**编译验证**:
+- 全部 8 交叉编译目标通过：aarch64/x86_64/x86 × linux-musl/macos/windows
+- `zig build test` 通过
+- `zig build test-integration` 通过（7 测试套件，43 场景，0 失败）
+
+**真机部署验证**:
+- linuxvm (aarch64-linux): v0.13.0 → v0.13.1，`--exec` + `--status` 正常
+- macvm (aarch64-macos): v0.13.0 → v0.13.1，LSA 发现正常
+- windowsvm (aarch64-windows): v0.13.0 → v0.13.1，UDP LSA 正常（TCP 2121 仍未开放，预存问题）
+- winx64 (x86_64-windows, 192.168.3.108): 仍运行 v0.12.2，待后续升级
+
+**已知遗留**:
+- Windows VM TCP 2121 端口未监听（仅 UDP 2121 LSA 可用），非本次变更所致
+- winx64 仍运行旧版 v0.12.2
+
+### 2026-07-29 — Phase 5-7：集成测试补充 + 代码审查修复 + 部署门禁
 
 **成果**: 新增 4 个 e2e 集成测试（16 场景）、12 项代码审查修复全部完成、CLAUDE.md 部署门禁规则
 

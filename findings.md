@@ -272,3 +272,72 @@ defer list.deinit(alloc);
 - 无例外 — "trivial" 变更同样可能引入协议回归（如 C1 就是一行 Host 端 buildCmdWithMarker 调用导致的）
 
 **关联**: [[Finding 175]]（测试覆盖不足）、[[Finding 177]]（代码扫描结论）
+
+---
+
+## Phase 8: Windows 跨平台 Socket 抽象层 — 研究发现
+
+### Finding 182: `callconv(.winapi)` — 解决 32 位 Windows stdcall 符号修饰
+
+**背景**: x86-windows-gnu 交叉编译时链接器报告 6 个未定义 Winsock2 符号：
+`socket`、`listen`、`accept`、`send`、`recv`、`closesocket`、`shutdown`。
+但 64 位目标（aarch64-windows、x86_64-windows）编译正常。
+
+**根因**: `extern "ws2_32"` 声明默认使用 C 调用约定（cdecl），生成无修饰符号（如 `_send`）。
+32 位 Windows `stdcall` 调用约定需要 `@n` 名称修饰（如 `_send@16`），未修饰符号与 DLL
+导出表不匹配，导致链接失败。64 位 Windows 的 `.winapi` = `.C`（无操作），所以 64 位目标不受影响。
+
+**修复**: 所有 6 个 Winsock2 extern 声明添加 `callconv(.winapi)`：
+```zig
+// ✅ 正确：callconv(.winapi) 在 32 位 = .Stdcall（@n 修饰），64 位 = .C（无操作）
+extern "ws2_32" fn send(s: socket_t, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn recv(s: socket_t, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn accept(s: socket_t, addr: ?*anyopaque, addrlen: ?*std.posix.socklen_t) callconv(.winapi) c_int;
+extern "ws2_32" fn listen(s: socket_t, backlog: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn closesocket(s: socket_t) callconv(.winapi) c_int;
+extern "ws2_32" fn shutdown(s: socket_t, how: c_int) callconv(.winapi) c_int;
+```
+
+**影响文件**: `src/tcp.zig`、`tests/common.zig`
+
+### Finding 183: `std.posix.socket_t` 的平台差异
+
+**发现**: `std.posix.socket_t` 在 POSIX 是 `c_int`（文件描述符），在 Windows 是 `*anyopaque`（SOCKET 句柄）。
+这要求所有 socket I/O 操作使用跨平台抽象而非裸系统调用。
+
+**影响**: Windows 上 `accept()` 返回 `c_int` → `c_uint`（`@bitCast`）→ `usize` → `@ptrFromInt` 转为 `socket_t`。
+POSIX 上直接使用 `system.accept` 返回的 `c_int`。
+
+### Finding 184: Zig 0.16.0 Windows `Bool` 类型变更
+
+**背景**: `svc.zig` 中 `LockFileEx` 返回 `std.os.windows.Bool`（内部是 `c_int` 的 enum），
+不能直接与整数 `== 0` 比较。
+
+**修复**:
+```zig
+// ❌ 旧代码
+if (LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped) == 0) { ... }
+
+// ✅ 修复
+const result = LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped);
+if (@intFromEnum(result) == @as(c_int, 0)) { ... }
+```
+
+### Finding 185: 跨平台 socket I/O 抽象层的设计原则
+
+**设计**: `tcp.zig` 中新增 7 个 `sock*` wrapper 函数，`tests/common.zig` 中复制相同函数。
+测试可执行文件独立编译不能依赖主二进制，所以需要复制。
+
+**Wrapper 清单**:
+| 函数 | POSIX 底层 | Windows 底层 |
+|------|-----------|-------------|
+| `sockWrite` | `system.write()` | `send()` via ws2_32 |
+| `sockRead` | `system.read()` | `recv()` via ws2_32 |
+| `sockClose` | `system.close()` | `closesocket()` via ws2_32 |
+| `sockShutdown` | `system.shutdown()` | `shutdown()` via ws2_32 |
+| `sockAccept` | `system.accept()` | `accept()` via ws2_32（含类型转换）|
+| `sockListen` | `system.listen()` | `listen()` via ws2_32 |
+| `makePair` | `socketpair()` | TCP loopback 替代 |
+
+**编译时零开销**: 全部使用 `builtin.os.tag == .windows` comptime 分支，
+非目标平台的代码路径完全消除。

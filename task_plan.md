@@ -2,6 +2,8 @@
 
 ## 状态：全部完成 ✅
 
+**最新版本**: v0.13.1 — Windows 跨平台 socket 抽象层修复
+
 - **分支**: `refac/layered-arch`
 - **源文件**: 20 → 16
 - **测试**: 150 执行 / 141 唯一测试 + 43 集成测试场景，全部通过
@@ -143,3 +145,23 @@ src/
 | 13 | Integration tests 新增 4 个 e2e | exec/upload/download/upgrade 端到端 TCP loopback 协议验证，补全 REVIEW 指出的测试缺口 |
 | 14 | system.read/write 返回 isize 非 error union | Zig 0.16.0 POSIX 系统调用返回 C 风格返回值，需 @intCast 且不能 try/catch |
 | 15 | 部署前必须通过集成测试 | 协议回归（如双 MDELIM）在真机调测前先被集成测试捕获，低修复成本 |
+
+### Phase 8: Windows 跨平台 Socket 抽象层修复 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 38 | tcp.zig 新增跨平台 socket I/O 抽象层（sockRead/sockWrite/sockClose/sockShutdown/sockAccept/sockListen/makePair）| ✅ |
+| 39 | tests/common.zig 新增相同跨平台 socket 辅助函数（6 个 extern + 7 个 wrapper）| ✅ |
+| 40 | 所有 6 个测试文件迁移至 common.zig 统一辅助函数 | ✅ |
+| 41 | Winsock2 extern 添加 `callconv(.winapi)` — 修复 x86-windows-gnu 链接 | ✅ |
+| 42 | svc.zig LockFileEx Bool 比较修复（`@intFromEnum`）| ✅ |
+| 43 | 8 交叉编译目标全部通过 | ✅ |
+| 44 | 部署 linuxvm + macvm + windowsvm 真机验证通过 | ✅ |
+
+## 关键决策记录（续）
+
+| # | 决策 | 理由 |
+|---|------|------|
+| 16 | 跨平台 socket I/O 抽象层放在 tcp.zig（非独立文件）| 所有网络 I/O 的统一入口，避免分散 |
+| 17 | `callconv(.winapi)` 解决 x86 stdcall 名称修饰 | 32 位 Windows: `.winapi` = `.Stdcall`（`@n` 后缀），64 位: = `.C`（无修饰）|
+| 18 | tests/common.zig 复制 tcp.zig 的 socket 抽象 | 测试可执行文件独立编译，不依赖主二进制 |
