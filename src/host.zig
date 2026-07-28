@@ -849,7 +849,7 @@ fn upgradeTcpListener(
     };
     defer sock.close(io);
 
-    _ = std.posix.system.listen(sock.handle, 8);
+    _ = tcp.sockListen(sock.handle, 8);
     std.log.info("[host] upgrade TCP listener on :{d}", .{port});
 
     while (!shutdown.load(.acquire)) {
