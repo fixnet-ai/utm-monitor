@@ -23,32 +23,34 @@ jobs:
         run: zig build test --summary all
 
       - name: Build all targets
+        # zig build orchestrates a two-step build internally:
+        #   1. Build utmmd (supervisor daemon) → cp to src/embed/utmmd.bin
+        #   2. shasum utmmd.bin → src/embed/utmmd.sha256
+        #   3. Build utmm (main binary, @embedFile utmmd.bin + utmmd.sha256)
+        # Deployment filenames include version suffix (e.g. utmm-aarch64-linux-0.11.23).
         run: |
           mkdir -p release
           targets="x86_64-windows aarch64-windows x86-windows-gnu x86_64-macos aarch64-macos x86-linux-musl x86_64-linux-musl aarch64-linux-musl"
           for target in $targets; do
             echo "==> Building $target ..."
             zig build -Dtarget=$target -Doptimize=ReleaseSafe
-            case "$target" in
-              x86_64-windows)       bin="utmm-x86_64-windows.exe" ;;
-              aarch64-windows)      bin="utmm-aarch64-windows.exe" ;;
-              x86-windows-gnu)      bin="utmm-x86-windows.exe" ;;
-              x86_64-macos)         bin="utmm-x86_64-macos" ;;
-              aarch64-macos)        bin="utmm-aarch64-macos" ;;
-              x86-linux-musl)       bin="utmm-x86-linux" ;;
-              x86_64-linux-musl)    bin="utmm-x86_64-linux" ;;
-              aarch64-linux-musl)   bin="utmm-aarch64-linux" ;;
-            esac
-            cp "zig-out/bin/$bin" "release/"
+          done
+          echo "==> Collecting deployment binaries..."
+          for f in zig-out/bin/utmm-*; do
+            if [ -f "$f" ]; then
+              cp "$f" release/
+              printf "    %8s  %s\n" "$(wc -c < "$f" | tr -d ' ')" "$(basename "$f")"
+            fi
           done
           echo "==> Release artifacts:"
           ls -lh release/
 
-      - name: Copy install scripts
+      - name: Copy install scripts and version file
         run: |
-          echo "==> Adding install scripts..."
+          echo "==> Adding install scripts + ver.txt..."
           cp install.sh release/
           cp install.bat release/
+          cp src/ver.txt release/
           echo "==> Final release contents:"
           ls -lh release/
 
