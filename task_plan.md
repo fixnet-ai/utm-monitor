@@ -47,7 +47,20 @@ DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 | 12 | 修复 dpipe_file hash mismatch 测试（warn→debug）| ✅ |
 | 13 | 清理 build.zig standalone_test_modules（去重 tcp/lsa，新增 shm）| ✅ |
 | 14 | 代码库扫描（TODO、日志、refac.md 修正）| ✅ |
-| 15 | 新增 config.auto_upgrade 开关（默认 false，跳过自动升级避免测试干扰）| ✅ |
+| 15 | 新增 config.auto_upgrade 开关（默认 false）| ✅ |
+
+
+### Phase 5: 集成测试 📋
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 16 | 测试基础设施 `tests/common.zig` | 📋 |
+| 17 | `tcp_frame` TCP 帧协议 + SOCKS4a 集成测试 | 📋 |
+| 18 | `lsa_routing` LSA 编解码 + Dijkstra 路由集成测试 | 📋 |
+| 19 | `dpipe_relay` DuplexPipe relay 集成测试 | 📋 |
+| 20 | `svc_install` 安装/卸载集成测试 | 📋 |
+| 21 | `auto_upgrade` 自动升级集成测试 | 📋 |
+| 22 | build.zig 集成 `test-integration` 构建步骤 | 📋 |
 
 ## 删除文件清单（10 个）
 

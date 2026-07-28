@@ -94,7 +94,7 @@ pub fn socks4Connect(
     target_hostname: []const u8,
     target_port: u16,
 ) !std.Io.net.Stream {
-    const stream = std.Io.net.IpAddress.connect(target_ip, io, .{}) catch |err| {
+    const stream = std.Io.net.IpAddress.connect(&target_ip, io, .{ .mode = .stream }) catch |err| {
         return err;
     };
     errdefer stream.close(io);

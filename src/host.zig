@@ -650,7 +650,7 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
 
 /// Check that a version string looks like "X.Y.Z" (digits only).
 /// Rejects anything that doesn't match — human-verification pages, HTML, etc.
-fn isValidVersion(ver: []const u8) bool {
+pub fn isValidVersion(ver: []const u8) bool {
     if (ver.len < 5) return false; // minimum: "0.0.0"
     var parts = std.mem.splitSequence(u8, ver, ".");
     var count: u8 = 0;

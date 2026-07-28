@@ -158,4 +158,61 @@ pub fn build(b: *std.Build) void {
         const run_mod_tests = b.addRunArtifact(mod_tests);
         test_step.dependOn(&run_mod_tests.step);
     }
+
+    // ── Integration tests (tests/ directory) ──
+    // Each test is a standalone executable with pub fn main().
+    // Run independently via ./zig-out/bin/<name> or via "zig build test-integration".
+    //
+    // Zig 0.16.0: one file = one module. Tests import "testlib" (re-exports all src/*
+    // as pub const) and "common" (test helpers). No per-file src modules — that would
+    // conflict with internal relative @import chains within src files.
+
+    const testlib_mod = b.createModule(.{
+        .root_source_file = b.path("src/testlib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const test_common_mod = b.createModule(.{
+        .root_source_file = b.path("tests/common.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const integration_tests = [_]struct { name: []const u8, path: []const u8, needs_utmmd: bool }{
+        .{ .name = "tcp_frame_int", .path = "tests/tcp_frame/main.zig", .needs_utmmd = false },
+        .{ .name = "lsa_routing_int", .path = "tests/lsa_routing/main.zig", .needs_utmmd = false },
+        .{ .name = "dpipe_relay_int", .path = "tests/dpipe_relay/main.zig", .needs_utmmd = false },
+        .{ .name = "svc_install_int", .path = "tests/svc_install/main.zig", .needs_utmmd = true },
+        .{ .name = "auto_upgrade_int", .path = "tests/auto_upgrade/main.zig", .needs_utmmd = false },
+    };
+
+    const test_integration_step = b.step("test-integration", "Run integration tests");
+
+    for (integration_tests) |t| {
+        const test_exe = b.addExecutable(.{
+            .name = t.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(t.path),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        test_exe.root_module.addImport("testlib", testlib_mod);
+        test_exe.root_module.addImport("common", test_common_mod);
+
+        if (target.result.os.tag == .windows) {
+            test_exe.root_module.linkSystemLibrary("ws2_32", .{});
+        }
+        if (t.needs_utmmd) {
+            test_exe.step.dependOn(&hash_utmmd.step);
+        }
+
+        const run_test = b.addRunArtifact(test_exe);
+        run_test.step.dependOn(&test_exe.step);
+        test_integration_step.dependOn(&run_test.step);
+
+        b.installArtifact(test_exe);
+    }
 }

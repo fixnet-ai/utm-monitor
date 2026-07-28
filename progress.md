@@ -22,6 +22,24 @@
 | Task 14 | 代码库遗留问题扫描（TODO、日志、refac.md）| ✅ |
 | Task 15 | 新增 config.auto_upgrade 开关（默认 false，5 文件变更）| ✅ |
 
+### 2026-07-29 — Phase 5 集成测试（计划中）
+
+**计划**: 创建 `tests/` 目录，5 个独立可执行集成测试程序 + 共享测试库。
+
+| 任务 | 描述 | 状态 |
+|------|------|------|
+| Task 16 | 测试基础设施 `tests/common.zig` | 📋 |
+| Task 17 | `tcp_frame` — TCP 帧协议 + SOCKS4a | 📋 |
+| Task 18 | `lsa_routing` — LSA + Dijkstra 路由 | 📋 |
+| Task 19 | `dpipe_relay` — DuplexPipe 双向转发 | 📋 |
+| Task 20 | `svc_install` — 安装/卸载 | 📋 |
+| Task 21 | `auto_upgrade` — 自动升级 | 📋 |
+| Task 22 | build.zig `test-integration` 构建步骤 | 📋 |
+
+详见 `refac.md` §8 集成测试计划。
+
+---
+
 **auto_upgrade 开关详情**:
 - `config.zig`: 新增 `auto_upgrade: bool = false` 字段
 - `main.zig`: 新增 `--auto-upgrade` CLI flag（显式启用）及 help text

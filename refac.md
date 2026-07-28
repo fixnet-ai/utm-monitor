@@ -414,3 +414,134 @@ src/
 | 8 | per-command shell（不保留 cd/export） | 简单，匹配独立连接模型 |
 | 9 | lock.zig → svc.zig 内联 flock/LockFileEx | OS 级别锁自动随进程退出释放，无 stale lock；固定路径替代 CWD 相对路径 |
 | 10 | Platform/genInit → svc.zig（不独立构建 install）| 独立构建收益低（发布目标翻倍、@embedFile 依赖），聚合到服务管理层即可 |
+| 11 | auto_upgrade 默认 false | 避免自动升级在测试中干扰；部署时 --auto-upgrade 显式启用 |
+| 12 | 独立测试目录 tests/ | 跨模块集成测试程序固化功能需求，防止回归 |
+
+
+## 8. 集成测试计划
+
+### 8.1 动机
+
+当前测试全部是模块内单元测试（`test "..." {}` 块），没有跨模块验证端到端流程的测试。
+这导致修改一个模块时，常常无声地破坏另一个模块的协议兼容性 —— "按下葫芦起来瓢"。
+
+**目标**: 创建 `tests/` 目录，放置独立可执行、跨平台的集成测试程序，每个测试针对特定业务流程，
+具备清晰固化的功能需求。不要求 root 权限，不依赖真实 VM。
+
+### 8.2 目录结构
+
+```
+tests/
+  common.zig              共享测试基础设施（TestRunner、TestCase、TempDir）
+  tcp_frame/main.zig       TCP 帧协议 + SOCKS4a 环回测试
+  lsa_routing/main.zig     LSA 编解码 + Dijkstra 路由（无网络）
+  dpipe_relay/main.zig     DuplexPipe relay + 真实 socket 对
+  svc_install/main.zig     安装/卸载：锁、自拷贝、genInit、二进制提取
+  auto_upgrade/main.zig    自动升级：版本检测、信号流、upgrade_req 协议
+```
+
+### 8.3 设计原则
+
+1. **独立可执行程序** — 每个测试有 `pub fn main()`，可脱离构建系统直接运行
+2. **独立构建步骤** — `zig build test-integration` 运行集成测试，与 `zig build test` 分离
+3. **子目录隔离** — 每个测试独立子目录，可附加辅助文件不冲突
+4. **共享测试库** — `tests/common.zig` 提供 TestRunner / TestCase / TempDir / findFreePort
+
+### 8.4 测试清单
+
+#### Test 1: `tcp_frame` — TCP 帧协议 + SOCKS4a
+
+**涉及模块**: tcp.zig, protocol.zig  
+**优先级**: 最高（所有 Guest-Host 通信的基础传输层）
+
+| # | 场景 | 验证方式 |
+|---|------|---------|
+| 1 | SOCKS4a 完整握手 | TcpListener 监听 127.0.0.1:0 → 客户端 socks4Connect → 服务端 socks4Accept → 验证 hostname/port → 两端确认 SOCKS_REP_OK |
+| 2 | TCP 帧协议 | 已连接 TCP 对 → sendFrame → recvFrame → 精确比对内容。含 64KB 大帧 |
+| 3 | Connection + 协议消息 | buildPtyExecInput → Connection.sendAndFlush → Connection.recv → parsePtyExecInput → 验证字段一致 |
+| 4 | 连接关闭检测 | 客户端 close → 服务端 recv 返回 0 → isAlive() 返回 false |
+| 5 | TcpListener 拒绝错误 hostname | 客户端以 "wronghost" 连接 → 服务端 socks4Accept 返回 SOCKS_REP_REJECTED |
+
+**网络**: TCP 环回，无需 root。跨平台（含 Windows ws2_32）。
+
+#### Test 2: `lsa_routing` — LSA 编解码 + Dijkstra 路由
+
+**涉及模块**: lsa.zig  
+**优先级**: 高（Mesh 发现骨干，纯逻辑，完全跨平台）
+
+| # | 场景 | 验证方式 |
+|---|------|---------|
+| 1 | encodeLsa/decodeLsa 往返 | 构造含邻居的 LSA → 编码 → 解码 → 全部字段一致 |
+| 2 | NodeId 解析/格式化一致性 | "aa:bb:cc:dd:ee:ff" → parseNodeId → formatNodeId → 原串一致 |
+| 3 | Dijkstra 路由（3 节点线形） | A-B-C 拓扑 → rebuildRoutes → routeTo(C) = B |
+| 4 | LSA 重启检测（nonce） | 同 nonce→无变更；不同 nonce→检测到变更；缺失 nonce→回退对比 |
+| 5 | 邻居过期 | 添加邻居 → 推进时钟 20s → expireStale → 邻居已删除 |
+| 6 | LSA 序列号去重 | seq=5 → 拒绝 seq=3（更低）→ 拒绝 seq=5（相同）→ 接受 seq=7（更高）|
+
+#### Test 3: `dpipe_relay` — DuplexPipe 双向转发
+
+**涉及模块**: dpipe.zig, tcp.zig  
+**优先级**: 中高（文件上传/下载流式传输核心）
+
+| # | 场景 | 验证方式 |
+|---|------|---------|
+| 1 | BytePipe 读写 | 写入 "hello"+" world" → 读取验证 → 再读返回 0 (EOF) |
+| 2 | BytePipe 大数据 | 写入 128KB → 4KB 分块读 → 验证全部数据 |
+| 3 | TCP socket → DuplexPipe 适配 | socket pair → 一端包装为 DuplexPipe → 另一端写入 → DuplexPipe.read 验证 |
+| 4 | relay() 双向转发 | 两个 socket pair → relay(A, B) → A 写入 "hello A" → B 读取验证 |
+| 5 | relay() EOF 终止 | socket pair → 一端提前关闭 → relay 应正常返回不挂起 |
+
+**网络**: socketpair() (POSIX) / TCP 环回 (Windows)。不支持的子测试标记 SKIP。
+
+#### Test 4: `svc_install` — 安装/卸载
+
+**涉及模块**: svc.zig, main.zig, fail.zig  
+**优先级**: 高（部署基础操作，曾出过 lock.zig CWD bug 和 genInit 服务名多次变更）
+
+| # | 场景 | 验证方式 |
+|---|------|---------|
+| 1 | InstallLock 获取/释放 | 临时锁文件测试 acquire→锁存在→release→再次 acquire 成功。POSIX flock + Windows LockFileEx 双路径 |
+| 2 | genInit 脚本生成（3 平台） | 生成 linux/macos/windows 脚本 → 验证服务名 utmmd、二进制路径、--role 参数等模板关键字 |
+| 3 | extractUtmmd 二进制提取 | 嵌入的 utmmd.bin → 提取到临时目录 → SHA256 验证 → POSIX 权限位 0o755 |
+| 4 | selfCopy 自拷贝完整性 | 自拷贝到临时目录 → 源与目标逐字节比对 → 文件大小一致 |
+| 5 | canonicalSvcPath 路径 | POSIX → /opt/utmm/utmm，Windows → C:\opt\utmm\utmm.exe |
+
+**权限**: 无需 root（锁文件用临时目录替代系统路径）。
+
+#### Test 5: `auto_upgrade` — 自动升级
+
+**涉及模块**: lsa.zig, guest.zig, protocol.zig, host.zig  
+**优先级**: 高（最复杂的跨模块流程，当前有未完成的 TODO）
+
+| # | 场景 | 验证方式 |
+|---|------|---------|
+| 1 | LSA 版本不匹配检测 | 注入 "role:host\nversion:9.9.9" → upgrade_needed 被置 true。注入相同版本 → 保持 false |
+| 2 | 非 Host LSA 不触发升级 | 注入 "role:guest\nversion:9.9.9" → upgrade_needed 不变（仅 Host 版本触发） |
+| 3 | upgrade_req 消息编解码 | buildUpgradeReq → parseUpgradeReq → cmd_id + target 字段一致 |
+| 4 | auto_upgrade=false 门控 | upgrade_needed 传 null → 注入版本不匹配 LSA → 不崩溃、无操作 |
+| 5 | 版本号格式验证 | isValidVersion("0.11.19")=true; "v0.11.19"=false; "1.2"=false |
+
+### 8.5 构建集成
+
+```zig
+const integration_tests = [_]struct { name, path, needs_utmmd: bool }{
+    .{ .name = "tcp_frame_int",    .path = "tests/tcp_frame/main.zig",    .needs_utmmd = false },
+    .{ .name = "lsa_routing_int",  .path = "tests/lsa_routing/main.zig",  .needs_utmmd = false },
+    .{ .name = "dpipe_relay_int",  .path = "tests/dpipe_relay/main.zig",  .needs_utmmd = false },
+    .{ .name = "svc_install_int",  .path = "tests/svc_install/main.zig",  .needs_utmmd = true  },
+    .{ .name = "auto_upgrade_int", .path = "tests/auto_upgrade/main.zig", .needs_utmmd = false },
+};
+```
+
+`needs_utmmd: true` 的测试依赖构建管道中的 `hash_utmmd` 步骤，确保 `src/embed/utmmd.bin` + `utmmd.sha256` 已就绪。
+
+### 8.6 实现顺序
+
+| Phase | 内容 | 文件 |
+|-------|------|------|
+| 1 | 测试基础设施 | `tests/common.zig` |
+| 2 | tcp_frame 测试 | `tests/tcp_frame/main.zig` + build.zig |
+| 3 | lsa_routing 测试 | `tests/lsa_routing/main.zig` |
+| 4 | dpipe_relay 测试 | `tests/dpipe_relay/main.zig` |
+| 5 | svc_install 测试 | `tests/svc_install/main.zig` |
+| 6 | auto_upgrade 测试 | `tests/auto_upgrade/main.zig` |
