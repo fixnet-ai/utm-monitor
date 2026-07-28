@@ -6,9 +6,9 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const net = std.Io.net;
 const protocol = @import("protocol.zig");
-const tunnel_mod = @import("tunnel.zig");
 const tunproto = @import("tunproto.zig");
 const mesh_mod = @import("mesh.zig");
+const netconn = @import("netconn.zig");
 const svc = @import("svc.zig");
 const shm = @import("shm.zig");
 
@@ -575,7 +575,7 @@ fn getGatewayWindows(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// v0.11.0: pty session model — persistent pty per KCP tunnel connection
+// v0.11.0: pty session model — persistent pty per connection
 // ═══════════════════════════════════════════════════════════════════════════
 
 // POSIX pty externs (available on macOS and Linux via libc)
@@ -853,119 +853,6 @@ fn ptySpawnWindows(allocator: std.mem.Allocator) !PtySession {
         .stdin_fd = stdin_write,
     };
 }
-
-/// Thread: continuously read pty master_fd, send pty_output frames to Host.
-/// Runs for entire WS connection lifetime. Sets pty_dead on EOF (shell exited).
-fn ptyReadLoop(
-    master_fd: std.posix.fd_t,
-    tun: *tunnel_mod.Tunnel,
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    active_cmd_id: *[]const u8,
-    cmd_mutex: *std.Io.Mutex,
-    pty_dead: *std.atomic.Value(bool),
-) void {
-    var buf: [4096]u8 = undefined;
-
-    while (true) {
-        // Check for shutdown signal from main thread (e.g. tunnel died).
-        // Without this, the main thread's pty_dead.store(true) + close(fd)
-        // has a race with sendAndFlush: if the pty output thread is stalled
-        // in sendAndFlush (waiting on sessions_mutex), closing the fd won't
-        // wake it. The signaled flag provides a guaranteed exit path.
-        if (pty_dead.load(.acquire)) {
-            std.log.info("[guest-pty] pty_dead signaled, exiting", .{});
-            break;
-        }
-
-        if (builtin.os.tag == .windows) {
-            // Windows: use PeekNamedPipe to check for data without blocking.
-            // Blocking ReadFile cannot be interrupted by CloseHandle from
-            // another thread on ARM64, so we must poll cooperatively and
-            // check pty_dead between iterations.
-            const PeekNamedPipe = @extern(
-                *const fn (std.os.windows.HANDLE, ?[*]u8, std.os.windows.DWORD, ?*std.os.windows.DWORD, ?*std.os.windows.DWORD, ?*std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL,
-                .{ .name = "PeekNamedPipe", .library_name = "kernel32" },
-            );
-            var available: std.os.windows.DWORD = 0;
-            if (@intFromEnum(PeekNamedPipe(master_fd, null, 0, null, &available, null)) == 0) {
-                // Pipe broken or closed — shell process exited.
-                std.log.info("[guest-pty] pty pipe broken (shell exited)", .{});
-                pty_dead.store(true, .release);
-                break;
-            }
-            if (available == 0) {
-                // No data available — sleep 100ms then re-check pty_dead.
-                // The main thread sets pty_dead before calling closePtyFd,
-                // so we will detect shutdown within one sleep interval.
-                const Sleep = @extern(
-                    *const fn (std.os.windows.DWORD) callconv(.winapi) void,
-                    .{ .name = "Sleep", .library_name = "kernel32" },
-                );
-                Sleep(100);
-                continue;
-            }
-            // Data available — fall through to ptyRead below.
-        } else {
-            // POSIX: poll master_fd with 100ms timeout to check pty_dead
-            var fds: [1]std.posix.pollfd = .{
-                .{ .fd = master_fd, .events = std.posix.POLL.IN, .revents = 0 },
-            };
-            _ = std.posix.poll(&fds, 100) catch |err| {
-                if (err == error.Interrupted) continue;
-                std.log.err("[guest-pty] pty poll error: {}", .{err});
-                break;
-            };
-
-            // POLL.HUP: shell process exited (or never started).
-            // Poll returns immediately with HUP set, so we must handle
-            // it before the POLL.IN check — otherwise we spin at 100% CPU.
-            if (fds[0].revents & std.posix.POLL.HUP != 0) {
-                std.log.info("[guest-pty] pty hangup (shell exited)", .{});
-                pty_dead.store(true, .release);
-                break;
-            }
-            if (fds[0].revents & std.posix.POLL.IN == 0) continue;
-        }
-
-        const n = ptyRead(master_fd, &buf) catch |err| {
-            std.log.err("[guest-pty] pty read error: {}", .{err});
-            break;
-        };
-
-        if (n == 0) {
-            // EOF: shell process exited
-            std.log.info("[guest-pty] pty EOF (shell exited)", .{});
-            pty_dead.store(true, .release);
-            break;
-        }
-
-        // Read current cmd_id under mutex
-        cmd_mutex.lock(io) catch continue;
-        const cmd_id = active_cmd_id.*;
-        const cmd_owned = allocator.dupe(u8, cmd_id) catch {
-            cmd_mutex.unlock(io);
-            continue;
-        };
-        cmd_mutex.unlock(io);
-        defer allocator.free(cmd_owned);
-
-        // Send pty_exec_output frame via tunnel with immediate flush.
-        // On Windows, the mesh loop uses blocking receive() without timeout,
-        // so periodicTasks (which normally flushes KCP) only runs when a
-        // packet arrives. Without immediate flush, output data would sit in
-        // KCP snd_queue until the next incoming packet (up to 5s delay).
-        // sendAndFlush() triggers kcp.update() which calls the output callback
-        // to transmit queued segments via UDP immediately.
-        const frame = tunproto.buildPtyExecOutput(allocator, cmd_owned, buf[0..n]) catch continue;
-        defer allocator.free(frame);
-        _ = tun.sendAndFlush(frame, tun.session.mesh.clock_ms) catch |err| {
-            std.log.err("[guest-pty] pty_exec_output send error: {}", .{err});
-            break;
-        };
-    }
-}
-
 /// Cross-platform child process termination (for pty cleanup).
 fn killChild(pid: std.posix.pid_t) void {
     switch (builtin.os.tag) {
@@ -988,8 +875,7 @@ fn killChild(pid: std.posix.pid_t) void {
 
 /// Close a pty master fd. On Windows the fd is a pipe HANDLE from
 /// CreatePipe — POSIX close() does nothing on it, so we must call
-/// CloseHandle directly. Without this, ptyReadLoop stays blocked
-/// in ReadFile and t.join() deadlocks the shutdown path.
+/// CloseHandle directly.
 fn closePtyFd(fd: std.posix.fd_t) void {
     if (builtin.os.tag == .windows) {
         const CloseHandle = @extern(
@@ -999,500 +885,6 @@ fn closePtyFd(fd: std.posix.fd_t) void {
         _ = CloseHandle(@ptrCast(fd));
     } else {
         _ = close(fd);
-    }
-}
-
-pub fn meshSessionLoop(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    info: SystemInfo,
-    upgrade: *UpgradeSignal,
-    mesh_port: u16,
-    peer_mesh: ?[]const u8,
-    shutdown: ?*std.atomic.Value(bool),
-) !void {
-    // Start mesh networking thread (LSA broadcast + KCP data dispatch).
-    // Mesh owns UDP :2121 for LSA + KCP relay + PING/PONG.
-    var mesh_opt: ?mesh_mod.Mesh = null;
-    var mesh_thread: ?std.Thread = null;
-    var mesh_socket_opt: ?net.Socket = null;
-
-    // Create a dedicated Io.Threaded for mesh background thread.
-    // The main init.io does not support cross-thread concurrent I/O on
-    // Windows, causing error.ConcurrencyUnavailable when
-    // socket.receiveTimeout() is called from the mesh thread.
-    // Using a dedicated instance ensures the socket and its I/O operations
-    // live on the same Io, avoiding the cross-thread issue.
-    var mesh_threaded = std.Io.Threaded.init(allocator, .{});
-    const mesh_io = mesh_threaded.io();
-
-    start_mesh: {
-        // Collect broadcast addresses (subnet-directed + 255.255.255.255)
-        var broadcast_addrs = getSubnetBroadcasts(allocator) catch |err| {
-            std.log.err("[guest-mesh] getSubnetBroadcasts failed: {}", .{err});
-            break :start_mesh;
-        };
-
-        // Add explicit peer mesh address for local testing (different mesh ports)
-        if (peer_mesh) |pm| {
-            if (protocol.parsePeerMeshAddr(pm)) |peer_addr| {
-                broadcast_addrs.append(allocator, peer_addr) catch |err| {
-                    std.log.err("[guest-mesh] append peer-mesh '{s}': {}", .{ pm, err });
-                };
-            } else {
-                std.log.err("[guest-mesh] invalid --peer-mesh '{s}'", .{pm});
-            }
-        }
-
-        // Bind UDP socket for mesh
-        const bind_addr = net.IpAddress.parse("0.0.0.0", mesh_port) catch |err| {
-            std.log.err("[guest-mesh] Mesh bind addr parse failed: {}", .{err});
-            broadcast_addrs.deinit(allocator);
-            break :start_mesh;
-        };
-        const mesh_socket = bind_addr.bind(mesh_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
-            std.log.err("[guest-mesh] Mesh UDP bind :{d} failed: {}", .{ mesh_port, err });
-            broadcast_addrs.deinit(allocator);
-            break :start_mesh;
-        };
-        mesh_socket_opt = mesh_socket;
-
-        // Parse MAC as mesh NodeId.
-        // When peer_mesh is set (local testing, same machine as Host),
-        // derive a unique NodeId from MAC+hostname to avoid collision.
-        const node_id = if (peer_mesh != null)
-            mesh_mod.deriveNodeId(info.mac, info.hostname) catch |err| {
-                std.log.err("[guest-mesh] deriveNodeId '{s}'+'{s}' failed: {}", .{ info.mac, info.hostname, err });
-                mesh_socket.close(mesh_io);
-                broadcast_addrs.deinit(allocator);
-                break :start_mesh;
-            }
-        else
-            mesh_mod.parseNodeId(info.mac) catch |err| {
-                std.log.err("[guest-mesh] Mesh MAC parse '{s}' failed: {}", .{ info.mac, err });
-                mesh_socket.close(mesh_io);
-                broadcast_addrs.deinit(allocator);
-                break :start_mesh;
-            };
-
-        // Build node_info string for LSA broadcast
-        const node_info = std.fmt.allocPrint(allocator,
-            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:serving",
-            .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
-        ) catch |err| {
-            std.log.err("[guest-mesh] Mesh node_info alloc failed: {}", .{err});
-            mesh_socket.close(mesh_io);
-            broadcast_addrs.deinit(allocator);
-            break :start_mesh;
-        };
-
-        // Create mesh instance (mesh takes ownership of node_info and broadcast_addrs)
-        mesh_opt = mesh_mod.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs, getSubnetBroadcasts, null, null, null) catch |err| {
-            std.log.err("[guest-mesh] Mesh init failed: {}", .{err});
-            allocator.free(node_info);
-            mesh_socket.close(mesh_io);
-            broadcast_addrs.deinit(allocator);
-            break :start_mesh;
-        };
-
-        // Spawn mesh.run() in background thread
-        mesh_thread = std.Thread.spawn(.{}, mesh_mod.Mesh.run, .{&mesh_opt.?}) catch |err| {
-            std.log.err("[guest-mesh] Mesh thread spawn failed: {}", .{err});
-            mesh_opt.?.deinit();
-            mesh_socket.close(mesh_io);
-            mesh_opt = null;
-            break :start_mesh;
-        };
-
-        std.log.info("[guest-mesh] Mesh networking started (LSA on UDP :{d})", .{mesh_port});
-    }
-
-    defer {
-        if (mesh_thread) |t| {
-            if (mesh_opt) |*m| m.signalShutdown();
-            t.join();
-        }
-        if (mesh_opt) |*m| {
-            const m_io = m.io;
-            m.deinit();
-            if (mesh_socket_opt) |s| s.close(m_io);
-        }
-    }
-
-    if (mesh_opt == null) {
-        std.log.err("[guest-mesh] Mesh failed to start, exiting", .{});
-        return error.MeshInitFailed;
-    }
-
-    // Helper: check shutdown flag without namespace-qualifying the type
-    const checkShutdown = struct {
-        fn check(s: ?*std.atomic.Value(bool)) bool {
-            if (s) |ptr| return ptr.load(.acquire);
-            return false;
-        }
-    }.check;
-
-    // Main loop: wait for Host tunnel, process commands, handle reconnect.
-    while (true) {
-        if (checkShutdown(shutdown)) {
-            std.log.info("[guest-mesh] Shutdown requested, exiting", .{});
-            break;
-        }
-
-        // Check for pending auto-upgrade before entering any command session.
-        // This runs outside the command loop — no pty threads or in-flight
-        // commands exist at this point, so the upgrade can safely stop
-        // responding to Host requests.
-        if (upgrade.needed.load(.acquire)) {
-            std.log.info("[guest-mesh] upgrade signal detected, entering upgrade mode...", .{});
-            upgrade.needed.store(false, .release);
-
-            if (mesh_opt) |*m| {
-                const new_info = std.fmt.allocPrint(allocator,
-                    "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:upgrading",
-                    .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
-                ) catch {
-                    std.log.err("[guest-mesh] allocPrint for upgrade node_info failed", .{});
-                    continue;
-                };
-                m.updateNodeInfo(new_info);
-            }
-
-            const upgrade_ok = doAutoUpgrade(io, allocator, &mesh_opt, info, shutdown) catch |err| {
-                std.log.err("[guest-mesh] auto-upgrade failed: {}", .{err});
-                // Restore status so Host sees Guest as available again
-                if (mesh_opt) |*m| {
-                    const new_info = std.fmt.allocPrint(allocator,
-                        "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:serving",
-                        .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
-                    ) catch continue;
-                    m.updateNodeInfo(new_info);
-                }
-                continue;
-            };
-
-            if (upgrade_ok) {
-                std.log.info("[guest-mesh] upgrade signaled to utmmd, exiting for restart...", .{});
-                break;
-            }
-            // upgrade_ok == false: shm.open failed, restore serving status and continue
-            if (mesh_opt) |*m| {
-                const new_info = std.fmt.allocPrint(allocator,
-                    "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:serving",
-                    .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
-                ) catch continue;
-                m.updateNodeInfo(new_info);
-            }
-        }
-
-        // Wait for Host to establish a KCP tunnel and send pty_spawn
-        std.log.info("[guest-mesh] Entering waitForHostTunnel...", .{});
-        var tunnel = waitForHostTunnel(io, allocator, &mesh_opt, shutdown) catch |err| {
-            if (err == error.ShutdownRequested) break;
-            std.log.err("[guest-mesh] waitForHostTunnel failed: {}", .{err});
-            continue;
-        };
-
-        // Read initial frame from Host. Usually pty_spawn, but on Host
-        // restart the old command loop may have already consumed it and
-        // the next frame is pty_exec_input. Accept either as the spawn
-        // trigger, and buffer a pre-consumed exec command for delivery
-        // after the pty is ready.
-        var pending_cmd_id: []const u8 = &.{};
-        var pending_cmd_data: []const u8 = &.{};
-        defer {
-            if (pending_cmd_id.len > 0) allocator.free(pending_cmd_id);
-            if (pending_cmd_data.len > 0) allocator.free(pending_cmd_data);
-        }
-
-        const spawn_ok = blk: {
-            var rbuf: [4096]u8 = undefined;
-            while (true) {
-                if (checkShutdown(shutdown)) break :blk false;
-                const n = tunnel.recv(&rbuf) catch |err| {
-                    std.log.err("[guest-mesh] pty_spawn recv error: {}", .{err});
-                    break :blk false;
-                };
-                if (n == 0) {
-                    if (!tunnel.isAlive()) {
-                        std.log.info("[guest-mesh] Tunnel dead before pty_spawn", .{});
-                        break :blk false;
-                    }
-                    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
-                    continue;
-                }
-                if (n > 0 and rbuf[0] == @intFromEnum(tunproto.MsgType.pty_spawn)) {
-                    std.log.info("[guest-spawn] got pty_spawn on conv={d}", .{tunnel.session.conv});
-                    break :blk true;
-                }
-                // Host restart race: old command loop consumed pty_spawn,
-                // next frame is pty_exec_input. Accept as implicit spawn
-                // and buffer the command for delivery after pty is ready.
-                if (n > 0 and rbuf[0] == @intFromEnum(tunproto.MsgType.pty_exec_input)) {
-                    std.log.info("[guest-spawn] pty exec before spawn (reconnect race), buffering on conv={d}", .{tunnel.session.conv});
-                    if (tunproto.parsePtyExecInput(rbuf[1..n])) |input| {
-                        pending_cmd_id = allocator.dupe(u8, input.cmd_id) catch &.{};
-                        pending_cmd_data = allocator.dupe(u8, input.command) catch &.{};
-                    }
-                    break :blk true;
-                }
-                std.log.info("[guest-spawn] Ignoring pre-spawn frame type={d} len={d} conv={d}", .{ rbuf[0], n, tunnel.session.conv });
-            }
-        };
-        if (!spawn_ok) {
-            std.log.info("[guest-mesh] No pty_spawn received, waiting for reconnect...", .{});
-            tunnel.deinit();
-            continue;
-        }
-
-        // Spawn pty session
-        // detectShell only fails on OOM; "/bin/sh" is a compile-time literal.
-        // Track allocation origin so defer free doesn't release .rodata memory.
-        var shell_is_heap = true;
-        const shell = detectShell(allocator) catch blk: {
-            shell_is_heap = false;
-            break :blk "/bin/sh";
-        };
-        defer if (shell_is_heap) allocator.free(shell);
-        const pty = ptySpawn(allocator, shell) catch |err| {
-            std.log.err("[guest-mesh] ptySpawn failed: {}", .{err});
-            tunnel.deinit();
-            continue;
-        };
-        defer {
-            allocator.free(pty.shell);
-            killChild(pty.child_pid);
-            closePtyFd(pty.master_fd);
-        }
-
-        // Shared state between main loop and ptyReadLoop thread
-        var active_cmd_id: []const u8 = &.{};
-        var cmd_mutex: std.Io.Mutex = std.Io.Mutex.init;
-        var pty_dead: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-        // Start ptyReadLoop thread (stored for join on exit — no detach)
-        var pty_read_thread: ?std.Thread = null;
-        {
-            pty_read_thread = try std.Thread.spawn(.{}, ptyReadLoop, .{
-                pty.master_fd,
-                &tunnel,
-                io,
-                allocator,
-                &active_cmd_id,
-                &cmd_mutex,
-                &pty_dead,
-            });
-        }
-
-        // Deliver any exec command buffered from reconnect race
-        if (pending_cmd_data.len > 0) {
-            cmd_mutex.lock(io) catch continue;
-            if (active_cmd_id.len > 0) allocator.free(active_cmd_id);
-            active_cmd_id = pending_cmd_id;
-            pending_cmd_id = &.{}; // ownership transferred
-            cmd_mutex.unlock(io);
-            ptyWrite(&pty, pending_cmd_data) catch |err| {
-                std.log.err("[guest-mesh] ptyWrite pending failed: {}", .{err});
-            };
-        }
-
-        std.log.info("[guest-mesh] Pty session started, entering command loop", .{});
-
-        // Command dispatch loop — uses 256KB fixed buffer.
-        // File transfers (upload/download/upgrade) use chunked protocol:
-        // upload_cmd + file_chunk × N + file_eof, avoiding full-file buffering.
-        var rbuf: [262144]u8 = undefined;
-        while (!pty_dead.load(.acquire)) {
-            // Check Windows service shutdown signal before blocking recv.
-            if (checkShutdown(shutdown)) {
-                std.log.info("[guest-mesh] Shutdown requested, exiting command loop", .{});
-                break;
-            }
-
-            // Check for pending auto-upgrade (version mismatch detected via LSA).
-            // Exit the command loop to let the outer loop handle the upgrade.
-            if (upgrade.needed.load(.acquire)) {
-                std.log.info("[guest-mesh] Upgrade signal detected, exiting command loop", .{});
-                break;
-            }
-
-            if (!tunnel.isAlive()) {
-                std.log.info("[guest-mesh] Tunnel dead (keepalive), reconnecting", .{});
-                break;
-            }
-
-            const n = tunnel.recv(&rbuf) catch |err| {
-                std.log.err("[guest-mesh] tunnel recv error: {}", .{err});
-                break;
-            };
-            if (n == 0 or rbuf[0] == 0) {
-                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
-                continue;
-            }
-
-            const msg_type: u8 = rbuf[0];
-            const payload = rbuf[1..n]; // strip type byte — parse*() expects data[0]=first field
-
-            switch (msg_type) {
-                @intFromEnum(tunproto.MsgType.pty_spawn) => {
-                    std.log.info("[guest-mesh] pty re-spawn requested", .{});
-                    break;
-                },
-                @intFromEnum(tunproto.MsgType.pty_exec_input) => {
-                    if (tunproto.parsePtyExecInput(payload)) |input| {
-                        // Update active_cmd_id under mutex
-                        cmd_mutex.lock(io) catch continue;
-                        if (active_cmd_id.len > 0) allocator.free(active_cmd_id);
-                        active_cmd_id = allocator.dupe(u8, input.cmd_id) catch &.{};
-                        cmd_mutex.unlock(io);
-
-                        // Write command data to pty master (stdin of shell).
-                        // Ctrl+C (0x03) and other control chars are forwarded
-                        // through pty stdin — termios generates signal automatically.
-                        ptyWrite(&pty, input.command) catch |err| {
-                            std.log.err("[guest-mesh] ptyWrite cmd failed: {}", .{err});
-                            continue;
-                        };
-                    }
-                },
-                @intFromEnum(tunproto.MsgType.upload_cmd) => {
-                    if (tunproto.parseUploadCmd(payload)) |cmd| {
-                        std.log.debug("[guest-mesh] Upload cmd: {s} ({d} bytes, hash={s})", .{ cmd.path, cmd.file_size, cmd.file_hash });
-                        receiveChunkedFile(io, allocator, &tunnel, cmd.cmd_id, cmd.path, cmd.file_hash) catch |e| {
-                            std.log.err("[guest-mesh] Upload receive failed: {}", .{e});
-                            const resp = tunproto.buildUploadResult(allocator, cmd.cmd_id, -1) catch continue;
-                            defer allocator.free(resp);
-                            _ = tunnel.sendAndFlush(resp, tunnel.session.mesh.clock_ms) catch {};
-                        };
-                    }
-                },
-                @intFromEnum(tunproto.MsgType.download_cmd) => {
-                    std.log.info("[guest-mesh] Download cmd received (type=0x14)", .{});
-                    if (tunproto.parseDownloadCmd(payload)) |cmd| {
-                        std.log.info("[guest-mesh] Download cmd: {s}", .{cmd.path});
-                        sendChunkedFile(io, allocator, &tunnel, cmd.cmd_id, cmd.path) catch |e| {
-                            std.log.err("[guest-mesh] Download send failed: {}", .{e});
-                            const eof = tunproto.buildFileEof(allocator, cmd.cmd_id, -1, 0, "") catch continue;
-                            defer allocator.free(eof);
-                            _ = tunnel.sendAndFlush(eof, tunnel.session.mesh.clock_ms) catch {};
-                        };
-                    } else {
-                        std.log.err("[guest-mesh] Download cmd parse failed!", .{});
-                    }
-                },
-                @intFromEnum(tunproto.MsgType.file_chunk) => {
-                    std.log.debug("[guest-mesh] Unexpected file_chunk in command loop (ignored)", .{});
-                },
-                @intFromEnum(tunproto.MsgType.file_eof) => {
-                    std.log.debug("[guest-mesh] Unexpected file_eof in command loop (ignored)", .{});
-                },
-                else => {
-                    std.log.info("[guest-mesh] Unknown msg type: {d} (0x{x:0>2})", .{ msg_type, msg_type });
-                },
-            }
-        }
-
-        std.log.info("[guest-mesh] Pty session ended, waiting for reconnect...", .{});
-
-        // Send pty_exec_done for active command — notifies Host immediately
-        // that the pty session has ended. The Host normally detects command
-        // completion via MDELIM marker scanning, but this covers edge cases
-        // where the shell exits without producing a marker (e.g. Ctrl+D).
-        {
-            cmd_mutex.lock(io) catch {};
-            defer cmd_mutex.unlock(io);
-            const final_cmd_id = active_cmd_id;
-            if (final_cmd_id.len > 0) {
-                const done_msg = tunproto.buildPtyExecDone(allocator, final_cmd_id, -1) catch null;
-                if (done_msg) |msg| {
-                    defer allocator.free(msg);
-                    _ = tunnel.sendAndFlush(msg, tunnel.session.mesh.clock_ms) catch {};
-                }
-            }
-        }
-
-        // Signal ptyReadLoop to exit, then wait for it.
-        // (The defer above will also close master_fd, but we need to do it
-        // now so ptyReadLoop's poll() wakes up before we join.)
-        pty_dead.store(true, .release);
-        closePtyFd(pty.master_fd);
-        if (pty_read_thread) |t| {
-            t.join();
-        }
-
-        tunnel.deinit();
-        std.log.info("[guest-mesh] Cleanup done, looping back to waitForHostTunnel", .{});
-    }
-}
-
-/// Wait for Host to establish a KCP tunnel via mesh.
-/// Wait for a KCP tunnel from the Host with data ready to read.
-///
-/// When multiple sessions have pending data (e.g. after Host restart —
-/// stale sessions from the old Host epoch alongside a fresh session from
-/// the new Host), picks the one with the most recent `last_recv_ms`.
-/// After Host restart, new sessions are fed by the new Host's KCP data
-/// and have a near-current timestamp, while old sessions were last fed
-/// before the crash — so the fresh session wins. This resolves the
-/// dual-session mismatch that caused exec to return empty output
-/// (Finding 93) without relying on KCP keepalive timeout (~15s).
-fn waitForHostTunnel(io: std.Io, allocator: std.mem.Allocator, mesh_opt: *?mesh_mod.Mesh, shutdown: ?*std.atomic.Value(bool)) !tunnel_mod.Tunnel {
-    while (true) {
-        // Check for service shutdown signal before blocking on tunnel
-        // availability. Without this, sc stop hangs forever (STOP_PENDING)
-        // when the main loop is in reconnect-wait rather than the command
-        // loop — the outer while's checkShutdown is never reached.
-        if (shutdown) |s| {
-            if (s.load(.acquire)) return error.ShutdownRequested;
-        }
-        if (mesh_opt.*) |*m| {
-            m.sessions_mutex.lock(m.io) catch |err| {
-                // Lock failure (e.g. Io canceled) — back off instead of
-                // spinning. Skipping the sleep at the bottom of the loop
-                // would turn this into a 100% CPU busy-loop.
-                std.log.err("[guest-wait] sessions_mutex lock failed: {}", .{err});
-                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
-                continue;
-            };
-            const count = m.sessions.count();
-            if (count > 0) {
-                var best: ?*mesh_mod.MeshSession = null;
-                var best_ms: u32 = 0;
-                var total_dead: u32 = 0;
-                var total_with_data: u32 = 0;
-                var it = m.sessions.iterator();
-                while (it.next()) |entry| {
-                    const sess = entry.value_ptr.*;
-                    if (sess.dead) {
-                        total_dead += 1;
-                        continue;
-                    }
-                    const peek = sess.kcp_inst.peekSize();
-                    if (peek > 0) {
-                        total_with_data += 1;
-                        if (best == null or sess.last_recv_ms > best_ms) {
-                            best = sess;
-                            best_ms = sess.last_recv_ms;
-                        }
-                    }
-                }
-                if (total_with_data > 0) {
-                    std.log.debug("[guest-wait] sessions={d} dead={d} data={d}", .{ count, total_dead, total_with_data });
-                }
-                if (best) |sess| {
-                    std.log.debug("[guest-wait] selected conv={d} peek={d}", .{ sess.conv, sess.kcp_inst.peekSize() });
-                    // Must hold sessions_mutex during Tunnel.init() to prevent
-                    // the session from being freed by another thread between
-                    // unlock and init (Finding 129). Tunnel.init() is a pure
-                    // struct literal — no allocation, no blocking.
-                    const tun = tunnel_mod.Tunnel.init(allocator, m.io, sess);
-                    m.sessions_mutex.unlock(m.io);
-                    return tun;
-                }
-            }
-            m.sessions_mutex.unlock(m.io);
-        }
-        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
     }
 }
 /// Convert 32-byte SHA256 hash to hex string. Caller owns returned string.
@@ -1511,7 +903,7 @@ pub fn hexHash(allocator: std.mem.Allocator, hash: *const [32]u8) ![]const u8 {
 fn receiveChunkedFile(
     io: std.Io,
     allocator: std.mem.Allocator,
-    tun: *tunnel_mod.Tunnel,
+    conn: *netconn.Connection,
     cmd_id: []const u8,
     dest_path: []const u8,
     expected_hash: []const u8,
@@ -1541,19 +933,19 @@ fn receiveChunkedFile(
     // Inner loop: receive file_chunk + file_eof
     var rbuf: [262144]u8 = undefined;
     while (true) {
-        if (!tun.isAlive()) {
+        if (!conn.isAlive()) {
             return error.TunnelDeadDuringUpload;
         }
 
-        const n = tun.recv(&rbuf) catch |err| {
+        const n = conn.recv(&rbuf) catch |err| {
             std.log.err("[guest-mesh] Chunk recv error: {}", .{err});
             return err;
         };
         if (n == 0) {
-            // Yield to mesh thread — without this sleep the tight recv loop
-            // starves sessions_mutex, preventing kcp.input()/kcp.update()
-            // from delivering ACKs and new data. Large file transfers (>~1MB)
-            // fail with TunnelDeadDuringUpload without this yield.
+            // Yield to give the TCP stack time to deliver more data.
+            // Without this yield the tight recv loop starves the connection
+            // from receiving new data. Large file transfers (>~1MB)
+            // fail with timeout without this yield.
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
             continue;
         }
@@ -1604,7 +996,7 @@ fn receiveChunkedFile(
                     std.log.err("[guest-mesh] Upload hash mismatch: got {s}, expected {s}", .{ actual_hex, expected_hash });
                     const resp = try tunproto.buildUploadResult(allocator, cmd_id, -1);
                     defer allocator.free(resp);
-                    _ = tun.sendAndFlush(resp, tun.session.mesh.clock_ms) catch {};
+                    _ = conn.sendAndFlush(resp, 0) catch {};
                     return error.HashMismatch;
                 }
 
@@ -1616,7 +1008,7 @@ fn receiveChunkedFile(
 
                 const resp = try tunproto.buildUploadResult(allocator, cmd_id, 0);
                 defer allocator.free(resp);
-                _ = tun.sendAndFlush(resp, tun.session.mesh.clock_ms) catch |e| {
+                _ = conn.sendAndFlush(resp, 0) catch |e| {
                     std.log.err("[guest-mesh] upload_result send failed: {}", .{e});
                 };
                 return;
@@ -1635,214 +1027,31 @@ fn receiveChunkedFile(
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Auto-upgrade functions
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Receive the upgrade binary from Host via KCP chunked transfer.
-/// Based on receiveChunkedFile but simplified: fixed destination dir,
-/// no upload_result response, adds timeout protection.
-/// Returns the path to the successfully received and verified temp file.
-fn receiveUpgradeFile(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    tun: *tunnel_mod.Tunnel,
-    cmd_id: []const u8,
-) ![]const u8 {
-    const dirname = svc.canonicalDir();
-    var rand_bytes: [8]u8 = undefined;
-    io.random(&rand_bytes);
-    var temp_hex: [16]u8 = undefined;
-    for (rand_bytes, 0..) |b, j| {
-        temp_hex[j * 2] = "0123456789abcdef"[b >> 4];
-        temp_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
-    }
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}/.utmm-upgrade-{s}", .{ dirname, &temp_hex });
-    errdefer allocator.free(temp_path);
-
-    // Clean up stale temp file from a previous failed upgrade
-    std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
-
-    const temp_file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
-    defer temp_file.close(io);
-
-    var wb: [65536]u8 = undefined;
-    var writer = temp_file.writer(io, &wb);
-
-    var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
-    var received: u32 = 0;
-
-    var rbuf: [262144]u8 = undefined;
-    var last_data_ts: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
-
-    while (true) {
-        if (!tun.isAlive()) {
-            std.log.err("[upgrade] tunnel died during download", .{});
-            return error.TunnelDead;
-        }
-
-        // Timeout: 120s of no data
-        const now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
-        if (now_ns - last_data_ts > 120 * std.time.ns_per_s) {
-            std.log.err("[upgrade] download timed out after 120s", .{});
-            return error.UpgradeTimeout;
-        }
-
-        const n = tun.recv(&rbuf) catch |err| {
-            std.log.err("[upgrade] recv error: {}", .{err});
-            return err;
-        };
-        if (n == 0) {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
-            continue;
-        }
-        last_data_ts = now_ns;
-
-        const msg_type: u8 = rbuf[0];
-        const payload = rbuf[1..n];
-
-        switch (msg_type) {
-            @intFromEnum(tunproto.MsgType.file_chunk) => {
-                const chunk = tunproto.parseFileChunk(payload) orelse {
-                    std.log.err("[upgrade] parseFileChunk failed", .{});
-                    return error.ParseFailed;
-                };
-                if (!std.mem.eql(u8, chunk.cmd_id, cmd_id)) continue;
-
-                _ = writer.interface.write(chunk.data) catch |e| {
-                    std.log.err("[upgrade] write chunk: {}", .{e});
-                    return error.WriteFailed;
-                };
-                sha256.update(chunk.data);
-                received += @intCast(chunk.data.len);
-            },
-            @intFromEnum(tunproto.MsgType.file_eof) => {
-                const eof = tunproto.parseFileEof(payload) orelse {
-                    std.log.err("[upgrade] parseFileEof failed", .{});
-                    return error.ParseFailed;
-                };
-                if (!std.mem.eql(u8, eof.cmd_id, cmd_id)) continue;
-
-                writer.interface.flush() catch |err| {
-                    std.log.err("[upgrade] flush temp file: {}", .{err});
-                    return error.WriteFailed;
-                };
-
-                if (eof.exit_code != 0) {
-                    std.log.err("[upgrade] host rejected upgrade: exit_code={d}", .{eof.exit_code});
-                    return error.UpgradeRejected;
-                }
-
-                // Verify SHA256
-                var hash: [32]u8 = undefined;
-                sha256.final(&hash);
-                const actual_hex = try hexHash(allocator, &hash);
-                defer allocator.free(actual_hex);
-
-                if (eof.file_hash.len > 0 and !std.mem.eql(u8, actual_hex, eof.file_hash)) {
-                    std.log.err("[upgrade] hash mismatch: got {s}, expected {s}", .{ actual_hex, eof.file_hash });
-                    return error.HashMismatch;
-                }
-
-                std.log.info("[upgrade] download complete: {d} bytes, hash={s}", .{ received, actual_hex });
-                return temp_path;
-            },
-            else => continue,
-        }
-    }
-}
-
-/// Perform auto-upgrade: connect to Host via KCP, download new binary,
-/// write the temp file path to shared memory, and signal utmmd to handle
-/// the upgrade. utmmd will rename the binary, restart utmm, and manage
-/// the backoff strategy.
-/// Returns true if upgrade was initiated (utmm should exit), false on error.
-fn doAutoUpgrade(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    mesh_opt: *?mesh_mod.Mesh,
-    info: SystemInfo,
-    shutdown: ?*std.atomic.Value(bool),
-) !bool {
-    // Get a KCP tunnel to the Host
-    var tunnel = try waitForHostTunnel(io, allocator, mesh_opt, shutdown);
-    defer tunnel.deinit();
-
-    // Generate unique cmd_id for this upgrade
-    const cmd_id = try std.fmt.allocPrint(allocator, "upgrade_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds});
-    defer allocator.free(cmd_id);
-
-    // Send upgrade request
-    const req = try tunproto.buildUpgradeReq(allocator, cmd_id, info.target);
-    defer allocator.free(req);
-    _ = try tunnel.sendAndFlush(req, tunnel.session.mesh.clock_ms);
-    std.log.info("[upgrade] upgrade_req sent: target={s} cmd_id={s}", .{ info.target, cmd_id });
-
-    // Receive the new binary
-    const temp_path = try receiveUpgradeFile(io, allocator, &tunnel, cmd_id);
-    errdefer {
-        std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
-        allocator.free(temp_path);
-    }
-
-    // Write upgrade command to shared memory for utmmd.
-    // utmmd reads cmd_data (temp file path) and cmd=UPGRADE, then:
-    //   1. Renames temp file → canonical path
-    //   2. Restarts utmm with the new binary
-    const h = shm.open() catch |err| {
-        std.log.err("[upgrade] shm.open failed: {} — cannot signal utmmd", .{err});
-        return false;
-    };
-    defer shm.detach(h);
-
-    // Copy temp path into cmd_data (truncate if too long)
-    const max_len = @min(temp_path.len, h.cmd_data.len);
-    @memcpy(h.cmd_data[0..max_len], temp_path[0..max_len]);
-    if (temp_path.len < h.cmd_data.len) {
-        @memset(h.cmd_data[temp_path.len..], 0);
-    }
-    h.cmd = @intFromEnum(shm.Cmd.upgrade);
-    h.cmd_status = 0; // pending
-    h.utmm_state = @intFromEnum(shm.UtmmState.upgrading);
-
-    std.log.info("[upgrade] signaled utmmd: cmd=UPGRADE path={s}", .{temp_path});
-    return true;
-}
 
 /// Send a file as chunked transfer (download): open file, read MSS-aligned chunks,
 /// send as file_chunk messages with incremental SHA256, finish with file_eof.
 fn sendChunkedFile(
     io: std.Io,
     allocator: std.mem.Allocator,
-    tun: *tunnel_mod.Tunnel,
+    conn: *netconn.Connection,
     cmd_id: []const u8,
     path: []const u8,
 ) !void {
     // Chunk size: tunproto.FILE_CHUNK_DATA_MAX = 1200 bytes.
-    // KCP MSS = 1242 bytes (IKCP_MTU_DEFAULT 1266 - IKCP_OVERHEAD 24).
-    // file_chunk frame = type(1) + cmd_id(NT, ~24) + blob_len(4) + data(1200)
-    //                  = ~1229 bytes < MSS 1242
-    // Result: exactly 1 KCP segment per file_chunk — NO KCP-level fragmentation.
+    // Each file_chunk maps to one tcpf frame, sent via sendAndFlush().
     //
-    // Why MSS-aligned (not larger):
-    //   - Eliminates KCP frg reassembly: one lost segment = one lost chunk,
-    //     no head-of-line blocking across segments within a message.
-    //   - Simpler protocol: each KCP send() = 1 UDP datagram = 1 application chunk.
-    //   - No "secondary fragmentation": app chunks don't get re-split by KCP,
-    //     removing a layer of complexity from the protocol stack.
+    // Why 1200 bytes per chunk (not larger):
+    //   - Low latency: ACK/interactive traffic can interleave between chunks.
+    //   - Simpler protocol: each tcpf frame = one application chunk.
+    //   - No fragmentation: app chunks don't get re-split by TCP.
     //
-    // Trade-off vs 8KB chunks: ~7x more sendAndFlush() calls per file.
-    // This is acceptable because (a) files are typically < 100MB in practice,
-    // (b) the per-chunk overhead (~24/1200 = 2%) is still small,
-    // (c) the protocol simplicity gain outweighs the syscall overhead.
-    //
-    // Each chunk is sent via sendAndFlush() — atomic lock->send->flush
-    // prevents KCP send-window stalls.
+    // Trade-off vs larger chunks: more sendAndFlush() calls per file.
+    // This is acceptable because files are typically < 100MB in practice.
     const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         std.log.err("[guest-mesh] Download open failed: {}", .{err});
         if (tunproto.buildFileEof(allocator, cmd_id, -1, 0, "")) |eof| {
             defer allocator.free(eof);
-            _ = tun.sendAndFlush(eof, tun.session.mesh.clock_ms) catch {};
+            _ = conn.sendAndFlush(eof, 0) catch {};
         } else |build_err| {
             std.log.err("[guest-mesh] buildFileEof failed for open error: {}", .{build_err});
         }
@@ -1862,7 +1071,7 @@ fn sendChunkedFile(
             std.log.err("[guest-mesh] Download read error: {}", .{err2});
             if (tunproto.buildFileEof(allocator, cmd_id, -1, 0, "")) |eof| {
                 defer allocator.free(eof);
-                _ = tun.sendAndFlush(eof, tun.session.mesh.clock_ms) catch {};
+                _ = conn.sendAndFlush(eof, 0) catch {};
             } else |build_err| {
                 std.log.err("[guest-mesh] buildFileEof failed for read error: {}", .{build_err});
             }
@@ -1874,16 +1083,15 @@ fn sendChunkedFile(
 
         const chunk = try tunproto.buildFileChunk(allocator, cmd_id, chunk_buf[0..n]);
         defer allocator.free(chunk);
-        _ = tun.sendAndFlush(chunk, tun.session.mesh.clock_ms) catch |e| {
+        _ = conn.sendAndFlush(chunk, 0) catch |e| {
             std.log.err("[guest-mesh] file_chunk send failed: {}", .{e});
             return e;
         };
         total += @intCast(n);
         chunk_count += 1;
 
-        // Yield every 32 chunks (one KCP send window) to let the mesh thread
-        // process incoming ACKs. Without this yield, the tight send loop
-        // starves kcp.input() → ACKs are never processed → snd_wnd stalls.
+        // Yield every 32 chunks to let the TCP stack process incoming ACKs.
+        // Without this yield, the tight send loop can starve the connection.
         if (chunk_count % 32 == 0) {
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
         }
@@ -1899,7 +1107,7 @@ fn sendChunkedFile(
 
     const eof = try tunproto.buildFileEof(allocator, cmd_id, 0, total, hex);
     defer allocator.free(eof);
-    _ = tun.sendAndFlush(eof, tun.session.mesh.clock_ms) catch |e| {
+    _ = conn.sendAndFlush(eof, 0) catch |e| {
         std.log.err("[guest-mesh] file_eof send failed: {}", .{e});
     };
 }
@@ -1965,6 +1173,330 @@ test "zigTarget - valid format" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Guest TCP 主循环（替代 meshSessionLoop）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Guest TCP 服务 — TCP + SOCKS4 + tcpf 替代 KCP tunnel。
+///
+/// 1. 启动 LSA/UDP 发现线程（mesh.zig）
+/// 2. TCP 监听端口 2121
+/// 3. accept 循环 → SOCKS4a 握手 → 处理命令
+/// 4. 每命令独立连接，命令结束即关闭
+pub fn guestTcpLoop(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    info: SystemInfo,
+    upgrade: *UpgradeSignal,
+    mesh_port: u16,
+    peer_mesh: ?[]const u8,
+    shutdown: ?*std.atomic.Value(bool),
+) !void {
+    // ── LSA/UDP 发现线程 ──
+    var mesh_opt: ?mesh_mod.Mesh = null;
+    var mesh_thread: ?std.Thread = null;
+    var mesh_socket_opt: ?std.Io.net.Socket = null;
+
+    start_mesh: {
+        var broadcast_addrs = getSubnetBroadcasts(allocator) catch |err| {
+            std.log.err("[guest-tcp] getSubnetBroadcasts failed: {}", .{err});
+            break :start_mesh;
+        };
+
+        if (peer_mesh) |pm| {
+            if (protocol.parsePeerMeshAddr(pm)) |peer_addr| {
+                broadcast_addrs.append(allocator, peer_addr) catch |err| {
+                    std.log.err("[guest-tcp] append peer-mesh failed: {}", .{err});
+                };
+            } else {
+                std.log.err("[guest-tcp] invalid --peer-mesh '{s}'", .{pm});
+            }
+        }
+
+        var mesh_threaded = std.Io.Threaded.init(allocator, .{});
+        const mesh_io = mesh_threaded.io();
+
+        const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", mesh_port) catch |err| {
+            std.log.err("[guest-tcp] Mesh bind addr parse: {}", .{err});
+            broadcast_addrs.deinit(allocator);
+            break :start_mesh;
+        };
+        const mesh_socket = bind_addr.bind(mesh_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
+            std.log.err("[guest-tcp] Mesh UDP bind :{d}: {}", .{ mesh_port, err });
+            broadcast_addrs.deinit(allocator);
+            break :start_mesh;
+        };
+        mesh_socket_opt = mesh_socket;
+
+        const node_id = if (peer_mesh != null)
+            mesh_mod.deriveNodeId(info.mac, info.hostname) catch |err| {
+                std.log.err("[guest-tcp] deriveNodeId: {}", .{err});
+                mesh_socket.close(mesh_io);
+                broadcast_addrs.deinit(allocator);
+                break :start_mesh;
+            }
+        else
+            mesh_mod.parseNodeId(info.mac) catch |err| {
+                std.log.err("[guest-tcp] parseNodeId: {}", .{err});
+                mesh_socket.close(mesh_io);
+                broadcast_addrs.deinit(allocator);
+                break :start_mesh;
+            };
+
+        const node_info = std.fmt.allocPrint(allocator,
+            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:serving",
+            .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
+        ) catch |err| {
+            std.log.err("[guest-tcp] node_info alloc: {}", .{err});
+            mesh_socket.close(mesh_io);
+            broadcast_addrs.deinit(allocator);
+            break :start_mesh;
+        };
+
+        mesh_opt = mesh_mod.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, &upgrade.needed, broadcast_addrs, getSubnetBroadcasts, null, null, null) catch |err| {
+            std.log.err("[guest-tcp] Mesh init: {}", .{err});
+            allocator.free(node_info);
+            mesh_socket.close(mesh_io);
+            broadcast_addrs.deinit(allocator);
+            break :start_mesh;
+        };
+
+        mesh_thread = std.Thread.spawn(.{}, mesh_mod.Mesh.run, .{&mesh_opt.?}) catch |err| {
+            std.log.err("[guest-tcp] Mesh thread spawn: {}", .{err});
+            mesh_opt.?.deinit();
+            mesh_socket.close(mesh_io);
+            mesh_opt = null;
+            break :start_mesh;
+        };
+
+        std.log.info("[guest-tcp] LSA mesh started on UDP :{d}", .{mesh_port});
+    }
+
+    defer {
+        if (mesh_thread) |t| {
+            if (mesh_opt) |*m| m.signalShutdown();
+            t.join();
+        }
+        if (mesh_opt) |*m| {
+            const m_io = m.io;
+            m.deinit();
+            if (mesh_socket_opt) |s| s.close(m_io);
+        }
+    }
+
+    if (mesh_opt == null) {
+        std.log.err("[guest-tcp] Mesh failed to start", .{});
+        return error.MeshInitFailed;
+    }
+
+    // ── TCP accept 循环 ──
+    var listener = netconn.TcpListener.init(io, mesh_port) catch |err| {
+        std.log.err("[guest-tcp] TCP listen :{d} failed: {}", .{ mesh_port, err });
+        return error.TcpBindFailed;
+    };
+    defer listener.deinit();
+
+    std.log.info("[guest-tcp] TCP server listening on :{d}", .{mesh_port});
+
+    while (true) {
+        if (shutdown) |s| {
+            if (s.load(.acquire)) {
+                std.log.info("[guest-tcp] Shutdown requested", .{});
+                break;
+            }
+        }
+
+        // 检查升级信号
+        if (upgrade.needed.load(.acquire)) {
+            std.log.info("[guest-tcp] upgrade signal detected", .{});
+            upgrade.needed.store(false, .release);
+            // TODO: TCP 版本自动升级
+        }
+
+        // Accept SOCKS4 连接
+        var conn = listener.accept(info.hostname) catch |err| {
+            if (err == error.WouldBlock) continue;
+            std.log.err("[guest-tcp] accept failed: {}", .{err});
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
+            continue;
+        };
+
+        // 处理单条命令
+        handleOneCommand(io, allocator, info, &conn, shutdown) catch |err| {
+            std.log.err("[guest-tcp] handleOneCommand: {}", .{err});
+        };
+        conn.deinit();
+    }
+}
+
+/// 处理一条命令（单个 TCP 连接）。
+fn handleOneCommand(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    info: SystemInfo,
+    conn: *netconn.Connection,
+    shutdown: ?*std.atomic.Value(bool),
+) !void {
+    var rbuf: [262144]u8 = undefined;
+
+    while (true) {
+        if (shutdown) |s| {
+            if (s.load(.acquire)) return;
+        }
+        if (!conn.isAlive()) return;
+
+        const n = conn.recv(&rbuf) catch |err| {
+            std.log.err("[guest-tcp] recv error: {}", .{err});
+            return;
+        };
+        if (n == 0) {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+            continue;
+        }
+
+        const msg_type: u8 = rbuf[0];
+        const payload = rbuf[1..n];
+
+        switch (msg_type) {
+            @intFromEnum(tunproto.MsgType.pty_exec_input) => {
+                // 执行命令并返回
+                try handleExecCmd(io, allocator, info, conn, payload);
+                return; // 命令完成，关闭连接
+            },
+            @intFromEnum(tunproto.MsgType.upload_cmd) => {
+                if (tunproto.parseUploadCmd(payload)) |cmd| {
+                    std.log.debug("[guest-tcp] Upload cmd: {s} ({d} bytes)", .{ cmd.path, cmd.file_size });
+                    receiveChunkedFile(io, allocator, conn, cmd.cmd_id, cmd.path, cmd.file_hash) catch |e| {
+                        std.log.err("[guest-tcp] Upload failed: {}", .{e});
+                        const resp = tunproto.buildUploadResult(allocator, cmd.cmd_id, -1) catch continue;
+                        defer allocator.free(resp);
+                        _ = conn.sendAndFlush(resp, 0) catch {};
+                    };
+                }
+                return;
+            },
+            @intFromEnum(tunproto.MsgType.download_cmd) => {
+                if (tunproto.parseDownloadCmd(payload)) |cmd| {
+                    std.log.info("[guest-tcp] Download cmd: {s}", .{cmd.path});
+                    sendChunkedFile(io, allocator, conn, cmd.cmd_id, cmd.path) catch |e| {
+                        std.log.err("[guest-tcp] Download failed: {}", .{e});
+                        const eof = tunproto.buildFileEof(allocator, cmd.cmd_id, -1, 0, "") catch continue;
+                        defer allocator.free(eof);
+                        _ = conn.sendAndFlush(eof, 0) catch {};
+                    };
+                }
+                return;
+            },
+            else => {
+                std.log.info("[guest-tcp] Unknown msg type: {d}", .{msg_type});
+                return;
+            },
+        }
+    }
+}
+
+/// 处理单次 exec 命令：spawn shell → 写入命令 → 流式读取输出 → 发送 exec_done。
+fn handleExecCmd(
+    _io: std.Io,
+    allocator: std.mem.Allocator,
+    info: SystemInfo,
+    conn: *netconn.Connection,
+    payload: []const u8,
+) !void {
+    _ = _io;
+    const input = tunproto.parsePtyExecInput(payload) orelse {
+        std.log.err("[guest-tcp] parsePtyExecInput failed", .{});
+        return;
+    };
+
+    std.log.info("[guest-tcp] exec cmd_id={s} cmd={s}", .{ input.cmd_id, input.command });
+
+    // 生成带 MDELIM 标记的命令
+    const cmd_with_marker = try buildCmdWithMarker(allocator, input.command);
+    defer allocator.free(cmd_with_marker);
+
+    // Spawn shell（每命令新 shell）
+    const pty = ptySpawn(allocator, info.shell) catch |err| {
+        std.log.err("[guest-tcp] ptySpawn failed: {}", .{err});
+        const done_msg = tunproto.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
+        defer allocator.free(done_msg);
+        _ = conn.sendAndFlush(done_msg, 0) catch {};
+        return;
+    };
+    defer {
+        allocator.free(pty.shell);
+        killChild(pty.child_pid);
+        closePtyFd(pty.master_fd);
+    }
+
+    // 写入命令到 pty
+    ptyWrite(&pty, cmd_with_marker) catch |err| {
+        std.log.err("[guest-tcp] ptyWrite failed: {}", .{err});
+        const done_msg = tunproto.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
+        defer allocator.free(done_msg);
+        _ = conn.sendAndFlush(done_msg, 0) catch {};
+        return;
+    };
+
+    // 流式读取 pty 输出 → 发送 pty_exec_output 帧
+    var output_buf: [4096]u8 = undefined;
+    var accumulated: std.ArrayList(u8) = .empty;
+    defer accumulated.deinit(allocator);
+
+    while (true) {
+        const nr = ptyRead(pty.master_fd, &output_buf) catch |err| {
+            std.log.err("[guest-tcp] ptyRead error: {}", .{err});
+            break;
+        };
+        if (nr == 0) break; // EOF
+
+        accumulated.appendSlice(allocator, output_buf[0..nr]) catch continue;
+
+        // 扫描 MDELIM 标记
+        if (scanForMarker(accumulated.items)) |exit_code| {
+            // 发送最后一段输出（去掉标记部分）
+            const marker_pos = std.mem.lastIndexOf(u8, accumulated.items, "MDELIM:") orelse accumulated.items.len;
+            const clean_output = accumulated.items[0..marker_pos];
+            if (clean_output.len > 0) {
+                const output_msg = tunproto.buildPtyExecOutput(allocator, input.cmd_id, clean_output) catch continue;
+                defer allocator.free(output_msg);
+                _ = conn.sendAndFlush(output_msg, 0) catch {};
+            }
+
+            // 发送 exec_done
+            const done_msg = tunproto.buildPtyExecDone(allocator, input.cmd_id, exit_code) catch break;
+            defer allocator.free(done_msg);
+            _ = conn.sendAndFlush(done_msg, 0) catch {};
+            std.log.info("[guest-tcp] exec done: cmd_id={s} exit={d}", .{ input.cmd_id, exit_code });
+            return;
+        }
+    }
+
+    // pty 异常关闭（无 MDELIM 标记）
+    const done_msg = tunproto.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
+    defer allocator.free(done_msg);
+    _ = conn.sendAndFlush(done_msg, 0) catch {};
+    std.log.info("[guest-tcp] exec done (pty closed): cmd_id={s}", .{input.cmd_id});
+}
+
+/// 构建带 MDELIM 标记的命令行。
+fn buildCmdWithMarker(allocator: std.mem.Allocator, cmd: []const u8) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        return std.fmt.allocPrint(allocator, "{s}\r\necho MDELIM:%ERRORLEVEL%\r\n", .{cmd});
+    }
+    return std.fmt.allocPrint(allocator, "{s}; echo MDELIM:$?\n", .{cmd});
+}
+
+/// 扫描累积输出中的 MDELIM 标记。返回 exit code，未找到返回 null。
+fn scanForMarker(data: []const u8) ?i32 {
+    const marker = "MDELIM:";
+    const pos = std.mem.lastIndexOf(u8, data, marker) orelse return null;
+    const after_marker = data[pos + marker.len ..];
+    const end = std.mem.indexOfAny(u8, after_marker, "\r\n") orelse return null;
+    const num_str = after_marker[0..end];
+    return std.fmt.parseInt(i32, num_str, 10) catch null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Guest mode entry points (曾 guest.zig)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2016,9 +1548,9 @@ pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig
         }
     }
 
-    // Mesh session loop — persistent KCP tunnel, real-time push.
+    // TCP session loop — per-command TCP connections with SOCKS4 handshake.
     // UpgradeSignal allows mesh LSA version check to signal the main loop
     // when a version mismatch is detected from Host broadcast.
     var upgrade_signal = UpgradeSignal{};
-    try meshSessionLoop(io, gpa, sysinfo, &upgrade_signal, cli.mesh_port, cli.peer_mesh, shutdown);
+    try guestTcpLoop(io, gpa, sysinfo, &upgrade_signal, cli.mesh_port, cli.peer_mesh, shutdown);
 }

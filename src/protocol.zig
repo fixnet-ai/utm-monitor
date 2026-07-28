@@ -18,7 +18,6 @@ pub const DISCOVERY_RESPONSE_PREFIX = "ANNOUNCE\r\n";
 /// Unified mesh protocol message types (first-byte dispatch on UDP :2121).
 /// LSA replaces the legacy "ARE YOU OK?" / "ANNOUNCE" text protocol.
 pub const MESH_TYPE_LSA = 0x01; // Link-State Advertisement (heartbeat + node info + topology)
-pub const MESH_TYPE_KCP = 0x02; // KCP reliable data
 pub const MESH_TYPE_PING = 0x03; // Direct unicast reachability probe
 pub const MESH_TYPE_PONG = 0x04; // Probe response
 
@@ -28,13 +27,8 @@ pub const MESH_LEGACY_MAGIC: u8 = 'A';
 /// LSA broadcast interval (ms). Every node broadcasts its own LSA at this rate.
 pub const MESH_LSA_INTERVAL_MS: u32 = 2000;
 
-/// Max relay hops (TTL) for LSA and KCP data. Prevents amplification attacks.
+/// Max relay hops (TTL) for LSA data. Prevents amplification attacks.
 pub const MESH_MAX_TTL: u8 = 8;
-
-/// KCP/MTU constants
-pub const MESH_MTU: u32 = 1300; // Max mesh payload (avoids fragmentation)
-pub const MESH_KCP_OVERHEAD: u32 = 24; // KCP header size in bytes
-pub const MESH_MSS: u32 = MESH_MTU - MESH_KCP_OVERHEAD; // ~1276 bytes
 
 /// Build a discovery query with Host version appended.
 /// Format: "ARE YOU OK?\r\n{version}\r\n"

@@ -1,6 +1,6 @@
 //! Host mode — mesh networking daemon on UDP :2121.
 //!
-//! LSA broadcast + KCP tunnel replace the old HTTP server (v0.11.0).
+//! LSA broadcast + TCP/SOCKS4 replace the old HTTP server (v0.11.0) and KCP transport (v0.14.0).
 //! Management commands (--status/--exec/--upload/--download) communicate via IPC socket.
 
 const std = @import("std");
@@ -10,7 +10,7 @@ const protocol = @import("protocol.zig");
 const hst = @import("state.zig");
 const broadcast = @import("broadcast.zig");
 const mesh_mod = @import("mesh.zig");
-const tunnel_mod = @import("tunnel.zig");
+const netconn = @import("netconn.zig");
 const tunproto = @import("tunproto.zig");
 const cmdchan = @import("cmdchan.zig");
 const svc = @import("svc.zig");
@@ -227,7 +227,7 @@ fn cmdVerify(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
             .object => |o| o,
             else => continue,
         };
-        // Skip Host — no KCP tunnel to itself, ping/exec would fail
+        // Skip Host — no connection to itself, ping/exec would fail
         if (hst.jsonGetString(g, "role")) |r| {
             if (std.mem.eql(u8, r, "host")) continue;
         }
@@ -648,7 +648,7 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Host daemon (--host): Mesh LSA + KCP tunnels + IPC server
+// Host daemon (--host): Mesh LSA + TCP/SOCKS4 connections + IPC server
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Check that a version string looks like "X.Y.Z" (digits only).
@@ -762,7 +762,7 @@ fn verifyServeDirBinaries(io: std.Io, serve_dir: []const u8) bool {
     return true;
 }
 
-/// Command handler callback — bridges Mesh (KCP sessions) with HostState (tunnels, guests).
+/// Command handler callback — bridges Mesh with HostState (connections, guests).
 /// Called by mesh.dispatchCmd() from the Mesh I/O thread for each command popped from CmdQueue.
 fn hostCmdHandler(state_ptr: *anyopaque, mesh: *mesh_mod.Mesh, cmd: *const cmdchan.Cmd) void {
     const state: *hst.HostState = @ptrCast(@alignCast(state_ptr));
@@ -777,20 +777,20 @@ fn hostCmdHandler(state_ptr: *anyopaque, mesh: *mesh_mod.Mesh, cmd: *const cmdch
     }
 }
 
-/// Send a pty_exec_input command to a Guest via KCP tunnel.
+/// Send a pty_exec_input command to a Guest via TCP/SOCKS4 connection.
 /// OpState is created by the IPC handler BEFORE pushing this command.
 fn handleCmdExec(state: *hst.HostState, mesh: *mesh_mod.Mesh, cmd: *const cmdchan.Cmd) void {
+    _ = mesh;
     const vm_name = cmd.vmStr();
     const command = cmd.arg1Str();
     const cmd_id = cmd.cmdIdStr();
 
-    const tun = state.getGuestTunnel(vm_name) orelse {
-        std.log.err("[host-cmd] exec: no tunnel for '{s}'", .{vm_name});
+    const conn = state.getGuestTunnel(vm_name) orelse {
+        std.log.err("[host-cmd] exec: no connection for '{s}'", .{vm_name});
         return;
     };
 
     // Build pty_exec_input frame with the pre-built command (already has MDELIM marker).
-    // IPC handler built the full command string (shell-appropriate marker) and stored it in arg1.
     const allocator = state.allocator;
     const frame = tunproto.buildPtyExecInput(allocator, cmd_id, command) catch {
         std.log.err("[host-cmd] exec: buildPtyExecInput failed for {s}", .{cmd_id});
@@ -798,7 +798,7 @@ fn handleCmdExec(state: *hst.HostState, mesh: *mesh_mod.Mesh, cmd: *const cmdcha
     };
     defer allocator.free(frame);
 
-    _ = tun.sendAndFlush(frame, mesh.clock_ms) catch |err| {
+    _ = conn.sendAndFlush(frame, 0) catch |err| {
         std.log.err("[host-cmd] exec: send failed: {}", .{err});
     };
 }
@@ -1028,7 +1028,7 @@ fn parseNodeInfoLine(line: []const u8, key: []const u8) ?[]const u8 {
 }
 
 /// Background thread: periodically scans mesh LSAs for guest nodes,
-/// syncs them to the guest table, establishes KCP tunnels, and spawns
+/// syncs them to the guest table, establishes TCP connections, and spawns
 /// per-guest handler threads (handleMeshGuest).
 fn tunnelManager(
     allocator: std.mem.Allocator,
@@ -1108,36 +1108,22 @@ fn tunnelManager(
                 const tun_dead = state.isTunnelDead(hostname);
 
                 if (tun_dead) {
-                    // Create fresh Host-initiated session via m.connect().
-                    // The Guest's waitForHostTunnel() picks it up on the
-                    // next poll cycle.
-                    const sess = m.connect(saved_node_id) catch |err| {
-                        std.log.err("[tun-mgr] connect to {s} failed: {} (will retry)", .{ hostname, err });
+                    // Create TCP+SOCKS4a connection to Guest.
+                    const conn_ptr = allocator.create(netconn.Connection) catch continue;
+                    conn_ptr.* = netconn.hostConnect(m.io, ip, hostname, protocol.DEFAULT_PORT) catch |err| {
+                        std.log.err("[tun-mgr] TCP connect to {s} ({s}:{d}) failed: {} (will retry)", .{ hostname, ip, protocol.DEFAULT_PORT, err });
+                        allocator.destroy(conn_ptr);
                         continue;
                     };
-                    const tun_ptr = allocator.create(tunnel_mod.Tunnel) catch continue;
-                    tun_ptr.* = tunnel_mod.Tunnel.init(allocator, m.io, sess);
 
                     // Register with HostState
-                    state.registerGuestTunnel(hostname, tun_ptr) catch |err| {
+                    state.registerGuestTunnel(hostname, conn_ptr) catch |err| {
                         std.log.err("[tun-mgr] registerGuestTunnel for {s} failed: {}", .{ hostname, err });
-                        tun_ptr.deinit();
-                        allocator.destroy(tun_ptr);
+                        conn_ptr.deinit();
+                        allocator.destroy(conn_ptr);
                         continue;
                     };
                     state.setGuestMeshMac(hostname, saved_node_id);
-
-                    // Send pty_spawn to trigger the Guest's pty shell creation.
-                    // Without this, the Guest waits for the first pty_exec_input
-                    // as an implicit spawn trigger — but keepalive probes (0xFF)
-                    // may arrive first, delaying the spawn detection.
-                    const spawn_frame = tunproto.buildPtySpawn(allocator) catch null;
-                    if (spawn_frame) |sf| {
-                        defer allocator.free(sf);
-                        _ = tun_ptr.send(sf) catch {};
-                        tun_ptr.flush(m.clock_ms);
-                        std.log.info("[tun-mgr] pty_spawn sent to {s}", .{hostname});
-                    }
 
                     // Spawn per-guest handler thread
                     const hostname_dup = allocator.dupe(u8, hostname) catch {
@@ -1145,22 +1131,18 @@ fn tunnelManager(
                         continue;
                     };
                     const t = std.Thread.spawn(.{}, hst.handleMeshGuest, .{
-                        allocator, state, hostname_dup, tun_ptr,
+                        allocator, state, hostname_dup, conn_ptr,
                     }) catch |err| {
                         std.log.err("[tun-mgr] handleMeshGuest spawn failed for {s}: {}", .{ hostname, err });
                         allocator.free(hostname_dup);
                         state.removeGuestTunnel(hostname);
-                        tun_ptr.deinit();
-                        allocator.destroy(tun_ptr);
+                        conn_ptr.deinit();
+                        allocator.destroy(conn_ptr);
                         continue;
                     };
                     t.detach();
 
-                    std.log.info("[tun-mgr] Tunnel + handler started for {s}", .{hostname});
-
-                    // Auto-upgrade is Guest-initiated: Guests detect version
-                    // mismatch via LSA and download the new binary themselves.
-                    // No Host-side push needed.
+                    std.log.info("[tun-mgr] TCP connection + handler started for {s}", .{hostname});
                 }
             }
         }

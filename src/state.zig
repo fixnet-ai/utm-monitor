@@ -4,7 +4,7 @@
 //!   - HostState: mutex-protected guest table, tunnels, and operation tracking
 //!   - JSON helpers for building and parsing JSON-RPC payloads
 //!   - handleMeshGuest: mesh guest session handler
-//!   - serveUpgradeFile: KCP-based binary upgrade serving
+//!   - serveUpgradeFile: TCP-based binary upgrade serving
 //!   - syncHostsFromState: /etc/hosts sync from guest table
 //!
 //! This module was formerly named httpd.zig. After WebSocket removal (v0.11.0)
@@ -16,10 +16,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const hosts_file = @import("hosts_file.zig");
-const tunnel_mod = @import("tunnel.zig");
 const tunproto = @import("tunproto.zig");
-const mesh_mod = @import("mesh.zig");
 const cmdchan = @import("cmdchan.zig");
+const netconn = @import("netconn.zig");
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -175,9 +174,9 @@ pub const HostState = struct {
     mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Guest table — ArrayList with linear search (only ~3 VMs, no HashMap needed).
     guests: std.ArrayList(GuestEntry),
-    /// Guest tunnel mapping: hostname → KCP Tunnel pointer.
-    /// HTTP handlers send frames via tunnel.send(), handler threads recv responses.
-    guest_tunnels: std.StringHashMap(*tunnel_mod.Tunnel),
+    /// Guest tunnel mapping: hostname → TCP Connection pointer.
+    /// HTTP handlers send frames via conn.sendAndFlush(), handler threads recv responses.
+    guest_tunnels: std.StringHashMap(*netconn.Connection),
     /// Operation state tracking: cmd_id → OpState.
     /// Used by exec/upload/download to track completion.
     op_states: std.StringHashMap(OpState),
@@ -204,7 +203,7 @@ pub const HostState = struct {
     pub fn init(allocator: std.mem.Allocator) HostState {
         return .{
             .guests = .empty,
-            .guest_tunnels = std.StringHashMap(*tunnel_mod.Tunnel).init(allocator),
+            .guest_tunnels = std.StringHashMap(*netconn.Connection).init(allocator),
             .op_states = std.StringHashMap(OpState).init(allocator),
             .transfers = std.StringHashMap(TransferState).init(allocator),
             .allocator = allocator,
@@ -361,9 +360,9 @@ pub const HostState = struct {
     // Guest tunnel registry (Host threads push, handler threads drain)
     // ══════════════════════════════════════════════════════════
 
-    /// Register a KCP tunnel for a guest. Called by the LSA callback when
-    /// Host establishes a tunnel to a discovered guest.
-    pub fn registerGuestTunnel(self: *HostState, hostname: []const u8, tun: *tunnel_mod.Tunnel) !void {
+    /// Register a TCP connection for a guest. Called by the LSA callback when
+    /// Host establishes a connection to a discovered guest.
+    pub fn registerGuestTunnel(self: *HostState, hostname: []const u8, conn: *netconn.Connection) !void {
         self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
 
@@ -371,32 +370,32 @@ pub const HostState = struct {
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.allocator.dupe(u8, hostname);
         }
-        gop.value_ptr.* = tun;
+        gop.value_ptr.* = conn;
     }
 
-    /// Look up a guest's KCP tunnel. Returns null if no tunnel registered.
-    pub fn getGuestTunnel(self: *HostState, hostname: []const u8) ?*tunnel_mod.Tunnel {
+    /// Look up a guest's TCP connection. Returns null if no connection registered.
+    pub fn getGuestTunnel(self: *HostState, hostname: []const u8) ?*netconn.Connection {
         self.mutex.lock(self.io.?) catch return null;
         defer self.mutex.unlock(self.io.?);
 
         return self.guest_tunnels.get(hostname);
     }
 
-    /// Check if a guest's tunnel is dead. Returns true if:
-    /// - no tunnel is registered for this guest
-    /// - the tunnel's isAlive() returns false
+    /// Check if a guest's connection is dead. Returns true if:
+    /// - no connection is registered for this guest
+    /// - the connection's isAlive() returns false
     /// Safe to call from tunnelManager — holds state.mutex across the
-    /// lookup + isAlive check, preventing use-after-free when the mesh
-    /// handler thread concurrently frees the tunnel.
+    /// lookup + isAlive check, preventing use-after-free when the handler
+    /// thread concurrently frees the connection.
     pub fn isTunnelDead(self: *HostState, hostname: []const u8) bool {
         self.mutex.lock(self.io.?) catch return true;
         defer self.mutex.unlock(self.io.?);
 
-        const tun = self.guest_tunnels.get(hostname) orelse return true;
-        return !tun.isAlive();
+        const conn = self.guest_tunnels.get(hostname) orelse return true;
+        return !conn.isAlive();
     }
 
-    /// Remove a guest's tunnel registration. Called when tunnel disconnects.
+    /// Remove a guest's connection registration. Called when connection disconnects.
     pub fn removeGuestTunnel(self: *HostState, hostname: []const u8) void {
         self.mutex.lock(self.io.?) catch return;
         defer self.mutex.unlock(self.io.?);
@@ -696,49 +695,33 @@ pub fn buildCmdWithMarker(allocator: std.mem.Allocator, shell: []const u8, comma
 
 // ── Mesh guest handler (tunnel per guest) ───────────────────────────────────
 
-/// Per-guest mesh session handler spawned as a new thread.
-/// Reads pty_output + file_chunk + file_eof messages from the KCP tunnel
+/// Per-guest TCP connection handler spawned as a new thread.
+/// Reads pty_output + file_chunk + file_eof messages from the TCP connection
 /// and updates the shared HostState.
 pub fn handleMeshGuest(
     allocator: std.mem.Allocator,
     state: *HostState,
     hostname: []const u8,
-    tun: *tunnel_mod.Tunnel,
+    conn: *netconn.Connection,
 ) void {
     defer {
-        // Remove from guest table BEFORE freeing hostname — removeGuestTunnel
-        // does a HashMap lookup by hostname. If we free hostname first, the
-        // allocator could reuse the memory, corrupting the lookup and leaving
-        // a stale tunnel pointer in the map (use-after-free crash, Finding 79).
         state.removeGuestTunnel(hostname);
         allocator.free(hostname);
-        tun.deinit();
-        allocator.destroy(tun);
+        conn.deinit();
+        allocator.destroy(conn);
     }
 
     var rbuf: [262144]u8 = undefined;
-    std.log.info("[tun-hdl] mesh handler started for {s}", .{hostname});
+    std.log.info("[tcp-hdl] connection handler started for {s}", .{hostname});
 
-    while (tun.isAlive()) {
-        // Peek message size first (message mode, each recv = one complete message)
-        const peek_size = tun.peekSize();
-        if (peek_size <= 0) {
-            // No complete message yet — sleep briefly to avoid busy-wait
-            std.Io.sleep(state.io.?, std.Io.Duration.fromMilliseconds(100), .awake) catch break;
-            continue;
-        }
-        if (peek_size > rbuf.len) {
-            std.log.err("[tun-hdl] Message too large for {s}: {d} bytes", .{ hostname, peek_size });
-            break;
-        }
-
-        const n = tun.recv(rbuf[0..@intCast(peek_size)]) catch |err| {
-            std.log.err("[tun-hdl] recv error for {s}: {}", .{ hostname, err });
+    while (conn.isAlive()) {
+        const n = conn.recv(&rbuf) catch |err| {
+            std.log.err("[tcp-hdl] recv error for {s}: {}", .{ hostname, err });
             break;
         };
         if (n == 0) {
-            std.Io.sleep(state.io.?, std.Io.Duration.fromMilliseconds(100), .awake) catch break;
-            continue;
+            std.log.info("[tcp-hdl] connection closed for {s}", .{hostname});
+            break;
         }
 
         const data = rbuf[0..n];
@@ -747,33 +730,21 @@ pub fn handleMeshGuest(
         const msg_type = data[0];
         switch (msg_type) {
             @intFromEnum(tunproto.MsgType.pty_exec_output) => {
-                // Use dedicated parser — buildPtyExecOutput writes raw data
-                // (not a length-prefixed blob). The payload is every byte
-                // after the null-terminated cmd_id.
                 const out = tunproto.parsePtyExecOutput(data[1..]) orelse {
-                    std.log.err("[tun-hdl] pty_output parse failed for {s}", .{hostname});
+                    std.log.err("[tcp-hdl] pty_output parse failed for {s}", .{hostname});
                     continue;
                 };
                 state.appendOpOutput(out.cmd_id, out.data);
-                // Scan for MDELIM marker in accumulated output
                 state.scanForMarker(out.cmd_id);
-                // Wake the waiting HTTP handler.
-                // Do NOT call reset() here — the waiting thread resets
-                // after returning from waitTimeout(). Calling reset() from
-                // this thread while waitTimeout() is still in-flight causes
-                // unreachable panic in std.Io.Event.waitTimeout.
                 state.wake_event.set(state.io.?);
             },
             @intFromEnum(tunproto.MsgType.pty_exec_done) => {
                 const done = tunproto.parsePtyExecDone(data[1..]) orelse {
-                    std.log.err("[tun-hdl] pty_exec_done parse failed for {s}", .{hostname});
+                    std.log.err("[tcp-hdl] pty_exec_done parse failed for {s}", .{hostname});
                     continue;
                 };
-                std.log.debug("[tun-hdl] pty_exec_done for {s}: cmd={s} exit={d}", .{ hostname, done.cmd_id, done.exit_code });
-                // Scan for any remaining MDELIM marker (arrived in last pty_output).
-                // If the op is already done (MDELIM detected), this is a no-op.
+                std.log.debug("[tcp-hdl] pty_exec_done for {s}: cmd={s} exit={d}", .{ hostname, done.cmd_id, done.exit_code });
                 state.scanForMarker(done.cmd_id);
-                // If still not done, complete with the received exit code.
                 if (!state.isOpDone(done.cmd_id)) {
                     state.completeOpState(done.cmd_id, done.exit_code);
                     state.wake_event.set(state.io.?);
@@ -784,7 +755,7 @@ pub fn handleMeshGuest(
                 const cmd_id_opt = tunproto.readString(data, &pos);
                 const payload_opt = tunproto.readBlob(data, &pos);
                 if (cmd_id_opt == null or payload_opt == null) {
-                    std.log.err("[tun-hdl] file_chunk parse failed for {s}", .{hostname});
+                    std.log.err("[tcp-hdl] file_chunk parse failed for {s}", .{hostname});
                     continue;
                 }
                 state.appendOpOutput(cmd_id_opt.?, payload_opt.?);
@@ -792,12 +763,10 @@ pub fn handleMeshGuest(
             },
             @intFromEnum(tunproto.MsgType.file_eof) => {
                 const eof = tunproto.parseFileEof(data[1..]) orelse {
-                    std.log.err("[tun-hdl] file_eof parse failed for {s}", .{hostname});
-                    // Mark the op done anyway so the handler doesn't hang.
-                    // Extract cmd_id before falling through to manual extraction.
+                    std.log.err("[tcp-hdl] file_eof parse failed for {s}", .{hostname});
                     var pos2: usize = 1;
                     const cmd_id_str = tunproto.readString(data, &pos2) orelse {
-                        std.log.err("[tun-hdl] file_eof missing cmd_id for {s}", .{hostname});
+                        std.log.err("[tcp-hdl] file_eof missing cmd_id for {s}", .{hostname});
                         continue;
                     };
                     if (!std.mem.eql(u8, cmd_id_str, "dl_") and !std.mem.eql(u8, cmd_id_str, "up_")) {
@@ -808,7 +777,7 @@ pub fn handleMeshGuest(
                     state.wake_event.set(state.io.?);
                     continue;
                 };
-                std.log.info("[tun-hdl] file_eof for {s}: {d} bytes, sha256={s}", .{ eof.cmd_id, eof.file_size, eof.file_hash });
+                std.log.info("[tcp-hdl] file_eof for {s}: {d} bytes, sha256={s}", .{ eof.cmd_id, eof.file_size, eof.file_hash });
                 state.completeOpState(eof.cmd_id, eof.exit_code);
                 if (eof.file_hash.len > 0) {
                     state.setOpFileMeta(eof.cmd_id, eof.file_hash, eof.file_size);
@@ -820,40 +789,39 @@ pub fn handleMeshGuest(
                 const cmd_id_opt = tunproto.readString(data, &pos);
                 const target_opt = tunproto.readString(data, &pos);
                 if (cmd_id_opt == null or target_opt == null) {
-                    std.log.err("[tun-hdl] upgrade_req parse failed for {s}", .{hostname});
+                    std.log.err("[tcp-hdl] upgrade_req parse failed for {s}", .{hostname});
                     continue;
                 }
-                std.log.info("[tun-hdl] upgrade request from {s} target={s}", .{ hostname, target_opt.? });
-                serveUpgradeFile(state.io.?, allocator, tun, cmd_id_opt.?, target_opt.?, state.serve_dir) catch |err| {
-                    std.log.err("[tun-hdl] serveUpgradeFile failed: {}", .{err});
+                std.log.info("[tcp-hdl] upgrade request from {s} target={s}", .{ hostname, target_opt.? });
+                serveUpgradeFile(state.io.?, allocator, conn, cmd_id_opt.?, target_opt.?, state.serve_dir) catch |err| {
+                    std.log.err("[tcp-hdl] serveUpgradeFile failed: {}", .{err});
                 };
             },
             @intFromEnum(tunproto.MsgType.upload_result) => {
                 const ur = tunproto.parseUploadResult(data[1..]) orelse {
-                    std.log.err("[tun-hdl] upload_result parse failed for {s}", .{hostname});
+                    std.log.err("[tcp-hdl] upload_result parse failed for {s}", .{hostname});
                     continue;
                 };
-                std.log.info("[tun-hdl] upload_result from {s}: cmd={s} exit={d}", .{ hostname, ur.cmd_id, ur.exit_code });
-                // Complete any matching OpState (upload or upgrade operations)
+                std.log.info("[tcp-hdl] upload_result from {s}: cmd={s} exit={d}", .{ hostname, ur.cmd_id, ur.exit_code });
                 if (!state.isOpDone(ur.cmd_id)) {
                     state.completeOpState(ur.cmd_id, ur.exit_code);
                     state.wake_event.set(state.io.?);
                 }
             },
             else => {
-                std.log.err("[tun-hdl] unknown msg type 0x{x:0>2} for {s}", .{ msg_type, hostname });
+                std.log.err("[tcp-hdl] unknown msg type 0x{x:0>2} for {s}", .{ msg_type, hostname });
             },
         }
     }
 
-    std.log.info("[tun-hdl] mesh handler exiting for {s}", .{hostname});
+    std.log.info("[tcp-hdl] connection handler exiting for {s}", .{hostname});
 }
 
-/// Serve upgrade binary to Guest via file_chunk + file_eof over KCP tunnel.
+/// Serve upgrade binary to Guest via file_chunk + file_eof over TCP connection.
 fn serveUpgradeFile(
     io: std.Io,
     allocator: std.mem.Allocator,
-    tun: *tunnel_mod.Tunnel,
+    conn: *netconn.Connection,
     cmd_id: []const u8,
     target: []const u8,
     serve_dir: []const u8,
@@ -862,7 +830,7 @@ fn serveUpgradeFile(
         std.log.err("[upgrade] Unknown target: {s}", .{target});
         const eof_frame = try tunproto.buildFileEof(allocator, cmd_id, 1, 0, &[_]u8{0} ** 64);
         defer allocator.free(eof_frame);
-        _ = tun.send(eof_frame) catch {};
+        _ = conn.sendAndFlush(eof_frame, 0) catch {};
         return;
     };
 
@@ -874,7 +842,7 @@ fn serveUpgradeFile(
         std.log.err("[upgrade] Cannot open {s}: {}", .{ file_path, err });
         const eof_frame = try tunproto.buildFileEof(allocator, cmd_id, 1, 0, &[_]u8{0} ** 64);
         defer allocator.free(eof_frame);
-        _ = tun.send(eof_frame) catch {};
+        _ = conn.sendAndFlush(eof_frame, 0) catch {};
         return;
     };
     defer file.close(io);
@@ -884,8 +852,6 @@ fn serveUpgradeFile(
 
     var sha256 = std.crypto.hash.sha2.Sha256.init(.{});
     var total: u64 = 0;
-    // Separate buffers: file_buf for data, read_buf for the reader's internal buffering.
-    // Using the same buffer for both would cause @memcpy alias in readSliceAll.
     var file_buf: [8192]u8 = undefined;
     var read_buf: [4096]u8 = undefined;
     var file_reader = file.reader(io, &read_buf);
@@ -896,20 +862,15 @@ fn serveUpgradeFile(
         if (chunk_size == 0) break;
 
         try file_reader.interface.readSliceAll(file_buf[0..chunk_size]);
-
         sha256.update(file_buf[0..chunk_size]);
 
         const fchunk = try tunproto.buildFileChunk(allocator, cmd_id, file_buf[0..chunk_size]);
         defer allocator.free(fchunk);
 
-        // Lock once per chunk — mesh thread runs in same Io, competition is rare
-        tun.lock() catch return;
-        defer tun.unlock();
-        _ = tun.sendLocked(fchunk) catch |err| {
+        _ = conn.sendAndFlush(fchunk, 0) catch |err| {
             std.log.err("[upgrade] Failed to send chunk: {}", .{err});
             return;
         };
-        tun.flushLocked(tun.session.mesh.clock_ms);
 
         total += chunk_size;
     }
@@ -925,16 +886,10 @@ fn serveUpgradeFile(
     const eof_frame = try tunproto.buildFileEof(allocator, cmd_id, 0, @intCast(total), &hash_hex);
     defer allocator.free(eof_frame);
 
-    {
-        tun.lock() catch return;
-        defer tun.unlock();
-        _ = tun.sendLocked(eof_frame) catch |err| {
-            std.log.err("[upgrade] Failed to send file_eof: {}", .{err});
-            return;
-        };
-        tun.flushLocked(tun.session.mesh.clock_ms);
-    }
-    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+    _ = conn.sendAndFlush(eof_frame, 0) catch |err| {
+        std.log.err("[upgrade] Failed to send file_eof: {}", .{err});
+        return;
+    };
 
     std.log.info("[upgrade] Sent {s} ({d} bytes, sha256={s}) to {s}", .{
         filename, total, &hash_hex, cmd_id,

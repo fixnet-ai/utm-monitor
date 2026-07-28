@@ -1,14 +1,17 @@
-//! Tunnel protocol — binary message framing for KCP tunnel communication.
+//! Tunnel protocol — binary message framing for tunnel communication.
 //!
 //! Replaces wsproto.zig after WebSocket removal (v0.11.0).
 //! Messages are framed identically to wsproto: 1-byte type + type-specific payload.
 //! String fields: null-terminated. Binary fields: 4-byte BE length prefix + data.
 //! Integer fields: 4-byte BE.
+//!
+//! Previously carried over KCP tunnel (v0.11.0–v0.13.0). Now carried over TCP/SOCKS4
+//! via tcpf frame protocol (v0.14.0+).
 
 const std = @import("std");
 
-/// Tunnel protocol message types (inner payload inside KCP tunnel).
-/// These flow over the KCP reliable transport — not directly on UDP :2121.
+/// Tunnel protocol message types (inner payload inside tcpf frames).
+/// These flow over TCP/SOCKS4 connections — not directly on UDP :2121.
 pub const MsgType = enum(u8) {
     // Host → Guest commands
     pty_spawn = 0x10, // Trigger pty shell creation (no payload)
@@ -36,13 +39,12 @@ pub const MsgType = enum(u8) {
 
 /// Max file data bytes per file_chunk message.
 ///
-/// Sized so the entire file_chunk frame (type + cmd_id NT + blob prefix + data)
-/// fits in one KCP segment (MSS = MTU 1266 - OVERHEAD 24 = 1242 bytes).
-/// Each file_chunk maps 1:1 to a KCP segment — no KCP-level frg fragmentation,
-/// no head-of-line blocking across segments within one chunk.
+/// Sized to be small enough for efficient streaming over TCP. 1200 bytes per chunk
+/// allows interleaving with ACK traffic and keeps latency low for interactive commands.
+/// Each file_chunk is a standalone tcpf frame — no fragmentation needed.
 ///
 /// Frame overhead: type(1) + cmd_id(~24 with timestamp) + blob_len(4) ≈ 29.
-/// MSS 1242 - 29 = 1213. Reserve margin to 1200 for safety.
+/// 1200 bytes data + ~29 overhead ≈ 1229 bytes per frame.
 pub const FILE_CHUNK_DATA_MAX: usize = 1200;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -50,7 +52,7 @@ pub const FILE_CHUNK_DATA_MAX: usize = 1200;
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Maximum blob length from untrusted network data (1 MB).
-/// KCP messages are MTU-bounded (~1300 bytes), so any blob exceeding
+/// Normal tcpf frames are well under this limit; any blob exceeding
 /// this is either malicious or a protocol bug.
 pub const MAX_BLOB_LEN: u32 = 1024 * 1024;
 
@@ -545,7 +547,7 @@ test "file_chunk with MSS-aligned payload" {
     const parsed = parseFileChunk(msg[1..]) orelse return error.ParseFailed;
     try std.testing.expectEqualStrings("fc2", parsed.cmd_id);
     try std.testing.expectEqualSlices(u8, &chunk, parsed.data);
-        // Verify the full frame fits in one KCP segment (MSS = 1266 - 24 = 1242).
+        // Verify the full frame fits within the expected tcpf frame size.
         try std.testing.expect(msg.len <= 1242);
 }
 

@@ -125,11 +125,32 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run utmm");
     run_step.dependOn(&run_cmd.step);
 
-    // Tests
+    // Tests — main binary tests
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
     const run_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_tests.step);
+
+    // Tests — refac/layered-arch new modules (P0-P5) + TCP/SOCKS4
+    const refac_modules = [_][]const u8{
+        "tcpf.zig",
+        "socks4.zig",
+        "netconn.zig",
+    };
+    for (refac_modules) |mod_src| {
+        const mod = b.createModule(.{
+            .root_source_file = b.path(b.fmt("src/{s}", .{mod_src})),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        if (target.result.os.tag == .windows) {
+            mod.linkSystemLibrary("ws2_32", .{});
+        }
+        const mod_tests = b.addTest(.{ .root_module = mod });
+        const run_mod_tests = b.addRunArtifact(mod_tests);
+        test_step.dependOn(&run_mod_tests.step);
+    }
 }

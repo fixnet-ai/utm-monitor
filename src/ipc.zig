@@ -678,8 +678,8 @@ fn handleExec(
     };
 
     // Submit command to Mesh thread via lock-free channel.
-    // The Mesh thread builds the pty_exec_input frame and sends it via KCP —
-    // no KCP calls from this IPC handler thread.
+    // The Mesh thread builds the pty_exec_input frame and sends it via TCP/SOCKS4 —
+    // no network I/O from this IPC handler thread.
     {
         const cmdchan_mod = @import("cmdchan.zig");
         const cmd = cmdchan_mod.Cmd.exec(cmd_id, vm, cmd_with_marker);
@@ -691,8 +691,8 @@ fn handleExec(
             sendError(conn, "CmdQueueFull");
             return;
         }
-        // Channel push succeeded — Mesh thread will pick up and send via KCP.
-        // No tunnel lookup, no KCP I/O from this thread.
+        // Channel push succeeded — Mesh thread will pick up and send via TCP.
+        // No connection lookup, no network I/O from this thread.
     }
 
     std.log.info("[ipc-exec] sent {s} to {s}", .{ cmd_id, vm });
@@ -777,33 +777,33 @@ fn handleUpload(
     io: std.Io,
     gpa: std.mem.Allocator,
     state_ptr: *anyopaque,
-    conn: Connection,
+    ipc_conn: Connection,
     header: []const u8,
 ) void {
     var pos: usize = 0;
     const vm = readString(header, &pos) orelse {
-        sendError(conn, "InvalidRequest: missing vm");
+        sendError(ipc_conn, "InvalidRequest: missing vm");
         return;
     };
     const dest_path = readString(header, &pos) orelse {
-        sendError(conn, "InvalidRequest: missing path");
+        sendError(ipc_conn, "InvalidRequest: missing path");
         return;
     };
     const file_hash = readString(header, &pos) orelse {
-        sendError(conn, "InvalidRequest: missing hash");
+        sendError(ipc_conn, "InvalidRequest: missing hash");
         return;
     };
     const file_size = readU32(header, &pos) orelse {
-        sendError(conn, "InvalidRequest: missing file_size");
+        sendError(ipc_conn, "InvalidRequest: missing file_size");
         return;
     };
 
     const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
     const tunproto = @import("tunproto.zig");
 
-    // Get guest tunnel
-    const tun = state.getGuestTunnel(vm) orelse {
-        sendError(conn, "GuestNotConnected");
+    // Get guest TCP connection
+    const guest_conn = state.getGuestTunnel(vm) orelse {
+        sendError(ipc_conn, "GuestNotConnected");
         return;
     };
 
@@ -811,7 +811,7 @@ fn handleUpload(
     const cmd_id = blk: {
         const ts = std.Io.Timestamp.now(io, .real).nanoseconds;
         break :blk std.fmt.allocPrint(gpa, "upload_{d}", .{ts}) catch {
-            sendError(conn, "AllocFailed");
+            sendError(ipc_conn, "AllocFailed");
             return;
         };
     };
@@ -819,73 +819,47 @@ fn handleUpload(
 
     // Create op state for upload result tracking
     state.createOpState(cmd_id) catch {
-        sendError(conn, "OpStateFailed");
+        sendError(ipc_conn, "OpStateFailed");
         return;
     };
     defer state.cleanupOpState(cmd_id);
 
-    // Send upload_cmd via KCP tunnel — use sendAndFlush to atomically
-    // lock+send+flush+unlock, preventing race with mesh thread flush.
+    // Send upload_cmd via TCP connection
     const up_cmd = tunproto.buildUploadCmd(gpa, cmd_id, dest_path, file_size, file_hash) catch {
-        sendError(conn, "AllocFailed");
+        sendError(ipc_conn, "AllocFailed");
         return;
     };
     defer gpa.free(up_cmd);
-    const clock_ms = tun.session.mesh.clock_ms;
-    _ = tun.sendAndFlush(up_cmd, clock_ms) catch {
-        sendError(conn, "TunnelSendFailed");
+    _ = guest_conn.sendAndFlush(up_cmd, 0) catch {
+        sendError(ipc_conn, "TunnelSendFailed");
         return;
     };
 
-    // Read file data from connection and send via KCP.
-    // Batch with periodic flush to avoid overwhelming KCP send queue.
-    // Each batch: lock → send up to 32 chunks → flush → unlock →
-    // sleep briefly to let mesh thread process ACKs and advance send window.
+    // Read file data from IPC connection and send via TCP.
+    // TCP send is synchronous — no batching or locking needed.
     var file_buf: [tunproto.FILE_CHUNK_DATA_MAX]u8 = undefined;
     var total_sent: u32 = 0;
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
-    const BATCH_SIZE: u32 = 32; // one KCP send window
     while (total_sent < file_size) {
-        tun.lock() catch {
-            sendError(conn, "TunnelLockFailed");
+        const to_read: usize = @min(file_buf.len, file_size - total_sent);
+        const n = ipc_conn.readFull(file_buf[0..to_read]) catch {
+            sendError(ipc_conn, "FileReadFailed");
             return;
         };
-        errdefer tun.unlock();
+        if (n == 0) break;
 
-        var batch_count: u32 = 0;
-        while (batch_count < BATCH_SIZE and total_sent < file_size) {
-            const to_read: usize = @min(file_buf.len, file_size - total_sent);
-            const n = conn.readFull(file_buf[0..to_read]) catch {
-                tun.unlock();
-                sendError(conn, "FileReadFailed");
-                return;
-            };
-            if (n == 0) break;
+        sha.update(file_buf[0..n]);
 
-            sha.update(file_buf[0..n]);
-
-            const chunk = tunproto.buildFileChunk(gpa, cmd_id, file_buf[0..n]) catch {
-                tun.unlock();
-                sendError(conn, "AllocFailed");
-                return;
-            };
-            defer gpa.free(chunk);
-            _ = tun.sendLocked(chunk) catch {
-                tun.unlock();
-                sendError(conn, "TunnelSendFailed");
-                return;
-            };
-            total_sent += @intCast(n);
-            batch_count += 1;
-        }
-        tun.flushLocked(clock_ms);
-        tun.unlock();
-        // Yield to mesh thread so it can process ACKs and flush more data.
-        // Without this, the Host's single-threaded Io event loop can't
-        // run the mesh handler, starving ACK delivery and causing dead_link.
-        if (total_sent < file_size) {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(5), .awake) catch {};
-        }
+        const chunk = tunproto.buildFileChunk(gpa, cmd_id, file_buf[0..n]) catch {
+            sendError(ipc_conn, "AllocFailed");
+            return;
+        };
+        defer gpa.free(chunk);
+        _ = guest_conn.sendAndFlush(chunk, 0) catch {
+            sendError(ipc_conn, "TunnelSendFailed");
+            return;
+        };
+        total_sent += @intCast(n);
     }
 
     // Send file_eof
@@ -897,47 +871,23 @@ fn handleUpload(
         hash_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
     }
     {
-        tun.lock() catch {
-            sendError(conn, "TunnelLockFailed");
-            return;
-        };
-        defer tun.unlock();
         const eof = tunproto.buildFileEof(gpa, cmd_id, 0, total_sent, &hash_hex) catch {
-            sendError(conn, "AllocFailed");
+            sendError(ipc_conn, "AllocFailed");
             return;
         };
         defer gpa.free(eof);
-        _ = tun.sendLocked(eof) catch {
-            sendError(conn, "TunnelSendFailed");
+        _ = guest_conn.sendAndFlush(eof, 0) catch {
+            sendError(ipc_conn, "TunnelSendFailed");
             return;
         };
-        tun.flushLocked(clock_ms);
     }
 
-    // Wait for KCP send queue to drain. This ensures data is actually
-    // transmitted (not just queued) before reporting success.
-    // Use a generous timeout: 10s per MB + 60s base.
-    {
-        const drain_timeout_s: u64 = 60 + @as(u64, file_size) / (1024 * 1024) * 10;
-        const now_ns: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
-        const deadline_s = now_ns / std.time.ns_per_s + drain_timeout_s;
-        while (true) {
-            const waiting = tun.waiting();
-            if (waiting == 0) break;
-            const now_ns2: u64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
-            const now_s = now_ns2 / std.time.ns_per_s;
-            if (now_s >= deadline_s) {
-                sendError(conn, "UploadDrainTimeout");
-                return;
-            }
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
-        }
-    }
+    // TCP send is synchronous — no drain wait needed.
 
     // Send OK response
     var ok_buf: [1]u8 = undefined;
     ok_buf[0] = @intFromEnum(Response.ok);
-    conn.writeAll( &ok_buf) catch {};
+    ipc_conn.writeAll(&ok_buf) catch {};
 }
 
 fn handleDownload(
@@ -960,7 +910,7 @@ fn handleDownload(
     const state = @as(*@import("state.zig").HostState, @ptrCast(@alignCast(state_ptr)));
     const tunproto = @import("tunproto.zig");
 
-    const tun = state.getGuestTunnel(vm) orelse {
+    const guest_conn = state.getGuestTunnel(vm) orelse {
         sendError(conn, "GuestNotConnected");
         return;
     };
@@ -982,13 +932,13 @@ fn handleDownload(
     };
     defer state.cleanupOpState(cmd_id);
 
-    // Send download_cmd via KCP tunnel
+    // Send download_cmd via TCP connection
     const dl_cmd = tunproto.buildDownloadCmd(gpa, cmd_id, remote_path) catch {
         sendError(conn, "AllocFailed");
         return;
     };
     defer gpa.free(dl_cmd);
-    _ = tun.sendAndFlush(dl_cmd, tun.session.mesh.clock_ms) catch {
+    _ = guest_conn.sendAndFlush(dl_cmd, 0) catch {
         sendError(conn, "TunnelSendFailed");
         return;
     };

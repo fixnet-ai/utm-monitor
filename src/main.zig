@@ -1,6 +1,6 @@
 //! UTM Monitor — Automatic VM IP sync tool
 //!
-//! Guest mode (default): mesh LSA + KCP tunnel to Host
+//! Guest mode (default): mesh LSA + TCP/SOCKS4 connection to Host
 //! Host mode (--host): ensures Host service is running
 //!
 //! Self-copy model: binary copies itself to canonical path /opt/utmm/utmm[.exe].
@@ -15,10 +15,8 @@ const svc = @import("svc.zig");
 const fail = @import("fail.zig");
 const mcp = @import("mcp.zig");
 const shm = @import("shm.zig");
-const ringbuf = @import("ringbuf.zig");
 const cmdchan = @import("cmdchan.zig");
-const completion = @import("completion.zig");
-comptime { _ = ringbuf; _ = cmdchan; _ = completion; }
+comptime { _ = cmdchan; }
 
 /// Embedded utmmd binary — compiled at build time, extracted at install time.
 const utmmd_bin = @embedFile("embed/utmmd.bin");
@@ -30,9 +28,7 @@ const utmmd_sha256_hex: [:0]const u8 = @embedFile("embed/utmmd.sha256");
 comptime {
     _ = @import("hosts_file.zig");
     _ = @import("config.zig");
-    _ = @import("kcp.zig");
     _ = @import("mesh.zig");
-    _ = @import("tunnel.zig");
     _ = @import("tunproto.zig");
     _ = @import("lock.zig");
     _ = @import("mcp.zig");
@@ -47,7 +43,7 @@ pub const CliArgs = struct {
     is_host: bool = false,
     /// Mesh UDP port (Host mode)
     port: u16 = protocol.DEFAULT_PORT,
-    /// Mesh UDP port for LSA + KCP
+    /// Mesh UDP port for LSA broadcast
     mesh_port: u16 = protocol.DEFAULT_PORT,
     /// Direct peer mesh address for local testing
     peer_mesh: ?[]const u8 = null,
