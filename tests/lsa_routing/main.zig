@@ -135,7 +135,6 @@ pub fn main(init: std.process.Init) !void {
             node_info,
             sock,
             io,
-            null, // no upgrade_needed
             broadcast_addrs,
             null, // no broadcast_refresh_fn
         ) catch {
@@ -242,7 +241,6 @@ pub fn main(init: std.process.Init) !void {
             node_info,
             sock,
             io,
-            null,
             broadcast_addrs,
             null,
         ) catch {

@@ -110,6 +110,7 @@ pub const Request = enum(u8) {
     upload = 0x04,
     download = 0x05,
     version = 0x06,
+    upgrade = 0x07,
 };
 
 /// IPC response types (Host daemon → CLI/MCP)
@@ -482,6 +483,7 @@ fn handleConnection(
         .ping => handlePing(io, gpa, state_ptr, mesh_ptr, conn, payload.items),
         .download => handleDownload(io, gpa, state_ptr, conn, payload.items),
         .version => handleVersion(conn),
+        .upgrade => handleUpgrade(io, gpa, state_ptr, mesh_ptr, conn, payload.items),
         .upload => unreachable, // handled above
     }
 }
@@ -818,6 +820,139 @@ fn handleUpload(
     var ok_buf: [1]u8 = undefined;
     ok_buf[0] = @intFromEnum(Response.ok);
     ipc_conn.writeAll(&ok_buf) catch {};
+}
+
+/// Host→Guest 直推升级：读取 serve-dir 二进制 → SOCKS4a → upgrade_cmd → 流式推送
+fn handleUpgrade(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    state_ptr: *anyopaque,
+    _: *anyopaque, // mesh_ptr — unused for upgrade
+    ipc_conn: Connection,
+    header: []const u8,
+) void {
+    var pos: usize = 0;
+    const vm = readString(header, &pos) orelse {
+        sendError(ipc_conn, "InvalidRequest: missing vm");
+        return;
+    };
+
+    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
+    const tcp_mod = @import("tcp.zig");
+    const ptcl = @import("protocol.zig");
+
+    // Look up guest
+    const guest = state.findByHostname(vm) orelse {
+        sendError(ipc_conn, "GuestNotFound");
+        return;
+    };
+
+    // 确定 deploy target 和二进制文件名
+    const filename = ptcl.deploymentFilename(guest.target) orelse {
+        std.log.err("[ipc-upgrade] unknown guest target: {s}", .{guest.target});
+        sendError(ipc_conn, "UnknownTarget");
+        return;
+    };
+
+    var path_buf: [512]u8 = undefined;
+    const serve_path = std.fmt.bufPrint(&path_buf, "/opt/utmm/{s}", .{filename}) catch {
+        sendError(ipc_conn, "PathTooLong");
+        return;
+    };
+
+    // 读二进制并计算 SHA256
+    const bin_file = std.Io.Dir.cwd().openFile(io, serve_path, .{ .mode = .read_only }) catch |err| {
+        std.log.err("[ipc-upgrade] open {s}: {}", .{ serve_path, err });
+        sendError(ipc_conn, "BinaryNotFound");
+        return;
+    };
+    defer bin_file.close(io);
+
+    // 读取整个文件（upgrade 二进制通常 ~2-10MB，一次性读入简化逻辑）
+    const file_size_b: u64 = bin_file.stat(io) catch 0;
+    if (file_size_b == 0 or file_size_b > 50 * 1024 * 1024) {
+        std.log.err("[ipc-upgrade] invalid file size: {d}", .{file_size_b});
+        sendError(ipc_conn, "InvalidBinary");
+        return;
+    }
+    const file_size: u32 = @intCast(file_size_b);
+
+    const file_data = gpa.alloc(u8, file_size) catch {
+        sendError(ipc_conn, "AllocFailed");
+        return;
+    };
+    defer gpa.free(file_data);
+
+    _ = bin_file.readAll(io, file_data) catch |err| {
+        std.log.err("[ipc-upgrade] read {s}: {}", .{ serve_path, err });
+        sendError(ipc_conn, "ReadFailed");
+        return;
+    };
+
+    // SHA256
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(file_data);
+    var hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&hash);
+    var sha256_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&sha256_hex, "{s}", .{std.fmt.fmtSliceHexLower(&hash)}) catch {
+        sendError(ipc_conn, "HexEncodeFailed");
+        return;
+    };
+
+    std.log.info("[ipc-upgrade] {s} ({s}): {d} bytes, sha256={s}", .{ vm, guest.target, file_size, &sha256_hex });
+
+    // Per-command TCP connection via SOCKS4a
+    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
+        std.log.err("[ipc-upgrade] TCP connect to {s} failed: {}", .{ vm, err });
+        sendError(ipc_conn, "GuestNotConnected");
+        return;
+    };
+    defer tcp_conn.deinit();
+
+    // Send upgrade_cmd frame
+    const cmd_id = std.fmt.allocPrint(gpa, "upgrade_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds}) catch {
+        sendError(ipc_conn, "AllocFailed");
+        return;
+    };
+    defer gpa.free(cmd_id);
+
+    const up_frame = ptcl.buildUpgradeCmd(gpa, cmd_id, guest.target, file_size, &sha256_hex) catch {
+        sendError(ipc_conn, "AllocFailed");
+        return;
+    };
+    defer gpa.free(up_frame);
+    tcp_conn.sendAndFlush(up_frame, 0) catch {
+        sendError(ipc_conn, "TunnelSendFailed");
+        return;
+    };
+
+    // Stream raw binary bytes (unframed)
+    _ = tcp_mod.sockWrite(tcp_conn.fd, file_data.ptr, file_size);
+
+    // Receive upload_result frame
+    var rbuf: [256]u8 = undefined;
+    const nr = tcp_conn.recv(&rbuf) catch |err| {
+        std.log.err("[ipc-upgrade] recv upload_result: {}", .{err});
+        sendError(ipc_conn, "UpgradeResultFailed");
+        return;
+    };
+    if (nr > 0 and rbuf[0] == @intFromEnum(ptcl.MsgType.upload_result)) {
+        var mpos: usize = 1;
+        _ = readString(rbuf[0..nr], &mpos);
+        const exit_code = readI32(rbuf[0..nr], &mpos) orelse @as(i32, -1);
+        if (exit_code != 0) {
+            std.log.err("[ipc-upgrade] upgrade failed: exit={d}", .{exit_code});
+            sendError(ipc_conn, "UpgradeFailed");
+            return;
+        }
+    }
+
+    // Send OK
+    var ok_buf2: [1]u8 = undefined;
+    ok_buf2[0] = @intFromEnum(Response.ok);
+    ipc_conn.writeAll(&ok_buf2) catch {};
+    std.log.info("[ipc-upgrade] {s} upgraded successfully", .{vm});
 }
 
 fn handleDownload(
@@ -1213,6 +1348,42 @@ pub fn ipcUpload(io: std.Io, gpa: std.mem.Allocator, vm: []const u8, local_path:
         .err => {
             const msg = readString(resp.items, &pos) orelse "UnknownError";
             std.log.err("[ipc] upload error: {s}", .{msg});
+            return error.IpcError;
+        },
+        else => return error.IpcProtocolError,
+    }
+}
+
+/// Push upgrade binary to a Guest via the Host daemon.
+pub fn ipcUpgrade(io: std.Io, gpa: std.mem.Allocator, vm: []const u8) !void {
+    _ = io;
+    // Connect to Host daemon IPC socket
+    var conn: Connection = undefined;
+    try clientConnect(&conn);
+    defer conn.close();
+
+    // Build request: [Request.upgrade][vm\0]
+    var req_buf: [256]u8 = undefined;
+    var req = std.ArrayList(u8).fromOwnedSlice(&req_buf);
+    req.items.len = 0;
+    req.appendAssumeCapacity(@intFromEnum(Request.upgrade));
+    try writeString(&req, vm);
+    try conn.writeAll( req.items);
+
+    // Read response
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    try clientReadAll(conn, gpa, &resp);
+
+    var pos: usize = 0;
+    const type_byte = readByte(resp.items, &pos) orelse return error.IpcProtocolError;
+    const rtype: Response = @enumFromInt(type_byte);
+
+    switch (rtype) {
+        .ok => {},
+        .err => {
+            const msg = readString(resp.items, &pos) orelse "UnknownError";
+            std.log.err("[ipc] upgrade error: {s}", .{msg});
             return error.IpcError;
         },
         else => return error.IpcProtocolError,

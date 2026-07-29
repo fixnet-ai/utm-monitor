@@ -59,11 +59,13 @@ utmm --exec linuxvm "cd /opt/myapp && source ./venv/bin/activate && pip list"
 
 # Check health across all machines with one command
 utmm --status      # Host + all guests: role, version, status, last seen
-utmm --verify      # Health matrix: status + ping + exec echo per guest
 
 # One-shot deploy to all machines
 utmm --deploy      # Build + SCP + SSH install to all guests
 utmm --deploy linuxvm  # Deploy single guest
+
+# Push upgrade to Guest (no SSH needed)
+utmm --upgrade linuxvm
 
 # File transfer
 utmm --upload build.zip linuxvm
@@ -112,7 +114,6 @@ claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp
 
 ```bash
 utmm --status                      # All nodes at a glance (Host + guests, role/status/version/last seen)
-utmm --verify                      # Health check matrix: status + ping + exec per guest
 utmm --ping linuxvm                # Ping a guest (Host→Guest mesh ping, returns JSON)
 utmm --exec linuxvm "uname -a"     # Command (streaming output, no timeout)
 utmm --exec linuxvm "gdb ..."      # Attach debugger
@@ -121,6 +122,7 @@ utmm --exec windowsvm "dir"        # Windows commands too
 utmm --upload build.zip linuxvm    # Push a build (raw binary)
 utmm --download linuxvm core ./    # Pull a core dump (streaming binary)
 utmm --deploy [<vm>]              # Build + SCP + SSH deploy to all guests (or single)
+utmm --upgrade <vm>                # Push upgrade binary to Guest VM
 utmm --version                     # Print version
 ```
 
@@ -136,7 +138,7 @@ socket (`/var/run/utmm.sock` on POSIX, named pipe on Windows) — no HTTP.
 ```
 Guest (linuxvm)      ──TCP/SOCKS4──┐
 Guest (macvm)        ──TCP/SOCKS4──┤──→ Host ── IPC socket ── CLI (--status, --exec, --ping)
-Guest (windowsvm)    ──TCP/SOCKS4──┤          ── Binary serve (TCP upgrade_req)
+Guest (windowsvm)    ──TCP/SOCKS4──┤          ── deploy + upgrade (push model)
                          ┌── LSA broadcast (UDP:2121) ──┘  (topology + version detection)
                          │
 AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
@@ -151,9 +153,9 @@ AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
   (spawn, monitor, crash recovery) via shared memory heartbeat.
   `--install` = unconditional force overwrite. Upgrade = scp new binary + `--install`.
   Zero shell commands.
-- **Guest-initiated auto-upgrade** (v0.12.0+): Guest detects Host version change via
-  LSA broadcast, downloads new binary through TCP connection, and signals utmmd
-  via shared memory to restart with the new binary. Host never pushes upgrades.
+- **Host-initiated upgrade** (v0.14.0+): `utmm --upgrade <vm>` pushes new binary
+  directly to Guest via SOCKS4a TCP (push model). `utmm --deploy` automates
+  compilation + serve-dir maintenance.
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
 - **Single UDP port 2121** for LSA mesh networking.
   MCP and CLI use local IPC socket (stdio for MCP, Unix domain socket for CLI) — no TCP/HTTP ports needed.
@@ -166,22 +168,18 @@ AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
 
 ## Upgrade
 
-**`--deploy` (fastest, v0.11.18+):** cross-compile, SCP, and SSH install in one command.
+**`--upgrade` (v0.14.0+):** push binary to Guest via SOCKS4a TCP (push model).
+```bash
+utmm --upgrade linuxvm              # Push latest binary to Guest
+```
+
+**`--deploy` (fastest, v0.11.18+):** cross-compile, SCP, and SSH install + copy to serve-dir in one command.
 ```bash
 sudo utmm --deploy                # All guests
 sudo utmm --deploy linuxvm        # Single guest
 ```
 Requires `sshpass` on the Host. Validates binary type (ELF/Mach-O/PE) before copying.
-
-**Online machines:** re-run the install script — it upgrades in place.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sudo sh
-```
-
-**Guest auto-upgrade (hands-free):** Guests detect a Host version change via
-LSA broadcast, download the new binary through TCP, and signal
-utmmd to restart with the new binary. No human intervention needed.
+Also copies compiled binaries to serve-dir (`/opt/utmm/`) for future `--upgrade` use.
 
 **Offline/manual:** download `utmm.zip` from the
 [latest release](https://github.com/fixnet-ai/utm-monitor/releases/latest),

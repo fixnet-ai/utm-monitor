@@ -19,12 +19,12 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
 pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
     // Management commands: stateless, no Host daemon needed
     if (cli.cmd_status) return cmdStatus(block_io, gpa, cli.port);
-    if (cli.cmd_verify) return cmdVerify(block_io, gpa, cli.port);
     if (cli.cmd_deploy) return cmdDeploy(block_io, gpa, cli.deploy_target);
     if (cli.cmd_ping) return cmdPing(block_io, gpa, cli.port, cli.ping_target.?);
     if (cli.cmd_exec) return cmdExec(block_io, gpa, cli.port, cli.exec_target.?, cli.exec_cmd.?);
     if (cli.cmd_upload) return cmdUpload(block_io, gpa, cli.port, cli.upload_target.?, cli.upload_file.?);
     if (cli.cmd_download) return cmdDownload(block_io, gpa, cli.port, cli.download_target.?, cli.download_remote.?, cli.download_local.?);
+    if (cli.cmd_upgrade) return cmdUpgrade(block_io, gpa, cli.port, cli.upgrade_target.?);
     // --gen-init
     if (cli.cmd_gen_init) {
         const platform_str = cli.gen_init_platform orelse "linux";
@@ -71,7 +71,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 
     // --host (via --svc): start Host daemon
     if (cli.is_host) {
-        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, cli.auto_upgrade, shutdown);
+        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown);
         return;
     }
 }
@@ -161,205 +161,6 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         }
     }
     std.debug.print("\n", .{});
-}
-
-/// Health check: for each guest, run status + ping + exec echo and print a
-/// pass/fail matrix. Each check has a 5-second timeout — if any check hangs
-/// (e.g. tunnel stalled), it's marked as a failure rather than blocking forever.
-fn cmdVerify(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
-    _ = gpa;
-    _ = port;
-    const ipc_mod = @import("ipc.zig");
-
-    // ── helpers ──
-    const GREEN = "\x1b[32m";
-    const RED = "\x1b[31m";
-    const YELLOW = "\x1b[33m";
-    const RESET = "\x1b[0m";
-
-    const CheckResult = enum { pass, fail, skip };
-    const checkIcon = struct {
-        fn icon(result: CheckResult) []const u8 {
-            return switch (result) {
-                .pass => GREEN ++ "✓" ++ RESET,
-                .fail => RED ++ "✗" ++ RESET,
-                .skip => YELLOW ++ "−" ++ RESET,
-            };
-        }
-    }.icon;
-
-    // 1. Get guest list via IPC status
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-
-    const json_str = ipc_mod.ipcStatus(block_io, aa) catch |err| {
-        std.debug.print("[verify] Failed to query guest list: {}\n", .{err});
-        std.process.exit(1);
-    };
-    defer aa.free(json_str);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, aa, json_str, .{ .allocate = .alloc_always }) catch |err| {
-        std.debug.print("[verify] JSON parse error: {}\n", .{err});
-        std.process.exit(1);
-    };
-
-    const guests = switch (parsed.value) {
-        .array => |arr| arr,
-        else => {
-            std.debug.print("No UTM guests found.\n", .{});
-            return;
-        },
-    };
-
-    if (guests.items.len == 0) {
-        std.debug.print("No UTM guests found.\n", .{});
-        return;
-    }
-
-    // Collect hostnames (skip Host itself — no tunnel for ping/exec)
-    var hostnames: std.ArrayListAligned([]const u8, null) = .empty;
-    for (guests.items) |guest_val| {
-        const g = switch (guest_val) {
-            .object => |o| o,
-            else => continue,
-        };
-        // Skip Host — no connection to itself, ping/exec would fail
-        if (protocol.jsonGetString(g, "role")) |r| {
-            if (std.mem.eql(u8, r, "host")) continue;
-        }
-        if (protocol.jsonGetString(g, "hostname")) |h| {
-            try hostnames.append(aa, try aa.dupe(u8, h));
-        }
-    }
-
-    // 2. Run checks for each guest
-    const GuestResult = struct {
-        status: CheckResult = .skip,
-        ping: CheckResult = .skip,
-        exec: CheckResult = .skip,
-        ping_rtt: ?u32 = null,
-        exec_error: ?[]const u8 = null,
-    };
-
-    var results = std.StringHashMap(GuestResult).init(aa);
-    for (hostnames.items) |h| {
-        try results.put(h, GuestResult{});
-    }
-
-    // 2a. Status check — guests are already in the list (from LSA)
-    for (hostnames.items) |h| {
-        var r = results.getPtr(h).?;
-        r.status = .pass;
-    }
-
-    // 2b. Ping check (mesh reachability)
-    for (hostnames.items) |h| {
-        var r = results.getPtr(h).?;
-        const ping_json = ipc_mod.ipcPing(block_io, aa, h) catch {
-            r.ping = .fail;
-            continue;
-        };
-        defer aa.free(ping_json);
-
-        // Parse RTT from ping response JSON
-        const ping_parsed = std.json.parseFromSlice(std.json.Value, aa, ping_json, .{ .allocate = .alloc_always }) catch {
-            r.ping = .fail;
-            continue;
-        };
-        if (ping_parsed.value == .object) {
-            if (ping_parsed.value.object.get("rtt_ms")) |rtt_val| {
-                if (rtt_val == .integer) {
-                    r.ping_rtt = @intCast(rtt_val.integer);
-                }
-            }
-            if (ping_parsed.value.object.get("error")) |_| {
-                r.ping = .fail;
-            } else {
-                r.ping = .pass;
-            }
-        } else {
-            r.ping = .fail;
-        }
-    }
-
-    // 2c. Exec echo check (tunnel + shell working)
-    for (hostnames.items) |h| {
-        var r = results.getPtr(h).?;
-
-        // Run "echo utmm-verify" — we only care about exit code.
-        // Write output to /dev/null (NUL on Windows).
-        const null_path = if (builtin.os.tag == .windows) "NUL" else "/dev/null";
-        var null_file = std.Io.Dir.cwd().openFile(block_io, null_path, .{ .mode = .write_only }) catch {
-            r.exec = .fail;
-            r.exec_error = try aa.dupe(u8, "cannot open null device");
-            continue;
-        };
-        defer null_file.close(block_io);
-        var null_wb: [256]u8 = undefined;
-        var null_writer = null_file.writer(block_io, &null_wb);
-        const null_iface = &null_writer.interface;
-
-        const exit_code = ipc_mod.ipcExec(block_io, aa, h, "echo utmm-verify", null_iface) catch {
-            r.exec = .fail;
-            r.exec_error = try aa.dupe(u8, "IPC error (tunnel down?)");
-            continue;
-        };
-
-        if (exit_code == 0) {
-            r.exec = .pass;
-        } else {
-            r.exec = .fail;
-            r.exec_error = try std.fmt.allocPrint(aa, "exit_code={d}", .{exit_code});
-        }
-    }
-
-    // 3. Print pass/fail matrix
-    std.debug.print("\n{s: <16} {s}  {s}  {s}  {s}\n", .{ "Guest", "Status", "Ping", "Exec", "Details" });
-    std.debug.print("{s:-<60}\n", .{""});
-
-    var all_pass = true;
-    for (hostnames.items) |h| {
-        const r = results.get(h).?;
-        var details: std.ArrayListAligned(u8, null) = .empty;
-        defer details.deinit(aa);
-
-        if (r.ping == .pass) {
-            if (r.ping_rtt) |rtt| {
-                const rtt_str = try std.fmt.allocPrint(aa, "{d}ms", .{rtt});
-                try details.appendSlice(aa, rtt_str);
-            }
-        } else if (r.ping == .fail) {
-            try details.appendSlice(aa, "unreachable");
-        }
-
-        if (r.exec == .fail) {
-            if (details.items.len > 0) try details.appendSlice(aa, ", ");
-            try details.appendSlice(aa, r.exec_error orelse "exec failed");
-        }
-
-        const detail_str = if (details.items.len > 0) details.items else "-";
-
-        std.debug.print("{s: <16} {s}     {s}     {s}     {s}\n", .{
-            h,
-            checkIcon(r.status),
-            checkIcon(r.ping),
-            checkIcon(r.exec),
-            detail_str,
-        });
-
-        if (r.status != .pass or r.ping != .pass or r.exec != .pass) {
-            all_pass = false;
-        }
-    }
-
-    std.debug.print("\n", .{});
-    if (all_pass) {
-        std.debug.print("All checks passed. {d} guest(s) healthy.\n", .{hostnames.items.len});
-    } else {
-        std.debug.print("Some checks failed. Review the matrix above.\n", .{});
-        std.process.exit(1);
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -484,6 +285,14 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         try compiled.put(vm.target, bin_path);
 
         std.debug.print("[deploy]   -> {s}\n", .{bin_path});
+
+        // Copy to serve-dir for future --upgrade use
+        const serve_copy_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ "/opt/utmm", bin_name });
+        defer gpa.free(serve_copy_path);
+        std.Io.Dir.cwd().copyFile(io, bin_path, std.Io.Dir.cwd(), serve_copy_path, .{}) catch |err| {
+            std.log.warn("[deploy] copy to serve-dir failed: {}", .{err});
+        };
+        std.debug.print("[deploy]   -> serve-dir: {s}\n", .{serve_copy_path});
     }
 
     // ── 3. SCP + install for each VM ──
@@ -608,6 +417,16 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
     std.debug.print("[upload] OK\n", .{});
 }
 
+fn cmdUpgrade(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8) !void {
+    _ = port;
+    const ipc_mod = @import("ipc.zig");
+
+    std.debug.print("[upgrade] Pushing upgrade binary to {s}...\n", .{target});
+
+    try ipc_mod.ipcUpgrade(block_io, gpa, target);
+    std.debug.print("[upgrade] OK\n", .{});
+}
+
 fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, remote_file: []const u8, local_path: []const u8) !void {
     _ = port; // HTTP handlers preserved for future WebUI
     const ipc_mod = @import("ipc.zig");
@@ -647,266 +466,21 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
 // ═══════════════════════════════════════════════════════════════════════════
 // Host daemon (--host): Mesh LSA + TCP/SOCKS4 connections + IPC server
 // ═══════════════════════════════════════════════════════════════════════════
-
-/// Check that a version string looks like "X.Y.Z" (digits only).
-/// Rejects anything that doesn't match — human-verification pages, HTML, etc.
-pub fn isValidVersion(ver: []const u8) bool {
-    if (ver.len < 5) return false; // minimum: "0.0.0"
-    var parts = std.mem.splitSequence(u8, ver, ".");
-    var count: u8 = 0;
-    while (parts.next()) |part| : (count += 1) {
-        if (part.len == 0) return false;
-        for (part) |c| {
-            if (c < '0' or c > '9') return false;
-        }
-        if (count > 3) return false;
-    }
-    return count == 3;
-}
-
-/// Fire-and-forget OS thread: check GitHub for the latest release version.
-/// On mismatch, logs "New version X.Y.Z available on github" and returns.
-/// Never triggers any upgrade — purely informational.
-fn checkGitHubVersion() void {
-    // Own Io instance for HTTP request in this detached thread.
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var gpa = std.heap.DebugAllocator(.{}).init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer client.deinit();
-
-    const uri = std.Uri.parse("https://api.github.com/repos/fixnet-ai/utm-monitor/releases/latest") catch return;
-    // Allow up to 5 redirects — GitHub may issue 302.
-    var req = client.request(.GET, uri, .{ .redirect_behavior = .init(5) }) catch return;
-    defer req.deinit();
-
-    req.sendBodiless() catch return;
-
-    var redirect_buf: [4096]u8 = undefined;
-    _ = req.receiveHead(&redirect_buf) catch return;
-
-    // Read response body — use req.reader.bodyReader() directly since
-    // Response.reader() skips GET (checks requestHasBody, not responseHasBody).
-    var body_buf: [4096]u8 = undefined;
-    const body_reader = req.reader.bodyReader(&body_buf, req.response_transfer_encoding, req.response_content_length);
-
-    var body_data: [8192]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&body_data);
-    _ = body_reader.stream(&w, .limited(8192)) catch {};
-    const body = w.buffered();
-
-    // Parse "tag_name" from JSON response.
-    const tag_key = "\"tag_name\":\"";
-    if (std.mem.indexOf(u8, body, tag_key)) |start| {
-        const value_start = start + tag_key.len;
-        if (std.mem.indexOfScalar(u8, body[value_start..], '"')) |end| {
-            const tag = body[value_start .. value_start + end];
-            // Strip leading "v" (e.g. "v0.11.19" → "0.11.19")
-            const new_ver = if (tag.len > 0 and tag[0] == 'v') tag[1..] else tag;
-            // Validate version format — rejects human-verification pages, HTML, etc.
-            if (!isValidVersion(new_ver)) return;
-            if (!std.mem.eql(u8, new_ver, protocol.VERSION)) {
-                std.log.warn("[host] New version {s} available on github", .{new_ver});
-            }
-        }
-    }
-}
-
-/// Verify that platform binaries in serve_dir match the running Host version.
-/// Checks each known deployment target's versioned filename exists.
-/// Returns true if at least one platform binary is found (partial deployment OK).
-/// Returns false only if NO platform binaries exist at all.
-fn verifyServeDirBinaries(io: std.Io, serve_dir: []const u8) bool {
-    const targets = [_][]const u8{
-        "aarch64-linux-musl", "x86_64-linux-musl", "x86-linux-musl",
-        "aarch64-macos", "x86_64-macos",
-        "x86-windows", "x86_64-windows", "aarch64-windows",
-        "aarch64-linux", "x86_64-linux", "x86-linux",
-    };
-
-    var found: usize = 0;
-    var missing: usize = 0;
-
-    for (targets) |target| {
-        const filename = protocol.deploymentFilename(target) orelse continue;
-        var path_buf: [1024]u8 = undefined;
-        const file_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ serve_dir, filename }) catch continue;
-
-        if (std.Io.Dir.cwd().statFile(io, file_path, .{})) |_| {
-            found += 1;
-        } else |_| {
-            missing += 1;
-        }
-    }
-
-    if (found == 0) {
-        std.log.err("[host] No platform binaries found in serve-dir '{s}'", .{serve_dir});
-        std.log.err("[host] Host version is {s} but no matching binaries exist.", .{protocol.VERSION});
-        std.log.err("[host] Please download the full release package and re-install.", .{});
-        return false;
-    }
-
-    if (missing > 0) {
-        std.log.warn("[host] {d} platform binaries missing from serve-dir (some Guests may not auto-upgrade)", .{missing});
-    }
-
-    std.log.info("[host] {d} platform binaries verified in serve-dir", .{found});
-    return true;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 升级 TCP 监听器 — Guest 连接 Host 下载新二进制
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// 处理单个升级连接：接收 upgrade_req → 流式返回二进制。
-fn handleUpgradeConnection(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    fd: std.posix.socket_t,
-    serve_dir: []const u8,
-) void {
-    defer {
-        tcp.sockShutdown(fd, 2);
-        tcp.sockClose(fd);
-    }
-
-    // 接收 upgrade_req 帧（sendFrame 写入 4B BE length + payload）
-    const frame = tcp.recvFrame(allocator, fd) catch |err| {
-        std.log.warn("[host] upgrade: recv upgrade_req: {}", .{err});
-        return;
-    };
-    defer allocator.free(frame);
-
-    // frame[0] = type byte, frame[1..] = cmd_id + target
-    if (frame.len < 1 or frame[0] != @intFromEnum(protocol.MsgType.upgrade_req)) {
-        std.log.warn("[host] upgrade: unexpected frame type 0x{x}", .{frame[0]});
-        return;
-    }
-
-    const req = protocol.parseUpgradeReq(frame[1..]) orelse {
-        std.log.warn("[host] upgrade: parse upgrade_req failed", .{});
-        return;
-    };
-
-    std.log.info("[host] upgrade: serving binary for target={s}", .{req.target});
-
-    // 构造二进制文件名并打开
-    const filename = protocol.deploymentFilename(req.target) orelse {
-        std.log.err("[host] upgrade: unknown target '{s}'", .{req.target});
-        return;
-    };
-    var path_buf: [512]u8 = undefined;
-    const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ serve_dir, filename }) catch {
-        std.log.err("[host] upgrade: path too long: {s}/{s}", .{ serve_dir, filename });
-        return;
-    };
-
-    const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch |err| {
-        std.log.err("[host] upgrade: open {s}: {}", .{ full_path, err });
-        return;
-    };
-    defer file.close(io);
-
-    // 流式发送文件内容（原始字节，无帧协议，sendFrame 不适合大文件）
-    var rbuf: [65536]u8 = undefined;
-    while (true) {
-        const nr = file.readStreaming(io, &.{rbuf[0..]}) catch |err| {
-            std.log.err("[host] upgrade: read {s}: {}", .{ full_path, err });
-            return;
-        };
-        if (nr == 0) break; // EOF
-
-        const nw = tcp.sockWrite(fd, &rbuf, nr);
-        if (nw != @as(isize, @intCast(nr))) {
-            std.log.err("[host] upgrade: send binary failed", .{});
-            return;
-        }
-    }
-
-    std.log.info("[host] upgrade: served {s} successfully", .{filename});
-}
-
-/// TCP 升级监听器线程入口。
-fn upgradeTcpListener(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    port: u16,
-    serve_dir: []const u8,
-    shutdown: *std.atomic.Value(bool),
-) void {
-    const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", port) catch |err| {
-        std.log.err("[host] upgrade listener: bind addr parse: {}", .{err});
-        return;
-    };
-    const sock = bind_addr.bind(io, .{ .mode = .stream }) catch |err| {
-        std.log.err("[host] upgrade listener: TCP bind :{d}: {}", .{ port, err });
-        return;
-    };
-    defer sock.close(io);
-
-    _ = tcp.sockListen(sock.handle, 8);
-    std.log.info("[host] upgrade TCP listener on :{d}", .{port});
-
-    while (!shutdown.load(.acquire)) {
-        const client_fd = tcp.sockAccept(sock.handle) catch |err| {
-            if (err == error.WouldBlock) {
-                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
-                continue;
-            }
-            std.log.err("[host] upgrade listener: accept failed: {}", .{err});
-            continue;
-        };
-
-        // 处理升级连接（阻塞，但连接是独立的且通常很快）
-        handleUpgradeConnection(io, allocator, client_fd, serve_dir);
-    }
-
-    std.log.info("[host] upgrade TCP listener stopped", .{});
-}
-
 fn startHost(
     block_io: std.Io,
     gpa: std.mem.Allocator,
     mesh_port: u16,
     serve_dir: ?[]const u8,
     peer_mesh: ?[]const u8,
-    auto_upgrade: bool,
     shutdown: ?*std.atomic.Value(bool),
 ) !void {
     const sd = serve_dir orelse "/opt/utmm";
     std.debug.print("[host] Host daemon starting (mesh UDP :{d})\n", .{mesh_port});
     std.debug.print("[host] Serve dir: {s}\n", .{sd});
 
-    if (auto_upgrade) {
-        // Verify serve-dir platform binaries match running Host version.
-        // Missing binaries are logged as warnings; the Host continues running
-        // so Guests can still be managed (exec/upload/download). Guest
-        // auto-upgrade is degraded until matching binaries are provided.
-        // Auto-uninstall was removed: self-destructing on version mismatch
-        // leaves the machine unreachable with zero recovery path — far worse
-        // than an upgrade loop (which is self-limiting anyway).
-        _ = verifyServeDirBinaries(block_io, sd);
-
-        // Spawn fire-and-forget GitHub version check thread.
-        // OS thread, detach immediately, runs once — no join needed.
-        if (std.Thread.spawn(.{}, checkGitHubVersion, .{})) |t| {
-            t.detach();
-        } else |_| {
-            // spawn failed — silently ignored
-        }
-    }
-
     // Initialize guest table
     var state = GuestTable.init(gpa, block_io);
     defer state.deinit();
-
-    // Upgrade signal for version mismatch detection via LSA (only when auto_upgrade enabled).
-    var upgrade_signal = guest.UpgradeSignal{};
 
     // Spawn mesh networking thread — replaces periodic UDP guest.
     // Mesh broadcasts LSA every 2s (carries version for auto-upgrade),
@@ -982,7 +556,7 @@ fn startHost(
         };
 
         // Create mesh instance (epoch is auto-appended to node_info by init())
-        mesh_opt = lsa.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, if (auto_upgrade) &upgrade_signal.needed else null, bc_addrs, guest.getSubnetBroadcasts) catch |err| {
+        mesh_opt = lsa.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, bc_addrs, guest.getSubnetBroadcasts) catch |err| {
             std.log.err("[host] Mesh init failed: {}", .{err});
             gpa.free(node_info);
             mesh_socket.close(mesh_io);
@@ -1015,19 +589,6 @@ fn startHost(
     // Must spawn before the defer below so join() runs in correct order.
     var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ block_io, gpa, &state, &mesh_opt });
 
-    // Spawn upgrade TCP listener thread — serves binary to upgrading Guests.
-    // Only spawned when auto_upgrade is enabled.
-    var upgrade_shutdown = std.atomic.Value(bool).init(false);
-    var upgrade_thread: ?std.Thread = null;
-    if (auto_upgrade) {
-        upgrade_thread = std.Thread.spawn(.{}, upgradeTcpListener, .{
-            block_io, gpa, mesh_port, sd, &upgrade_shutdown,
-        }) catch |err| blk: {
-            std.log.err("[host] upgrade listener thread spawn failed: {}", .{err});
-            break :blk null;
-        };
-    }
-
     // Spawn IPC server thread — Unix domain socket (POSIX) / named pipe (Windows).
     // Shares HostState and Mesh with the mesh networking layer.
     var ipc_shutdown = std.atomic.Value(bool).init(false);
@@ -1039,13 +600,11 @@ fn startHost(
     defer {
         // 1. Signal all background threads to stop
         ipc_shutdown.store(true, .release);
-        upgrade_shutdown.store(true, .release);
         // 2. Signal mesh shutdown — tunnelManager checks this each loop iteration
         if (mesh_opt) |*m| m.signalShutdown();
 
-        // 3. Join threads (order: IPC → upgrade → tunnel mgr → mesh)
+        // 3. Join threads (order: IPC → tunnel mgr → mesh)
         ipc_thread.join();
-        if (upgrade_thread) |t| t.join();
         tun_mgr_thread.join();
 
         // 4. Join mesh thread after all consumers have exited
@@ -1176,13 +735,6 @@ fn tunnelManager(
     }
 }
 
-
-test "isValidVersion - valid semver" {
-    try std.testing.expect(isValidVersion("0.11.18"));
-    try std.testing.expect(isValidVersion("1.0.0"));
-    try std.testing.expect(isValidVersion("10.20.30"));
-    try std.testing.expect(isValidVersion("0.0.0"));
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GuestTable — minimal guest registry
@@ -1398,22 +950,6 @@ pub fn syncHostsFromTable(io: std.Io, allocator: std.mem.Allocator, table: *Gues
     var writer = out_file.writer(io, &wbuf);
     writer.interface.writeAll(output.items) catch {};
     writer.interface.flush() catch {};
-}
-
-test "isValidVersion - invalid" {
-    try std.testing.expect(!isValidVersion(""));
-    try std.testing.expect(!isValidVersion("0"));
-    try std.testing.expect(!isValidVersion("0.11"));
-    try std.testing.expect(!isValidVersion("0.11.18.1"));
-    try std.testing.expect(!isValidVersion("v0.11.18"));
-    try std.testing.expect(!isValidVersion("a.b.c"));
-    try std.testing.expect(!isValidVersion("0.11.alpha"));
-}
-
-test "isValidVersion - garbage (human verification page)" {
-    try std.testing.expect(!isValidVersion("<!DOCTYPE html>"));
-    try std.testing.expect(!isValidVersion("<html>captcha</html>"));
-    try std.testing.expect(!isValidVersion("Please verify you are human"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

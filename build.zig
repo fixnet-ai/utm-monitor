@@ -196,7 +196,6 @@ pub fn build(b: *std.Build) void {
         .{ .name = "lsa_routing_int", .path = "tests/lsa_routing/main.zig", .needs_utmmd = false },
         .{ .name = "dpipe_relay_int", .path = "tests/dpipe_relay/main.zig", .needs_utmmd = false },
         .{ .name = "svc_install_int", .path = "tests/svc_install/main.zig", .needs_utmmd = true },
-        .{ .name = "auto_upgrade_int", .path = "tests/auto_upgrade/main.zig", .needs_utmmd = false },
         .{ .name = "exec_e2e_int", .path = "tests/exec_e2e/main.zig", .needs_utmmd = false },
         .{ .name = "upload_e2e_int", .path = "tests/upload_e2e/main.zig", .needs_utmmd = false },
         .{ .name = "download_e2e_int", .path = "tests/download_e2e/main.zig", .needs_utmmd = false },

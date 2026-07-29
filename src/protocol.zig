@@ -162,9 +162,9 @@ pub const MsgType = enum(u8) {
     upload_result = 0x17,
     _unused_0x18 = 0x18,
 
-    // Guest → Host: upgrade request
-    upgrade_req = 0x19,
-    _unused_0x1a = 0x1a,
+    // Host → Guest: upgrade push
+    upgrade_cmd = 0x1a,
+    _unused_0x19 = 0x19,
 
     // File transfer
     upload_cmd = 0x1b,
@@ -280,12 +280,14 @@ pub fn buildUploadCmd(allocator: std.mem.Allocator, cmd_id: []const u8, path: []
     return buf.toOwnedSlice(allocator);
 }
 
-pub fn buildUpgradeReq(allocator: std.mem.Allocator, cmd_id: []const u8, target: []const u8) ![]const u8 {
+pub fn buildUpgradeCmd(allocator: std.mem.Allocator, cmd_id: []const u8, target: []const u8, file_size: u32, sha256_hex: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-    try buf.append(allocator, @intFromEnum(MsgType.upgrade_req));
+    try buf.append(allocator, @intFromEnum(MsgType.upgrade_cmd));
     try writeString(&buf, allocator, cmd_id);
     try writeString(&buf, allocator, target);
+    try writeU32(&buf, allocator, file_size);
+    try writeString(&buf, allocator, sha256_hex);
     return buf.toOwnedSlice(allocator);
 }
 
@@ -350,9 +352,11 @@ pub const UploadCmdData = struct {
     file_hash: []const u8,
 };
 
-pub const UpgradeReqData = struct {
+pub const UpgradeCmdData = struct {
     cmd_id: []const u8,
     target: []const u8,
+    file_size: u32,
+    sha256_hex: []const u8,
 };
 
 // ── Parse functions ──
@@ -404,11 +408,13 @@ pub fn parseUploadCmd(data: []const u8) ?UploadCmdData {
     return .{ .cmd_id = cmd_id, .path = path, .file_size = file_size, .file_hash = file_hash };
 }
 
-pub fn parseUpgradeReq(data: []const u8) ?UpgradeReqData {
+pub fn parseUpgradeCmd(data: []const u8) ?UpgradeCmdData {
     var pos: usize = 0;
     const cmd_id = readString(data, &pos) orelse return null;
     const target = readString(data, &pos) orelse return null;
-    return .{ .cmd_id = cmd_id, .target = target };
+    const file_size = readU32(data, &pos) orelse return null;
+    const sha256_hex = readString(data, &pos) orelse return null;
+    return .{ .cmd_id = cmd_id, .target = target, .file_size = file_size, .sha256_hex = sha256_hex };
 }
 
 /// Parsed Guest info
@@ -860,14 +866,17 @@ test "pty_exec_output with binary data" {
     try std.testing.expectEqualSlices(u8, binary, parsed.data);
 }
 
-test "upgrade_req round-trip" {
+test "upgrade_cmd round-trip" {
     const allocator = std.testing.allocator;
-    const msg = try buildUpgradeReq(allocator, "up1", "aarch64-linux-musl");
+    const hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const msg = try buildUpgradeCmd(allocator, "up1", "aarch64-linux-musl", 1048576, hash);
     defer allocator.free(msg);
-    try std.testing.expectEqual(@intFromEnum(MsgType.upgrade_req), msg[0]);
-    const parsed = parseUpgradeReq(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqual(@intFromEnum(MsgType.upgrade_cmd), msg[0]);
+    const parsed = parseUpgradeCmd(msg[1..]) orelse return error.ParseFailed;
     try std.testing.expectEqualStrings("up1", parsed.cmd_id);
     try std.testing.expectEqualStrings("aarch64-linux-musl", parsed.target);
+    try std.testing.expectEqual(@as(u32, 1048576), parsed.file_size);
+    try std.testing.expectEqualStrings(hash, parsed.sha256_hex);
 }
 
 test "upload_cmd round-trip" {

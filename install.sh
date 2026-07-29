@@ -18,11 +18,10 @@
 #      sudo /opt/utmm/utmm --install --hostname mybox    (Guest)
 #   Note: --install extracts the utmmd supervisor from the utmm binary and registers
 #   utmmd as the system service. utmmd manages utmm's lifecycle (spawn, monitor, crash
-#   recovery, auto-upgrade).
+#   recovery, upgrade).
 #
 # Deploy to existing Host network (v0.12.0+):
 #   sudo utmm --deploy                # Build + SCP + SSH deploy to all guests
-#   sudo utmm --verify                # Health check: status + ping + exec per guest
 # ==============================================================================
 
 set -e
@@ -265,8 +264,8 @@ if [ "${MODE}" = "guest" ]; then
     find "${CANONICAL_DIR}" -maxdepth 1 -type f \( -name "utmm-*" -o -name "utmm*.exe" \) ! -name "${ZIP_BINARY}" -delete 2>/dev/null || true
     dim "  Kept: ${ZIP_BINARY} (as utmm, contains utmmd supervisor)"
 else
-    # Host: keep all platform binaries for Guest auto-upgrade via KCP tunnel
-    echo "  Host mode - keeping all platform binaries for Guest auto-upgrade."
+    # Host: keep all platform binaries for Host-initiated --upgrade (push model)
+    echo "  Host mode - keeping all platform binaries for Guest upgrade."
     for f in "${CANONICAL_DIR}"/utmm-* "${CANONICAL_DIR}"/utmm*.exe; do
         [ -f "$f" ] && dim "  $(basename "$f")"
     done
@@ -292,7 +291,6 @@ if "${CANONICAL_DIR}/${BINARY_NAME}" ${INSTALL_ARGS}; then
     if [ "${MODE}" = "host" ]; then
         echo "  utmmd supervisor is managing the Host service on UDP :2121"
         echo "  Status:  sudo ${CANONICAL_DIR}/${BINARY_NAME} --status"
-        echo "  Verify:  sudo ${CANONICAL_DIR}/${BINARY_NAME} --verify"
         echo "  Deploy:  sudo ${CANONICAL_DIR}/${BINARY_NAME} --deploy [<vm>]"
     else
         echo "  utmmd supervisor installed — Guest auto-starts on boot."

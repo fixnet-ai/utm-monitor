@@ -17,13 +17,6 @@ const dpipe = @import("dpipe.zig");
 const dpipe_shell = @import("dpipe_shell.zig");
 const dpipe_file = @import("dpipe_file.zig");
 
-/// Shared signal between udpDiscoveryListener (background thread) and
-/// wsAnnounceLoop (main thread). When the UDP listener detects a version
-/// mismatch from the Host broadcast, it sets `needed` to true.
-pub const UpgradeSignal = struct {
-    needed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-};
-
 // libc network interface enumeration (getifaddrs)
 const in_addr = extern struct { s_addr: u32 };
 
@@ -654,8 +647,6 @@ pub fn guestTcpLoop(
     io: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
-    upgrade: *UpgradeSignal,
-    auto_upgrade: bool,
     mesh_port: u16,
     peer_mesh: ?[]const u8,
     shutdown: ?*std.atomic.Value(bool),
@@ -721,7 +712,7 @@ pub fn guestTcpLoop(
             break :start_mesh;
         };
 
-        mesh_opt = lsa.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, if (auto_upgrade) &upgrade.needed else null, broadcast_addrs, getSubnetBroadcasts) catch |err| {
+        mesh_opt = lsa.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, broadcast_addrs, getSubnetBroadcasts) catch |err| {
             std.log.err("[guest] Mesh init: {}", .{err});
             allocator.free(node_info);
             mesh_socket.close(mesh_io);
@@ -774,14 +765,6 @@ pub fn guestTcpLoop(
             }
         }
 
-        // 检查升级信号（仅 auto_upgrade 启用时）
-        if (auto_upgrade and upgrade.needed.load(.acquire)) {
-            upgrade.needed.store(false, .release);
-            if (mesh_opt) |*m| {
-                tryPerformUpgrade(io, allocator, info, m, mesh_port);
-            }
-        }
-
         // Accept SOCKS4 连接
         var conn = listener.accept(info.hostname) catch |err| {
             if (err == error.WouldBlock) continue;
@@ -795,127 +778,6 @@ pub fn guestTcpLoop(
             std.log.err("[guest] handleOneCommand: {}", .{err});
         };
         conn.deinit();
-    }
-}
-
-/// 尝试执行自动升级：连接 Host TCP → 发送 upgrade_req → 接收二进制 → 保存 → 通知 utmmd。
-/// 所有错误被捕获并记录，不会导致主循环崩溃。
-fn tryPerformUpgrade(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    info: SystemInfo,
-    mesh: *lsa.Mesh,
-    mesh_port: u16,
-) void {
-    std.log.info("[guest] upgrade signal detected, starting auto-upgrade", .{});
-
-    // ── 1. 从 LSA 数据库查找 Host IP ──
-    var host_ip: ?[]const u8 = null;
-    defer if (host_ip) |h| allocator.free(h);
-
-    {
-        mesh.lsas_mutex.lock(mesh.io) catch {
-            std.log.warn("[guest] upgrade: failed to lock LSA database", .{});
-            return;
-        };
-        defer mesh.lsas_mutex.unlock(mesh.io);
-
-        var it = mesh.lsas.iterator();
-        while (it.next()) |entry| {
-            const ni = entry.value_ptr.node_info;
-            if (std.mem.indexOf(u8, ni, "role:host") != null) {
-                if (std.mem.indexOf(u8, ni, "ip:")) |ip_start| {
-                    const ip_line = ni[ip_start + 3 ..];
-                    const ip_end = std.mem.indexOfScalar(u8, ip_line, '\n') orelse ip_line.len;
-                    host_ip = allocator.dupe(u8, ip_line[0..ip_end]) catch null;
-                }
-                break;
-            }
-        }
-    }
-
-    const hip = host_ip orelse {
-        std.log.warn("[guest] upgrade: no Host IP found in LSA database", .{});
-        return;
-    };
-    std.log.info("[guest] upgrade: connecting to Host {s}:{d}", .{ hip, mesh_port });
-
-    // ── 2. 连接 Host TCP（直连，不走 SOCKS4a） ──
-    const host_addr = std.Io.net.IpAddress.parse(hip, mesh_port) catch |err| {
-        std.log.warn("[guest] upgrade: parse Host addr: {}", .{err});
-        return;
-    };
-    const stream = host_addr.connect(io, .{ .mode = .stream }) catch |err| {
-        std.log.warn("[guest] upgrade: connect to Host: {}", .{err});
-        return;
-    };
-    defer stream.close(io);
-    const fd = stream.socket.handle;
-
-    // ── 3. 发送 upgrade_req ──
-    const cmd_id = std.fmt.allocPrint(allocator, "upgrade_{d}", .{
-        std.Io.Timestamp.now(io, .real).nanoseconds,
-    }) catch return;
-    defer allocator.free(cmd_id);
-
-    const frame = protocol.buildUpgradeReq(allocator, cmd_id, info.target) catch |err| {
-        std.log.err("[guest] upgrade: buildUpgradeReq: {}", .{err});
-        return;
-    };
-    defer allocator.free(frame);
-
-    tcp.sendFrame(fd, frame) catch |err| {
-        std.log.err("[guest] upgrade: send upgrade_req: {}", .{err});
-        return;
-    };
-    std.log.info("[guest] upgrade: sent upgrade_req target={s}", .{info.target});
-
-    // ── 4. 接收二进制流，保存到临时文件 ──
-    const tmp_path = "/opt/utmm/utmm.new";
-    // 先清理可能残留的旧 temp 文件
-    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-
-    const tmp_file = std.Io.Dir.cwd().createFile(io, tmp_path, .{
-        .permissions = @enumFromInt(0o755),
-    }) catch |err| {
-        std.log.err("[guest] upgrade: create temp file {s}: {}", .{ tmp_path, err });
-        return;
-    };
-
-    var rbuf: [65536]u8 = undefined;
-    var total_bytes: usize = 0;
-    while (true) {
-        const nr = std.posix.system.read(fd, &rbuf, rbuf.len);
-        if (nr < 0) {
-            std.log.err("[guest] upgrade: read error at {d} bytes", .{total_bytes});
-            tmp_file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            return;
-        }
-        if (nr == 0) break; // EOF — Host closed after sending binary
-        tmp_file.writeStreamingAll(io, rbuf[0..@intCast(nr)]) catch |err| {
-            std.log.err("[guest] upgrade: write temp file: {}", .{err});
-            tmp_file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            return;
-        };
-        total_bytes += @intCast(nr);
-    }
-    tmp_file.close(io);
-
-    std.log.info("[guest] upgrade: received {d} bytes → {s}", .{ total_bytes, tmp_path });
-
-    // ── 5. 通过 shm 通知 utmmd 执行升级 ──
-    if (shm.open()) |h| {
-        defer shm.detach(h);
-        h.cmd = @intFromEnum(shm.Cmd.upgrade);
-        @memset(&h.cmd_data, 0);
-        const copy_len = @min(tmp_path.len, h.cmd_data.len - 1);
-        @memcpy(h.cmd_data[0..copy_len], tmp_path[0..copy_len]);
-        h.utmm_state = @intFromEnum(shm.UtmmState.stopping);
-        std.log.info("[guest] upgrade: utmmd signalled, exiting for restart", .{});
-    } else |err| {
-        std.log.err("[guest] upgrade: shm.open failed: {}", .{err});
     }
 }
 
@@ -953,6 +815,9 @@ fn handleOneCommand(
         },
         @intFromEnum(protocol.MsgType.download_cmd) => {
             try handleDownload(io, allocator, conn, payload);
+        },
+        @intFromEnum(protocol.MsgType.upgrade_cmd) => {
+            try handleUpgradeCmd(io, allocator, conn, payload);
         },
         else => {
             std.log.info("[guest] Unknown msg type: {d}", .{msg_type});
@@ -1084,6 +949,118 @@ fn handleUpload(
     _ = conn.sendAndFlush(resp, 0) catch {};
 }
 
+/// 处理 upgrade_cmd（Host→Guest 直推升级）：接收二进制流 → SHA256 校验 → 通知 utmmd。
+/// 流程与 upload 类似，但写入固定路径 /opt/utmm/utmm.new 并信号通知 utmmd。
+fn handleUpgradeCmd(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    conn: *tcp.Connection,
+    payload: []const u8,
+) !void {
+    const cmd = protocol.parseUpgradeCmd(payload) orelse {
+        std.log.err("[guest] parseUpgradeCmd failed", .{});
+        return;
+    };
+
+    std.log.info("[guest] upgrade: cmd_id={s} target={s} size={d}", .{ cmd.cmd_id, cmd.target, cmd.file_size });
+
+    const tmp_path = if (@import("builtin").os.tag == .windows)
+        "C:\\opt\\utmm\\utmm.new.exe"
+    else
+        "/opt/utmm/utmm.new";
+
+    // 清理可能残留的旧 temp 文件
+    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    // 创建 temp 文件
+    var write_buf: [65536]u8 = undefined;
+    const tmp_file = if (@import("builtin").os.tag != .windows)
+        std.Io.Dir.cwd().createFile(io, tmp_path, .{ .permissions = @enumFromInt(0o755) })
+    else
+        std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+    const file = tmp_file catch |err| {
+        std.log.err("[guest] upgrade: create temp file {s}: {}", .{ tmp_path, err });
+        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+        defer allocator.free(resp);
+        _ = conn.sendAndFlush(resp, 0) catch {};
+        return;
+    };
+    defer file.close(io);
+
+    // 增量 SHA256 计算
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var remaining: u32 = cmd.file_size;
+    while (remaining > 0) {
+        const to_read = @min(write_buf.len, remaining);
+        const nr = tcp.sockRead(conn.fd, &write_buf, to_read);
+        if (nr <= 0) {
+            std.log.err("[guest] upgrade: short read ({d} remaining)", .{remaining});
+            break;
+        }
+        const slice = write_buf[0..@intCast(nr)];
+        hasher.update(slice);
+        _ = file.writeStreamingAll(io, slice) catch |err| {
+            std.log.err("[guest] upgrade: write temp file: {}", .{err});
+            break;
+        };
+        remaining -= @intCast(nr);
+    }
+
+    file.close(io);
+
+    if (remaining != 0) {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+        defer allocator.free(resp);
+        _ = conn.sendAndFlush(resp, 0) catch {};
+        return;
+    }
+
+    // SHA256 校验
+    var computed_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&computed_hash);
+
+    // 比较 hex - cmd.sha256_hex 是 64 字符的 hex 字符串
+    var hex_buf: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&hex_buf, "{s}", .{std.fmt.fmtSliceHexLower(&computed_hash)}) catch {
+        std.log.err("[guest] upgrade: hex encode failed", .{});
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+        defer allocator.free(resp);
+        _ = conn.sendAndFlush(resp, 0) catch {};
+        return;
+    };
+
+    if (!std.mem.eql(u8, &hex_buf, cmd.sha256_hex)) {
+        std.log.err("[guest] upgrade: SHA256 mismatch, deleting {s}", .{tmp_path});
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+        defer allocator.free(resp);
+        _ = conn.sendAndFlush(resp, 0) catch {};
+        return;
+    }
+
+    std.log.info("[guest] upgrade: SHA256 verified, {d} bytes → {s}", .{ cmd.file_size, tmp_path });
+
+    // 发送成功响应
+    const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
+    defer allocator.free(resp);
+    _ = conn.sendAndFlush(resp, 0) catch {};
+
+    // 通过 shm 通知 utmmd 执行升级
+    if (shm.open()) |h| {
+        defer shm.detach(h);
+        h.cmd = @intFromEnum(shm.Cmd.upgrade);
+        @memset(&h.cmd_data, 0);
+        const copy_len = @min(tmp_path.len, h.cmd_data.len - 1);
+        @memcpy(h.cmd_data[0..copy_len], tmp_path[0..copy_len]);
+        h.utmm_state = @intFromEnum(shm.UtmmState.stopping);
+        std.log.info("[guest] upgrade: utmmd signalled, exiting for restart", .{});
+    } else |err| {
+        std.log.err("[guest] upgrade: shm.open failed: {}", .{err});
+    }
+}
+
 /// 处理 download：dpipe_file.readFile → 原始字节流发送到 TCP。
 fn handleDownload(
     io: std.Io,
@@ -1175,8 +1152,5 @@ pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig
     }
 
     // TCP session loop — per-command TCP connections with SOCKS4 handshake.
-    // UpgradeSignal allows mesh LSA version check to signal the main loop
-    // when a version mismatch is detected from Host broadcast.
-    var upgrade_signal = UpgradeSignal{};
-    try guestTcpLoop(io, gpa, sysinfo, &upgrade_signal, cli.auto_upgrade, cli.mesh_port, cli.peer_mesh, shutdown);
+    try guestTcpLoop(io, gpa, sysinfo, cli.mesh_port, cli.peer_mesh, shutdown);
 }

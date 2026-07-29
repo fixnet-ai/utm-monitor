@@ -304,10 +304,6 @@ pub const Mesh = struct {
     // Shutdown
     shutdown: std.atomic.Value(bool),
 
-    // Upgrade signal (set when version mismatch detected via LSA).
-    // null when auto-upgrade is disabled.
-    upgrade_needed: ?*std.atomic.Value(bool),
-
     // (was host_gateway_ip — removed. IP gating on version-mismatch check
     //  was unreliable on multihomed hosts where the Host's primary IP ≠
     //  guest-facing bridge/gateway IP. Version mismatch alone is sufficient:
@@ -337,7 +333,6 @@ pub const Mesh = struct {
         node_info: []const u8,
         socket: net.Socket,
         io: std.Io,
-        upgrade_needed: ?*std.atomic.Value(bool),
         broadcast_addrs: std.ArrayList(net.IpAddress),
         broadcast_refresh_fn: ?*const fn (std.mem.Allocator) anyerror!std.ArrayList(net.IpAddress),
     ) !Mesh {
@@ -373,7 +368,6 @@ pub const Mesh = struct {
             .routes = .empty,
             .routes_mutex = std.Io.Mutex.init,
             .shutdown = std.atomic.Value(bool).init(false),
-            .upgrade_needed = upgrade_needed,
             .nonce = nonce,
             .clock_ms = 0,
         };
@@ -780,27 +774,6 @@ pub const Mesh = struct {
             };
         }
         // ── neighbors_mutex released here ──
-
-        // Check for version mismatch (upgrade signal).
-        // Only compare against the Host's LSA (role:host). Other Guests may
-        // still be running an older version during a rolling upgrade — their
-        // version does NOT indicate that this Guest needs upgrading. The
-        // upgrade binary always comes from the Host via TCP.
-        if (self.upgrade_needed) |upgrade_needed| {
-            if (!upgrade_needed.load(.acquire)) {
-                if (std.mem.indexOf(u8, decoded.node_info, "role:host") != null) {
-                    if (std.mem.indexOf(u8, decoded.node_info, "version:")) |v_start| {
-                        const v_line = decoded.node_info[v_start + "version:".len ..];
-                        const v_end = std.mem.indexOfScalar(u8, v_line, '\n') orelse v_line.len;
-                        const remote_version = v_line[0..v_end];
-                        if (!std.mem.eql(u8, remote_version, protocol.VERSION)) {
-                            std.log.info("[lsa] LSA version mismatch: remote={s} local={s} — signalling upgrade", .{ remote_version, protocol.VERSION });
-                            upgrade_needed.store(true, .release);
-                        }
-                    }
-                }
-            }
-        }
 
         // Rebuild routes on topology change (no locks held)
         self.rebuildRoutes();

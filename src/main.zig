@@ -102,8 +102,6 @@ pub const CliArgs = struct {
     serve_dir: ?[]const u8 = null,
     /// Whether to save config
     save_config: bool = false,
-    /// Enable automatic upgrade (Guest→Host version matching via LSA)
-    auto_upgrade: bool = false,
     /// Run as daemon via service manager (--svc, set by service configs)
     is_svc: bool = false,
 
@@ -123,12 +121,13 @@ pub const CliArgs = struct {
     cmd_ping: bool = false,
     ping_target: ?[]const u8 = null,
 
-    // Verify health-check command
-    cmd_verify: bool = false,
-
     // Deploy command
     cmd_deploy: bool = false,
     deploy_target: ?[]const u8 = null,
+
+    // Upgrade command
+    cmd_upgrade: bool = false,
+    upgrade_target: ?[]const u8 = null,
 
     // Upload/download commands
     cmd_upload: bool = false,
@@ -207,8 +206,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
                 i += 1;
                 cli.exec_cmd = args[i];
             }
-        } else if (std.mem.eql(u8, arg, "--verify")) {
-            cli.cmd_verify = true;
         } else if (std.mem.eql(u8, arg, "--deploy")) {
             cli.cmd_deploy = true;
             if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "--")) {
@@ -223,8 +220,12 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             }
         } else if (std.mem.eql(u8, arg, "--save-config")) {
             cli.save_config = true;
-        } else if (std.mem.eql(u8, arg, "--auto-upgrade")) {
-            cli.auto_upgrade = true;
+        } else if (std.mem.eql(u8, arg, "--upgrade")) {
+            cli.cmd_upgrade = true;
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.upgrade_target = args[i];
+            }
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (i + 1 < args.len) {
                 i += 1;
@@ -306,16 +307,15 @@ pub fn printHelp() void {
         \\  --config PATH       Config file path
         \\  --log-file PATH     Log file path
         \\  --save-config       Save current parameters to config file
-        \\  --auto-upgrade      Enable automatic Guest→Host version matching via LSA
         \\
         \\Management commands (require Host service running):
         \\  --status            Query all online guest status
-        \\  --verify            Health check: status + ping + exec echo for all guests
         \\  --deploy [TARGET]   Cross-compile, SCP, install & verify guest(s)
         \\  --ping TARGET       Ping a guest via mesh (Host→Guest or relayed)
         \\  --exec TARGET CMD   Execute command on target guest
         \\  --upload FILE VM    Upload a file to Guest VM
         \\  --download VM REMOTE LOCAL  Download file from Guest VM
+        \\  --upgrade VM        Push upgrade binary to Guest VM
         \\  --gen-init PLATFORM Generate auto-start script (linux/macos/windows)
         \\  --version           Show version info
         \\
@@ -429,8 +429,8 @@ pub fn main(init: std.process.Init) !void {
     // Auto-start it if not running so users and AI agents can go directly
     // from "utmm --exec vm cmd" without a separate "utmm --host" step.
     const needs_host = cli.is_host or cli.cmd_status or cli.cmd_exec or cli.cmd_ping
-        or cli.cmd_upload or cli.cmd_download or cli.is_mcp or cli.cmd_verify
-        or cli.cmd_deploy;
+        or cli.cmd_upload or cli.cmd_download or cli.is_mcp
+        or cli.cmd_deploy or cli.cmd_upgrade;
     if (needs_host) {
         const was_running = svc.isRunning(init.io, init.gpa, .host);
         var extra_args = try buildServiceArgs(init.gpa, cli, .host);
@@ -459,7 +459,7 @@ pub fn main(init: std.process.Init) !void {
         if (cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_ping
             and !cli.cmd_upload and !cli.cmd_download
             and !cli.cmd_gen_init and !cli.save_config and !cli.is_mcp
-            and !cli.cmd_verify and !cli.cmd_deploy) {
+            and !cli.cmd_deploy and !cli.cmd_upgrade) {
             return;
         }
         // If the service was just started, give it time to bind the HTTP port
@@ -471,7 +471,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── 8. Management commands ──
-    if (cli.cmd_status or cli.cmd_exec or cli.cmd_ping or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.cmd_verify or cli.cmd_deploy) {
+    if (cli.cmd_status or cli.cmd_exec or cli.cmd_ping or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.cmd_deploy or cli.cmd_upgrade) {
         cli.is_host = false; // management commands don't need --host
         try host_mod.run(init, cli);
         return;

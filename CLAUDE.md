@@ -135,13 +135,13 @@ Per-command independent connection = no cross-thread shared state = no state.zig
 - **Guest mode (default)**: `utmmd --role guest` spawns `utmm --svc` (LSA broadcast
   + TCP listener + dpipe shell). utmmd monitors utmm via shared memory
   (`/utmmd-shm`), handles crash recovery (exponential backoff 2s→60s, 5 retries),
-  and coordinates auto-upgrade. `--install --hostname <name>`: force install as
+  and coordinates binary upgrade. `--install --hostname <name>`: force install as
   system auto-start service (single `utmmd` service per machine).
   `--version`: print version. No foreground mode — service model only.
 - **Host mode (`--host`)**: `utmmd --role host` spawns `utmm --host --svc`.
   UDP port 2121 mesh networking — guest registration via LSA broadcast,
   /etc/hosts sync, and IPC socket for CLI/MCP communication.
-  Guest auto-upgrade binary serving via TCP (`serveUpgradeFile`). All on one port.
+  Host-initiated binary upgrade via `--upgrade <vm>` (push model). All on one port.
 - **MCP mode (`--mcp`)**: stdio JSON-RPC server for AI agents. Talks to Host
   daemon via IPC socket (`/var/run/utmm.sock`); auto-ensures Host on first use.
 
@@ -151,7 +151,7 @@ Per-command independent connection = no cross-thread shared state = no state.zig
                          ┌── MCP stdio ← AI Agent (utmm --mcp → auto-ensure → IPC socket)
 Guest (macvm)    ──TCP──┐
 Guest (linuxvm)  ──TCP──┤──→ Host IPC socket ──┼── CLI/MCP
-Guest (windows)  ──TCP──┘                      ├── TCP upgrade_req (binary serve)
+Guest (windows)  ──TCP──┘
                          │   (LSA discovery)    └── /etc/hosts sync
                          │
 Guest ←── LSA broadcast (UDP) ──┘  (topology discovery + version detection)
@@ -206,7 +206,7 @@ File transfers use raw TCP streaming (no chunking — TCP provides reliable deli
 | download_cmd | 0x14 | host→guest | Download request (cmd_id + path) |
 | upload_cmd | 0x1b | host→guest | Upload request (cmd_id + path + file_size + hash) |
 | upload_result | 0x17 | guest→host | Upload result (cmd_id + exit_code) |
-| upgrade_req | 0x19 | guest→host | Request upgrade binary (cmd_id + target) |
+| upgrade_cmd | 0x1a | host→guest | Push upgrade binary (cmd_id + target + file_size + sha256) |
 
 > `file_chunk` (0x1c) and `file_eof` (0x1d) removed in v0.13.0 — TCP reliable
 > streaming eliminates the need for chunk-level verification.
@@ -277,14 +277,14 @@ Linux `Restart=on-failure`, Windows `start=auto`).
 **Upgrade (manual)**: scp new binary to VM + `sudo ./utmm-new --install`. forceInstall handles
 lock→stop→kill→copy→install→start.
 
-**Upgrade (automatic, v0.12.0+)**: Guest-initiated atomic operation:
-1. Guest detects Host version mismatch via LSA broadcast
-2. Guest signals upgrade intent to utmmd via shared memory
-3. Guest sends `upgrade_req` (0x19) via TCP
-4. Host responds with raw binary stream via TCP
-5. Guest saves to temp dir, `chmod +x`, signals utmmd to restart with new binary
+**Upgrade (Host-initiated push model, v0.14.0+)**: Host-controlled atomic operation:
+1. CLI: `utmm --upgrade <vm>` or `utmm --deploy` (compile + copy to serve-dir)
+2. Host reads target binary from serve-dir, computes SHA256
+3. Host connects to Guest via SOCKS4a (tcp.hostConnect)
+4. Host sends `upgrade_cmd` (0x1a) frame (target + file_size + sha256_hex) + raw binary bytes
+5. Guest receives: verify SHA256 → send `upload_result` (0x17) → signal utmmd via shm
 6. utmmd stops old utmm, replaces binary, spawns new utmm — zero-downtime handoff
-Host never pushes upgrades — the Guest is fully self-upgrading.
+Host pushes upgrades on demand — no autonomous Guest-side version polling.
 
 ### Key Design Decisions
 
@@ -317,12 +317,9 @@ Host never pushes upgrades — the Guest is fully self-upgrading.
 - **Chunked file transfer → direct TCP streaming** (v0.13.0): TCP provides reliable
   ordered delivery — application-level chunking and SHA256-per-chunk are unnecessary.
   dpipe_file handles incremental SHA256 for end-to-end integrity verification.
-- **LSA version broadcast**: Host broadcasts version in LSA every 2s. Guest compares
-  against `protocol.VERSION`, triggers Guest-initiated auto-upgrade on mismatch.
+- **LSA version broadcast**: Host broadcasts version in LSA every 2s for informational
+  purposes. Guest no longer takes autonomous action on version mismatch.
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
-- **No auto-uninstall on version mismatch** (v0.12.1+) — `verifyServeDirBinaries`
-  only warns when platform binaries don't match the Host version. Auto-uninstalling
-  leaves the machine unreachable with zero recovery path.
 
 ## Build & Run
 
@@ -446,11 +443,9 @@ Open the release URL printed by the script and confirm:
 - Tag points to the right commit
 
 ### Post-release
-After release, the Host's serve-dir auto-serves new binaries. Guests detect
-version mismatch via LSA broadcast and trigger Guest-initiated auto-upgrade:
-download new binary via TCP → signal utmmd via shared memory →
-utmmd performs atomic stop→replace→spawn handoff.
-Host never pushes upgrades — the Guest is fully self-upgrading.
+After release, use `utmm --deploy` to compile and copy new binaries to the
+serve-dir (`/opt/utmm/`). Then use `utmm --upgrade <vm>` to push upgrades
+to individual Guest VMs via the Host-initiated push model.
 
 ## Project File Structure (17 files)
 
@@ -512,16 +507,9 @@ Before starting any work, read (if they exist): `./CLAUDE.md`, `./README.md`,
 - `Io.Timeout` union: `{ none, duration: Clock.Duration, deadline: Clock.Timestamp }`
   Use `.awake` clock: `.{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } }`
 
-### HTTP Client Patterns (GitHub version check only)
+### HTTP Client Patterns (not currently used)
 
-The Host daemon uses `std.http.Client` for fire-and-forget GitHub version polling.
-No HTTP server — Host daemon uses IPC socket for CLI/MCP, UDP mesh for Guest-Host.
-
-- **Custom request headers**: `request.iterateHeaders()` returns `HeaderIterator`,
-  call `.next()` to get `http.Header{ .name, .value }`. Use `std.ascii.eqlIgnoreCase`
-  for case-insensitive name matching.
-- **Raw body read**: `request.head.content_length` + `body_reader.streamExact(&writer, content_length)`.
-  Use `std.Io.Limit.limited(n)` for streaming reads.
+No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
 
 ### TCP Frame Protocol Patterns
 
@@ -534,8 +522,8 @@ No HTTP server — Host daemon uses IPC socket for CLI/MCP, UDP mesh for Guest-H
 
 ### LSA Patterns
 
-- **LSA carries version**: Host node_info includes version string. Guest's
-  LSA handler compares against `protocol.VERSION`. Mismatch triggers auto-upgrade.
+- **LSA carries version**: Host node_info includes version string for informational
+  purposes (visible in `--status`). Version is no longer used for auto-upgrade triggering.
 - **Self-contained closed loop**: LSA rx → update node table → trigger hosts sync
   via range replacement (not splitScalar). No external state dependency.
 - **2s broadcast interval**: Host broadcasts LSA every 2 seconds. Nodes timeout
