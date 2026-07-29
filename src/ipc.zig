@@ -903,16 +903,17 @@ fn handleUpgrade(
 
     std.log.info("[ipc-upgrade] {s} ({s}): {d} bytes, sha256={s}", .{ vm, guest.target, file_size, &sha256_hex });
 
-    // Per-command TCP connection via SOCKS4a
+    // 盲推模式: 发送 upgrade_cmd + 二进制后立即关闭连接，不等待 Guest 响应。
+    // Guest 可能是不支持 upgrade_cmd 的旧版、可能中途崩溃、可能协议不兼容 —
+    // Host 不依赖 Guest 的配合，推送完成即视为成功。升级结果通过 --status 观察。
     var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
         std.log.err("[ipc-upgrade] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(ipc_conn, "GuestNotConnected");
+        sendError(ipc_conn, "GuestConnectFailed");
         return;
     };
     defer tcp_conn.deinit();
 
-    // Send upgrade_cmd frame
-    const cmd_id = std.fmt.allocPrint(gpa, "upgrade_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds}) catch {
+    const cmd_id = std.fmt.allocPrint(gpa, "up-{d}", .{@intFromEnum(std.Io.Timestamp.now(io, .real).nanoseconds)}) catch {
         sendError(ipc_conn, "AllocFailed");
         return;
     };
@@ -923,37 +924,16 @@ fn handleUpgrade(
         return;
     };
     defer gpa.free(up_frame);
-    tcp_conn.sendAndFlush(up_frame, 0) catch {
-        sendError(ipc_conn, "TunnelSendFailed");
-        return;
-    };
 
-    // Stream raw binary bytes (unframed)
+    // 推送 upgrade_cmd + 原始二进制，忽略发送错误（连接断开也不影响已推送的数据）
+    tcp_conn.sendAndFlush(up_frame, 0) catch {};
     _ = tcp_mod.sockWrite(tcp_conn.fd, file_data.ptr, file_size);
 
-    // Receive upload_result frame
-    var rbuf: [256]u8 = undefined;
-    const nr = tcp_conn.recv(&rbuf) catch |err| {
-        std.log.err("[ipc-upgrade] recv upload_result: {}", .{err});
-        sendError(ipc_conn, "UpgradeResultFailed");
-        return;
-    };
-    if (nr > 0 and rbuf[0] == @intFromEnum(ptcl.MsgType.upload_result)) {
-        var mpos: usize = 1;
-        _ = readString(rbuf[0..nr], &mpos);
-        const exit_code = readI32(rbuf[0..nr], &mpos) orelse @as(i32, -1);
-        if (exit_code != 0) {
-            std.log.err("[ipc-upgrade] upgrade failed: exit={d}", .{exit_code});
-            sendError(ipc_conn, "UpgradeFailed");
-            return;
-        }
-    }
-
-    // Send OK
+    // 不等待任何回应 — 直接返回 OK
     var ok_buf2: [1]u8 = undefined;
     ok_buf2[0] = @intFromEnum(Response.ok);
     ipc_conn.writeAll(&ok_buf2) catch {};
-    std.log.info("[ipc-upgrade] {s} upgraded successfully", .{vm});
+    std.log.info("[ipc-upgrade] {s} pushed (fire-and-forget)", .{vm});
 }
 
 fn handleDownload(
