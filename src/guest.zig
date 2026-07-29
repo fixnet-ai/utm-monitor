@@ -1062,7 +1062,7 @@ fn handleUpload(
     var remaining: u32 = cmd.file_size;
     while (remaining > 0) {
         const to_read = @min(buf.len, remaining);
-        const nr = std.posix.system.read(conn.fd, buf[0..to_read].ptr, to_read);
+        const nr = tcp.sockRead(conn.fd, buf[0..to_read].ptr, to_read);
         if (nr <= 0) {
             std.log.err("[guest] upload: short read ({d} remaining)", .{remaining});
             break;
@@ -1115,7 +1115,7 @@ fn handleDownload(
         };
         if (nr == 0) break; // EOF
 
-        _ = std.posix.system.write(conn.fd, buf[0..nr].ptr, nr);
+        _ = tcp.sockWrite(conn.fd, buf[0..nr].ptr, nr);
     }
 
     std.log.info("[guest] download complete: {s}", .{cmd.path});

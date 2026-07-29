@@ -22,6 +22,10 @@
 | Task 46 | 修复 upload 后 panic（handleUpload 双 close → use-after-free）| ✅ |
 | Task 47 | 修复 utmmd.bin 嵌入构建流程（按目标分目录 + comptime switch）| ✅ |
 | Task 48 | linuxvm E2E 真机验证（5 轮 exec/upload/download 全通过）| ✅ |
+| Task 49 | 修复 Windows SOCKS4a 拒绝（readUntilNull 悬垂栈指针）| ✅ |
+| Task 50 | 修复 Windows upload/download socket I/O（system.read/write → sockRead/sockWrite）| ✅ |
+| Task 51 | windowsvm E2E 全验证（exec + upload + download SHA256 一致）| ✅ |
+| Task 48 | linuxvm E2E 真机验证（5 轮 exec/upload/download 全通过）| ✅ |
 
 **Bug 修复详情**:
 
@@ -48,6 +52,31 @@
 **关键决策**:
 - 决策 19：`addr.listen()` 替代 `addr.bind()` + 手动 `fcntl(FD_CLOEXEC)` — 原生支持 reuse_address
 - 决策 20：handleUpload 移除 `defer file_pipe.close()` — 显式 close 已覆盖所有退出路径
+
+### 2026-07-29 — Phase 9（续）：Windows E2E 真机 Bug 修复
+
+**成果**: windowsvm (aarch64-windows) exec + upload + download 全通过，SHA256 一致验证。
+
+**Bug 修复详情**:
+
+4. **Windows SOCKS4a 拒绝 (0x5b)** (`src/tcp.zig`):
+   - 根因：`readUntilNull()` 返回指向栈缓冲区的切片，函数返回后 `socks4Accept` 调用方
+     访问该悬垂指针进行 hostname 比较 → 栈被重用 → 数据损坏 → 比较失败 → 拒绝连接
+   - 修复：新建 `socks4CheckAndReply()` — 在 `readUntilNull` 返回后立即比较 hostname
+     （在栈数据仍有效时），避免悬垂指针
+   - 保留原 `socks4Accept` 仅供测试使用
+
+5. **Windows upload/download socket I/O 失败** (`src/guest.zig` + `src/ipc.zig`):
+   - 根因：`std.posix.system.read/write(conn.fd, ...)` — `conn.fd` 是 raw Winsock2 SOCKET，
+     Windows 上 `system.read`/`write` 底层走 `ReadFile`/`WriteFile`，不支持 socket 句柄
+   - upload 症状：temp 文件创建成功但 0 字节（`system.read` 返回 -1 → while 循环不执行）
+   - download 症状：`system.write` 失败 → Host 收到 0 字节
+   - exec 不受影响：`handleExecCmd` 全程使用 `conn.sendAndFlush()`（framed），不走裸读写
+   - 修复：4 处 `system.read`/`write` → `tcp.sockRead`/`tcp.sockWrite`（Windows 走 `ws2_recv`/`ws2_send`）
+
+**真机验证**:
+- windowsvm (192.168.65.2): exec "echo" + ver 正常，50KB 二进制 upload + download SHA256 完全一致
+- 全部测试通过：unit tests (150 执行) + integration tests (7 suites, 0 failures)
 
 ### 2026-07-29 — Phase 8：Windows 跨平台 Socket 抽象层修复
 

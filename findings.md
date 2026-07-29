@@ -344,6 +344,37 @@ if (@intFromEnum(result) == @as(c_int, 0)) { ... }
 
 ---
 
+## Phase 9: E2E 真机 Bug 修复（续）
+
+### Finding 181: Windows socket fd 不可用 std.posix.system.read/write
+
+**背景**: windowsvm 上传报告 "OK" 但文件未创建（0 字节 temp 文件），下载返回 0 字节。
+
+**根因**: `guest.zig` 的 `handleUpload` 和 `handleDownload` 使用 `std.posix.system.read(conn.fd, ...)` /
+`std.posix.system.write(conn.fd, ...)` 读写 socket 数据。`conn.fd` 是 raw Winsock2 SOCKET（来自
+`sockAccept` → `ws2_accept`），而 `std.posix.system.read` 在 Windows 上底层走 `ReadFile`，
+`ReadFile` 不支持 socket 句柄。同样，`ipc.zig` Host daemon 的 `handleUpload` / `handleDownload`
+也使用 `system.read` / `system.write` 读写 TCP socket，存在同样问题（虽然当前 Host 跑在 macOS 上
+未触发）。
+
+**症状**:
+- upload: `system.read(conn.fd, ...)` 在 Windows 上返回 -1 或 0 → `handleUpload` 的 while
+  循环不执行 → temp 文件保持 0 字节 → `file_pipe.close()` SHA256 不匹配 → temp 文件被删除
+- download: `system.write(conn.fd, ...)` 在 Windows 上失败 → 数据无法发送 → Host 收到 0 字节
+
+**修复**: 将 4 处 `std.posix.system.read`/`write` 替换为 `tcp.sockRead`/`tcp.sockWrite`：
+- `src/guest.zig:1065`: `std.posix.system.read(conn.fd, ...)` → `tcp.sockRead(conn.fd, ...)`
+- `src/guest.zig:1118`: `std.posix.system.write(conn.fd, ...)` → `tcp.sockWrite(conn.fd, ...)`
+- `src/ipc.zig:795`: `std.posix.system.write(tcp_conn.fd, ...)` → `tcp_mod.sockWrite(tcp_conn.fd, ...)`
+- `src/ipc.zig:881`: `std.posix.system.read(tcp_conn.fd, ...)` → `tcp_mod.sockRead(tcp_conn.fd, ...)`
+
+**exec 为何不受影响**: `handleExecCmd` 全程使用 `conn.sendAndFlush()`（framed）收发数据，
+不走 `system.read`/`write`，因此 exec 在修复前已经正常工作。
+
+**验证**: windowsvm 上 exec/upload/download 全通过，50KB 二进制文件上传+下载 SHA256 完全一致。
+
+---
+
 ## Phase 9: E2E 真机 Bug 修复 — 研究发现
 
 ### Finding 186: AddressInUse 崩溃循环 — 根因 FD_CLOEXEC 缺失

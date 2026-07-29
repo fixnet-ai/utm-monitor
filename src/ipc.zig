@@ -792,7 +792,7 @@ fn handleUpload(
         };
         if (n == 0) break;
 
-        _ = std.posix.system.write(tcp_conn.fd, file_buf[0..n].ptr, n);
+        _ = tcp_mod.sockWrite(tcp_conn.fd, file_buf[0..n].ptr, n);
         total_sent += @intCast(n);
     }
 
@@ -878,7 +878,7 @@ fn handleDownload(
     // Receive raw file bytes (unframed — guest sends raw bytes after download_cmd)
     var rbuf: [65536]u8 = undefined;
     while (true) {
-        const nr = std.posix.system.read(tcp_conn.fd, rbuf[0..].ptr, rbuf.len);
+        const nr = tcp_mod.sockRead(tcp_conn.fd, rbuf[0..].ptr, rbuf.len);
         if (nr <= 0) break; // EOF or error
 
         const data = rbuf[0..@intCast(nr)];

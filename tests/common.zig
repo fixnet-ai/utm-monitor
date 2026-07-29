@@ -11,6 +11,16 @@ const system = std.posix.system;
 // ═══════════════════════════════════════════════════════════════════════════
 // 跨平台 Socket I/O 抽象
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// socket_t is platform-dependent: c_int on POSIX, *anyopaque on Windows.
+// system.read/write/close operate on c_int fds (POSIX) but NOT on Windows
+// sockets — Winsock2 requires send/recv/closesocket. These inline wrappers
+// branch at comptime so there is zero runtime overhead.
+//
+// IMPORTANT: On Windows, Zig 0.16.0's Io.net APIs (listen/bind/accept) use AFD
+// (Ancillary Function Driver) kernel handles, which are NOT compatible with
+// Winsock2 recv/send. We MUST use raw Winsock2 socket creation + accept to get
+// handles that work with ws2_recv/ws2_send.
 
 const socket_t = std.posix.socket_t;
 
@@ -28,6 +38,11 @@ pub inline fn sockRead(fd: socket_t, buf: [*]u8, len: usize) isize {
         return ws2_recv(fd, buf, @intCast(len), 0);
     }
     return system.read(fd, buf, len);
+}
+
+/// Check if a sockRead/sockWrite return value indicates an error (-1).
+pub inline fn sockIsError(n: isize) bool {
+    return n < 0;
 }
 
 /// Close a socket. POSIX: close(), Windows: closesocket() via ws2_32.
@@ -48,16 +63,22 @@ pub inline fn sockShutdown(fd: socket_t, how: i32) void {
     }
 }
 
-/// Accept a connection. Returns socket_t on both platforms.
+/// Accept a connection on a listening socket. Returns the client socket.
+/// On Windows: uses Winsock2 accept() returning a proper SOCKET handle
+/// (compatible with ws2_recv/ws2_send), NOT an AFD kernel handle.
 pub fn sockAccept(listen_fd: socket_t) !socket_t {
+    if (builtin.os.tag == .windows) {
+        ensureWinsock2();
+        var addr: sockaddr_in = std.mem.zeroes(sockaddr_in);
+        var addr_len: std.posix.socklen_t = @sizeOf(sockaddr_in);
+        const raw = ws2_accept(listen_fd, @ptrCast(&addr), &addr_len);
+        if (raw == INVALID_SOCKET) {
+            return error.AcceptFailed;
+        }
+        return raw;
+    }
     var addr: std.Io.net.IpAddress = undefined;
     var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
-    if (builtin.os.tag == .windows) {
-        const raw = ws2_accept(listen_fd, @ptrCast(&addr), &addr_len);
-        if (raw == -1) return error.AcceptFailed;
-        const u: c_uint = @bitCast(raw);
-        return @ptrFromInt(@as(usize, u));
-    }
     const fd = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
     if (fd < 0) return error.AcceptFailed;
     return fd;
@@ -72,22 +93,97 @@ pub inline fn sockListen(fd: socket_t, backlog: c_int) isize {
 }
 
 // ── Winsock2 externs (ws2_32 linked by build.zig when target is Windows) ──
-// All use callconv(.winapi) for correct 32-bit stdcall name decoration.
-extern "ws2_32" fn send(s: socket_t, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+// All use callconv(.winapi) for correct 32-bit stdcall name decoration
+// (@n suffix, e.g. _send@16). On 64-bit Windows, .winapi = .C (no-op).
+extern "ws2_32" fn socket(af: c_int, type: c_int, protocol: c_int) callconv(.winapi) std.posix.socket_t;
+const ws2_socket = socket;
+extern "ws2_32" fn bind(s: std.posix.socket_t, name: *const anyopaque, namelen: std.posix.socklen_t) callconv(.winapi) c_int;
+const ws2_bind = bind;
+extern "ws2_32" fn connect(s: std.posix.socket_t, name: *const anyopaque, namelen: std.posix.socklen_t) callconv(.winapi) c_int;
+const ws2_connect = connect;
+extern "ws2_32" fn getsockname(s: std.posix.socket_t, name: *anyopaque, namelen: *std.posix.socklen_t) callconv(.winapi) c_int;
+const ws2_getsockname = getsockname;
+extern "ws2_32" fn setsockopt(s: std.posix.socket_t, level: c_int, optname: c_int, optval: *const anyopaque, optlen: c_int) callconv(.winapi) c_int;
+const ws2_setsockopt = setsockopt;
+extern "ws2_32" fn htons(hostshort: u16) callconv(.winapi) u16;
+const ws2_htons = htons;
+extern "ws2_32" fn ntohs(netshort: u16) callconv(.winapi) u16;
+const ws2_ntohs = ntohs;
+extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *anyopaque) callconv(.winapi) c_int;
+const ws2_startup = WSAStartup;
+extern "ws2_32" fn send(s: std.posix.socket_t, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
 const ws2_send = send;
-extern "ws2_32" fn recv(s: socket_t, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn recv(s: std.posix.socket_t, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
 const ws2_recv = recv;
-extern "ws2_32" fn accept(s: socket_t, addr: ?*anyopaque, addrlen: ?*std.posix.socklen_t) callconv(.winapi) c_int;
+extern "ws2_32" fn accept(s: std.posix.socket_t, addr: ?*anyopaque, addrlen: ?*std.posix.socklen_t) callconv(.winapi) std.posix.socket_t;
 const ws2_accept = accept;
-extern "ws2_32" fn listen(s: socket_t, backlog: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn listen(s: std.posix.socket_t, backlog: c_int) callconv(.winapi) c_int;
 const ws2_listen = listen;
-extern "ws2_32" fn closesocket(s: socket_t) callconv(.winapi) c_int;
+extern "ws2_32" fn closesocket(s: std.posix.socket_t) callconv(.winapi) c_int;
 const ws2_closesocket = closesocket;
-extern "ws2_32" fn shutdown(s: socket_t, how: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn shutdown(s: std.posix.socket_t, how: c_int) callconv(.winapi) c_int;
 const ws2_shutdown = shutdown;
+
+/// Ensure Winsock2 is initialized (required for raw ws2_socket/ws2_recv etc.).
+/// Zig 0.16.0 uses AFD kernel handles for its own I/O, NOT Winsock2, so we
+/// must call WSAStartup ourselves. Safe to call multiple times.
+var ws2_initialized = false;
+fn ensureWinsock2() void {
+    if (ws2_initialized) return;
+    if (builtin.os.tag == .windows) {
+        var wsdata: [400]u8 align(4) = [_]u8{0} ** 400;
+        const rc = ws2_startup(0x0202, @ptrCast(&wsdata));
+        if (rc == 0) {
+            ws2_initialized = true;
+        }
+    }
+}
+
+const AF_INET = 2;
+const SOCK_STREAM = 1;
+const IPPROTO_TCP = 6;
+const SO_REUSEADDR = 0x0004;
+const SOL_SOCKET = 0xffff;
+const INVALID_SOCKET: std.posix.socket_t = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+
+/// Windows sockaddr_in — must match exactly what Winsock2 expects.
+/// Zig's std.Io.net.IpAddress is a tagged union with a different layout
+/// and cannot be cast directly to sockaddr.
+const sockaddr_in = extern struct {
+    family: u16 = AF_INET,
+    port: u16 = 0,
+    addr: u32 = 0,
+    zero: [8]u8 = [_]u8{0} ** 8,
+};
 
 /// 在 127.0.0.1:0 上创建 TCP 监听 socket。返回 socket fd + 实际端口。
 pub fn bindAny(io: std.Io) !struct { fd: socket_t, port: u16 } {
+    if (builtin.os.tag == .windows) {
+        ensureWinsock2();
+        const s = ws2_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return error.BindFailed;
+
+        const reuse: c_int = 1;
+        _ = ws2_setsockopt(s, SOL_SOCKET, SO_REUSEADDR, @ptrCast(&reuse), @sizeOf(c_int));
+
+        var bind_addr = sockaddr_in{
+            .family = AF_INET,
+            .port = 0,
+            .addr = 0x0100007f, // 127.0.0.1
+        };
+        const br = ws2_bind(s, @ptrCast(&bind_addr), @sizeOf(sockaddr_in));
+        if (br != 0) {
+            _ = ws2_closesocket(s);
+            return error.BindFailed;
+        }
+
+        var addr_len: std.posix.socklen_t = @sizeOf(sockaddr_in);
+        _ = ws2_getsockname(s, @ptrCast(&bind_addr), &addr_len);
+        const port = ws2_ntohs(bind_addr.port);
+
+        _ = ws2_listen(s, 128);
+        return .{ .fd = s, .port = port };
+    }
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     const sock = try addr.bind(io, .{ .mode = .stream });
     errdefer sock.close(io);
@@ -99,19 +195,53 @@ pub fn bindAny(io: std.Io) !struct { fd: socket_t, port: u16 } {
 /// Windows: TCP loopback 替代 (std.c.socketpair 不存在)。
 pub fn makePair() !struct { a: socket_t, b: socket_t } {
     if (builtin.os.tag == .windows) {
-        var threaded: std.Io.Threaded = .init_single_threaded;
-        const io = threaded.io();
-        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-        const listener = try addr.bind(io, .{ .mode = .stream });
-        defer listener.close(io);
-        _ = sockListen(listener.handle, 1);
+        ensureWinsock2();
 
-        const listener_port = listener.address.getPort();
-        const client = try std.Io.net.IpAddress.parse("127.0.0.1", listener_port);
-        const client_stream = try client.connect(io, .{ .mode = .stream });
+        const listener = ws2_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (listener == INVALID_SOCKET) return error.SocketPairFailed;
 
-        const server_fd = try sockAccept(listener.handle);
-        return .{ .a = client_stream.socket.handle, .b = server_fd };
+        const reuse: c_int = 1;
+        _ = ws2_setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, @ptrCast(&reuse), @sizeOf(c_int));
+
+        var bind_addr = sockaddr_in{
+            .family = AF_INET,
+            .port = 0,
+            .addr = 0x0100007f, // 127.0.0.1
+        };
+        const br = ws2_bind(listener, @ptrCast(&bind_addr), @sizeOf(sockaddr_in));
+        if (br != 0) {
+            _ = ws2_closesocket(listener);
+            return error.SocketPairFailed;
+        }
+
+        var addr_len: std.posix.socklen_t = @sizeOf(sockaddr_in);
+        _ = ws2_getsockname(listener, @ptrCast(&bind_addr), &addr_len);
+        const port = ws2_ntohs(bind_addr.port);
+
+        _ = ws2_listen(listener, 1);
+
+        const client = ws2_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (client == INVALID_SOCKET) {
+            _ = ws2_closesocket(listener);
+            return error.SocketPairFailed;
+        }
+
+        var conn_addr = sockaddr_in{
+            .family = AF_INET,
+            .port = ws2_htons(port),
+            .addr = 0x0100007f, // 127.0.0.1
+        };
+        const cr = ws2_connect(client, @ptrCast(&conn_addr), @sizeOf(sockaddr_in));
+        if (cr != 0) {
+            _ = ws2_closesocket(client);
+            _ = ws2_closesocket(listener);
+            return error.SocketPairFailed;
+        }
+
+        const server = try sockAccept(listener);
+        _ = ws2_closesocket(listener);
+
+        return .{ .a = client, .b = server };
     }
     var fds: [2]socket_t = undefined;
     if (std.c.socketpair(1, 1, 0, &fds) != 0) return error.SocketPairFailed;
@@ -260,12 +390,33 @@ pub const TempDir = struct {
 };
 
 /// 查找一个空闲 TCP 端口（绑定 :0 后读取实际端口号）。
-/// Zig 0.16.0: Socket.address 包含绑定的实际地址（含临时端口）。
 pub fn findFreePort(io: std.Io) !u16 {
+    if (builtin.os.tag == .windows) {
+        ensureWinsock2();
+        const s = ws2_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s == INVALID_SOCKET) return error.BindFailed;
+
+        var bind_addr = sockaddr_in{
+            .family = AF_INET,
+            .port = 0,
+            .addr = 0x0100007f, // 127.0.0.1
+        };
+        const br = ws2_bind(s, @ptrCast(&bind_addr), @sizeOf(sockaddr_in));
+        if (br != 0) {
+            _ = ws2_closesocket(s);
+            return error.BindFailed;
+        }
+
+        var addr_len: std.posix.socklen_t = @sizeOf(sockaddr_in);
+        _ = ws2_getsockname(s, @ptrCast(&bind_addr), &addr_len);
+        const port = ws2_ntohs(bind_addr.port);
+        _ = ws2_closesocket(s);
+        return port;
+    }
     const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
-    const socket = try addr.bind(io, .{ .mode = .stream });
-    defer socket.close(io);
-    return socket.address.getPort();
+    const sock = try addr.bind(io, .{ .mode = .stream });
+    defer sock.close(io);
+    return sock.address.getPort();
 }
 
 /// 是否 Windows 平台。
