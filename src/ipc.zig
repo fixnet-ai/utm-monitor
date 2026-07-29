@@ -845,102 +845,19 @@ fn handleUpgrade(
     };
 
     const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
-    const tcp_mod = @import("tcp.zig");
-    const ptcl = @import("protocol.zig");
+    const host_mod = @import("host.zig");
 
-    // Look up guest
-    const guest = state.findByHostname(vm) orelse {
-        sendError(ipc_conn, "GuestNotFound");
-        return;
-    };
-
-    // 确定 deploy target 和二进制文件名
-    const filename = ptcl.deploymentFilename(guest.target) orelse {
-        std.log.err("[ipc-upgrade] unknown guest target: {s}", .{guest.target});
-        sendError(ipc_conn, "UnknownTarget");
-        return;
-    };
-
-    var path_buf: [512]u8 = undefined;
-    const svc_mod = @import("svc.zig");
-    const serve_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ svc_mod.canonicalDir(), filename }) catch {
-        sendError(ipc_conn, "PathTooLong");
-        return;
-    };
-
-    // 读二进制并计算 SHA256
-    const bin_file = std.Io.Dir.cwd().openFile(io, serve_path, .{ .mode = .read_only }) catch |err| {
-        std.log.err("[ipc-upgrade] open {s}: {}", .{ serve_path, err });
-        sendError(ipc_conn, "BinaryNotFound");
-        return;
-    };
-    defer bin_file.close(io);
-
-    // 读取整个文件（upgrade 二进制通常 ~2-10MB，一次性读入简化逻辑）
-    const file_size_b: u64 = (bin_file.stat(io) catch return).size;
-    if (file_size_b == 0 or file_size_b > 50 * 1024 * 1024) {
-        std.log.err("[ipc-upgrade] invalid file size: {d}", .{file_size_b});
-        sendError(ipc_conn, "InvalidBinary");
+    const err_msg = host_mod.pushUpgrade(io, gpa, state, vm);
+    if (err_msg) |msg| {
+        std.log.err("[ipc-upgrade] {s}: {s}", .{ vm, msg });
+        sendError(ipc_conn, msg);
         return;
     }
-    const file_size: u32 = @intCast(file_size_b);
 
-    const file_data = gpa.alloc(u8, file_size) catch {
-        sendError(ipc_conn, "AllocFailed");
-        return;
-    };
-    defer gpa.free(file_data);
-
-    _ = bin_file.readPositionalAll(io, file_data, 0) catch |err| {
-        std.log.err("[ipc-upgrade] read {s}: {}", .{ serve_path, err });
-        sendError(ipc_conn, "ReadFailed");
-        return;
-    };
-
-    // SHA256
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(file_data);
-    var hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&hash);
-    var sha256_hex: [64]u8 = undefined;
-    for (hash, 0..) |byte, i| {
-        const h = "0123456789abcdef";
-        sha256_hex[i * 2] = h[byte >> 4];
-        sha256_hex[i * 2 + 1] = h[byte & 0x0f];
-    }
-
-    std.log.info("[ipc-upgrade] {s} ({s}): {d} bytes, sha256={s}", .{ vm, guest.target, file_size, &sha256_hex });
-
-    // 盲推模式: 发送 upgrade_cmd + 二进制后立即关闭连接，不等待 Guest 响应。
-    // Guest 可能是不支持 upgrade_cmd 的旧版、可能中途崩溃、可能协议不兼容 —
-    // Host 不依赖 Guest 的配合，推送完成即视为成功。升级结果通过 --status 观察。
-    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
-        std.log.err("[ipc-upgrade] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(ipc_conn, "GuestConnectFailed");
-        return;
-    };
-    defer tcp_conn.deinit();
-
-    const cmd_id = std.fmt.allocPrint(gpa, "up-{d}", .{@as(u64, @intCast(std.Io.Timestamp.now(io, .real).nanoseconds))}) catch {
-        sendError(ipc_conn, "AllocFailed");
-        return;
-    };
-    defer gpa.free(cmd_id);
-
-    const up_frame = ptcl.buildUpgradeCmd(gpa, cmd_id, guest.target, file_size, &sha256_hex) catch {
-        sendError(ipc_conn, "AllocFailed");
-        return;
-    };
-    defer gpa.free(up_frame);
-
-    // 推送 upgrade_cmd + 原始二进制，忽略发送错误（连接断开也不影响已推送的数据）
-    tcp_conn.sendAndFlush(up_frame, 0) catch {};
-    _ = tcp_mod.sockWrite(tcp_conn.fd, file_data.ptr, file_size);
-
-    // 不等待任何回应 — 直接返回 OK
-    var ok_buf2: [1]u8 = undefined;
-    ok_buf2[0] = @intFromEnum(Response.ok);
-    ipc_conn.writeAll(&ok_buf2) catch {};
+    // Send OK response
+    var ok_buf: [1]u8 = undefined;
+    ok_buf[0] = @intFromEnum(Response.ok);
+    ipc_conn.writeAll(&ok_buf) catch {};
     std.log.info("[ipc-upgrade] {s} pushed (fire-and-forget)", .{vm});
 }
 

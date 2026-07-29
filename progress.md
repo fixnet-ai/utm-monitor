@@ -3,13 +3,48 @@
 ## 当前状态
 
 - **分支**: `refac/layered-arch`
-- **版本**: v0.14.2（已通过裸机部署测试，4 台真机全 v0.14.2）
-- **测试**: 146 唯一单元测试 + 41 集成测试场景（9 套件），全部通过
+- **版本**: v0.14.3（自动升级启用 + Windows API 进程管理）
+- **测试**: 146 唯一单元测试 + 41 集成测试场景，全部通过
 - **源文件**: 17 src + 10 test
 - **8 交叉编译目标全部通过** ✅
-- **4 台真机全 v0.14.2** ✅ — 裸机部署测试 16/16 全通过
+- **自动升级**: AUTO_UPGRADE=true（Host LSA 版本检测 + SOCKS4a 直推 + 120s 冷却）
 
 ## 会话记录
+
+### 2026-07-30 — v0.14.3：自动升级启用 + Windows API 进程管理
+
+**成果**: 自动升级编译时默认开启（AUTO_UPGRADE=true）；Windows 进程管理换用 Toolhelp + TerminateProcess API；
+Windows upload 路径分隔符修复；SKILL 版本号批量更新；清理旧构建产物。
+
+**自动升级启用**:
+- `protocol.zig`：`AUTO_UPGRADE = true`（编译时常量，false 时死代码消除）
+- `host.zig` 新增 `pushUpgrade()`（查 GuestEntry → deploymentFilename → 读 serve-dir → SHA256 → SOCKS4a 推送）
+- `host.zig` 新增 `pushUpgradeThread()` 线程入口（分离线程，不阻塞 LSA 扫描）
+- `host.zig` 新增 `LastUpgradeMap`（`StringHashMap(i64)`，冷却 120s 防重复推送）
+- `host.zig` `tunnelManager` Phase 2 新增版本检测：比对 LSA 版本 → 检查冷却期 → 检查 upgrading 状态 → spawn 升级线程
+- `ipc.zig` `handleUpgrade` 重构：~110 行 → ~25 行，调用 `host_mod.pushUpgrade()` 复用核心逻辑
+- 冷却期 `AUTO_UPGRADE_COOLDOWN_MS = 120_000`（2 分钟）
+
+**Windows API 进程管理**:
+- `svc.zig` 新增 `w32` 命名空间（Toolhelp + TerminateProcess API）
+- `killAllUtmm` Windows 分支重写：快照枚举 → 匹配 "utmm.exe" → OpenProcess(PROCESS_TERMINATE) → TerminateProcess
+- `countOtherUtmmProcesses` Windows 分支重写：同上枚举计数
+- 替换 `taskkill /F` + `tasklist` → 原生 API，支持 SYSTEM 权限进程
+
+**其他修复**:
+- Windows upload 路径分隔符：`host.zig:408` `"/"` → `std.fs.path.sep_str`（跨平台正确）
+- SKILL 文件版本号批量更新：clean-deploy + deploy + utmm SKILL 0.14.1 → 0.14.2
+- 清理 8 个旧构建产物 `zig-out/bin/*-0.14.1*`
+
+**关键决策**:
+- 决策 33: 自动升级 Host 端 LSA 版本检测 + 推送（编译时常量开关）
+- 决策 34: Windows 进程杀死换用 Toolhelp + TerminateProcess API
+- 决策 35: `extractUtmmd/rename` AccessDenied 根本原因是 `sc.exe stop` 不可靠（见 memory/windows-stop-utmmd-ineffective.md）
+
+**编译验证**:
+- `zig build test` 全部通过 ✅
+- `zig build test-integration` 41/41 通过 ✅
+- 8 交叉编译目标全部通过 ✅
 
 ### 2026-07-30 — v0.14.2 裸机部署验证
 

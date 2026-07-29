@@ -2,12 +2,13 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.14.2 — Upgrade system refactor + macOS launchctl fix + path audit + temp cleanup
+**最新版本**: v0.14.3 — Auto-upgrade enabled + Windows API process management
 
 - **分支**: `refac/layered-arch`
 - **源文件**: 17 src + 10 test（9 集成测试 flat file + 1 common）
-- **测试**: 146 唯一单元测试 + 40 集成测试场景（8 套件），全部通过
+- **测试**: 146 唯一单元测试 + 41 集成测试场景，全部通过
 - **真机验证**: linuxvm + windowsvm + macvm + winx64 — 4 台全 v0.14.2 ✅
+- **自动升级**: AUTO_UPGRADE=true ✅
 - **设计文档**: `refac.md`
 
 ## 架构概述
@@ -277,3 +278,29 @@ src/
 2. linuxvm SSH 长命令链 exit 255 → 拆分为多个短 SSH 调用
 3. winx64 `waitOldProcesses` 5s 超时 → 旧进程残留触发了超时等待
 4. 交叉编译产物同时保留新旧版本后缀 → 部署时需手动选择正确版本
+
+### Phase 13: v0.14.3 — 自动升级启用 + Windows API 进程管理 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 86 | 自动升级编译时开关 `AUTO_UPGRADE = true`（protocol.zig）| ✅ |
+| 87 | host.zig 新增 `pushUpgrade()`（serve-dir 读取 + SHA256 + SOCKS4a 推送）| ✅ |
+| 88 | host.zig 新增 `LastUpgradeMap` + `pushUpgradeThread`（120s 冷却）| ✅ |
+| 89 | host.zig `tunnelManager` Phase 2 新增 LSA 版本检测 + 自动推送 | ✅ |
+| 90 | ipc.zig `handleUpgrade` 重构：~110 行 → ~25 行，复用 `pushUpgrade()` | ✅ |
+| 91 | svc.zig 新增 w32 命名空间：Toolhelp 进程枚举 + TerminateProcess API | ✅ |
+| 92 | svc.zig `killAllUtmm` Windows 分支重写：CreateToolhelp32Snapshot → Process32FirstW/NextW → OpenProcess → TerminateProcess | ✅ |
+| 93 | svc.zig `countOtherUtmmProcesses` Windows 分支重写：同上枚举计数 | ✅ |
+| 94 | host.zig Windows upload 路径分隔符修复（"/" → std.fs.path.sep_str）| ✅ |
+| 95 | SKILL 文件版本号批量更新（clean-deploy/deploy/utmm: 0.14.1 → 0.14.2）| ✅ |
+| 96 | 清理 8 个旧构建产物 `zig-out/bin/*-0.14.1*` | ✅ |
+| 97 | 版本号 bump: ver.txt 0.14.2 → 0.14.3 | ✅ |
+| 98 | 8 交叉编译目标构建 + 集成测试 41/41 通过 | ✅ |
+
+## 关键决策记录（续 3）
+
+| # | 决策 | 理由 |
+|---|------|------|
+| 33 | 自动升级 Host 端 LSA 版本检测 + 推送 | Host 已每 5s 解析所有 Guest 版本，零额外开销。编译时常量 false 时死代码消除 |
+| 34 | Windows 进程杀死换用 Toolhelp + TerminateProcess API | `taskkill /F` 无法终止 SYSTEM 权限进程；原生 API 层面终止 |
+| 35 | `sc.exe stop` 不可靠 → 不杀 utmmd.exe | utmmd 应通过服务管理器停止；killAllUtmm 只杀 utmm.exe 是正确的设计 |

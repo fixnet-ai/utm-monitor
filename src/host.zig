@@ -652,6 +652,110 @@ fn parseNodeInfoLine(line: []const u8, key: []const u8) ?[]const u8 {
 /// Background thread: periodically scans mesh LSAs for guest nodes
 /// and syncs them to the guest table. No persistent TCP connections —
 /// each exec/upload/download opens a fresh per-command TCP connection.
+// ═══════════════════════════════════════════════════════════════════════════
+// Auto-upgrade: push binary to Guest
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Cooldown between auto-upgrade attempts per Guest (ms).
+const AUTO_UPGRADE_COOLDOWN_MS: i64 = 120_000; // 2 minutes
+
+/// Tracks last auto-upgrade attempt timestamp per Guest hostname.
+const LastUpgradeMap = std.StringHashMap(i64);
+
+/// Push an upgrade binary to a Guest.  Used by both manual --upgrade (IPC)
+/// and automatic version-mismatch detection (tunnelManager).
+/// Returns an error string on failure (caller does NOT own), or null on success.
+pub fn pushUpgrade(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    state: *GuestTable,
+    hostname: []const u8,
+) ?[]const u8 {
+    // 1. Look up Guest entry
+    const guest_entry = state.findByHostname(hostname) orelse return "GuestNotFound";
+
+    // 2. Determine deployment filename from target triple
+    const filename = protocol.deploymentFilename(guest_entry.target) orelse {
+        std.log.err("[auto-upgrade] unknown guest target: {s}", .{guest_entry.target});
+        return "UnknownTarget";
+    };
+
+    // 3. Open binary from serve-dir
+    var path_buf: [512]u8 = undefined;
+    const serve_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ svc.canonicalDir(), filename }) catch return "PathTooLong";
+
+    const bin_file = std.Io.Dir.cwd().openFile(io, serve_path, .{ .mode = .read_only }) catch |err| {
+        std.log.err("[auto-upgrade] open {s}: {}", .{ serve_path, err });
+        return "BinaryNotFound";
+    };
+    defer bin_file.close(io);
+
+    // 4. Read and validate file size
+    const file_size_b: u64 = (bin_file.stat(io) catch return "StatFailed").size;
+    if (file_size_b == 0 or file_size_b > 50 * 1024 * 1024) {
+        std.log.err("[auto-upgrade] invalid file size: {d}", .{file_size_b});
+        return "InvalidBinary";
+    }
+    const file_size: u32 = @intCast(file_size_b);
+
+    // 5. Read entire binary into memory
+    const file_data = gpa.alloc(u8, file_size) catch return "AllocFailed";
+    defer gpa.free(file_data);
+    _ = bin_file.readPositionalAll(io, file_data, 0) catch |err| {
+        std.log.err("[auto-upgrade] read {s}: {}", .{ serve_path, err });
+        return "ReadFailed";
+    };
+
+    // 6. Compute SHA256
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(file_data);
+    var hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&hash);
+    var sha256_hex: [64]u8 = undefined;
+    for (hash, 0..) |byte, i| {
+        const h = "0123456789abcdef";
+        sha256_hex[i * 2] = h[byte >> 4];
+        sha256_hex[i * 2 + 1] = h[byte & 0x0f];
+    }
+
+    std.log.info("[auto-upgrade] {s} ({s}): {d} bytes, sha256={s}", .{ hostname, guest_entry.target, file_size, &sha256_hex });
+
+    // 7. Connect to Guest via SOCKS4a
+    var tcp_conn = tcp.hostConnect(io, guest_entry.ip, hostname, protocol.DEFAULT_PORT) catch |err| {
+        std.log.err("[auto-upgrade] TCP connect to {s} failed: {}", .{ hostname, err });
+        return "GuestConnectFailed";
+    };
+    defer tcp_conn.deinit();
+
+    // 8. Build and send upgrade_cmd frame
+    const cmd_id = std.fmt.allocPrint(gpa, "up-{d}", .{@as(u64, @intCast(std.Io.Timestamp.now(io, .real).nanoseconds))}) catch return "AllocFailed";
+    defer gpa.free(cmd_id);
+
+    const up_frame = protocol.buildUpgradeCmd(gpa, cmd_id, guest_entry.target, file_size, &sha256_hex) catch return "AllocFailed";
+    defer gpa.free(up_frame);
+
+    // Fire-and-forget: push upgrade_cmd + raw binary
+    tcp_conn.sendAndFlush(up_frame, 0) catch {};
+    _ = tcp.sockWrite(tcp_conn.fd, file_data.ptr, file_size);
+
+    std.log.info("[auto-upgrade] {s} pushed (fire-and-forget, {d} bytes)", .{ hostname, file_size });
+    return null; // success
+}
+
+/// Thread entry point for auto-upgrade push: calls pushUpgrade then frees hostname.
+fn pushUpgradeThread(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    state: *GuestTable,
+    hostname: []const u8,
+) void {
+    defer gpa.free(hostname);
+    const err_msg = pushUpgrade(io, gpa, state, hostname);
+    if (err_msg) |msg| {
+        std.log.err("[auto-upgrade] pushUpgrade({s}) failed: {s}", .{ hostname, msg });
+    }
+}
+
 fn tunnelManager(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -663,6 +767,14 @@ fn tunnelManager(
     defer {
         for (snapshots.items) |s| allocator.free(s.info_copy);
         snapshots.deinit(allocator);
+    }
+
+    // Auto-upgrade cooldown map: hostname → last push timestamp (ms)
+    var last_upgrade = LastUpgradeMap.init(allocator);
+    defer {
+        var it = last_upgrade.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        last_upgrade.deinit();
     }
 
     while (true) {
@@ -734,6 +846,37 @@ fn tunnelManager(
             if (changed and hostname.len > 0) {
                 state.setMeshMac(hostname, s.node_id);
                 syncHostsFromTable(io, allocator, state);
+            }
+
+            // ── Auto-upgrade: version mismatch → push ──
+            if (protocol.AUTO_UPGRADE) {
+                if (version.len > 0 and role.len > 0 and
+                    !std.mem.eql(u8, version, protocol.VERSION) and
+                    std.mem.eql(u8, role, "guest") and
+                    !std.mem.eql(u8, status, "upgrading"))
+                {
+                    const in_cooldown = if (last_upgrade.get(hostname)) |last_ts|
+                        (now_ms - last_ts) < AUTO_UPGRADE_COOLDOWN_MS
+                    else
+                        false;
+
+                    if (!in_cooldown) {
+                        std.log.info("[auto-upgrade] version mismatch: {s} v{s} != Host v{s}, pushing upgrade...", .{ hostname, version, protocol.VERSION });
+
+                        const key_dupe = allocator.dupe(u8, hostname) catch continue;
+                        last_upgrade.put(key_dupe, now_ms) catch {
+                            allocator.free(key_dupe);
+                            continue;
+                        };
+
+                        const push_hostname = allocator.dupe(u8, hostname) catch continue;
+                        const thread = std.Thread.spawn(.{}, pushUpgradeThread, .{ io, allocator, state, push_hostname }) catch {
+                            allocator.free(push_hostname);
+                            continue;
+                        };
+                        thread.detach();
+                    }
+                }
             }
         }
 

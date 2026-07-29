@@ -80,6 +80,10 @@ pub const VERSION: []const u8 = if (embedded_ver.len > 0 and embedded_ver[embedd
 else
     embedded_ver[0..embedded_ver.len :0];
 
+/// When true, Host daemon auto-pushes upgrade binary to any Guest whose
+/// LSA-advertised version differs from VERSION.  Disable by setting to false.
+pub const AUTO_UPGRADE = true;
+
 /// Parse "IP:port" string to net.IpAddress for local testing peer mesh.
 /// Returns null on any parse failure.
 pub fn parsePeerMeshAddr(s: []const u8) ?std.Io.net.IpAddress {
