@@ -71,11 +71,12 @@ pub fn main(init: std.process.Init) !void {
         };
         defer common.sockClose(cli_fd);
 
-        const req = tcp.socks4Accept(cli_fd) catch |err| {
+        const req = tcp.socks4Accept(cli_fd, alloc) catch |err| {
             tc.expect(false, "socks4Accept 失败: {}", .{err});
             tc.deinit();
             return;
         };
+        defer alloc.free(req.hostname);
         tc.expectStr(hostname, req.hostname, "hostname 匹配");
         tc.expectEqual(@as(u16, listener.port), req.port, "端口匹配");
         tcp.socks4ReplyOk(cli_fd);

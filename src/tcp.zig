@@ -409,10 +409,9 @@ pub fn socks4CheckAndReply(fd: std.posix.socket_t, self_hostname: []const u8) !b
 }
 
 /// 读取 SOCKS4a 请求（仅用于测试）。
-/// 注意：返回的 Socks4Request.hostname 指向测试调用者的栈 — 测试必须立即使用，
-/// 不得跨函数调用保存。
+/// 返回的 Socks4Request.hostname 由 allocator 分配，调用者负责释放。
 /// 生产代码请使用 socks4CheckAndReply。
-pub fn socks4Accept(fd: std.posix.socket_t) !Socks4Request {
+pub fn socks4Accept(fd: std.posix.socket_t, allocator: std.mem.Allocator) !Socks4Request {
     // 读取固定头: VER(1) CMD(1) DSTPORT(2) DSTIP(4) = 8 bytes
     var hdr: [8]u8 = undefined;
     var off: usize = 0;
@@ -436,7 +435,7 @@ pub fn socks4Accept(fd: std.posix.socket_t) !Socks4Request {
         var hn_buf: [MAX_HOSTNAME + 1]u8 = undefined;
         const hn = try readUntilNullBuf(fd, hn_buf[0..]);
         if (hn.len == 0 or hn.len > MAX_HOSTNAME) return error.Socks4BadHostname;
-        return Socks4Request{ .hostname = hn, .port = dst_port };
+        return Socks4Request{ .hostname = try allocator.dupe(u8, hn), .port = dst_port };
     }
     return error.Socks4aRequired;
 }
@@ -916,7 +915,8 @@ test "socks4a handshake round-trip" {
     defer client_thread.join();
 
     // 服务端：accept → 读取 SOCKS4a 请求 → 发回应
-    const request = try socks4Accept(pair.a);
+    const request = try socks4Accept(pair.a, std.testing.allocator);
+    defer std.testing.allocator.free(request.hostname);
     try std.testing.expectEqualStrings("test", request.hostname);
     try std.testing.expectEqual(@as(u16, 2121), request.port);
 
@@ -940,6 +940,136 @@ test "socks4ReplyRejected" {
         off += @intCast(n);
     }
     try std.testing.expect(resp[1] == SOCKS_REP_REJECTED);
+}
+
+test "socks4CheckAndReply matching hostname" {
+    const pair = try makePair();
+    defer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+
+    // 客户端线程：发送正确 hostname 的 SOCKS4a 请求
+    const client_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: std.posix.socket_t) void {
+            const req = [_]u8{
+                SOCKS_VER, SOCKS_CMD_CONNECT,
+                0x08, 0x49, // PORT = 2121
+                0x00, 0x00, 0x00, 0x01, // SOCKS4a
+                0, // USERID = ""
+                's',  'e',  'l',  'f',  0, // HOSTNAME
+            };
+            _ = sockWrite(fd, &req, req.len);
+
+            var resp: [8]u8 = [_]u8{0} ** 8;
+            var off: usize = 0;
+            while (off < 8) {
+                const n = sockRead(fd, resp[off..].ptr, resp.len - off);
+                if (n == 0) break;
+                off += @intCast(n);
+            }
+            std.debug.assert(resp[0] == 0x00);
+            std.debug.assert(resp[1] == SOCKS_REP_OK);
+        }
+    }.run, .{pair.b});
+    defer client_thread.join();
+
+    // 服务端：socks4CheckAndReply 应匹配 "self" 返回 true + 发送 OK
+    const accepted = try socks4CheckAndReply(pair.a, "self");
+    try std.testing.expect(accepted);
+}
+
+test "socks4CheckAndReply mismatched hostname" {
+    const pair = try makePair();
+    defer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+
+    // 客户端线程：发送 "intruder" hostname
+    const client_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: std.posix.socket_t) void {
+            const req = [_]u8{
+                SOCKS_VER, SOCKS_CMD_CONNECT,
+                0x08, 0x49,
+                0x00, 0x00, 0x00, 0x01,
+                0,
+                'i',  'n',  't',  'r',  'u',  'd',  'e',  'r',  0,
+            };
+            _ = sockWrite(fd, &req, req.len);
+
+            var resp: [8]u8 = [_]u8{0} ** 8;
+            var off: usize = 0;
+            while (off < 8) {
+                const n = sockRead(fd, resp[off..].ptr, resp.len - off);
+                if (n == 0) break;
+                off += @intCast(n);
+            }
+            std.debug.assert(resp[0] == 0x00);
+            std.debug.assert(resp[1] == SOCKS_REP_REJECTED);
+        }
+    }.run, .{pair.b});
+    defer client_thread.join();
+
+    // 服务端：socks4CheckAndReply 应不匹配并返回 false + 发送拒绝
+    const accepted = try socks4CheckAndReply(pair.a, "self");
+    try std.testing.expect(!accepted);
+}
+
+test "readUntilNullBuf basic" {
+    const pair = try makePair();
+    defer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+
+    // 写入 "hello\0world\0"
+    const data = [_]u8{ 'h', 'e', 'l', 'l', 'o', 0, 'w', 'o', 'r', 'l', 'd', 0 };
+    _ = sockWrite(pair.b, &data, data.len);
+
+    var buf: [64]u8 = undefined;
+    const first = try readUntilNullBuf(pair.a, buf[0..]);
+    try std.testing.expectEqualStrings("hello", first);
+
+    const second = try readUntilNullBuf(pair.a, buf[0..]);
+    try std.testing.expectEqualStrings("world", second);
+}
+
+test "readUntilNullBuf empty field" {
+    const pair = try makePair();
+    defer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+
+    // 写入空字段 "\0test\0"
+    const data = [_]u8{ 0, 't', 'e', 's', 't', 0 };
+    _ = sockWrite(pair.b, &data, data.len);
+
+    var buf: [64]u8 = undefined;
+    const first = try readUntilNullBuf(pair.a, buf[0..]);
+    try std.testing.expectEqual(@as(usize, 0), first.len);
+
+    const second = try readUntilNullBuf(pair.a, buf[0..]);
+    try std.testing.expectEqualStrings("test", second);
+}
+
+test "readUntilNullBuf buffer overflow" {
+    const pair = try makePair();
+    defer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+
+    // 写入超过小缓冲区的数据（无 null）
+    var over: [32]u8 = undefined;
+    @memset(&over, 'x');
+    _ = sockWrite(pair.b, &over, over.len);
+
+    // 小缓冲区 — 应填满后返回
+    var buf: [8]u8 = undefined;
+    const result = try readUntilNullBuf(pair.a, buf[0..]);
+    try std.testing.expectEqual(buf.len, result.len);
 }
 
 // ── Connection 测试 ──

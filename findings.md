@@ -467,6 +467,11 @@ defer 的第二次 close 对已释放的 ctx 操作：`self.file` 字段为垃�
   数据存在调用者栈帧中，`readUntilNullBuf` 返回后仍然有效
 - 消除了整个 `readUntilNull` 栈帧复用问题
 
-**影响文件**: `src/tcp.zig`（36 行变更，21 insertions / 15 deletions）
+**影响文件**: `src/tcp.zig`、`tests/tcp_frame/main.zig`
 
-**验证**: SOCKS4a 返回 0x5a，macvm exec 端到端通过
+**后续修复**: `socks4Accept` 同样存在悬垂指针问题 — `hn_buf` 在其栈帧中，返回的
+`Socks4Request.hostname` 指向已释放栈。改为接受 `allocator` 参数，堆分配 hostname，
+调用者负责释放。同步更新单元测试和集成测试。
+
+**验证**: SOCKS4a 返回 0x5a，macvm exec 端到端通过。
+`zig build test` + `zig build test-integration` 全部通过（新增 5 个测试）

@@ -36,9 +36,20 @@
 - 事后已恢复 Host daemon
 
 **验证状态**:
-- `zig build` 编译通过
+- `zig build` 编译通过 ✅
+- `zig build test` 全部通过（含新增 5 个测试：socks4CheckAndReply × 2, readUntilNullBuf × 3）✅
+- `zig build test-integration` 全部通过（9 套件 / 45 场景 / 0 失败）✅
 - SOCKS4a Python 测试: 0x5a (OK) ✅
 - macvm exec (CLI 端到端): `echo hello` → `hello` ✅
+
+**测试更新**:
+- `socks4Accept` 改为接受 allocator 参数，返回堆分配 hostname（消除 socks4Accept 自身的悬垂指针）
+- 新增 `socks4CheckAndReply matching hostname` 测试
+- 新增 `socks4CheckAndReply mismatched hostname` 测试
+- 新增 `readUntilNullBuf basic` 测试
+- 新增 `readUntilNullBuf empty field` 测试
+- 新增 `readUntilNullBuf buffer overflow` 测试
+- 集成测试 `tcp_frame/main.zig`: 更新 socks4Accept 调用传递 allocator
 
 ### 2026-07-29 — Phase 9：E2E 真机 Bug 修复
 
