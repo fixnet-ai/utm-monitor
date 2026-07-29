@@ -66,21 +66,33 @@ pub fn build(b: *std.Build) void {
         utmmd.root_module.linkSystemLibrary("ws2_32", .{});
     }
 
-    // Copy utmmd binary to src/embed/ for @embedFile by main.zig.
-    // addInstallBinFile writes to zig-out/ — use system copy command instead.
+    // Copy utmmd binary to target-specific embed directory for @embedFile by main.zig.
+    // Each target gets its own subdir (e.g., src/embed/aarch64-linux/utmmd.bin)
+    // so cross-compiling for multiple targets never overwrites the wrong binary.
     const embed_dir = "src/embed";
-    const embed_path = b.fmt("{s}/utmmd.bin", .{embed_dir});
+    const target_dir = b.fmt("{s}-{s}", .{
+        @tagName(target.result.cpu.arch),
+        @tagName(target.result.os.tag),
+    });
+    const target_embed_dir = b.fmt("{s}/{s}", .{ embed_dir, target_dir });
+    const embed_path = b.fmt("{s}/utmmd.bin", .{target_embed_dir});
+
+    // Ensure target-specific embed subdirectory exists
+    const mkdir_embed = b.addSystemCommand(&.{ "mkdir", "-p" });
+    mkdir_embed.addArg(target_embed_dir);
+
     const copy_utmmd = b.addSystemCommand(&.{ "cp", "-f" });
     copy_utmmd.addFileArg(utmmd.getEmittedBin());
     copy_utmmd.addArg(embed_path);
     copy_utmmd.step.dependOn(&utmmd.step);
+    copy_utmmd.step.dependOn(&mkdir_embed.step);
 
     // Pre-compute SHA256 hash of utmmd.bin so main.zig can embed it at compile
     // time without expensive comptime hashing (>20M eval branches for ~2MB binary).
     const hash_utmmd = b.addSystemCommand(&.{ "sh", "-c" });
     hash_utmmd.addArg(b.fmt(
         "shasum -a 256 {s} | cut -d' ' -f1 | tr -d '\\n' > {s}/utmmd.sha256",
-        .{ embed_path, embed_dir },
+        .{ embed_path, target_embed_dir },
     ));
     hash_utmmd.step.dependOn(&copy_utmmd.step);
 

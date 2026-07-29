@@ -17,11 +17,51 @@ const mcp = @import("mcp.zig");
 const shm = @import("shm.zig");
 
 /// Embedded utmmd binary — compiled at build time, extracted at install time.
-const utmmd_bin = @embedFile("embed/utmmd.bin");
+/// Target-specific: embed/{arch}-{os}/utmmd.bin, selected at comptime via builtin.
+const utmmd_bin: []const u8 = switch (builtin.cpu.arch) {
+    .aarch64 => switch (builtin.os.tag) {
+        .linux => @as([]const u8, @embedFile("embed/aarch64-linux/utmmd.bin")),
+        .macos => @as([]const u8, @embedFile("embed/aarch64-macos/utmmd.bin")),
+        .windows => @as([]const u8, @embedFile("embed/aarch64-windows/utmmd.bin")),
+        else => @compileError("unsupported OS for aarch64: " ++ @tagName(builtin.os.tag)),
+    },
+    .x86_64 => switch (builtin.os.tag) {
+        .linux => @as([]const u8, @embedFile("embed/x86_64-linux/utmmd.bin")),
+        .macos => @as([]const u8, @embedFile("embed/x86_64-macos/utmmd.bin")),
+        .windows => @as([]const u8, @embedFile("embed/x86_64-windows/utmmd.bin")),
+        else => @compileError("unsupported OS for x86_64: " ++ @tagName(builtin.os.tag)),
+    },
+    .x86 => switch (builtin.os.tag) {
+        .linux => @as([]const u8, @embedFile("embed/x86-linux/utmmd.bin")),
+        .windows => @as([]const u8, @embedFile("embed/x86-windows/utmmd.bin")),
+        else => @compileError("unsupported OS for x86: " ++ @tagName(builtin.os.tag)),
+    },
+    else => @compileError("unsupported arch: " ++ @tagName(builtin.cpu.arch)),
+};
 
 /// SHA256 hex string of the embedded utmmd binary (64 chars, pre-computed by build.zig).
 /// Used to determine whether the installed utmmd needs updating.
-const utmmd_sha256_hex: [:0]const u8 = @embedFile("embed/utmmd.sha256");
+/// Target-specific: embed/{arch}-{os}/utmmd.sha256, selected at comptime via builtin.
+const utmmd_sha256_hex: [:0]const u8 = switch (builtin.cpu.arch) {
+    .aarch64 => switch (builtin.os.tag) {
+        .linux => @embedFile("embed/aarch64-linux/utmmd.sha256"),
+        .macos => @embedFile("embed/aarch64-macos/utmmd.sha256"),
+        .windows => @embedFile("embed/aarch64-windows/utmmd.sha256"),
+        else => @compileError("unsupported OS for aarch64: " ++ @tagName(builtin.os.tag)),
+    },
+    .x86_64 => switch (builtin.os.tag) {
+        .linux => @embedFile("embed/x86_64-linux/utmmd.sha256"),
+        .macos => @embedFile("embed/x86_64-macos/utmmd.sha256"),
+        .windows => @embedFile("embed/x86_64-windows/utmmd.sha256"),
+        else => @compileError("unsupported OS for x86_64: " ++ @tagName(builtin.os.tag)),
+    },
+    .x86 => switch (builtin.os.tag) {
+        .linux => @embedFile("embed/x86-linux/utmmd.sha256"),
+        .windows => @embedFile("embed/x86-windows/utmmd.sha256"),
+        else => @compileError("unsupported OS for x86: " ++ @tagName(builtin.os.tag)),
+    },
+    else => @compileError("unsupported arch: " ++ @tagName(builtin.cpu.arch)),
+};
 
 comptime {
     _ = @import("lsa.zig");
