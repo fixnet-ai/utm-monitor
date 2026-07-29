@@ -883,11 +883,16 @@ fn handleUpgrade(
     };
     defer gpa.free(file_data);
 
-    _ = bin_file.readAll(io, file_data) catch |err| {
+    const read_n = bin_file.read(io, file_data) catch |err| {
         std.log.err("[ipc-upgrade] read {s}: {}", .{ serve_path, err });
         sendError(ipc_conn, "ReadFailed");
         return;
     };
+    if (read_n != file_size) {
+        std.log.err("[ipc-upgrade] short read {s}: {d}/{d}", .{ serve_path, read_n, file_size });
+        sendError(ipc_conn, "ShortRead");
+        return;
+    }
 
     // SHA256
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -895,10 +900,11 @@ fn handleUpgrade(
     var hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&hash);
     var sha256_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&sha256_hex, "{s}", .{std.fmt.fmtSliceHexLower(&hash)}) catch {
-        sendError(ipc_conn, "HexEncodeFailed");
-        return;
-    };
+    for (hash, 0..) |byte, i| {
+        const h = "0123456789abcdef";
+        sha256_hex[i * 2] = h[byte >> 4];
+        sha256_hex[i * 2 + 1] = h[byte & 0x0f];
+    }
 
     std.log.info("[ipc-upgrade] {s} ({s}): {d} bytes, sha256={s}", .{ vm, guest.target, file_size, &sha256_hex });
 

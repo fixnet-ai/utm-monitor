@@ -289,7 +289,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         // Copy to serve-dir for future --upgrade use
         const serve_copy_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ "/opt/utmm", bin_name });
         defer gpa.free(serve_copy_path);
-        std.Io.Dir.cwd().copyFile(bin_path, std.Io.Dir.cwd(), serve_copy_path, .{}) catch |err| {
+        std.Io.Dir.cwd().copyFile(bin_path, std.Io.Dir.cwd(), serve_copy_path, io, .{}) catch |err| {
             std.log.warn("[deploy] copy to serve-dir failed: {}", .{err});
         };
         std.debug.print("[deploy]   -> serve-dir: {s}\n", .{serve_copy_path});
