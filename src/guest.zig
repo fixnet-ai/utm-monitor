@@ -1022,17 +1022,14 @@ fn handleUpgradeCmd(
 
     // 比较 hex - cmd.sha256_hex 是 64 字符的 hex 字符串
     var hex_buf: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex_buf, "{s}", .{std.fmt.fmtSliceHexLower(&computed_hash)}) catch {
-        std.log.err("[guest] upgrade: hex encode failed", .{});
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
-        defer allocator.free(resp);
-        _ = conn.sendAndFlush(resp, 0) catch {};
-        return;
-    };
-
-    if (!std.mem.eql(u8, &hex_buf, cmd.sha256_hex)) {
-        std.log.err("[guest] upgrade: SHA256 mismatch, deleting {s}", .{tmp_path});
+    for (computed_hash, 0..) |byte, i| {
+        const h = "0123456789abcdef";
+        hex_buf[i * 2] = h[byte >> 4];
+        hex_buf[i * 2 + 1] = h[byte & 0x0f];
+    }
+    const hash_ok = std.mem.eql(u8, cmd.sha256_hex, &hex_buf);
+    if (!hash_ok) {
+        std.log.err("[guest] upgrade: SHA256 mismatch", .{});
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);

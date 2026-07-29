@@ -883,16 +883,11 @@ fn handleUpgrade(
     };
     defer gpa.free(file_data);
 
-    const read_n = bin_file.read(io, file_data) catch |err| {
+    bin_file.readPositionalAll(io, file_data, 0) catch |err| {
         std.log.err("[ipc-upgrade] read {s}: {}", .{ serve_path, err });
         sendError(ipc_conn, "ReadFailed");
         return;
     };
-    if (read_n != file_size) {
-        std.log.err("[ipc-upgrade] short read {s}: {d}/{d}", .{ serve_path, read_n, file_size });
-        sendError(ipc_conn, "ShortRead");
-        return;
-    }
 
     // SHA256
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
