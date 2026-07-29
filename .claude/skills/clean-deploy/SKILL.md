@@ -28,8 +28,8 @@ UTM Monitor 的完整流程。每次执行后总结问题点和可改进之处�
 | 3 | **macOS `timeout` 不可用** | macOS 无此命令 | 用后台进程 + `kill -0` 轮询模式 |
 | 4 | **macOS bootstrap errno=5** | `launchctl bootout` 重设 disabled flag | `enable → bootout → enable → bootstrap` |
 | 5 | **Windows 路径反斜杠被吞** | bash 把 `\` 当转义符 | 用单引号包裹：`'C:\opt\utmm\file.txt'` |
-| 6 | **二进制名含版本号** | `zig build -Dtarget=...` 产物带版本后缀 | 实际文件名 `utmm-aarch64-macos-0.14.1` |
-| 7 | **Windows taskkill /F 无效** | utmm 以 SYSTEM 权限运行，taskkill 无法终止 | 用 PowerShell `Stop-Process -Force` 替代 |
+| 6 | **二进制名含版本号** | `zig build -Dtarget=...` 产物带版本后缀 | 实际文件名 `utmm-aarch64-macos-0.14.2` |
+| 7 | **Windows taskkill /F 无效** | utmm 以 SYSTEM 权限运行，taskkill 无法终止 | v0.14.3: svc.zig 改用 Toolhelp + TerminateProcess API；手动清空用 PowerShell `Stop-Process -Force` |
 
 ## 执行流程
 
@@ -175,7 +175,7 @@ zig build test-integration
 zig build
 
 # 2.4 交叉编译（ReleaseSafe）
-# 产物含版本号后缀（如 utmm-aarch64-linux-0.14.1），部署时注意
+# 产物含版本号后缀（如 utmm-aarch64-linux-0.14.2），部署时注意
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
@@ -204,7 +204,7 @@ sudo ./zig-out/bin/utmm --status
 sshpass -p 111 ssh root@192.168.64.2 'mkdir -p /opt/utmm'
 
 # scp 二进制（注意：文件名含版本号后缀）
-sshpass -p 111 scp zig-out/bin/utmm-aarch64-linux-0.14.1 root@192.168.64.2:/opt/utmm/utmm-new
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-linux-0.14.2 root@192.168.64.2:/opt/utmm/utmm-new
 sshpass -p 111 ssh root@192.168.64.2 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname linuxvm'
 ```
 
@@ -215,7 +215,7 @@ sshpass -p 111 ssh root@192.168.64.2 'chmod +x /opt/utmm/utmm-new && /opt/utmm/u
 sshpass -p 111 ssh root@192.168.64.4 'mkdir -p /opt/utmm'
 
 # scp 二进制
-sshpass -p 111 scp zig-out/bin/utmm-aarch64-macos-0.14.1 root@192.168.64.4:/opt/utmm/utmm-new
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-macos-0.14.2 root@192.168.64.4:/opt/utmm/utmm-new
 sshpass -p 111 ssh root@192.168.64.4 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname macvm'
 ```
 
@@ -224,12 +224,12 @@ sshpass -p 111 ssh root@192.168.64.4 'chmod +x /opt/utmm/utmm-new && /opt/utmm/u
 ```bash
 # windowsvm — mkdir + scp + ssh install
 sshpass -p 111 ssh Administrator@192.168.65.2 'mkdir C:\opt\utmm 2>nul'
-sshpass -p 111 scp zig-out/bin/utmm-aarch64-windows-0.14.1.exe Administrator@192.168.65.2:C:/opt/utmm/utmm-new.exe
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-windows-0.14.2.exe Administrator@192.168.65.2:C:/opt/utmm/utmm-new.exe
 sshpass -p 111 ssh Administrator@192.168.65.2 'C:\opt\utmm\utmm-new.exe --install --hostname windowsvm'
 
 # winx64
 sshpass -p 111 ssh Administrator@192.168.3.108 'mkdir C:\opt\utmm 2>nul'
-sshpass -p 111 scp zig-out/bin/utmm-x86_64-windows-0.14.1.exe Administrator@192.168.3.108:C:/opt/utmm/utmm-new.exe
+sshpass -p 111 scp zig-out/bin/utmm-x86_64-windows-0.14.2.exe Administrator@192.168.3.108:C:/opt/utmm/utmm-new.exe
 sshpass -p 111 ssh Administrator@192.168.3.108 'C:\opt\utmm\utmm-new.exe --install --hostname winx64'
 ```
 
@@ -337,7 +337,7 @@ sudo ./zig-out/bin/utmm --ping winx64
 - 清空后 `/opt/utmm` 目录被删除，部署前需 `mkdir -p /opt/utmm`
 - LSA 同步需要等待 ~15s，不要在部署后立即测试
 - **Windows download 路径必须单引号包裹**，否则 bash 吞反斜杠：`'C:\opt\utmm\file.txt'`
-- **交叉编译产物含版本号后缀**（如 `utmm-aarch64-macos-0.14.1`），scp 时注意
+- **交叉编译产物含版本号后缀**（如 `utmm-aarch64-macos-0.14.2`），scp 时注意
 - **macOS `launchctl bootout` 会重设 disabled flag**，bootstrap 前必须 `enable`
 - SSH 复合命令避免过长（含 `&&`、管道、特殊字符多的），拆成多个短调用
 - macOS 无 `timeout` 命令，超时场景用后台进程 + `kill -0` 轮询

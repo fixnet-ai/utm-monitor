@@ -43,7 +43,7 @@ zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows       # windowsvm
 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows        # winx64
 
 # Output naming: utmm-{target}-{version}
-# e.g. zig-out/bin/utmm-aarch64-linux-0.14.1
+# e.g. zig-out/bin/utmm-aarch64-linux-0.14.2
 
 # Run tests
 zig build test

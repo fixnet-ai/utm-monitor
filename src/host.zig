@@ -405,7 +405,7 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
 
     const basename = std.fs.path.basename(local_file);
     const remote_dir = vmRemoteDir(target) orelse "/opt/utmm";
-    const dest = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ remote_dir, basename });
+    const dest = try std.fmt.allocPrint(gpa, "{s}" ++ std.fs.path.sep_str ++ "{s}", .{ remote_dir, basename });
     defer gpa.free(dest);
 
     std.debug.print("[upload] Uploading {s} -> {s} ({s})...\n", .{ local_file, target, dest });

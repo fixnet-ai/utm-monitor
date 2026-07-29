@@ -174,6 +174,49 @@ const InstallLock = struct {
         _ = CloseHandle(win_handle);
     }
 };
+// ─── Windows: Toolhelp process enumeration API (replace tasklist/taskkill) ───
+
+const w32 = struct {
+    const DWORD = std.os.windows.DWORD;
+    const BOOL = std.os.windows.BOOL;
+    const HANDLE = std.os.windows.HANDLE;
+
+    const TH32CS_SNAPPROCESS: DWORD = 0x00000002;
+    const PROCESS_TERMINATE: DWORD = 0x0001;
+
+    const PROCESSENTRY32W = extern struct {
+        dwSize: DWORD,
+        cntUsage: DWORD,
+        th32ProcessID: DWORD,
+        th32DefaultHeapID: usize,
+        th32ModuleID: DWORD,
+        cntThreads: DWORD,
+        th32ParentProcessID: DWORD,
+        pcPriClassBase: i32,
+        dwFlags: DWORD,
+        szExeFile: [260]u16,
+    };
+
+    extern "kernel32" fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) callconv(.winapi) HANDLE;
+    extern "kernel32" fn Process32FirstW(hSnapshot: HANDLE, lppe: *PROCESSENTRY32W) callconv(.winapi) BOOL;
+    extern "kernel32" fn Process32NextW(hSnapshot: HANDLE, lppe: *PROCESSENTRY32W) callconv(.winapi) BOOL;
+    extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) callconv(.winapi) BOOL;
+    extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+
+    /// Case-insensitive match against "utmm.exe" in UTF-16LE.
+    fn isUtmmExe(name: [*]const u16) bool {
+        const target = [_]u16{ 'u', 't', 'm', 'm', '.', 'e', 'x', 'e' };
+        var i: usize = 0;
+        while (name[i] != 0 and i < target.len) : (i += 1) {
+            const c = name[i];
+            const lower: u16 = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+            if (lower != target[i]) return false;
+        }
+        return i == target.len and name[i] == 0;
+    }
+};
+
 const protocol = @import("protocol.zig");
 
 /// Canonical install path for utmm (the managed process).
@@ -901,33 +944,34 @@ fn killAllUtmm(io: std.Io, alloc: std.mem.Allocator) !void {
             }
         },
         .windows => {
-            // Enumerate PIDs with tasklist; fall back to taskkill /im if unavailable.
-            const out = runCmdStdout(alloc, io, &[_][]const u8{
-                "tasklist", "/fi", "imagename eq utmm.exe", "/fo", "csv", "/nh",
-            }) orelse {
-                std.log.warn("[svc] tasklist failed, falling back to taskkill /im", .{});
-                runCmdQuiet(alloc, io, &[_][]const u8{ "taskkill", "/f", "/im", "utmm.exe" });
+            // Enumerate utmm.exe via Toolhelp snapshot → OpenProcess+TerminateProcess.
+            // Native API works even on SYSTEM-privileged processes where taskkill /F fails.
+            const snap = w32.CreateToolhelp32Snapshot(w32.TH32CS_SNAPPROCESS, 0);
+            if (snap == std.os.windows.INVALID_HANDLE_VALUE) {
+                std.log.err("[svc] killAllUtmm: CreateToolhelp32Snapshot failed", .{});
                 return;
-            };
-            defer alloc.free(out);
+            }
+            defer _ = w32.CloseHandle(snap);
+
+            var pe = std.mem.zeroInit(w32.PROCESSENTRY32W, .{});
+            pe.dwSize = @intCast(@sizeOf(w32.PROCESSENTRY32W));
+
+            if (@intFromEnum(w32.Process32FirstW(snap, &pe)) == 0) return;
+
             var killed: usize = 0;
-            var iter = std.mem.tokenizeScalar(u8, out, '\n');
-            while (iter.next()) |line| {
-                const trimmed = std.mem.trim(u8, line, " \r");
-                if (trimmed.len < 2) continue;
-                // CSV format: "utmm.exe","1234","Console","1","12,345 K"
-                var csv_iter = std.mem.splitScalar(u8, trimmed, ',');
-                _ = csv_iter.next(); // skip image name
-                const pid_field = csv_iter.next() orelse continue;
-                const pid_str = std.mem.trim(u8, pid_field, " \"\r");
-                const pid = std.fmt.parseInt(u32, pid_str, 10) catch continue;
-                if (pid == my_pid) {
-                    std.log.debug("[svc] killAllUtmm: skipping own PID {d}", .{pid});
-                    continue;
+            while (true) {
+                if (w32.isUtmmExe(&pe.szExeFile) and pe.th32ProcessID != my_pid) {
+                    std.log.info("[svc] killAllUtmm: killing PID {d}", .{pe.th32ProcessID});
+                    const h = w32.OpenProcess(w32.PROCESS_TERMINATE, .FALSE, pe.th32ProcessID) orelse {
+                        std.log.warn("[svc] killAllUtmm: OpenProcess(PID {d}) failed", .{pe.th32ProcessID});
+                        if (@intFromEnum(w32.Process32NextW(snap, &pe)) == 0) break;
+                        continue;
+                    };
+                    _ = w32.TerminateProcess(h, 1);
+                    _ = w32.CloseHandle(h);
+                    killed += 1;
                 }
-                std.log.info("[svc] killAllUtmm: killing PID {d}", .{pid});
-                _ = runCmdQuiet(alloc, io, &[_][]const u8{ "taskkill", "/f", "/pid", pid_str });
-                killed += 1;
+                if (@intFromEnum(w32.Process32NextW(snap, &pe)) == 0) break;
             }
             if (killed > 0) {
                 std.log.info("[svc] killAllUtmm: killed {d} process(es)", .{killed});
@@ -953,21 +997,21 @@ fn countOtherUtmmProcesses(alloc: std.mem.Allocator, io: std.Io, my_pid: u32) !u
             return count;
         },
         .windows => {
-            const out = runCmdStdout(alloc, io, &[_][]const u8{
-                "tasklist", "/fi", "imagename eq utmm.exe", "/fo", "csv", "/nh",
-            }) orelse return 0;
-            defer alloc.free(out);
+            const snap = w32.CreateToolhelp32Snapshot(w32.TH32CS_SNAPPROCESS, 0);
+            if (snap == std.os.windows.INVALID_HANDLE_VALUE) return 0;
+            defer _ = w32.CloseHandle(snap);
+
+            var pe = std.mem.zeroInit(w32.PROCESSENTRY32W, .{});
+            pe.dwSize = @intCast(@sizeOf(w32.PROCESSENTRY32W));
+
+            if (@intFromEnum(w32.Process32FirstW(snap, &pe)) == 0) return 0;
+
             var count: usize = 0;
-            var iter = std.mem.tokenizeScalar(u8, out, '\n');
-            while (iter.next()) |line| {
-                const trimmed = std.mem.trim(u8, line, " \r");
-                if (trimmed.len < 2) continue;
-                var csv_iter = std.mem.splitScalar(u8, trimmed, ',');
-                _ = csv_iter.next(); // skip image name
-                const pid_field = csv_iter.next() orelse continue;
-                const pid_str = std.mem.trim(u8, pid_field, " \"\r");
-                const pid = std.fmt.parseInt(u32, pid_str, 10) catch continue;
-                if (pid != my_pid) count += 1;
+            while (true) {
+                if (w32.isUtmmExe(&pe.szExeFile) and pe.th32ProcessID != my_pid) {
+                    count += 1;
+                }
+                if (@intFromEnum(w32.Process32NextW(snap, &pe)) == 0) break;
             }
             return count;
         },

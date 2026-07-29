@@ -43,7 +43,7 @@ zig build                          # → zig-out/bin/utmm (Mach-O aarch64)
 
 ```bash
 # ReleaseSafe — 所有部署必须使用
-# 注意：产物含版本号后缀，如 utmm-aarch64-linux-0.14.1
+# 注意：产物含版本号后缀，如 utmm-aarch64-linux-0.14.2
 #       用 `cat src/ver.txt` 获取当前版本号
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl    # → zig-out/bin/utmm-aarch64-linux-<ver>
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos         # → zig-out/bin/utmm-aarch64-macos-<ver>
@@ -80,24 +80,24 @@ sudo ./zig-out/bin/utmm --status
 
 **Linux Guest:**
 ```bash
-sshpass -p 111 scp zig-out/bin/utmm-aarch64-linux-0.14.1 root@192.168.64.2:/opt/utmm/utmm-new
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-linux-0.14.2 root@192.168.64.2:/opt/utmm/utmm-new
 sshpass -p 111 ssh root@192.168.64.2 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname linuxvm'
 ```
 
 **macOS Guest:**
 ```bash
-sshpass -p 111 scp zig-out/bin/utmm-aarch64-macos-0.14.1 root@192.168.64.4:/opt/utmm/utmm-new
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-macos-0.14.2 root@192.168.64.4:/opt/utmm/utmm-new
 sshpass -p 111 ssh root@192.168.64.4 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname macvm'
 ```
 
 **Windows Guest:**
 ```bash
 # windowsvm (aarch64)
-sshpass -p 111 scp zig-out/bin/utmm-aarch64-windows-0.14.1.exe Administrator@192.168.65.2:C:/opt/utmm/utmm-new.exe
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-windows-0.14.2.exe Administrator@192.168.65.2:C:/opt/utmm/utmm-new.exe
 sshpass -p 111 ssh Administrator@192.168.65.2 'C:\opt\utmm\utmm-new.exe --install --hostname windowsvm'
 
 # winx64 (x86_64)
-sshpass -p 111 scp zig-out/bin/utmm-x86_64-windows-0.14.1.exe Administrator@192.168.3.108:C:/opt/utmm/utmm-new.exe
+sshpass -p 111 scp zig-out/bin/utmm-x86_64-windows-0.14.2.exe Administrator@192.168.3.108:C:/opt/utmm/utmm-new.exe
 sshpass -p 111 ssh Administrator@192.168.3.108 'C:\opt\utmm\utmm-new.exe --install --hostname winx64'
 ```
 
@@ -140,7 +140,7 @@ sudo ./zig-out/bin/utmm --upload /tmp/test.txt linuxvm
 | IPC socket | `/var/run/utmm.sock` | `\\.\pipe\utmm` | ipc.zig 自动适配 |
 | 服务配置 | `/Library/LaunchDaemons/com.utmmd.plist` | `sc.exe create` | svc.zig 按平台分支 |
 | SSH 传 Windows 路径 | `C:\opt\utmm\file.txt` | 单引号包裹 | bash 吞噬反斜杠 |
-| 交叉编译产物 | `utmm-aarch64-macos-0.14.1` | `utmm-aarch64-windows-0.14.1.exe` | 含版本号后缀 |
+| 交叉编译产物 | `utmm-aarch64-macos-0.14.2` | `utmm-aarch64-windows-0.14.2.exe` | 含版本号后缀 |
 
 ## macOS 常见问题处理
 
