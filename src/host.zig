@@ -174,6 +174,15 @@ const VM_DEPLOY_TABLE: []const VmDeployConfig = &[_]VmDeployConfig{
     .{ .hostname = "winx64", .target = "x86_64-windows", .ip = "192.168.3.108", .user = "Administrator", .password = "111", .remote_dir = "C:\\opt\\utmm" },
 };
 
+/// Look up a VM's remote canonical directory by hostname.
+/// Returns null if hostname not found in VM_DEPLOY_TABLE.
+fn vmRemoteDir(hostname: []const u8) ?[]const u8 {
+    for (VM_DEPLOY_TABLE) |vm| {
+        if (std.mem.eql(u8, vm.hostname, hostname)) return vm.remote_dir;
+    }
+    return null;
+}
+
 /// One-shot deploy: cross-compile → SCP → SSH install → verify.
 /// Uses sshpass for non-interactive password auth.
 fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void {
@@ -395,7 +404,8 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
     const ipc_mod = @import("ipc.zig");
 
     const basename = std.fs.path.basename(local_file);
-    const dest = try std.fmt.allocPrint(gpa, "/opt/utmm/{s}", .{basename});
+    const remote_dir = vmRemoteDir(target) orelse "/opt/utmm";
+    const dest = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ remote_dir, basename });
     defer gpa.free(dest);
 
     std.debug.print("[upload] Uploading {s} -> {s} ({s})...\n", .{ local_file, target, dest });
@@ -472,7 +482,7 @@ fn startHost(
     defer state.deinit();
 
     // Spawn mesh networking thread — replaces periodic UDP guest.
-    // Mesh broadcasts LSA every 2s (carries version for auto-upgrade),
+    // Mesh broadcasts LSA every 2s (version is informational — displayed in --status),
     // maintains guest topology via LSA database.
     var mesh_opt: ?lsa.Mesh = null;
     var mesh_thread: ?std.Thread = null;

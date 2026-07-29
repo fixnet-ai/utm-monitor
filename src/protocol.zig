@@ -72,7 +72,7 @@ pub fn parseDiscoveryVersion(data: []const u8) ?[]const u8 {
 pub const HOSTS_MARKER_BEGIN = "# UTM-MONITOR-BEGIN";
 pub const HOSTS_MARKER_END = "# UTM-MONITOR-END";
 
-/// Program version number — bump to trigger auto-upgrade.
+/// Program version number — embedded at compile time, displayed in --status.
 /// Sourced from ver.txt at compile time via @embedFile.
 const embedded_ver = @embedFile("ver.txt");
 pub const VERSION: []const u8 = if (embedded_ver.len > 0 and embedded_ver[embedded_ver.len - 1] == '\n')
@@ -93,7 +93,7 @@ pub fn parsePeerMeshAddr(s: []const u8) ?std.Io.net.IpAddress {
 /// Map Guest target triple → versioned deployment binary filename in serve-dir.
 /// Filenames include the version suffix (e.g. utmm-aarch64-linux-0.11.19).
 /// The version suffix ensures a Host never serves stale binaries to Guests.
-/// Returns null for unknown targets (Host skips auto-upgrade in that case).
+/// Returns null for unknown targets (Host reports error on --upgrade in that case).
 pub fn deploymentFilename(target: []const u8) ?[]const u8 {
     const mappings = [_]struct { target: []const u8, filename: []const u8 }{
         .{ .target = "aarch64-linux-musl", .filename = "utmm-aarch64-linux-" ++ VERSION },

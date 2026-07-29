@@ -2,12 +2,12 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.14.1 — Integration test restructuring + ReleaseSafe enforcement + temp file cleanup fixes
+**最新版本**: v0.14.2 — Upgrade system refactor + macOS launchctl fix + path audit + temp cleanup
 
 - **分支**: `refac/layered-arch`
 - **源文件**: 17 src + 10 test（9 集成测试 flat file + 1 common）
 - **测试**: 146 唯一单元测试 + 40 集成测试场景（8 套件），全部通过
-- **真机验证**: linuxvm + windowsvm + macvm + winx64 — 4 台全 v0.14.1 ✅
+- **真机验证**: linuxvm + windowsvm + macvm + winx64 — 4 台全 v0.14.2 ✅
 - **设计文档**: `refac.md`
 
 ## 架构概述
@@ -219,3 +219,42 @@ src/
 | 23 | 新增 `socks4CheckAndReply` + `readUntilNullBuf` 测试 | 之前关键路径零测试覆盖；两个函数都是 bug 高发区 |
 | 24 | 集成测试从独立可执行文件改为单入口 flat file | 统一 leak detection + 简化 build.zig + 零独立 main.zig 样板 |
 | 25 | ReleaseSafe 强制所有发布构建 | Debug x86_64 80MB → ReleaseSafe 11MB；所有 release 路径统一使用 `-Doptimize=ReleaseSafe` |
+
+### Phase 11: v0.14.2 — 升级系统重构 + 质量修复 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 66 | macOS launchctl bootstrap errno=5 根因修复（bootout 重设 disabled flag → enable after bootout）| ✅ |
+| 67 | 跨平台路径审计：host.zig 3 处 + ipc.zig 1 处硬编码路径 → `svc.canonicalDir()` | ✅ |
+| 68 | 临时文件泄露修复：dpipe_file.zig rename 失败时 deleteFile + guest.zig 启动扫描清理 | ✅ |
+| 69 | 升级系统重构：Guest 自主升级 → Host 主控直推（`--upgrade <vm>`）| ✅ |
+| 70 | 删除旧升级代码：upgrade_req、auto_upgrade、UpgradeSignal、checkGitHubVersion、verifyServeDirBinaries、upgradeTcpListener、handleUpgradeConnection、isValidVersion | ✅ |
+| 71 | 新增 upgrade_cmd (0x1a) 协议 + guest.handleUpgradeCmd + host.cmdUpgrade + ipc.handleUpgrade | ✅ |
+| 72 | 新增 upgrade_e2e 集成测试（7 场景：正常/哈希不匹配/0字节/大文件/SOCKS4a/重传/并发）| ✅ |
+| 73 | 4 VM 遗留垃圾清理（旧服务名、temp 文件、日志、deploy 残留）| ✅ |
+| 74 | Windows VM 启用 OpenSSH Server，替代 SMB/RDP 手动操作 | ✅ |
+| 75 | 硬编码远程路径修复：host.zig cmdUpload + mcp.zig cmdVmUpload → 平台感知 remote_dir | ✅ |
+| 76 | 4 处陈旧注释修正：auto-upgrade 描述 → Host 直推模型 | ✅ |
+| 77 | deploy SKILL 更新：Windows SMB 手动 → SSH 命令；clean-deploy SKILL 新建 | ✅ |
+| 78 | 版本号 bump: ver.txt 0.14.1 → 0.14.2 | ✅ |
+
+**升级系统重构详情**：
+- Guest 侧删除：`UpgradeSignal` struct、`tryPerformUpgrade` 函数（~120 行）、LSA 版本比对、`auto_upgrade` 门控
+- Guest 侧新增：`handleUpgradeCmd`（~110 行）— 接收 upgrade_cmd 帧 + 流式二进制 → 增量 SHA256 → 通知 utmmd via shm
+- Host 侧删除：`checkGitHubVersion`（~55 行）、`verifyServeDirBinaries`（~40 行）、`upgradeTcpListener`（~40 行）、`handleUpgradeConnection`/`serveUpgradeFile`（~70 行）、`isValidVersion`（~15 行）、`upgrade_signal` + `upgrade_shutdown` 原子变量
+- Host 侧新增：`cmdUpgrade` → `ipcUpgrade`（查 GuestTable → SOCKS4a 连接 → 推送 upgrade_cmd + 二进制流）
+- IPC 新增：Request.upgrade (0x07) → handleUpgrade（从 serve-dir 读取二进制 → SOCKS4a 连接 → 推送）
+- CLI 新增：`--upgrade <vm>` 参数（`cmd_upgrade` + `upgrade_target`）
+- 完全删除 Guest 自主升级路径 — Host 通过 SOCKS4a 直推，复用以 `upload_result` (0x17) 响应
+- 升级后 utmmd 自动检测退出原因 (Cmd.upgrade) → rename temp → 重启 utmm
+
+## 关键决策记录（续 2）
+
+| # | 决策 | 理由 |
+|---|------|------|
+| 26 | 升级系统：Guest 自主 → Host 主控直推 | Guest 自主升级不可控（版本号变动触发全集群升级混乱），Host 直推按需触发 |
+| 27 | 复用以 `upload_result` (0x17) 作为升级响应 | 格式完全一致：cmd_id + exit_code，无需新消息类型 |
+| 28 | 升级 temp 文件用 `svc.tempDir()` | dpipe_file 写 `/tmp` = 跨文件系统 rename 高概率失败（特别是 macOS），升级二进制直接写 `canonicalDir()` 避免 EXDEV |
+| 29 | Windows SSH 替代 SMB/RDP | 自动化部署和清理必须 SSH；Windows 10 1809+ 内置 OpenSSH Server |
+| 30 | mcp.zig `guestDefaultDir()` 平台感知默认路径 | 无 host.zig 导入通路（MCP 为独立进程），使用 VM 名 "win" 前缀推断 Windows 路径 |
+| 31 | deploy/clean-deploy SKILL 二进制名含版本号 | 交叉编译产物含版本后缀（如 `utmm-aarch64-macos-0.14.2`），部署时必须用实际文件名 |

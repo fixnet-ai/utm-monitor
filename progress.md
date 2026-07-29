@@ -3,13 +3,58 @@
 ## 当前状态
 
 - **分支**: `refac/layered-arch`
-- **版本**: v0.14.1（未发布）
+- **版本**: v0.14.2（未发布）
 - **测试**: 146 唯一单元测试 + 40 集成测试场景（8 套件），全部通过
 - **源文件**: 17 src + 10 test
 - **8 交叉编译目标全部通过** ✅
-- **4 台真机全 v0.14.1** ✅
+- **4 台真机全 v0.14.2** ✅
 
 ## 会话记录
+
+### 2026-07-30 — v0.14.2：升级系统重构 + 质量修复
+
+**成果**: 升级系统从 Guest 自主升级重构为 Host 主控直推模型；修复 macOS launchctl bootstrap
+errno=5 根因；跨平台路径审计并修复 5 处硬编码；临时文件泄露修复；部署流程自动化改进。
+
+**升级系统重构**:
+- Guest 侧：删除 UpgradeSignal/tryPerformUpgrade/LSA 版本比对/auto_upgrade 门控，新增 handleUpgradeCmd（升级指令接收 + 流式二进制 + 增量 SHA256 + shm 通知 utmmd）
+- Host 侧：删除 checkGitHubVersion/verifyServeDirBinaries/upgradeTcpListener/handleUpgradeConnection/serveUpgradeFile/isValidVersion，新增 cmdUpgrade + ipcUpgrade（查 GuestTable → SOCKS4a 直推）
+- IPC 新增 handleUpgrade：Request.upgrade (0x07) → serve-dir 读取二进制 → Guest 推送
+- CLI 新增 `--upgrade <vm>` 参数，Host 直推模型
+- upgrade_e2e 集成测试：7 场景（正常/哈希不匹配/0 字节/大文件/SOCKS4a/重传/并发）
+- 删除 plan 文件 `floofy-skipping-gem.md`（已完全实现）
+
+**macOS launchctl 修复**:
+- 根因：`launchctl bootout` 重设 disabled flag，导致后续 bootstrap 返回 errno=5
+- 修复：bootout 后显式 `launchctl enable` — installMacOS() 和 start() 两处
+- macvm 验证：`state = running`，`enabled` flag 正确
+
+**跨平台路径审计**:
+- host.zig：3 处 `/opt/utmm` → `svc.canonicalDir()`
+- ipc.zig：1 处 `/opt/utmm` → `svc_mod.canonicalDir()`
+- host.zig cmdUpload：`/opt/utmm/{s}` → `vmRemoteDir()` 查 VM_DEPLOY_TABLE
+- mcp.zig cmdVmUpload：`/opt/utmm/{s}` → `guestDefaultDir(vm)` 平台感知默认路径
+
+**临时文件清理**:
+- dpipe_file.zig：rename 失败 (CrossDevice + 普通) 两路径均 deleteFile
+- guest.zig：新增 cleanupStaleTempFiles() — 启动时扫描 canonicalDir + tempDir，删除 `.utmm-*` 和 `.utmm-upgrade-*`
+
+**VM 维护**:
+- 4 VM 遗留垃圾清理（旧服务名 plist/service unit、temp 文件、日志）
+- Windows VM (windowsvm + winx64) 启用 OpenSSH Server
+- 版本号 bump：ver.txt 0.14.1 → 0.14.2
+
+**Skill 更新**:
+- clean-deploy/SKILL.md：新建裸机部署测试 skill（5 phase：清空→构建→部署→测试→总结）
+- deploy/SKILL.md：Windows SMB 手动复制 → SSH 命令，并行策略更新
+
+**关键决策**:
+- 决策 26：升级系统 Guest 自主 → Host 主控直推
+- 决策 27：复用 upload_result (0x17) 作为升级响应
+- 决策 28：升级 temp 文件用 svc.tempDir()
+- 决策 29：Windows SSH 替代 SMB/RDP
+- 决策 30：mcp.zig guestDefaultDir() VM 名前缀推断平台
+- 决策 31：deploy/clean-deploy SKILL 二进制名含版本号
 
 ### 2026-07-30 — v0.14.1：集成测试重构 + ReleaseSafe 强制 + 临时文件清理修复
 

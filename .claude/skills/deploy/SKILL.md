@@ -90,16 +90,18 @@ sshpass -p 111 scp zig-out/bin/utmm-aarch64-macos-0.14.1 root@192.168.64.4:/opt/
 sshpass -p 111 ssh root@192.168.64.4 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname macvm'
 ```
 
-**Windows Guest（SMB 手动复制）:**
+**Windows Guest:**
 ```bash
-zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
-# macOS 挂载 SMB 共享：
-#   open smb://192.168.65.2/C$/opt/utmm （访达 → 连接服务器）
-#   用户名 Administrator，密码 111
-# 复制 utmm-aarch64-windows.exe → C:\opt\utmm\utmm-new.exe
-# 然后在 Windows 上以管理员身份运行:
-#   C:\opt\utmm\utmm-new.exe --install --hostname windowsvm
+# windowsvm (aarch64)
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-windows-0.14.1.exe Administrator@192.168.65.2:C:/opt/utmm/utmm-new.exe
+sshpass -p 111 ssh Administrator@192.168.65.2 'C:\opt\utmm\utmm-new.exe --install --hostname windowsvm'
+
+# winx64 (x86_64)
+sshpass -p 111 scp zig-out/bin/utmm-x86_64-windows-0.14.1.exe Administrator@192.168.3.108:C:/opt/utmm/utmm-new.exe
+sshpass -p 111 ssh Administrator@192.168.3.108 'C:\opt\utmm\utmm-new.exe --install --hostname winx64'
 ```
+
+> **前提**：Windows VM 需启用 OpenSSH Server（`Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0`）。
 
 > **`--deploy` 命令**（实验性）：理论上 `sudo utmm --deploy [vm]` 可自动完成交叉编译 +
 > SCP + SSH 安装，但需要 sshpass 且实现不稳定，当前推荐手动方式。
@@ -164,9 +166,8 @@ sudo ./zig-out/bin/utmm --upload /tmp/test.txt linuxvm
 部署顺序（Guest 部署可并行）：
 
 1. **先部署 Host** — 停止服务 → 覆盖二进制 → 启动 → `--status` 确认
-2. **然后并行部署 Guest** — linuxvm + macvm 的 scp+ssh 可同时进行
-3. **Windows Guest** — 单独处理（SMB 手动复制，无法脚本化）
-4. **最后验证** — `--status` + `--exec <vm> "echo OK"` 逐个确认
+2. **然后并行部署 Guest** — linuxvm + macvm + windowsvm + winx64 的 scp+ssh 可同时进行
+3. **最后验证** — `--status` + `--exec <vm> "echo OK"` 逐个确认
 
 ## 安全注意事项
 

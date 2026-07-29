@@ -3,7 +3,7 @@
 //! LSA broadcast + node table + /etc/hosts sync (self-contained)
 //!
 //! Binary protocol on UDP :2121 with first-byte dispatch for message type
-//! identification. LSA carries topology and version info for auto-upgrade.
+//! identification. LSA carries topology and version info for display in --status.
 //!
 //! /etc/hosts marker block:
 //!   # UTM-MONITOR-BEGIN

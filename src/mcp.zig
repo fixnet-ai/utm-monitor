@@ -8,10 +8,15 @@
 //! Protocol: newline-delimited JSON, one JSON-RPC object per line.
 //! Logging goes to stderr; JSON-RPC traffic goes to stdout.
 
-const builtin = @import("builtin");
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const ipc_mod = @import("ipc.zig");
+
+/// Guest default upload directory — platform-aware default for remote_path.
+fn guestDefaultDir(vm: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, vm, "win") != null) return "C:\\opt\\utmm";
+    return "/opt/utmm";
+}
 
 /// Maximum JSON-RPC request size (64KB).
 const MAX_REQUEST_SIZE = 65536;
@@ -20,7 +25,7 @@ const MAX_REQUEST_SIZE = 65536;
 const SERVER_INFO = "{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"utmm\",\"version\":\"__VERSION__\"},\"capabilities\":{\"tools\":{}}}";
 
 /// MCP tool definitions (JSON). Single-line for MCP stdio transport.
-const TOOLS_JSON = "[{\"name\":\"vm_status\",\"description\":\"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},{\"name\":\"vm_exec\",\"description\":\"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check vm_status first to see each VM's shell type, then write compatible commands.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)\"}},\"required\":[\"vm\",\"command\"]}},{\"name\":\"vm_ping\",\"description\":\"Ping a Guest over the mesh network to test connectivity and measure RTT. Returns JSON with hostname, MAC address, and rtt_ms.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"}},\"required\":[\"vm\"]}},{\"name\":\"vm_upload\",\"description\":\"Upload a file from the Host to a Guest VM. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"local_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Host filesystem\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Destination path on the Guest (e.g. /opt/utmm/file.txt). Defaults to /opt/utmm/<basename> if omitted.\"}},\"required\":[\"vm\",\"local_path\"]}},{\"name\":\"vm_download\",\"description\":\"Download a file from a Guest VM to the Host. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Guest (e.g. /opt/utmm/core.dump)\"},\"local_path\":{\"type\":\"string\",\"description\":\"Local path on the Host to save the file. Defaults to ./<basename> if omitted.\"}},\"required\":[\"vm\",\"remote_path\"]}}]";
+const TOOLS_JSON = "[{\"name\":\"vm_status\",\"description\":\"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},{\"name\":\"vm_exec\",\"description\":\"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check vm_status first to see each VM's shell type, then write compatible commands.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)\"}},\"required\":[\"vm\",\"command\"]}},{\"name\":\"vm_ping\",\"description\":\"Ping a Guest over the mesh network to test connectivity and measure RTT. Returns JSON with hostname, MAC address, and rtt_ms.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"}},\"required\":[\"vm\"]}},{\"name\":\"vm_upload\",\"description\":\"Upload a file from the Host to a Guest VM. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"local_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Host filesystem\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Destination path on the Guest (e.g. /opt/utmm/file.txt). Defaults to /opt/utmm/<basename> (POSIX) or C:\\\\opt\\\\utmm\\\\<basename> (Windows) if omitted.\"}},\"required\":[\"vm\",\"local_path\"]}},{\"name\":\"vm_download\",\"description\":\"Download a file from a Guest VM to the Host. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Guest (e.g. /opt/utmm/core.dump)\"},\"local_path\":{\"type\":\"string\",\"description\":\"Local path on the Host to save the file. Defaults to ./<basename> if omitted.\"}},\"required\":[\"vm\",\"remote_path\"]}}]";
 
 /// MCP server entry point. Reads JSON-RPC from stdin, writes responses to stdout.
 pub fn run(io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
@@ -204,13 +209,13 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing argument: local_path");
             };
-            // remote_path defaults to /opt/utmm/<basename>
+            // remote_path defaults to <canonical_dir>/<basename> (platform-aware)
             const remote_path = jsonGetString(args.?, "remote_path") orelse blk: {
                 const basename = if (std.mem.lastIndexOfScalar(u8, local_path, '/')) |pos|
                     local_path[pos + 1 ..]
                 else
                     local_path;
-                break :blk try std.fmt.allocPrint(gpa, "/opt/utmm/{s}", .{basename});
+                break :blk try std.fmt.allocPrint(gpa, "{s}/{s}", .{ guestDefaultDir(vm), basename });
             };
             const result = handleVmUpload(gpa, io, port, vm, local_path, remote_path) catch |err| {
                 if (is_notification) return gpa.dupe(u8, "");
