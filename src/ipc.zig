@@ -913,7 +913,7 @@ fn handleUpgrade(
     };
     defer tcp_conn.deinit();
 
-    const cmd_id = std.fmt.allocPrint(gpa, "up-{d}", .{@intFromEnum(std.Io.Timestamp.now(io, .real).nanoseconds)}) catch {
+    const cmd_id = std.fmt.allocPrint(gpa, "up-{d}", .{@as(u64, @intCast(std.Io.Timestamp.now(io, .real).nanoseconds))}) catch {
         sendError(ipc_conn, "AllocFailed");
         return;
     };
