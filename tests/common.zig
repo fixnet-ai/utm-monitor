@@ -428,3 +428,52 @@ pub fn isWindows() bool {
 pub fn isMacOS() bool {
     return builtin.os.tag == .macos;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 非阻塞 Socket 工具 — 用于测试 EAGAIN/WouldBlock 代码路径
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Windows ioctlsocket 的 FIONBIO 命令码。
+const FIONBIO: c_int = 0x8004667e;
+
+/// 将 socket 设置为非阻塞模式。
+/// POSIX: fcntl(O_NONBLOCK), Windows: ioctlsocket(FIONBIO)。
+pub fn setNonBlocking(fd: socket_t) !void {
+    if (builtin.os.tag == .windows) {
+        ensureWinsock2();
+        var mode: std.os.windows.ULONG = 1;
+        const rc = ws2_ioctlsocket(fd, FIONBIO, &mode);
+        if (rc != 0) return error.SetNonBlockingFailed;
+    } else {
+        const NONBLOCK = if (builtin.os.tag == .linux) @as(c_int, 0x800) else @as(c_int, 0x4);
+        const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+        if (flags < 0) return error.FcntlFailed;
+        _ = std.c.fcntl(fd, std.posix.F.SETFL, flags | NONBLOCK);
+    }
+}
+
+/// 创建一对已连接的非阻塞 socket，用于测试 EAGAIN 重试逻辑。
+/// 写入一端的立即可用数据从另一端可以无阻塞读取。
+/// 但读空 socket 时会返回 EAGAIN/WouldBlock，这正是我们测试的目标。
+pub fn makeNonBlockingPair() !struct { a: socket_t, b: socket_t } {
+    const pair = try makePair();
+    errdefer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+    setNonBlocking(pair.a) catch |err| {
+        sockClose(pair.a);
+        sockClose(pair.b);
+        return err;
+    };
+    setNonBlocking(pair.b) catch |err| {
+        sockClose(pair.a);
+        sockClose(pair.b);
+        return err;
+    };
+    return pair;
+}
+
+// Windows ioctlsocket 声明
+extern "ws2_32" fn ioctlsocket(s: std.posix.socket_t, cmd: c_int, argp: *std.os.windows.ULONG) callconv(.winapi) c_int;
+const ws2_ioctlsocket = ioctlsocket;

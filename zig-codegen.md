@@ -64,6 +64,45 @@ const msg = socket.receiveTimeout(io, &buf, timeout) catch |err| {
 - `Socket.send()` — `(s, io, dest, data)` where `dest` is `*const IpAddress`.
 - `Socket.receiveTimeout()` — `(s, io, buffer, timeout)` returns `ReceiveTimeoutError!IncomingMessage` with `.from` and `.data`.
 
+### `std.Io.net` on macOS: kqueue Makes Sockets Non-Blocking
+
+**This is the root cause behind the EAGAIN bug (v0.13.2).**
+
+`std.Io.net.Server.listen()` uses kqueue on macOS, which requires all managed
+file descriptors to be non-blocking. The fd returned by `Server.accept()` inherits
+this property. Even though we never call `fcntl(O_NONBLOCK)`, the accepted TCP
+socket IS non-blocking at the kernel level.
+
+Our TCP I/O model is intentionally split across platforms:
+- **Socket setup**: `std.Io.net` (listen/accept/connect) — convenience, reuse_address, FD_CLOEXEC
+- **Data I/O**: raw `system.read()`/`system.write()` wrapped by `sockRead()`/`sockWrite()`
+
+This split exists because Zig 0.16.0 uses AFD kernel handles on Windows, which
+are incompatible with Winsock2 `recv`/`send`. Cross-platform consistency requires
+raw syscalls for data I/O on all platforms.
+
+The consequence: `system.read()` on a kqueue-managed fd returns EAGAIN when no
+data is available. `sockRead()`/`sockWrite()` bridge this gap with EAGAIN/EINTR
+retry loops, presenting blocking I/O semantics to callers.
+
+```zig
+// ✅ CORRECT — all TCP data I/O must go through sockRead/sockWrite
+const n = sockRead(fd, buf.ptr, buf.len);
+const n = sockWrite(fd, data.ptr, data.len);
+
+// ❌ WRONG — raw system.read/write on sockets from Io.net
+const n = system.read(fd, buf.ptr, buf.len);   // EAGAIN on macOS!
+const n = system.write(fd, data.ptr, data.len); // EAGAIN on macOS!
+```
+
+**Enforcement rule**: NO raw `system.read()` or `system.write()` on any socket fd
+in the entire codebase. Always use `tcp.sockRead()` / `tcp.sockWrite()`. This
+applies to `tcp.zig`, `ipc.zig`, `guest.zig`, `host.zig`, and any new code.
+
+**Why UDP doesn't have this problem**: LSA reads use `socket.receiveTimeout()`
+(Zig's `std.Io.net.Socket` method), which is part of the Io abstraction and
+handles kqueue semantics internally.
+
 ### ConnectOptions Must Specify mode
 
 ```zig

@@ -26,21 +26,38 @@ const dpipe = @import("dpipe.zig");
 const socket_t = std.posix.socket_t;
 
 /// Write data to a socket. POSIX: write(), Windows: send().
-/// Returns number of bytes written, or -1 on error (caller must check).
+/// Returns number of bytes written, or -1 on fatal error.
+/// Retries on EAGAIN (non-blocking socket, buffer full) and
+/// EINTR (interrupted by signal).
 pub inline fn sockWrite(fd: socket_t, buf: [*]const u8, len: usize) isize {
     if (builtin.os.tag == .windows) {
         return ws2_send(fd, buf, @intCast(len), 0);
     }
-    return system.write(fd, buf, len);
+    while (true) {
+        const n = system.write(fd, buf, len);
+        if (n >= 0) return n;
+        const e = std.posix.errno(n);
+        if (e == .AGAIN or e == .INTR) continue;
+        return n;
+    }
 }
 
 /// Read data from a socket. POSIX: read(), Windows: recv().
-/// Returns number of bytes read, 0 on EOF, or -1 on error (caller must check).
+/// Returns number of bytes read, 0 on EOF, or -1 on fatal error.
+/// Retries on EAGAIN (non-blocking socket, no data yet) and
+/// EINTR (interrupted by signal) — caller sees blocking read behavior
+/// regardless of the socket's non-blocking flag.
 pub inline fn sockRead(fd: socket_t, buf: [*]u8, len: usize) isize {
     if (builtin.os.tag == .windows) {
         return ws2_recv(fd, buf, @intCast(len), 0);
     }
-    return system.read(fd, buf, len);
+    while (true) {
+        const n = system.read(fd, buf, len);
+        if (n >= 0) return n;
+        const e = std.posix.errno(n);
+        if (e == .AGAIN or e == .INTR) continue;
+        return n;
+    }
 }
 
 /// Check if a sockRead/sockWrite return value indicates an error (-1).
@@ -232,6 +249,32 @@ pub fn makePair() !struct { a: socket_t, b: socket_t } {
     if (std.c.socketpair(1, 1, 0, &fds) != 0) return error.SocketPairFailed;
     return .{ .a = fds[0], .b = fds[1] };
 }
+
+/// 将 socket 设为非阻塞模式，用于测试 EAGAIN 重试路径。
+/// POSIX: fcntl(F_SETFL, O_NONBLOCK)。Windows: ioctlsocket(FIONBIO)。
+pub fn makeNonBlocking(fd: socket_t) void {
+    if (builtin.os.tag == .windows) {
+        ensureWinsock2();
+        var mode: std.os.windows.ULONG = 1;
+        _ = ws2_ioctlsocket(fd, FIONBIO, &mode);
+    } else {
+        const NONBLOCK = if (builtin.os.tag == .linux) @as(c_int, 0x800) else @as(c_int, 0x4);
+        const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+        _ = std.c.fcntl(fd, std.posix.F.SETFL, flags | NONBLOCK);
+    }
+}
+
+/// 创建一对非阻塞已连接 socket，用于测试 EAGAIN/WouldBlock 路径。
+pub fn makeNonBlockingPair() !struct { a: socket_t, b: socket_t } {
+    const pair = try makePair();
+    makeNonBlocking(pair.a);
+    makeNonBlocking(pair.b);
+    return .{ .a = pair.a, .b = pair.b };
+}
+
+const FIONBIO: c_int = 0x8004667e;
+extern "ws2_32" fn ioctlsocket(s: std.posix.socket_t, cmd: c_int, argp: *std.os.windows.ULONG) callconv(.winapi) c_int;
+const ws2_ioctlsocket = ioctlsocket;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Frame Protocol
@@ -1103,4 +1146,135 @@ test "Connection recv detects close" {
     var rbuf: [256]u8 = undefined;
     if (conn.recv(&rbuf)) |_| {} else |_| {}
     try std.testing.expect(!conn.isAlive());
+}
+
+// ── EAGAIN 回归测试 — 非阻塞 socket 上的 I/O 重试 ──
+// 这些测试验证 sockRead/sockWrite 在非阻塞 socket 上正确重试 EAGAIN，
+// 以及依赖它们的 sendFrame/recvFrame/recvExact/socks4CheckAndReply 等。
+// Bug 背景：macOS kqueue 非阻塞 socket 上 system.read() 返回 EAGAIN 时，
+// 旧代码直接当作错误处理，导致连接挂起/数据丢失。
+
+test "sockRead retries on EAGAIN (non-blocking socket, delayed write)" {
+    const pair = try makeNonBlockingPair();
+    defer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+
+    // 在另一个线程延迟 50ms 后写入数据，模拟非阻塞 socket 上数据分包到达。
+    // sockRead 在数据到达前会遇到 EAGAIN，必须重试直到数据可用。
+    const writer_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: std.posix.socket_t) void {
+            var t: std.Io.Threaded = .init_single_threaded;
+            std.Io.sleep(t.io(), std.Io.Duration.fromMilliseconds(50), .real) catch {};
+            _ = sockWrite(fd, "EAGAIN_OK", 9);
+        }
+    }.run, .{pair.b});
+    defer writer_thread.join();
+
+    var buf: [9]u8 = undefined;
+    var off: usize = 0;
+    while (off < buf.len) {
+        const n = sockRead(pair.a, buf[off..].ptr, buf.len - off);
+        if (n < 0) {
+            // fatal error on test socket — should not happen
+            @panic("sockRead returned error on non-blocking test socket");
+        }
+        if (n == 0) {
+            // writer hasn't sent yet, should retry on EAGAIN internally
+            continue;
+        }
+        off += @intCast(n);
+    }
+    try std.testing.expectEqualStrings("EAGAIN_OK", buf[0..]);
+}
+
+test "sendFrame/recvFrame on non-blocking socket" {
+    const allocator = std.testing.allocator;
+    const pair = try makeNonBlockingPair();
+    defer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+
+    // 用线程发送避免 socketpair 缓冲区满导致的死锁
+    const msg = "non-blocking frame test";
+    const sender = try std.Thread.spawn(.{}, sendInThread, .{SendArgs{ .fd = pair.a, .data = msg }});
+    defer sender.join();
+
+    const received = try recvFrame(allocator, pair.b);
+    defer allocator.free(received);
+    try std.testing.expectEqualStrings(msg, received);
+}
+
+test "recvExact handles partial reads on non-blocking socket" {
+    const pair = try makeNonBlockingPair();
+    defer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+
+    // 写入 16 字节数据
+    const data = "0123456789ABCDEF";
+    _ = sockWrite(pair.b, data, data.len);
+
+    // recvExact 在非阻塞 socket 上可能遇到部分读取（sockRead 返回 < buf.len），
+    // 它必须循环直到读满。EAGAIN 重试在 sockRead 内部处理。
+    var buf: [16]u8 = undefined;
+    const n = try recvExact(pair.a, buf[0..]);
+    try std.testing.expectEqual(data.len, n);
+    try std.testing.expectEqualStrings(data, buf[0..n]);
+}
+
+test "socks4CheckAndReply on non-blocking socket" {
+    const pair = try makeNonBlockingPair();
+    defer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+
+    // 客户端线程发送 SOCKS4a 请求（hostname="nbself"）
+    const client_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: std.posix.socket_t) void {
+            const req = [_]u8{
+                SOCKS_VER, SOCKS_CMD_CONNECT,
+                0x08, 0x49, // PORT = 2121
+                0x00, 0x00, 0x00, 0x01, // SOCKS4a
+                0, // USERID = ""
+                'n',  'b',  's',  'e',  'l',  'f',  0, // HOSTNAME
+            };
+            _ = sockWrite(fd, &req, req.len);
+
+            var resp: [8]u8 = [_]u8{0} ** 8;
+            var off: usize = 0;
+            while (off < 8) {
+                const n = sockRead(fd, resp[off..].ptr, resp.len - off);
+                if (n == 0) break;
+                off += @intCast(n);
+            }
+            std.debug.assert(resp[0] == 0x00);
+            std.debug.assert(resp[1] == SOCKS_REP_OK);
+        }
+    }.run, .{pair.b});
+    defer client_thread.join();
+
+    // 服务端在非阻塞 socket 上完成 SOCKS4a 握手
+    const accepted = try socks4CheckAndReply(pair.a, "nbself");
+    try std.testing.expect(accepted);
+}
+
+test "readUntilNullBuf on non-blocking socket" {
+    const pair = try makeNonBlockingPair();
+    defer {
+        sockClose(pair.a);
+        sockClose(pair.b);
+    }
+
+    // 写入 "hello\0" 到非阻塞 socket
+    const data = [_]u8{ 'h', 'e', 'l', 'l', 'o', 0 };
+    _ = sockWrite(pair.b, &data, data.len);
+
+    var buf: [64]u8 = undefined;
+    const result = try readUntilNullBuf(pair.a, buf[0..]);
+    try std.testing.expectEqualStrings("hello", result);
 }

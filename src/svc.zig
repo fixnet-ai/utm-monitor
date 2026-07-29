@@ -698,17 +698,40 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
 /// Start utmmd directly as a background process (no launchd/systemd/SCM).
 /// Fallback for environments where the service manager is unavailable or
 /// restricted (e.g. UTM macOS VMs with SIP-enforced launchd limits).
-fn startDirect(alloc: std.mem.Allocator, io: std.Io, role: ServiceRole) !void {
+fn startDirect(alloc: std.mem.Allocator, io: std.Io, role: ServiceRole, extra_args: []const []const u8) !void {
     const svc_path = canonicalSvcPath();
     const role_str = if (role == .host) "host" else "guest";
-    // Append & so the shell backgrounds the process and returns immediately.
-    // runCmd waits for the shell to exit, which with & happens instantly.
-    const cmd = try std.fmt.allocPrint(alloc, "{s} --role {s} > /var/log/utmmd.log 2>&1 &", .{ svc_path, role_str });
+
+    // Build command with role + all extra args (--hostname, --port, etc.).
+    // These are the same args embedded in the service config; startDirect
+    // bypasses the service manager so we must pass them explicitly.
+    var cmd_buf: std.ArrayListAligned(u8, null) = .empty;
+    defer cmd_buf.deinit(alloc);
+    try cmd_buf.appendSlice(alloc, svc_path);
+    try cmd_buf.appendSlice(alloc, " --role ");
+    try cmd_buf.appendSlice(alloc, role_str);
+    for (extra_args) |a| {
+        try cmd_buf.append(alloc, ' ');
+        try cmd_buf.appendSlice(alloc, a);
+    }
+    try cmd_buf.appendSlice(alloc, " > /var/log/utmmd.log 2>&1 &");
+    const cmd = try cmd_buf.toOwnedSlice(alloc);
     defer alloc.free(cmd);
     std.log.info("[svc] starting utmmd directly: {s}", .{cmd});
 
     if (builtin.os.tag == .windows) {
-        _ = runCmd(alloc, io, &[_][]const u8{ "cmd", "/c", "start", "/b", svc_path, "--role", role_str });
+        // Windows: cmd /c start /b <path> --role <role> <extra_args...>
+        var win_args = std.ArrayListAligned([]const u8, null).init(alloc);
+        defer win_args.deinit();
+        try win_args.append(alloc, "cmd");
+        try win_args.append(alloc, "/c");
+        try win_args.append(alloc, "start");
+        try win_args.append(alloc, "/b");
+        try win_args.append(alloc, svc_path);
+        try win_args.append(alloc, "--role");
+        try win_args.append(alloc, role_str);
+        for (extra_args) |a| try win_args.append(alloc, a);
+        _ = runCmd(alloc, io, win_args.items);
     } else {
         _ = runCmd(alloc, io, &[_][]const u8{ "sh", "-c", cmd });
     }
@@ -717,7 +740,7 @@ fn startDirect(alloc: std.mem.Allocator, io: std.Io, role: ServiceRole) !void {
 }
 
 /// Start the service.
-pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
+pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) !void {
     const name = svcName();
     switch (builtin.os.tag) {
         .macos => {
@@ -774,7 +797,7 @@ pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
                     // Common in UTM macOS VMs where bootstrap may fail with
                     // "5: Input/output error" due to shm creation issues.
                     std.log.warn("[svc] bootstrap failed, starting utmmd directly...", .{});
-                    try startDirect(alloc, io, role);
+                    try startDirect(alloc, io, role, extra_args);
                     launched_via_launchd = false;
                 }
             }
@@ -1287,7 +1310,7 @@ fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole,
     // or manual intervention) can bring the service back. Deleting everything
     // leaves the VM unreachable with no recovery path — especially critical
     // for auto-upgrade where the old Guest process was already killed.
-    start(io, alloc, role) catch |err| {
+    start(io, alloc, role, extra_args) catch |err| {
         std.log.err("[svc] start failed for {s}: {} — binary and config preserved, not rolling back", .{ name, err });
         fail.err("forceInstall/start", err);
     };

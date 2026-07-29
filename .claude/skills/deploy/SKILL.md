@@ -1,6 +1,6 @@
 # Deploy Skill — UTM Monitor 一键部署
 
-本 skill 封装了 UTM Monitor 的完整部署流程：编译 → 部署 Host → 部署 Guest → 验证。
+本 skill 封装了 UTM Monitor 的完整部署流程：编译 → 测试 → 部署 Host → 部署 Guest → 验证。
 
 ## 触发条件
 
@@ -9,6 +9,7 @@
 - "上线" / "发布"
 - "更新所有 VM"
 - "升级到 vX.Y.Z"
+- "交叉编译并部署"
 
 ## VM 配置表
 
@@ -21,118 +22,144 @@
 
 ## 部署流程
 
-### 1. 版本准备
+### 1. 编译 + 测试（必须先通过）
 
 ```bash
-# 读取当前版本
-grep "pub const VERSION" src/protocol.zig
+# 单元测试
+zig build test                    # 必须 0 失败
 
-# 如果尚未 bump，询问用户目标版本号
-# 更新 src/protocol.zig 和 build.zig.zon
+# 集成测试（本机架构）
+zig build test-integration         # 必须 0 失败
+
+# 本机编译 (macOS Host, Debug 用于开发)
+zig build                          # → zig-out/bin/utmm (Mach-O aarch64)
 ```
 
-### 2. 编译 + 测试
+> **重要**：集成测试二进制 `zig-out/bin/integration_test` 的架构取决于最后编译的 target。
+> 交叉编译后会被覆盖为 ELF 格式（无法在 macOS 运行）。部署到 VM 前如需重跑集成测试，
+> 先执行 `zig build test-integration` 恢复 Mach-O 格式。
+
+### 2. 交叉编译 Guest 二进制
 
 ```bash
-# 1. 运行全部测试
-zig build test
-
-# 2. 本地编译 (macOS Host)
-zig build
-
-# 3. 验证二进制类型
-file zig-out/bin/utmm
-# 必须输出: Mach-O 64-bit executable arm64
+# ReleaseSafe — 所有部署必须使用
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl    # → zig-out/bin/utmm-aarch64-linux
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos         # → zig-out/bin/utmm-aarch64-macos
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows       # → zig-out/bin/utmm-aarch64-windows.exe
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows        # → zig-out/bin/utmm-x86_64-windows.exe
 ```
 
-### 3. 部署 Host (本机 macOS)
+> **仅需 `utmm` 二进制**：`utmm` 内嵌了 `utmmd.bin`（监督进程），`--install` 会自动
+> 提取 `utmmd` 到 `/opt/utmm/utmmd`。部署只需复制一个文件。
+
+### 3. 部署 Host（本机 macOS）
+
+服务名为 `com.utmmd`（单一 utmmd 监督进程，角色通过 `--role host|guest` 区分）。
 
 ```bash
-# 停止旧服务 → 覆盖二进制 → 启动
-sudo launchctl bootout system/com.utmm.host 2>/dev/null || true
+# 停止旧服务
+sudo launchctl bootout system/com.utmmd 2>/dev/null || true
+
+# 覆盖二进制
 sudo cp zig-out/bin/utmm /opt/utmm/utmm
-# 如果 bootstrap 失败 (errno=5)，用 kickstart：
-sudo launchctl kickstart -k system/com.utmm.host 2>/dev/null || \
-  sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmm.host.plist
 
-# 等待 Host 启动
-sleep 3
+# 启动服务（kickstart 优先，失败则 bootstrap）
+sudo launchctl kickstart -k system/com.utmmd 2>/dev/null || \
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmmd.plist
+
+# 等待 LSA 稳定（Guest 需要 10-15s 重新注册）
+sleep 5
 sudo ./zig-out/bin/utmm --status
 ```
 
+> **注意**：首次安装（无 plist 文件）需用 `sudo utmm --host --install` 生成 plist。
+
 ### 4. 部署 Guest
 
-**推荐方式 — 使用 `--deploy` 命令（需要 sshpass）：**
-
+**Linux Guest:**
 ```bash
-# 部署所有 Guest (交叉编译 + SCP + SSH install)
-sudo ./zig-out/bin/utmm --deploy
-
-# 部署单个 Guest
-sudo ./zig-out/bin/utmm --deploy linuxvm
-```
-
-`--deploy` 命令自动完成：交叉编译 → SCP 上传 → SSH 安装 → 输出成功/失败摘要。
-
-**手动方式（不支持 `--deploy` 时使用）：**
-
-Linux Guest:
-```bash
-zig build -Dtarget=aarch64-linux-musl
 sshpass -p 111 scp zig-out/bin/utmm-aarch64-linux root@192.168.64.2:/opt/utmm/utmm-new
 sshpass -p 111 ssh root@192.168.64.2 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname linuxvm'
 ```
 
-macOS Guest:
+**macOS Guest:**
 ```bash
-zig build -Dtarget=aarch64-macos
 sshpass -p 111 scp zig-out/bin/utmm-aarch64-macos root@192.168.64.4:/opt/utmm/utmm-new
 sshpass -p 111 ssh root@192.168.64.4 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname macvm'
 ```
 
-Windows Guest (手动):
+**Windows Guest（SMB 手动复制）:**
 ```bash
-zig build -Dtarget=aarch64-windows
-# 复制 utmm-aarch64-windows.exe → C:\opt\utmm\utmm-new.exe（通过 SMB 共享或其他方式）
-# 然后运行: C:\opt\utmm\utmm-new.exe --install --hostname windowsvm
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
+# macOS 挂载 SMB 共享：
+#   open smb://192.168.65.2/C$/opt/utmm （访达 → 连接服务器）
+#   用户名 Administrator，密码 111
+# 复制 utmm-aarch64-windows.exe → C:\opt\utmm\utmm-new.exe
+# 然后在 Windows 上以管理员身份运行:
+#   C:\opt\utmm\utmm-new.exe --install --hostname windowsvm
 ```
 
-### 5. 验证
+> **`--deploy` 命令**（实验性）：理论上 `sudo utmm --deploy [vm]` 可自动完成交叉编译 +
+> SCP + SSH 安装，但需要 sshpass 且实现不稳定，当前推荐手动方式。
+
+### 5. 验证部署
 
 ```bash
-# 健康检查全部 Guest
-sudo ./zig-out/bin/utmm --verify
-# 期望输出: 全部 ✓ (status, ping, exec)
+# 1. 健康检查 — 确认所有 Guest 在线
+sudo ./zig-out/bin/utmm --status
+# 期望：所有 Guest 显示 online + 版本号
+
+# 2. 执行测试 — 每个 VM 跑一条简单命令
+sudo ./zig-out/bin/utmm --exec macvm "echo OK"
+sudo ./zig-out/bin/utmm --exec linuxvm "echo OK"
+sudo ./zig-out/bin/utmm --exec windowsvm "echo OK"
+sudo ./zig-out/bin/utmm --exec winx64 "echo OK"
+# 期望：全部返回 OK + exit_code=0
+
+# 3. 上传测试（已知可能失败 — 见下方已知问题）
+sudo ./zig-out/bin/utmm --upload /tmp/test.txt linuxvm
 ```
 
-### 6. 清理 + 更新规划文件
+### 6. 收尾
 
 部署确认后：
 - 更新 `task_plan.md` — 标记当前阶段完成
 - 更新 `progress.md` — 记录部署结果
-- 更新 `findings.md` — 记录任何新发现
+- 更新 `findings.md` — 记录新发现的问题
 - Git commit + push
 
 ## macOS 常见问题处理
 
 | 问题 | 症状 | 解决 |
 |------|------|------|
-| **bootstrap errno=5** | `launchctl bootstrap` 返回错误 5 | `sudo launchctl kickstart -k system/com.utmm.host` |
-| **bootstrap errno=2** | 服务未加载 | `sudo launchctl enable system/com.utmm.host && sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmm.host.plist` |
+| **bootstrap errno=5** | `launchctl bootstrap` 返回错误 5 | `sudo launchctl kickstart -k system/com.utmmd` |
+| **bootstrap errno=2** | 服务未加载 | `sudo launchctl enable system/com.utmmd && sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmmd.plist` |
 | **codesign 失效** | `kill -9` 后进程被系统终止 | `sudo codesign --force --sign - /opt/utmm/utmm` |
-| **Guest 不响应** | `GuestNotConnected` | 等待 10-15s 让 KCP 隧道重建，KCP 5s keepalive × 3 = 15s 死亡检测 |
+| **Guest 不响应** | `GuestNotConnected` | 等待 10-15s 让 LSA 重新注册（LSA 2s 广播 × 3 次超时 = 6s + 连接建立时间） |
+| **--install 卡 5 秒** | `waitOldProcesses` 等待超时 | 正常现象 — 固定 5s 超时等旧进程退出，不是 hang |
+
+## 已知问题
+
+| # | 问题 | 影响 | 状态 |
+|---|------|------|------|
+| 1 | **Upload GuestNotFound** | `--upload` 报 GuestNotFound 但 `--exec` 同 VM 正常 | 待修复 — ipc.zig `handleConnection` 字节级 upload header 解析 bug |
+| 2 | **5s 安装超时** | 每次 `--install` 都会等满 5s（`waitOldProcesses` 超时） | 已知延迟，非阻塞问题 |
+| 3 | **集成测试二进制覆盖** | `zig build -Dtarget=...` 交叉编译后 `integration_test` 变 ELF | 部署本地前重跑 `zig build test-integration` |
+| 4 | **二进制 hash 不一致** | 自复制安装修改二进制（嵌入规范路径），hash 与编译产物不同 | 正常行为，勿用 hash 对比验证部署 |
+| 5 | **`--deploy` 不可靠** | 依赖 sshpass 且实现不完整 | 使用手动 scp + ssh 方式 |
 
 ## 并行部署策略
 
-`--deploy` 命令自动处理并行部署，一次命令部署全部 Guest。如需手动控制，按以下顺序：
+部署顺序（Guest 部署可并行）：
 
-1. **先部署 Host**（版本 bump → 本地 `--install`）— Guest 通过 LSA 检测新版本
-2. **然后部署 Guest**（`--deploy` 或手动 scp + ssh）— 交叉编译可并行
-3. **最后验证**（`--verify`）— 确认全部通过
+1. **先部署 Host** — 停止服务 → 覆盖二进制 → 启动 → `--status` 确认
+2. **然后并行部署 Guest** — linuxvm + macvm 的 scp+ssh 可同时进行
+3. **Windows Guest** — 单独处理（SMB 手动复制，无法脚本化）
+4. **最后验证** — `--status` + `--exec <vm> "echo OK"` 逐个确认
 
 ## 安全注意事项
 
 - 密码硬编码在代码中仅用于本地 UTM 测试环境
 - `sshpass` 会暴露密码在进程列表中，仅在受信网络中使用
 - 生产环境应使用 SSH key 认证
-- 部署后验证 `--verify` 确保所有 Guest 在线且响应正常
+- 部署后必须逐个验证 VM 可执行命令

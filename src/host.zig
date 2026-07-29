@@ -59,7 +59,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 
     // --host (via --svc): start Host daemon
     if (cli.is_host) {
-        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown);
+        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown, cli.hostname);
         return;
     }
 }
@@ -461,6 +461,7 @@ fn startHost(
     serve_dir: ?[]const u8,
     peer_mesh: ?[]const u8,
     shutdown: ?*std.atomic.Value(bool),
+    hostname: ?[]const u8,
 ) !void {
     const sd = serve_dir orelse "/opt/utmm";
     std.debug.print("[host] Host daemon starting (mesh UDP :{d})\n", .{mesh_port});
@@ -478,7 +479,7 @@ fn startHost(
 
     start_mesh: {
         // Get Host's own system info for node identification
-        const host_info = guest.getSystemInfo(block_io, gpa) catch |err| {
+        var host_info = guest.getSystemInfo(block_io, gpa) catch |err| {
             std.log.err("[host] getSystemInfo failed: {}", .{err});
             break :start_mesh;
         };
@@ -489,6 +490,14 @@ fn startHost(
             // host_info.target is a compile-time constant from zigTarget()
             gpa.free(host_info.iface_name);
             gpa.free(host_info.shell);
+        }
+
+        // Override hostname if --hostname was specified (applies to host mode too)
+        if (hostname) |n| {
+            // getSystemInfo allocated hostname, but defer will free the original;
+            // free old first, then allocate the override so defer frees the new one.
+            gpa.free(host_info.hostname);
+            host_info.hostname = try gpa.dupe(u8, n);
         }
 
         // Collect broadcast addresses

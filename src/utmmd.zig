@@ -56,6 +56,9 @@ fn parseArgs(alloc: std.mem.Allocator, args: []const [:0]const u8) !CliArgs {
             if (i >= args.len) fail.msg("utmmd", "--role requires guest or host", .{});
             if (std.mem.eql(u8, args[i], "host")) {
                 cli.role = .host;
+                // utmm 需要 --host 标志才能以 host 模式运行
+                const host_arg = try alloc.dupe(u8, "--host");
+                try utmm_args_list.append(alloc, host_arg);
             } else if (std.mem.eql(u8, args[i], "guest")) {
                 cli.role = .guest;
             } else {
@@ -667,4 +670,84 @@ fn winServiceRun(io: std.Io, gpa: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
         std.log.err("[utmmd] SCM dispatch failed: {d}", .{@intFromEnum(std.os.windows.GetLastError())});
         return error.ServiceDispatchFailed;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests — 参数转发回归测试
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Bug 背景：utmmd 解析 --role host 后未将 --host 标志转发给 utmm 子进程，
+// utmm 默认为 guest 模式，Host daemon 的 IPC server 不启动，CLI 命令挂起。
+
+fn testParseArgs(alloc: std.mem.Allocator, args: []const [:0]const u8) !CliArgs {
+    return parseArgs(alloc, args);
+}
+
+test "parseArgs: --role host adds --host flag" {
+    const alloc = std.testing.allocator;
+    const argv = [_][:0]const u8{ "utmmd", "--role", "host", "--hostname", "testbox" };
+    const cli = try testParseArgs(alloc, &argv);
+    defer freeCliArgs(alloc, cli);
+
+    try std.testing.expect(cli.role == .host);
+
+    // 验证 --host 被添加到 utmm_args 中
+    var found_host = false;
+    var found_hostname = false;
+    for (cli.utmm_args) |a| {
+        if (std.mem.eql(u8, a, "--host")) found_host = true;
+        if (std.mem.eql(u8, a, "--hostname")) found_hostname = true;
+    }
+    try std.testing.expect(found_host);
+    try std.testing.expect(found_hostname);
+}
+
+test "parseArgs: --role guest does NOT add --host flag" {
+    const alloc = std.testing.allocator;
+    const argv = [_][:0]const u8{ "utmmd", "--role", "guest", "--hostname", "testbox" };
+    const cli = try testParseArgs(alloc, &argv);
+    defer freeCliArgs(alloc, cli);
+
+    try std.testing.expect(cli.role == .guest);
+
+    // 验证 --host 没有被添加到 utmm_args 中
+    for (cli.utmm_args) |a| {
+        try std.testing.expect(!std.mem.eql(u8, a, "--host"));
+    }
+}
+
+test "parseArgs: only --role and --svc are consumed, others forwarded" {
+    const alloc = std.testing.allocator;
+    const argv = [_][:0]const u8{ "utmmd", "--role", "guest", "--svc", "--port", "2122", "--log-file", "/tmp/utmm.log" };
+    const cli = try testParseArgs(alloc, &argv);
+    defer freeCliArgs(alloc, cli);
+
+    try std.testing.expect(cli.role == .guest);
+    try std.testing.expect(cli.is_svc);
+
+    // 验证其他参数被透传
+    var found_port = false;
+    var found_log = false;
+    for (cli.utmm_args) |a| {
+        if (std.mem.eql(u8, a, "--port")) found_port = true;
+        if (std.mem.eql(u8, a, "--log-file")) found_log = true;
+    }
+    try std.testing.expect(found_port);
+    try std.testing.expect(found_log);
+}
+
+test "parseArgs: --role host with extra args correctly includes --host" {
+    const alloc = std.testing.allocator;
+    const argv = [_][:0]const u8{ "utmmd", "--svc", "--role", "host", "--hostname", "myhost", "--port", "2121" };
+    const cli = try testParseArgs(alloc, &argv);
+    defer freeCliArgs(alloc, cli);
+
+    try std.testing.expect(cli.role == .host);
+    try std.testing.expect(cli.is_svc);
+
+    var found_host = false;
+    for (cli.utmm_args) |a| {
+        if (std.mem.eql(u8, a, "--host")) found_host = true;
+    }
+    try std.testing.expect(found_host);
 }

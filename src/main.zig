@@ -434,7 +434,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (!was_running) {
             // 3b path: utmmd unchanged, just start the service (skip reinstall)
             std.log.info("[main] utmmd unchanged, starting service directly", .{});
-            svc.start(init.io, init.gpa, .host) catch |err| {
+            svc.start(init.io, init.gpa, .host, extra_args.items) catch |err| {
                 std.log.err("[main] start failed: {} — falling back to ensure", .{err});
                 extractUtmmdIfMissing(init.io, init.gpa) catch {};
                 svc.ensure(init.io, init.gpa, .host, extra_args.items);
@@ -487,7 +487,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (!was_running) {
             // 3b path: utmmd unchanged, just start the service (skip reinstall)
             std.log.info("[main] utmmd unchanged, starting guest service directly", .{});
-            svc.start(init.io, init.gpa, .guest) catch |err| {
+            svc.start(init.io, init.gpa, .guest, extra_args_guest.items) catch |err| {
                 std.log.err("[main] start failed: {} — falling back to ensure", .{err});
                 extractUtmmdIfMissing(init.io, init.gpa) catch {};
                 svc.ensure(init.io, init.gpa, .guest, extra_args_guest.items);
