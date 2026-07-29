@@ -950,7 +950,9 @@ fn handleUpload(
 }
 
 /// 处理 upgrade_cmd（Host→Guest 直推升级）：接收二进制流 → SHA256 校验 → 通知 utmmd。
-/// 流程与 upload 类似，但写入固定路径 /opt/utmm/utmm.new 并信号通知 utmmd。
+///
+/// 使用随机临时文件名（如 /opt/utmm/.utmm-<random>）避免并发冲突，
+/// 校验通过后由 utmmd 负责原子 rename 到最终路径。
 fn handleUpgradeCmd(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -964,15 +966,18 @@ fn handleUpgradeCmd(
 
     std.log.info("[guest] upgrade: cmd_id={s} target={s} size={d}", .{ cmd.cmd_id, cmd.target, cmd.file_size });
 
-    const tmp_path = if (@import("builtin").os.tag == .windows)
-        "C:\\opt\\utmm\\utmm.new.exe"
-    else
-        "/opt/utmm/utmm.new";
+    // 生成随机临时文件名，避免并发升级冲突
+    var rand_bytes: [8]u8 = undefined;
+    io.random(&rand_bytes);
+    var temp_hex: [16]u8 = undefined;
+    for (rand_bytes, 0..) |b, j| {
+        temp_hex[j * 2] = "0123456789abcdef"[b >> 4];
+        temp_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}/.utmm-{s}", .{ svc.tempDir(), &temp_hex });
+    defer allocator.free(tmp_path);
 
-    // 清理可能残留的旧 temp 文件
-    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-
-    // 创建 temp 文件
+    // 创建临时文件（随机文件名，无需预先清理）
     var write_buf: [65536]u8 = undefined;
     const tmp_file = if (@import("builtin").os.tag != .windows)
         std.Io.Dir.cwd().createFile(io, tmp_path, .{ .permissions = @enumFromInt(0o755) })
@@ -1044,7 +1049,7 @@ fn handleUpgradeCmd(
     defer allocator.free(resp);
     _ = conn.sendAndFlush(resp, 0) catch {};
 
-    // 通过 shm 通知 utmmd 执行升级
+    // 通过 shm 通知 utmmd 执行升级（utmmd 负责 rename temp → 最终路径）
     if (shm.open()) |h| {
         defer shm.detach(h);
         h.cmd = @intFromEnum(shm.Cmd.upgrade);

@@ -213,6 +213,19 @@ pub fn canonicalDir() []const u8 {
     return "/opt/utmm";
 }
 
+/// Return the system temporary directory.
+/// On POSIX: $TMPDIR or /tmp.
+/// On Windows: %TEMP%, %TMP%, or C:\Windows\Temp.
+pub fn tempDir() [:0]const u8 {
+    if (builtin.os.tag == .windows) {
+        if (std.c.getenv("TEMP")) |td| return std.mem.span(td);
+        if (std.c.getenv("TMP")) |td| return std.mem.span(td);
+        return "C:\\Windows\\Temp";
+    }
+    if (std.c.getenv("TMPDIR")) |td| return std.mem.span(td);
+    return "/tmp";
+}
+
 /// Return the canonical install path for utmmd (the supervisor daemon).
 pub fn canonicalSvcPath() []const u8 {
     if (builtin.os.tag == .windows) return CANONICAL_SVC_PATH_WIN;
