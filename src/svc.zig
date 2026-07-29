@@ -325,7 +325,7 @@ pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) bool 
             // launchctl load (legacy) may have started it without launchd
             // tracking the PID properly. pgrep catches this case.
             if (runCmdCheckExit(alloc, io, &[_][]const u8{
-                "pgrep", "-f", "/opt/utmm/utmmd",
+                "pgrep", "-f", CANONICAL_SVC_PATH_POSIX,
             })) {
                 break :blk true;
             }
@@ -474,9 +474,12 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
     // Without bootout, bootstrap fails with errno=5/17 when the service
     // label is already registered — even if not running.
     bootoutMacOS(alloc, io, name);
-    // Bootstrap (also starts via RunAtLoad=true). Best-effort: bootstrap
-    // may fail due to launchd throttle (EIO on recently-booted-out labels)
-    // or transient errors. start() handles the full retry + fallback chain.
+    // Enable again after bootout — bootout re-sets the disabled flag on
+    // the label, causing subsequent bootstrap to fail with errno=5
+    // (Input/output error). This is the root cause of the recurring
+    // "bootstrap errno=5" issue on macOS, especially after repeated
+    // install/upgrade cycles.
+    _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
     _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path });
 
     std.log.info("[svc] macOS service {s} installed", .{name});
@@ -762,6 +765,8 @@ pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args
                 std.log.info("[svc] kickstart failed, re-registering service...", .{});
                 _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
                 bootoutMacOS(alloc, io, name);
+                // Enable after bootout — bootout re-sets the disabled flag.
+                _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
                 std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
 
                 const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name});
@@ -794,8 +799,9 @@ pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args
                 }
                 if (!bootstrapped) {
                     // launchd bootstrap unavailable — start utmmd directly.
-                    // Common in UTM macOS VMs where bootstrap may fail with
-                    // "5: Input/output error" due to shm creation issues.
+                    // Most commonly caused by the service being in "disabled"
+                    // state in launchd (errno=5 Input/output error). The
+                    // startDirect fallback bypasses launchd entirely.
                     std.log.warn("[svc] bootstrap failed, starting utmmd directly...", .{});
                     try startDirect(alloc, io, role, extra_args);
                     launched_via_launchd = false;

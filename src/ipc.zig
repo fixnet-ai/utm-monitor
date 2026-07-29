@@ -862,7 +862,8 @@ fn handleUpgrade(
     };
 
     var path_buf: [512]u8 = undefined;
-    const serve_path = std.fmt.bufPrint(&path_buf, "/opt/utmm/{s}", .{filename}) catch {
+    const svc_mod = @import("svc.zig");
+    const serve_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ svc_mod.canonicalDir(), filename }) catch {
         sendError(ipc_conn, "PathTooLong");
         return;
     };

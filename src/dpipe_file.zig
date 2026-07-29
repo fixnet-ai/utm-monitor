@@ -187,11 +187,15 @@ fn writeFileCloseFn(ctx: *anyopaque) void {
     cwd.rename(self.temp_path, cwd, self.dest_path, self.io) catch |e| {
         if (e == error.CrossDevice) {
             // 跨文件系统：先 copy 再删除 temp
-            copyAndDelete(self.io, self.temp_path, self.dest_path) catch |ce| {
+            if (copyAndDelete(self.io, self.temp_path, self.dest_path)) {
+                // copy+delete 成功，temp 已删除；目标已创建
+            } else |ce| {
                 std.log.err("[dpipe-file] cross-device copy failed: {} temp={s} dest={s}", .{ ce, self.temp_path, self.dest_path });
-            };
+                std.Io.Dir.cwd().deleteFile(self.io, self.temp_path) catch {};
+            }
         } else {
             std.log.err("[dpipe-file] rename failed: {} temp={s} dest={s}", .{ e, self.temp_path, self.dest_path });
+            std.Io.Dir.cwd().deleteFile(self.io, self.temp_path) catch {};
         }
     };
 }

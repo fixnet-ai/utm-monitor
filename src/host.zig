@@ -42,7 +42,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
     const serve_dir = if (cli.serve_dir) |sd| sd else blk: {
         const exe_path = try std.process.executablePathAlloc(block_io, gpa);
         defer gpa.free(exe_path);
-        const dir = std.fs.path.dirname(exe_path) orelse "/opt/utmm";
+        const dir = std.fs.path.dirname(exe_path) orelse svc.canonicalDir();
         break :blk try gpa.dupe(u8, dir);
     };
     defer if (cli.serve_dir == null) gpa.free(serve_dir);
@@ -275,7 +275,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         std.debug.print("[deploy]   -> {s}\n", .{bin_path});
 
         // Copy to serve-dir for future --upgrade use
-        const serve_copy_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ "/opt/utmm", bin_name });
+        const serve_copy_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ svc.canonicalDir(), bin_name });
         defer gpa.free(serve_copy_path);
         std.Io.Dir.cwd().copyFile(bin_path, std.Io.Dir.cwd(), serve_copy_path, io, .{}) catch |err| {
             std.log.warn("[deploy] copy to serve-dir failed: {}", .{err});
@@ -463,7 +463,7 @@ fn startHost(
     shutdown: ?*std.atomic.Value(bool),
     hostname: ?[]const u8,
 ) !void {
-    const sd = serve_dir orelse "/opt/utmm";
+    const sd = serve_dir orelse svc.canonicalDir();
     std.debug.print("[host] Host daemon starting (mesh UDP :{d})\n", .{mesh_port});
     std.debug.print("[host] Serve dir: {s}\n", .{sd});
 

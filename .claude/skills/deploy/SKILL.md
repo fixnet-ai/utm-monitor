@@ -43,10 +43,12 @@ zig build                          # → zig-out/bin/utmm (Mach-O aarch64)
 
 ```bash
 # ReleaseSafe — 所有部署必须使用
-zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl    # → zig-out/bin/utmm-aarch64-linux
-zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos         # → zig-out/bin/utmm-aarch64-macos
-zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows       # → zig-out/bin/utmm-aarch64-windows.exe
-zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows        # → zig-out/bin/utmm-x86_64-windows.exe
+# 注意：产物含版本号后缀，如 utmm-aarch64-linux-0.14.1
+#       用 `cat src/ver.txt` 获取当前版本号
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl    # → zig-out/bin/utmm-aarch64-linux-<ver>
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos         # → zig-out/bin/utmm-aarch64-macos-<ver>
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows       # → zig-out/bin/utmm-aarch64-windows-<ver>.exe
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows        # → zig-out/bin/utmm-x86_64-windows-<ver>.exe
 ```
 
 > **仅需 `utmm` 二进制**：`utmm` 内嵌了 `utmmd.bin`（监督进程），`--install` 会自动
@@ -78,13 +80,13 @@ sudo ./zig-out/bin/utmm --status
 
 **Linux Guest:**
 ```bash
-sshpass -p 111 scp zig-out/bin/utmm-aarch64-linux root@192.168.64.2:/opt/utmm/utmm-new
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-linux-0.14.1 root@192.168.64.2:/opt/utmm/utmm-new
 sshpass -p 111 ssh root@192.168.64.2 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname linuxvm'
 ```
 
 **macOS Guest:**
 ```bash
-sshpass -p 111 scp zig-out/bin/utmm-aarch64-macos root@192.168.64.4:/opt/utmm/utmm-new
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-macos-0.14.1 root@192.168.64.4:/opt/utmm/utmm-new
 sshpass -p 111 ssh root@192.168.64.4 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname macvm'
 ```
 
@@ -128,11 +130,21 @@ sudo ./zig-out/bin/utmm --upload /tmp/test.txt linuxvm
 - 更新 `findings.md` — 记录新发现的问题
 - Git commit + push
 
+## 跨平台路径注意事项
+
+| 场景 | POSIX | Windows | 注意 |
+|------|-------|---------|------|
+| Guest 安装目录 | `/opt/utmm` | `C:\opt\utmm` | svc.canonicalDir() 自动适配 |
+| IPC socket | `/var/run/utmm.sock` | `\\.\pipe\utmm` | ipc.zig 自动适配 |
+| 服务配置 | `/Library/LaunchDaemons/com.utmmd.plist` | `sc.exe create` | svc.zig 按平台分支 |
+| SSH 传 Windows 路径 | `C:\opt\utmm\file.txt` | 单引号包裹 | bash 吞噬反斜杠 |
+| 交叉编译产物 | `utmm-aarch64-macos-0.14.1` | `utmm-aarch64-windows-0.14.1.exe` | 含版本号后缀 |
+
 ## macOS 常见问题处理
 
 | 问题 | 症状 | 解决 |
 |------|------|------|
-| **bootstrap errno=5** | `launchctl bootstrap` 返回错误 5 | `sudo launchctl kickstart -k system/com.utmmd` |
+| **bootstrap errno=5** | `launchctl bootstrap` 返回错误 5 | v0.14.2 已修复：bootout 重设 disabled flag → enable after bootout。旧版可手动 `launchctl enable system/com.utmmd` 后再 bootstrap |
 | **bootstrap errno=2** | 服务未加载 | `sudo launchctl enable system/com.utmmd && sudo launchctl bootstrap system /Library/LaunchDaemons/com.utmmd.plist` |
 | **codesign 失效** | `kill -9` 后进程被系统终止 | `sudo codesign --force --sign - /opt/utmm/utmm` |
 | **Guest 不响应** | `GuestNotConnected` | 等待 10-15s 让 LSA 重新注册（LSA 2s 广播 × 3 次超时 = 6s + 连接建立时间） |
@@ -142,11 +154,10 @@ sudo ./zig-out/bin/utmm --upload /tmp/test.txt linuxvm
 
 | # | 问题 | 影响 | 状态 |
 |---|------|------|------|
-| 1 | **Upload GuestNotFound** | `--upload` 报 GuestNotFound 但 `--exec` 同 VM 正常 | 待修复 — ipc.zig `handleConnection` 字节级 upload header 解析 bug |
-| 2 | **5s 安装超时** | 每次 `--install` 都会等满 5s（`waitOldProcesses` 超时） | 已知延迟，非阻塞问题 |
-| 3 | **集成测试二进制覆盖** | `zig build -Dtarget=...` 交叉编译后 `integration_test` 变 ELF | 部署本地前重跑 `zig build test-integration` |
-| 4 | **二进制 hash 不一致** | 自复制安装修改二进制（嵌入规范路径），hash 与编译产物不同 | 正常行为，勿用 hash 对比验证部署 |
-| 5 | **`--deploy` 不可靠** | 依赖 sshpass 且实现不完整 | 使用手动 scp + ssh 方式 |
+| 1 | **5s 安装超时** | 每次 `--install` 都会等满 5s（`waitOldProcesses` 超时） | 已知延迟，非阻塞问题 |
+| 2 | **集成测试二进制覆盖** | `zig build -Dtarget=...` 交叉编译后 `integration_test` 变 ELF | 部署本地前重跑 `zig build test-integration` |
+| 3 | **二进制 hash 不一致** | 自复制安装修改二进制（嵌入规范路径），hash 与编译产物不同 | 正常行为，勿用 hash 对比验证部署 |
+| 4 | **`--deploy` 不可靠** | 依赖 sshpass 且实现不完整 | 使用手动 scp + ssh 方式 |
 
 ## 并行部署策略
 

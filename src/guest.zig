@@ -1114,7 +1114,37 @@ pub fn guestRun(init: std.process.Init, cli: @import("main.zig").CliArgs) !void 
 /// shutdown is an optional atomic flag — when set (Windows service stop), the
 /// mesh session loop exits cleanly so the SCM receives STOPPED instead of a
 /// broken pipe error.
+/// 启动时清理残留的临时文件（升级/上传失败遗留）。
+/// 扫描 canonicalDir 和 tempDir，删除 `.utmm-*` 和 `.utmm-upgrade-*` 前缀的文件。
+fn cleanupStaleTempFiles(io: std.Io, alloc: std.mem.Allocator) void {
+    const dirs = [_][]const u8{ svc.canonicalDir(), svc.tempDir() };
+    const prefixes = [_][]const u8{ ".utmm-upgrade-", ".utmm-" };
+
+    for (dirs) |dir_path| {
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch continue;
+        defer dir.close(io);
+
+        var walker = dir.walk(alloc) catch continue;
+        defer walker.deinit();
+
+        while (walker.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const name = entry.basename;
+            for (prefixes) |prefix| {
+                if (std.mem.startsWith(u8, name, prefix)) {
+                    dir.deleteFile(io, name) catch {};
+                    std.log.debug("[guest] cleanup: removed stale {s}/{s}", .{ dir_path, name });
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
+    // 启动时清理残留 temp 文件（升级失败/Crash 遗留）
+    cleanupStaleTempFiles(io, gpa);
+
     // Collect system information (sync, uses blocking Io for process.run etc.)
     var sysinfo = try getSystemInfo(io, gpa);
     defer {
