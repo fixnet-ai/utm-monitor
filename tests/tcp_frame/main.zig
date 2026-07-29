@@ -227,7 +227,7 @@ pub fn main(init: std.process.Init) !void {
         };
         defer listener.deinit();
 
-        const bound_port = listener.socket.address.getPort();
+        const bound_port = listener.server.socket.address.getPort();
         tc.expectTrue(bound_port > 0, "端口已绑定");
 
         // 验证客户端可以连接到该端口

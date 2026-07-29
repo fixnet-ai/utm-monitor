@@ -489,7 +489,7 @@ pub fn duplexPipe(fd: std.posix.socket_t, allocator: std.mem.Allocator) !dpipe.D
 
 /// TCP 监听器 — 绑定端口并 accept 连接。
 pub const TcpListener = struct {
-    socket: std.Io.net.Socket,
+    server: std.Io.net.Server,
     io: std.Io,
 
     pub fn init(io: std.Io, port: u16) !TcpListener {
@@ -497,29 +497,43 @@ pub const TcpListener = struct {
             std.log.err("[tcp] bind addr parse failed: {}", .{err});
             return error.BindFailed;
         };
-        const sock = addr.bind(io, .{ .mode = .stream }) catch |err| {
-            std.log.err("[tcp] TCP bind :{d} failed: {}", .{ port, err });
+        const server = addr.listen(io, .{
+            .reuse_address = true,
+            .kernel_backlog = 128,
+            .mode = .stream,
+        }) catch |err| {
+            std.log.err("[tcp] TCP listen :{d} failed: {}", .{ port, err });
             return error.BindFailed;
         };
-        _ = sockListen(sock.handle, 128);
-        return TcpListener{ .socket = sock, .io = io };
+
+        // 在监听 socket 上设置 FD_CLOEXEC — 防止 dpipe_shell fork 的子进程
+        // 继承此 socket。若孤儿子进程持有端口，utmm 重启时会出现 AddressInUse
+        // 崩溃循环。
+        if (builtin.os.tag != .windows) {
+            const fd = server.socket.handle;
+            const flags = std.c.fcntl(fd, @intCast(std.posix.F.GETFD), @as(c_int, 0));
+            _ = std.c.fcntl(fd, @intCast(std.posix.F.SETFD), @as(c_int, flags | std.posix.FD_CLOEXEC));
+        }
+
+        return TcpListener{ .server = server, .io = io };
     }
 
     pub fn deinit(self: *TcpListener) void {
-        self.socket.close(self.io);
+        self.server.deinit(self.io);
     }
 
     /// 接受一个 TCP 连接，完成 SOCKS4a 握手，返回 Connection。
     /// 只有目标是 self_hostname 才接受，否则拒绝并返回错误。
     pub fn accept(self: *TcpListener, self_hostname: []const u8) !Connection {
         while (true) {
-            const fd = sockAccept(self.socket.handle) catch |err| {
+            const stream = self.server.accept(self.io) catch |err| {
                 if (err == error.WouldBlock) {
                     std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
                     continue;
                 }
-                return err;
+                return error.AcceptFailed;
             };
+            const fd = stream.socket.handle;
 
             // SOCKS4a 握手
             const req = socks4Accept(fd) catch |err| {

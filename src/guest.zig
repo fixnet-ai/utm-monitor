@@ -1055,7 +1055,7 @@ fn handleUpload(
         _ = conn.sendAndFlush(resp, 0) catch {};
         return;
     };
-    defer file_pipe.close();
+    // defer file_pipe.close(); — 在 line 1078 显式关闭，避免双 close
 
     // 从 TCP 直接读取原始字节（无帧协议）→ 写入 file_pipe
     var buf: [65536]u8 = undefined;
