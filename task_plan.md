@@ -1,13 +1,13 @@
-# Task Plan: v0.13.0 — 分层架构重构
+# Task Plan: v0.13.0+ — 分层架构重构
 
-## 状态：全部完成 ✅
+## 状态：持续迭代中 🔄
 
-**最新版本**: v0.13.1 — SOCKS4a 栈悬垂指针修复 + 跨平台 socket I/O 完善
+**最新版本**: v0.14.1 — Integration test restructuring + ReleaseSafe enforcement + temp file cleanup fixes
 
 - **分支**: `refac/layered-arch`
-- **源文件**: 20 → 17（10 删除 + 1 新增 testlib.zig）
-- **测试**: 155 执行 / 146 唯一测试（新增 5 个 tcp.zig 测试）+ 45 集成测试场景（9 套件），全部通过
-- **真机验证**: linuxvm + windowsvm + macvm exec/upload/download 全通过
+- **源文件**: 17 src + 10 test（9 集成测试 flat file + 1 common）
+- **测试**: 146 唯一单元测试 + 40 集成测试场景（8 套件），全部通过
+- **真机验证**: linuxvm + windowsvm + macvm + winx64 — 4 台全 v0.14.1 ✅
 - **设计文档**: `refac.md`
 
 ## 架构概述
@@ -175,6 +175,36 @@ src/
 | 54 | 新增 socks4CheckAndReply × 2 + readUntilNullBuf × 3 单元测试 | ✅ |
 | 55 | 更新 tcp_frame 集成测试适配新 API | ✅ |
 
+### Phase 10: v0.14.1 — 集成测试重构 + ReleaseSafe 强制 + 临时文件清理修复 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 56 | 集成测试重构：8 独立可执行文件 → 单入口 flat file（`tests/integration_test.zig`）| ✅ |
+| 57 | 统一 DebugAllocator + TestRunner + 内存泄漏检测 | ✅ |
+| 58 | 9 个集成测试文件从子目录迁移到 flat `pub fn test_xxx()` 签名 | ✅ |
+| 59 | 修复 `_ = io` pointless discard（test_tcp_frame.zig Zig 0.16.0 编译错误）| ✅ |
+| 60 | 修复 x86_64-linux-musl Debug 80MB 二进制（`.data.rel.ro` = 20MB → ReleaseSafe 11MB）| ✅ |
+| 61 | ReleaseSafe 强制：release.sh + CI workflow + CLAUDE.md 全部使用 `-Doptimize=ReleaseSafe` | ✅ |
+| 62 | 临时文件清理审计：dpipe_file.zig writeFile errdefer 清理 temp 文件 + guest.zig 双 close 修复 | ✅ |
+| 63 | 8 交叉编译目标 ReleaseSafe 构建 + 二进制尺寸验证 | ✅ |
+| 64 | 4 台真机部署：linuxvm/macvm/windowsvm/winx64 全 v0.14.1 + 烟雾测试 | ✅ |
+| 65 | 更新 task_plan.md + progress.md + CLAUDE.md | ✅ |
+
+**集成测试重构详情**：
+- 8 个旧目录删除：`tests/tcp_frame/`, `tests/lsa_routing/`, `tests/dpipe_relay/`, `tests/svc_install/`, `tests/exec_e2e/`, `tests/upload_e2e/`, `tests/download_e2e/`, `tests/upgrade_e2e/`
+- 9 个新 flat file 创建：`tests/common.zig`, `tests/integration_test.zig`, `tests/test_tcp_frame.zig`, `tests/test_lsa_routing.zig`, `tests/test_dpipe_relay.zig`, `tests/test_svc_install.zig`, `tests/test_exec_e2e.zig`, `tests/test_upload_e2e.zig`, `tests/test_download_e2e.zig`, `tests/test_upgrade_e2e.zig`
+- `build.zig` 简化：8 个独立 executable → 1 个 `integration_test` executable + `test-integration` step
+- 40 测试场景全部通过，0 失败，0 泄漏
+
+**Bug 修复详情**：
+1. dpipe_file.zig writeFile errdefer：`createFile()` 成功后 `allocator.create(WriteFileCtx)` 失败 → 只 close 不 delete → temp 文件泄露。修复：errdefer 增加 `deleteFile` 调用
+2. guest.zig handleUpgradeCmd：`defer file.close(io)` + 显式 `file.close(io)` → 双 close。修复：移除 defer
+
+**x86_64 二进制尺寸根因**：
+- x86_64-elf Debug 模式 `.data.rel.ro` 段 = 20.3MB（relocation data for read-only data, stack traces, lazy symbol resolution）
+- aarch64 无此段（Mach-O/ELF 均无）
+- ReleaseSafe 消除此段：x86_64-linux-musl 从 80MB → 11MB
+
 ## 关键决策记录（续）
 
 | # | 决策 | 理由 |
@@ -187,3 +217,5 @@ src/
 | 21 | `readUntilNull` → `readUntilNullBuf(fd, buf)` | 缓冲区由调用者提供，消除栈悬垂指针。macOS aarch64 ABI 导致 `std.mem.eql` 覆盖旧栈帧 |
 | 22 | `socks4Accept` 改为接受 allocator | 返回的 hostname 堆分配，调用者负责释放。消除 socks4Accept 自身的悬垂指针 |
 | 23 | 新增 `socks4CheckAndReply` + `readUntilNullBuf` 测试 | 之前关键路径零测试覆盖；两个函数都是 bug 高发区 |
+| 24 | 集成测试从独立可执行文件改为单入口 flat file | 统一 leak detection + 简化 build.zig + 零独立 main.zig 样板 |
+| 25 | ReleaseSafe 强制所有发布构建 | Debug x86_64 80MB → ReleaseSafe 11MB；所有 release 路径统一使用 `-Doptimize=ReleaseSafe` |

@@ -1,12 +1,4 @@
 //! Upload 端到端集成测试 — TCP loopback 上验证完整 upload 协议流程
-//!
-//! 验证场景：
-//! 1. 小文件上传 + SHA256 验证
-//! 2. 上传结果（exit_code）回传
-//! 3. 零字节文件上传
-//! 4. 二进制文件上传
-//!
-//! Guest 模拟器接收 upload_cmd 帧 → 读取原始文件字节 → 验证 SHA256 → 发送 upload_result
 
 const std = @import("std");
 const lib = @import("testlib");
@@ -33,7 +25,6 @@ fn guestUploadSimulator(
         common.sockClose(cli_fd);
     }
 
-    // 步骤 1: 接收 upload_cmd 帧
     const cmd_frame = tcp.recvFrame(allocator, cli_fd) catch return;
     defer allocator.free(cmd_frame);
 
@@ -41,7 +32,6 @@ fn guestUploadSimulator(
 
     const cmd = protocol.parseUploadCmd(cmd_frame[1..]) orelse return;
 
-    // 步骤 2: 读取原始文件数据（file_size 字节）
     var received: std.ArrayList(u8) = .empty;
     defer received.deinit(allocator);
 
@@ -55,18 +45,15 @@ fn guestUploadSimulator(
         remaining -= @intCast(n);
     }
 
-    // 步骤 3: 验证 SHA256
     var sha: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(received.items, &sha, .{});
     const expected_hash = cmd.file_hash;
     for (sha, 0..) |b, i| {
-        if (b != expected_hash[i]) return; // SHA256 不匹配
+        if (b != expected_hash[i]) return;
     }
 
-    // 步骤 4: 验证内容
     if (!std.mem.eql(u8, expected_data, received.items)) return;
 
-    // 步骤 5: 发送 upload_result
     const result_frame = protocol.buildUploadResult(allocator, cmd.cmd_id, exit_code) catch return;
     defer allocator.free(result_frame);
     tcp.sendFrame(cli_fd, result_frame) catch return;
@@ -74,31 +61,13 @@ fn guestUploadSimulator(
     result_ok.store(true, .release);
 }
 
-/// 计算文件数据的 SHA256
 fn computeSha256(data: []const u8) ![32]u8 {
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &hash, .{});
     return hash;
 }
 
-pub fn main(init: std.process.Init) !void {
-    _ = init;
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.io();
-
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer {
-        const leaked = gpa.deinit();
-        if (leaked == .leak) @panic("内存泄漏");
-    }
-    const alloc = gpa.allocator();
-
-    var runner = common.TestRunner{};
-    defer {
-        const all_pass = runner.summary();
-        if (!all_pass) std.process.exit(1);
-    }
-
+pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestRunner) !void {
     // ── 场景 1: 小文件上传 ──
     {
         var tc = runner.case("upload: 小文件上传 + SHA256 验证");
@@ -120,7 +89,6 @@ pub fn main(init: std.process.Init) !void {
             io, alloc, listener.fd, test_data, 0, &guest_done, &guest_ok,
         });
 
-        // Host 端：连接 + 发送 upload_cmd + 原始文件数据 + 接收结果
         const stream = std.Io.net.IpAddress.parse("127.0.0.1", listener.port) catch |err| {
             tc.expect(false, "解析地址失败: {}", .{err});
             tc.deinit();
@@ -134,15 +102,12 @@ pub fn main(init: std.process.Init) !void {
         defer conn.close(io);
         const fd = conn.socket.handle;
 
-        // 发送 upload_cmd 帧
         const cmd_frame = try protocol.buildUploadCmd(alloc, "up-1", "/tmp/test.txt", @intCast(test_data.len), &file_hash);
         defer alloc.free(cmd_frame);
         try tcp.sendFrame(fd, cmd_frame);
 
-        // 直接发送原始文件数据
-        _ = common.sockWrite(fd,test_data.ptr, test_data.len);
+        _ = common.sockWrite(fd, test_data.ptr, test_data.len);
 
-        // 接收 upload_result
         const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
             tc.deinit();
@@ -201,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
         const cmd_frame = try protocol.buildUploadCmd(alloc, "up-2", "/tmp/err.txt", @intCast(test_data.len), &file_hash);
         defer alloc.free(cmd_frame);
         try tcp.sendFrame(fd, cmd_frame);
-        _ = common.sockWrite(fd,test_data.ptr, test_data.len);
+        _ = common.sockWrite(fd, test_data.ptr, test_data.len);
 
         const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
@@ -259,7 +224,6 @@ pub fn main(init: std.process.Init) !void {
         const cmd_frame = try protocol.buildUploadCmd(alloc, "up-3", "/tmp/empty.txt", 0, &file_hash);
         defer alloc.free(cmd_frame);
         try tcp.sendFrame(fd, cmd_frame);
-        // 零字节文件：不发送任何数据
 
         const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
@@ -281,7 +245,7 @@ pub fn main(init: std.process.Init) !void {
         tc.deinit();
     }
 
-    // ── 场景 4: 二进制文件上传（含 null 字节）──
+    // ── 场景 4: 二进制文件上传 ──
     {
         var tc = runner.case("upload: 二进制文件");
 
@@ -295,7 +259,6 @@ pub fn main(init: std.process.Init) !void {
         var guest_ok = std.atomic.Value(bool).init(false);
         var guest_done = std.atomic.Value(bool).init(false);
 
-        // 生成包含所有字节值 0x00-0xFF 的二进制数据
         var binary_data: [256]u8 = undefined;
         for (&binary_data, 0..) |*b, i| {
             b.* = @intCast(i);
@@ -322,7 +285,7 @@ pub fn main(init: std.process.Init) !void {
         const cmd_frame = try protocol.buildUploadCmd(alloc, "up-4", "/tmp/binary.bin", 256, &file_hash);
         defer alloc.free(cmd_frame);
         try tcp.sendFrame(fd, cmd_frame);
-        _ = common.sockWrite(fd,&binary_data, binary_data.len);
+        _ = common.sockWrite(fd, &binary_data, binary_data.len);
 
         const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});

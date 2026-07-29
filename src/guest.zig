@@ -990,7 +990,6 @@ fn handleUpgradeCmd(
         _ = conn.sendAndFlush(resp, 0) catch {};
         return;
     };
-    defer file.close(io);
 
     // 增量 SHA256 计算
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1011,6 +1010,7 @@ fn handleUpgradeCmd(
         remaining -= @intCast(nr);
     }
 
+    // 关闭文件（之后仅通过路径操作，避免 double-close）
     file.close(io);
 
     if (remaining != 0) {

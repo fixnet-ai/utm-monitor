@@ -92,6 +92,14 @@ if ! zig build test --summary all 2>&1; then
     echo "Continuing with build anyway..."
 fi
 
+echo ""
+echo "==> Running integration tests..."
+if ! zig build test-integration 2>&1; then
+    echo ""
+    echo "ERROR: Integration tests failed. Fix before releasing."
+    exit 1
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Build all 8 cross-compilation targets
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -191,43 +191,28 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const integration_tests = [_]struct { name: []const u8, path: []const u8, needs_utmmd: bool }{
-        .{ .name = "tcp_frame_int", .path = "tests/tcp_frame/main.zig", .needs_utmmd = false },
-        .{ .name = "lsa_routing_int", .path = "tests/lsa_routing/main.zig", .needs_utmmd = false },
-        .{ .name = "dpipe_relay_int", .path = "tests/dpipe_relay/main.zig", .needs_utmmd = false },
-        .{ .name = "svc_install_int", .path = "tests/svc_install/main.zig", .needs_utmmd = true },
-        .{ .name = "exec_e2e_int", .path = "tests/exec_e2e/main.zig", .needs_utmmd = false },
-        .{ .name = "upload_e2e_int", .path = "tests/upload_e2e/main.zig", .needs_utmmd = false },
-        .{ .name = "download_e2e_int", .path = "tests/download_e2e/main.zig", .needs_utmmd = false },
-        .{ .name = "upgrade_e2e_int", .path = "tests/upgrade_e2e/main.zig", .needs_utmmd = false },
-    };
-
+    // ── Integration tests ──
+    // Single executable with flat test files, shared setup/teardown, memory leak check.
+    // Each module defines pub fn test_xxx(io, alloc, runner) — no main() needed.
     const test_integration_step = b.step("test-integration", "Run integration tests");
 
-    for (integration_tests) |t| {
-        const test_exe = b.addExecutable(.{
-            .name = t.name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(t.path),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            }),
-        });
-        test_exe.root_module.addImport("testlib", testlib_mod);
-        test_exe.root_module.addImport("common", test_common_mod);
+    const integration_test = b.addExecutable(.{
+        .name = "integration_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    integration_test.root_module.addImport("testlib", testlib_mod);
+    integration_test.root_module.addImport("common", test_common_mod);
 
-        if (target.result.os.tag == .windows) {
-            test_exe.root_module.linkSystemLibrary("ws2_32", .{});
-        }
-        if (t.needs_utmmd) {
-            test_exe.step.dependOn(&hash_utmmd.step);
-        }
-
-        const run_test = b.addRunArtifact(test_exe);
-        run_test.step.dependOn(&test_exe.step);
-        test_integration_step.dependOn(&run_test.step);
-
-        b.installArtifact(test_exe);
+    if (target.result.os.tag == .windows) {
+        integration_test.root_module.linkSystemLibrary("ws2_32", .{});
     }
+
+    const run_integration = b.addRunArtifact(integration_test);
+    test_integration_step.dependOn(&run_integration.step);
+    b.installArtifact(integration_test);
 }

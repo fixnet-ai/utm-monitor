@@ -324,25 +324,35 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
 ## Build & Run
 
 ### Build
+
+**开发构建（Debug，快速编译，含调试符号）：**
 ```bash
 zig build                    # Native build → zig-out/bin/utmm
-zig build -Dtarget=aarch64-linux-musl    # → zig-out/bin/utmm-aarch64-linux
-zig build -Dtarget=x86_64-linux-musl     # → zig-out/bin/utmm-x86_64-linux
-zig build -Dtarget=x86-linux-musl        # → zig-out/bin/utmm-x86-linux
-zig build -Dtarget=aarch64-macos         # → zig-out/bin/utmm-aarch64-macos
-zig build -Dtarget=x86_64-macos          # → zig-out/bin/utmm-x86_64-macos
-zig build -Dtarget=aarch64-windows       # → zig-out/bin/utmm-aarch64-windows.exe
-zig build -Dtarget=x86_64-windows        # → zig-out/bin/utmm-x86_64-windows.exe
-zig build -Dtarget=x86-windows-gnu       # → zig-out/bin/utmm-x86-windows.exe
 ```
 
+**发布构建（ReleaseSafe — 所有部署、CI、release 必须使用）：**
+```bash
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl    # → zig-out/bin/utmm-aarch64-linux
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl     # → zig-out/bin/utmm-x86_64-linux
+zig build -Doptimize=ReleaseSafe -Dtarget=x86-linux-musl        # → zig-out/bin/utmm-x86-linux
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos         # → zig-out/bin/utmm-aarch64-macos
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos          # → zig-out/bin/utmm-x86_64-macos
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows       # → zig-out/bin/utmm-aarch64-windows.exe
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows        # → zig-out/bin/utmm-x86_64-windows.exe
+zig build -Doptimize=ReleaseSafe -Dtarget=x86-windows-gnu       # → zig-out/bin/utmm-x86-windows.exe
+```
+
+> **重要**：Debug 构建仅用于开发调试。部署、发布、CI 必须使用 `-Doptimize=ReleaseSafe`。
+> x86_64-linux-musl Debug 模式 `.data.rel.ro` 段膨胀至 20MB+，整体 80MB+；ReleaseSafe 后降至 11MB。
+>
 > 32-bit x86-linux-musl builds and passes tests. 32-bit x86-windows uses
 > `x86-windows-gnu` to avoid MinGW `_system@4` linker warning that Zig
 > promotes to error.
 
 ### Tests
 ```bash
-zig build test
+zig build test               # Unit tests (all src/*.zig)
+zig build test-integration   # Integration tests (single binary, flat test files)
 ```
 
 ### Guest Runtime
@@ -447,7 +457,7 @@ After release, use `utmm --deploy` to compile and copy new binaries to the
 serve-dir (`/opt/utmm/`). Then use `utmm --upgrade <vm>` to push upgrades
 to individual Guest VMs via the Host-initiated push model.
 
-## Project File Structure (17 files)
+## Project File Structure (17 src files + 10 test files)
 
 ```
 src/
@@ -468,10 +478,24 @@ src/
 ├── utmmd.zig          Supervisor daemon: utmm lifecycle, crash recovery, shared memory IPC
 ├── shm.zig            Shared memory protocol: utmmd↔utmm IPC, heartbeat, commands
 └── testlib.zig        Test re-export module (protocol + tcp + dpipe + lsa + host + svc + fail + config)
+
+tests/
+├── common.zig              Test infrastructure (TestRunner, TestCase, socket I/O, TempDir)
+├── integration_test.zig    Single entry point: setup → all tests → leak check → summary
+├── test_tcp_frame.zig      TCP 帧协议 + SOCKS4a 集成测试 (pub fn test_tcp_frame)
+├── test_lsa_routing.zig    LSA + Dijkstra 集成测试 (pub fn test_lsa_routing)
+├── test_dpipe_relay.zig    DuplexPipe relay 集成测试 (pub fn test_dpipe_relay)
+├── test_svc_install.zig    安装/卸载集成测试 (pub fn test_svc_install)
+├── test_exec_e2e.zig       Exec 端到端集成测试 (pub fn test_exec_e2e)
+├── test_upload_e2e.zig     Upload 端到端集成测试 (pub fn test_upload_e2e)
+├── test_download_e2e.zig   Download 端到端集成测试 (pub fn test_download_e2e)
+└── test_upgrade_e2e.zig    Upgrade 端到端集成测试 (pub fn test_upgrade_e2e)
 ```
 
 > v0.13.0: 20 → 17 files (10 deleted, 1 new testlib.zig). Deleted: state.zig, broadcast.zig, mesh.zig, hosts_file.zig,
 > tunproto.zig, tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig.
+> v0.13.2: Integration tests restructured from 8 separate executables to single binary with flat `pub fn test_xxx()` modules.
+> Run via `zig build test-integration`.
 
 ## Code of Conduct / Guidelines
 

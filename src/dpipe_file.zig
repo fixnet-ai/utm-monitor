@@ -110,6 +110,7 @@ pub fn writeFile(
     const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
     errdefer {
         file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
         allocator.free(temp_path);
     }
 

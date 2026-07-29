@@ -1,11 +1,4 @@
 //! TCP 帧协议 + SOCKS4a 集成测试
-//!
-//! 验证场景：
-//! 1. SOCKS4a 完整握手（环回 TCP）
-//! 2. 帧协议 sendFrame/recvFrame 往返（含 64KB 大帧）
-//! 3. Connection + protocol 消息往返
-//! 4. Connection 关闭检测 (isAlive)
-//! 5. TcpListener 拒绝错误 hostname
 
 const std = @import("std");
 const lib = @import("testlib");
@@ -13,24 +6,7 @@ const common = @import("common");
 const tcp = lib.tcp;
 const protocol = lib.protocol;
 
-pub fn main(init: std.process.Init) !void {
-    _ = init;
-    var threaded: std.Io.Threaded = .init_single_threaded;
-    const io = threaded.io();
-
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer {
-        const leaked = gpa.deinit();
-        if (leaked == .leak) @panic("内存泄漏");
-    }
-    const alloc = gpa.allocator();
-
-    var runner = common.TestRunner{};
-    defer {
-        const all_pass = runner.summary();
-        if (!all_pass) std.process.exit(1);
-    }
-
+pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestRunner) !void {
     // ── 场景 1: SOCKS4a 完整握手 ──
     {
         var tc = runner.case("SOCKS4a 完整握手");
@@ -63,7 +39,6 @@ pub fn main(init: std.process.Init) !void {
             }
         }.f, .{ io, listener.port, hostname, &client_done, &client_ok });
 
-        // 服务端：接受连接并完成 SOCKS4a 握手
         const cli_fd = common.sockAccept(listener.fd) catch |err| {
             tc.expect(false, "accept 失败: {}", .{err});
             tc.deinit();
@@ -81,7 +56,6 @@ pub fn main(init: std.process.Init) !void {
         tc.expectEqual(@as(u16, listener.port), req.port, "端口匹配");
         tcp.socks4ReplyOk(cli_fd);
 
-        // 等待客户端完成
         while (!client_done.load(.acquire)) {
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
         }
@@ -133,7 +107,6 @@ pub fn main(init: std.process.Init) !void {
             b.* = @truncate(i & 0xff);
         }
 
-        // 用独立线程发送，避免 socketpair 缓冲区死锁
         const SendCtx = struct { fd: std.posix.socket_t, data: []const u8 };
         const ctx = SendCtx{ .fd = pair.a, .data = &big_data };
         const sender = try std.Thread.spawn(.{}, struct {
@@ -206,7 +179,6 @@ pub fn main(init: std.process.Init) !void {
 
         tc.expectTrue(conn.isAlive(), "初始状态 alive=true");
 
-        // 关闭对端 → 对端读立即返回 EOF
         common.sockClose(pair.b);
 
         var rbuf: [64]u8 = undefined;
@@ -231,7 +203,6 @@ pub fn main(init: std.process.Init) !void {
         const bound_port = listener.port;
         tc.expectTrue(bound_port > 0, "端口已绑定");
 
-        // 验证客户端可以连接到该端口
         var connected = std.atomic.Value(bool).init(false);
         const client_thread = try std.Thread.spawn(.{}, struct {
             fn f(io2: std.Io, port2: u16, flag: *std.atomic.Value(bool)) void {

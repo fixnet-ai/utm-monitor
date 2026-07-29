@@ -1,15 +1,51 @@
-# Progress: v0.13.1 分层架构重构
+# Progress: 分层架构重构
 
 ## 当前状态
 
 - **分支**: `refac/layered-arch`
-- **版本**: v0.13.1（已发布）
-- **测试**: 150 执行 / 141 唯一测试 + 43 集成测试场景，全部通过
-- **源文件**: 16 个（20 → 16）
-- **全部任务完成** ✅
+- **版本**: v0.14.1（未发布）
+- **测试**: 146 唯一单元测试 + 40 集成测试场景（8 套件），全部通过
+- **源文件**: 17 src + 10 test
 - **8 交叉编译目标全部通过** ✅
+- **4 台真机全 v0.14.1** ✅
 
 ## 会话记录
+
+### 2026-07-30 — v0.14.1：集成测试重构 + ReleaseSafe 强制 + 临时文件清理修复
+
+**成果**: 集成测试从 8 个独立可执行文件重构为单入口 flat file 模式；强制所有发布构建使用 ReleaseSafe；
+审计并修复所有上传/下载/升级错误路径的临时文件清理；4 台真机部署 v0.14.1。
+
+**集成测试重构**:
+- 8 个 `tests/<name>/main.zig` 目录删除 → 9 个 flat `tests/test_xxx.zig` 文件（`pub fn test_xxx(io, alloc, runner)` 签名）
+- 单入口 `tests/integration_test.zig`：统一 DebugAllocator + TestRunner + 内存泄漏检测
+- `build.zig` 简化：8 个独立 executable → 1 个 `integration_test` executable
+- 修复 `_ = io` pointless discard（Zig 0.16.0 编译错误 — io 后续被使用）
+- 40 测试场景全部通过，0 失败，0 泄漏
+
+**x86_64 二进制尺寸根因**:
+- 问题：x86_64-linux-musl Debug 模式 80MB
+- 根因：x86_64-elf 的 `.data.rel.ro` 段 = 20.3MB（relocation data for read-only data, stack traces, lazy symbol resolution）；aarch64 无此段
+- 解决：`-Doptimize=ReleaseSafe` 消除 `.data.rel.ro`：x86_64 从 80MB → 11MB
+- ReleaseSafe 尺寸：Linux musl 8.8-11MB（静态链接 musl），macOS 1.4-1.6MB，Windows 2.0-2.3MB
+
+**临时文件清理审计**:
+1. dpipe_file.zig writeFile：`createFile()` 成功后 `allocator.create(WriteFileCtx)` 失败 → 旧 errdefer 只 close 不 delete → temp 文件泄露。修复：增加 `deleteFile` 调用
+2. guest.zig handleUpgradeCmd：`defer file.close(io)` + 显式 `file.close(io)` → 双 close。修复：移除 defer
+
+**ReleaseSafe 强制**:
+- release.sh：所有 `zig build -Dtarget=` 添加 `-Doptimize=ReleaseSafe`
+- CI workflow：所有构建添加 `-Doptimize=ReleaseSafe`
+- CLAUDE.md：Build & Run 分 Debug/ReleaseSafe 两节，8 交叉编译命令均标注 ReleaseSafe
+
+**真机部署验证**:
+- linuxvm (aarch64): v0.14.1 ✅ — exec "uname -a" 正常
+- macvm (aarch64): v0.14.1 ✅ — 需手动 cp + killall（macOS launchctl bootout 问题），exec 正常
+- windowsvm (aarch64): v0.14.1 ✅ — taskkill /F utmm.exe 后 --install，exec 正常
+- winx64 (x86_64): v0.14.1 ✅ — taskkill /F utmm.exe + utmmd.exe 后 --install，exec 正常
+- Host (macOS aarch64): v0.14.1 ✅ — IPC + MCP + LSA 全部正常
+
+**待提交**: 21 文件变更（新增 9 test、删除 8 旧 test 目录、修改 build.zig/release.sh/CI/CLAUDE.md/guest.zig/dpipe_file.zig/ver.txt）
 
 ### 2026-07-29 — Phase 9（续2）：修复 macOS SOCKS4a 栈悬垂指针
 
