@@ -258,3 +258,22 @@ src/
 | 29 | Windows SSH 替代 SMB/RDP | 自动化部署和清理必须 SSH；Windows 10 1809+ 内置 OpenSSH Server |
 | 30 | mcp.zig `guestDefaultDir()` 平台感知默认路径 | 无 host.zig 导入通路（MCP 为独立进程），使用 VM 名 "win" 前缀推断 Windows 路径 |
 | 31 | deploy/clean-deploy SKILL 二进制名含版本号 | 交叉编译产物含版本后缀（如 `utmm-aarch64-macos-0.14.2`），部署时必须用实际文件名 |
+| 32 | Windows `Stop-Process -Force` 替代 `taskkill /F` | `taskkill /F` 无法终止 SYSTEM 权限 utmm 进程，PowerShell `Stop-Process -Force` 有效 |
+
+### Phase 12: v0.14.2 裸机部署验证 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 79 | 全量清空 5 台机器（Host + 4 VM）→ 0 残留进程/文件 | ✅ |
+| 80 | 构建：单元测试 + 集成测试 (41 pass) + 4 交叉编译 | ✅ |
+| 81 | 部署：Host (macOS) + linuxvm + macvm + windowsvm + winx64 | ✅ |
+| 82 | Exec 测试：linuxvm/macvm/windowsvm/winx64 全部 OK | ✅ |
+| 83 | Upload 测试：4 VM 全部 OK，SHA256 一致 | ✅ |
+| 84 | Download 测试：4 VM 全部 OK (56 bytes)，SHA256 一致 | ✅ |
+| 85 | Ping 测试：4 VM 全部 OK (RTT 0-9ms) | ✅ |
+
+**踩坑记录**:
+1. Windows `taskkill /F` 无法终止 SYSTEM 权限 utmm → 需 PowerShell `Stop-Process -Force`
+2. linuxvm SSH 长命令链 exit 255 → 拆分为多个短 SSH 调用
+3. winx64 `waitOldProcesses` 5s 超时 → 旧进程残留触发了超时等待
+4. 交叉编译产物同时保留新旧版本后缀 → 部署时需手动选择正确版本

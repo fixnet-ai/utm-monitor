@@ -29,6 +29,7 @@ UTM Monitor 的完整流程。每次执行后总结问题点和可改进之处�
 | 4 | **macOS bootstrap errno=5** | `launchctl bootout` 重设 disabled flag | `enable → bootout → enable → bootstrap` |
 | 5 | **Windows 路径反斜杠被吞** | bash 把 `\` 当转义符 | 用单引号包裹：`'C:\opt\utmm\file.txt'` |
 | 6 | **二进制名含版本号** | `zig build -Dtarget=...` 产物带版本后缀 | 实际文件名 `utmm-aarch64-macos-0.14.1` |
+| 7 | **Windows taskkill /F 无效** | utmm 以 SYSTEM 权限运行，taskkill 无法终止 | 用 PowerShell `Stop-Process -Force` 替代 |
 
 ## 执行流程
 
@@ -128,8 +129,9 @@ echo "linuxvm cleaned"
 # windowsvm
 sshpass -p 111 ssh Administrator@192.168.65.2 'powershell -Command "
 sc.exe stop UTM-MonitorD 2>$null; sc.exe delete UTM-MonitorD 2>$null;
+Get-Process -Name utmm -ErrorAction SilentlyContinue | Stop-Process -Force;
+Get-Process -Name utmmd -ErrorAction SilentlyContinue | Stop-Process -Force;
 Start-Sleep -Seconds 3;
-taskkill /F /IM utmm.exe 2>$null; taskkill /F /IM utmmd.exe 2>$null;
 Remove-Item -Recurse -Force C:\opt\utmm -ErrorAction SilentlyContinue
 "'
 echo "windowsvm cleaned"
@@ -137,8 +139,9 @@ echo "windowsvm cleaned"
 # winx64
 sshpass -p 111 ssh Administrator@192.168.3.108 'powershell -Command "
 sc.exe stop UTM-MonitorD 2>$null; sc.exe delete UTM-MonitorD 2>$null;
+Get-Process -Name utmm -ErrorAction SilentlyContinue | Stop-Process -Force;
+Get-Process -Name utmmd -ErrorAction SilentlyContinue | Stop-Process -Force;
 Start-Sleep -Seconds 3;
-taskkill /F /IM utmm.exe 2>$null; taskkill /F /IM utmmd.exe 2>$null;
 Remove-Item -Recurse -Force C:\opt\utmm -ErrorAction SilentlyContinue
 "'
 echo "winx64 cleaned"
