@@ -869,7 +869,7 @@ fn handleUpgrade(
     defer bin_file.close(io);
 
     // 读取整个文件（upgrade 二进制通常 ~2-10MB，一次性读入简化逻辑）
-    const file_size_b: u64 = bin_file.stat(io) catch 0;
+    const file_size_b: u64 = (bin_file.stat(io) catch return).size;
     if (file_size_b == 0 or file_size_b > 50 * 1024 * 1024) {
         std.log.err("[ipc-upgrade] invalid file size: {d}", .{file_size_b});
         sendError(ipc_conn, "InvalidBinary");
@@ -1356,10 +1356,8 @@ pub fn ipcUpload(io: std.Io, gpa: std.mem.Allocator, vm: []const u8, local_path:
 
 /// Push upgrade binary to a Guest via the Host daemon.
 pub fn ipcUpgrade(io: std.Io, gpa: std.mem.Allocator, vm: []const u8) !void {
-    _ = io;
     // Connect to Host daemon IPC socket
-    var conn: Connection = undefined;
-    try clientConnect(&conn);
+    var conn = try clientConnect(io);
     defer conn.close();
 
     // Build request: [Request.upgrade][vm\0]
