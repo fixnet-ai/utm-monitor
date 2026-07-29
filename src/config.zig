@@ -1,26 +1,7 @@
-//! Configuration persistence and logging system
-//! --save-config: save current parameters to config file
+//! Logging system
 //! --log-file: log output to file
 
 const std = @import("std");
-
-/// Configuration items
-pub const Config = struct {
-    port: u16 = 2121,
-    name: []const u8 = "",
-    hosts_file: []const u8 = "/etc/hosts",
-    marker: []const u8 = "UTM-MONITOR",
-
-    /// VM SSH configuration — deployment-specific, empty by default.
-    vms: []const VmConfig = &.{},
-};
-
-/// Single VM configuration
-pub const VmConfig = struct {
-    name: []const u8,
-    ssh: []const u8,
-    path: []const u8,
-};
 
 /// Log level
 pub const LogLevel = enum {
@@ -73,76 +54,6 @@ pub const Logger = struct {
         }
     }
 };
-
-/// Save configuration to file
-pub fn saveConfig(io: std.Io, _: std.mem.Allocator, config: Config, path: []const u8) !void {
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .permissions = @enumFromInt(0o644) });
-    defer file.close(io);
-
-    var write_buf: [4096]u8 = undefined;
-    var writer = file.writer(io, &write_buf);
-
-    try writer.interface.print("# UTM Monitor config file\n", .{});
-    try writer.interface.print("port={d}\n", .{config.port});
-    try writer.interface.print("name={s}\n", .{config.name});
-    try writer.interface.print("hosts_file={s}\n", .{config.hosts_file});
-    try writer.interface.print("marker={s}\n", .{config.marker});
-
-    for (config.vms) |vm| {
-        try writer.interface.print("vm.{s}.ssh={s}\n", .{ vm.name, vm.ssh });
-        try writer.interface.print("vm.{s}.path={s}\n", .{ vm.name, vm.path });
-    }
-
-    try writer.interface.flush();
-    std.debug.print("[config] configuration saved to {s}\n", .{path});
-}
-
-/// Load configuration from file.
-/// Returns error.Unimplemented — config file parsing is not yet implemented.
-/// Callers should use Config{} defaults and override via CLI flags.
-pub fn loadConfig(io: std.Io, allocator: std.mem.Allocator, path: []const u8) error{Unimplemented}!Config {
-    _ = io;
-    _ = allocator;
-    _ = path;
-    return error.Unimplemented;
-}
-
-test "Config default port is 2121" {
-    const cfg = Config{};
-    try std.testing.expectEqual(@as(u16, 2121), cfg.port);
-}
-
-test "Config default empty name" {
-    const cfg = Config{};
-    try std.testing.expectEqualStrings("", cfg.name);
-}
-
-test "Config default hosts_file" {
-    const cfg = Config{};
-    try std.testing.expectEqualStrings("/etc/hosts", cfg.hosts_file);
-}
-
-test "Config default marker" {
-    const cfg = Config{};
-    try std.testing.expectEqualStrings("UTM-MONITOR", cfg.marker);
-}
-
-test "Config default no VMs" {
-    const cfg = Config{};
-    try std.testing.expectEqual(@as(usize, 0), cfg.vms.len);
-}
-
-test "Config custom port" {
-    const cfg = Config{ .port = 8080 };
-    try std.testing.expectEqual(@as(u16, 8080), cfg.port);
-}
-
-test "VmConfig fields" {
-    const vm = VmConfig{ .name = "test", .ssh = "ssh cmd", .path = "/opt/app" };
-    try std.testing.expectEqualStrings("test", vm.name);
-    try std.testing.expectEqualStrings("ssh cmd", vm.ssh);
-    try std.testing.expectEqualStrings("/opt/app", vm.path);
-}
 
 test "LogLevel order" {
     try std.testing.expect(@intFromEnum(LogLevel.debug) < @intFromEnum(LogLevel.info));

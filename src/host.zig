@@ -38,18 +38,6 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
         std.debug.print("{s}", .{script});
         return;
     }
-    // --save-config
-    if (cli.save_config) {
-        const config_mod = @import("config.zig");
-        const cfg = config_mod.Config{
-            .port = cli.port,
-            .name = cli.hostname orelse "",
-            .hosts_file = cli.hosts_file,
-            .marker = cli.marker,
-        };
-        return config_mod.saveConfig(block_io, gpa, cfg, cli.config_path orelse "utmm.conf");
-    }
-
     // Default serve_dir to exe directory if not specified
     const serve_dir = if (cli.serve_dir) |sd| sd else blk: {
         const exe_path = try std.process.executablePathAlloc(block_io, gpa);

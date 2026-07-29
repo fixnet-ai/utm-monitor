@@ -94,14 +94,10 @@ pub const CliArgs = struct {
         "/etc/hosts",
     /// hosts marker comment text
     marker: []const u8 = protocol.HOSTS_MARKER_BEGIN,
-    /// Config file path
-    config_path: ?[]const u8 = null,
     /// Log file path
     log_file: ?[]const u8 = null,
     /// HTTP serve directory for Host (--serve-dir), default: exe directory
     serve_dir: ?[]const u8 = null,
-    /// Whether to save config
-    save_config: bool = false,
     /// Run as daemon via service manager (--svc, set by service configs)
     is_svc: bool = false,
 
@@ -218,8 +214,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
                 i += 1;
                 cli.ping_target = args[i];
             }
-        } else if (std.mem.eql(u8, arg, "--save-config")) {
-            cli.save_config = true;
         } else if (std.mem.eql(u8, arg, "--upgrade")) {
             cli.cmd_upgrade = true;
             if (i + 1 < args.len) {
@@ -261,11 +255,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
                 i += 1;
                 cli.marker = args[i];
             } else fail.msg("arg", "--marker requires a value", .{});
-        } else if (std.mem.eql(u8, arg, "--config")) {
-            if (i + 1 < args.len) {
-                i += 1;
-                cli.config_path = args[i];
-            } else fail.msg("arg", "--config requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--log-file")) {
             if (i + 1 < args.len) {
                 i += 1;
@@ -304,9 +293,7 @@ pub fn printHelp() void {
         \\  --hosts-file PATH   hosts file path (default /etc/hosts)
         \\  --serve-dir PATH    HTTP serve directory (default: exe directory)
         \\  --marker TAG        Marker comment text (default "UTM-MONITOR")
-        \\  --config PATH       Config file path
         \\  --log-file PATH     Log file path
-        \\  --save-config       Save current parameters to config file
         \\
         \\Management commands (require Host service running):
         \\  --status            Query all online guest status
@@ -439,7 +426,7 @@ pub fn main(init: std.process.Init) !void {
             extra_args.deinit(init.gpa);
         }
 
-        if (svc.shouldUpdateUtmmd(init.io, init.gpa, .host, extra_args.items, utmmd_sha256_hex)) {
+        if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
             // 3a path: utmmd needs update — extract + full forceInstall
             try extractUtmmd(init.io, init.gpa);
             svc.forceInstall(init.io, init.gpa, .host, extra_args.items);
@@ -458,7 +445,7 @@ pub fn main(init: std.process.Init) !void {
         // --host alone (no management command): ensure + exit
         if (cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_ping
             and !cli.cmd_upload and !cli.cmd_download
-            and !cli.cmd_gen_init and !cli.save_config and !cli.is_mcp
+            and !cli.cmd_gen_init and !cli.is_mcp
             and !cli.cmd_deploy and !cli.cmd_upgrade) {
             return;
         }
@@ -471,7 +458,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── 8. Management commands ──
-    if (cli.cmd_status or cli.cmd_exec or cli.cmd_ping or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.cmd_deploy or cli.cmd_upgrade) {
+    if (cli.cmd_status or cli.cmd_exec or cli.cmd_ping or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.cmd_deploy or cli.cmd_upgrade) {
         cli.is_host = false; // management commands don't need --host
         try host_mod.run(init, cli);
         return;
@@ -492,7 +479,7 @@ pub fn main(init: std.process.Init) !void {
             extra_args_guest.deinit(init.gpa);
         }
 
-        if (svc.shouldUpdateUtmmd(init.io, init.gpa, .guest, extra_args_guest.items, utmmd_sha256_hex)) {
+        if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
             // 3a path: utmmd needs update — extract + full forceInstall
             try extractUtmmd(init.io, init.gpa);
             svc.forceInstall(init.io, init.gpa, .guest, extra_args_guest.items);
