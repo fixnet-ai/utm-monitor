@@ -1349,6 +1349,11 @@ pub fn ipcUpgrade(io: std.Io, gpa: std.mem.Allocator, vm: []const u8) !void {
     try writeString(&req, vm);
     try conn.writeAll( req.items);
 
+    // Close write half so server knows the request is complete
+    if (builtin.os.tag != .windows) {
+        _ = std.posix.system.shutdown(conn.fd, std.posix.SHUT.WR);
+    }
+
     // Read response
     var resp: std.ArrayList(u8) = .empty;
     defer resp.deinit(gpa);
