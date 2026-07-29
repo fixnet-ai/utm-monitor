@@ -11,6 +11,35 @@
 
 ## 会话记录
 
+### 2026-07-29 — Phase 9（续2）：修复 macOS SOCKS4a 栈悬垂指针
+
+**成果**: 定位并修复 macOS aarch64 上 `readUntilNull` 栈悬垂指针导致 SOCKS4a 始终拒绝连接的 bug。
+
+**Bug 修复详情**:
+
+6. **SOCKS4a 栈悬垂指针** (`src/tcp.zig`):
+   - 根因：`readUntilNull` 返回指向自身栈缓冲区的切片，函数返回后栈帧被释放。即使
+     `socks4CheckAndReply` 在返回后"立即"调用 `std.mem.eql` 比较，`std.mem.eql` 的函数
+     调用栈帧恰好与 `readUntilNull` 旧栈帧重叠（macOS aarch64 ABI），数据被破坏。
+     调试日志证实：`hn` 前 4 字节 "dasi" 正确，后续被垃圾覆盖。
+   - 修复：`readUntilNull` → `readUntilNullBuf(fd, buf)` — 缓冲区由调用者提供，数据存在于
+     调用者栈帧中，`readUntilNullBuf` 返回后持续有效
+   - 影响函数：`socks4CheckAndReply`（生产）、`socks4Accept`（测试）
+   - 修复前：SOCKS4a 所有 hostname 都返回 REJECTED (0x5b)
+   - 修复后：SOCKS4a 返回 OK (0x5a)，macvm exec 端到端通过
+
+**测试方法反思**:
+- 错误 1：从开发目录 `sudo ./zig-out/bin/utmm --exec` 触发了 `forceInstall(.host)`，
+  覆盖本机 Host daemon 二进制
+- 错误 2：用 Python 裸 SOCKS4a 测试而非走 CLI 路径
+- 正确流程：build → scp 到 guest → `--install` 重启 → 走本机已有 Host daemon CLI 验证
+- 事后已恢复 Host daemon
+
+**验证状态**:
+- `zig build` 编译通过
+- SOCKS4a Python 测试: 0x5a (OK) ✅
+- macvm exec (CLI 端到端): `echo hello` → `hello` ✅
+
 ### 2026-07-29 — Phase 9：E2E 真机 Bug 修复
 
 **成果**: 真机 E2E 验证发现并修复 2 个致命 bug（AddressInUse 崩溃循环 + upload 双 close panic），

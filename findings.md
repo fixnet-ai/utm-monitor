@@ -446,3 +446,27 @@ defer 的第二次 close 对已释放的 ctx 操作：`self.file` 字段为垃�
 - Binary embed 各分支 coerces 到 `[]const u8`；SHA256 embed 各分支返回相同大小的 `*const [64:0]u8`
 
 **影响文件**: `build.zig`、`src/main.zig`（2 文件）
+
+### Finding 189: SOCKS4a 栈悬垂指针 — macOS aarch64 上 readUntilNull 返回后栈被 std.mem.eql 覆盖
+
+**根因**: `readUntilNull` 将数据读入局部 `var buf: [MAX_HOSTNAME+64]u8`，返回 `buf[0..pos]` 切片。
+函数返回后栈帧被弹出，切片成为悬垂指针。`socks4CheckAndReply` 虽"立即"调用
+`std.mem.eql(u8, hn, self_hostname)` 比较，但 `std.mem.eql` 本身是函数调用，会使用栈空间。
+在 macOS aarch64 上，其栈帧恰好与 `readUntilNull` 的旧栈帧重叠，`buf` 数据被破坏。
+
+**症状**: SOCKS4a 始终返回 `0x5b` (REJECTED)，日志显示 `self_hostname` 正确但比较失败。
+调试日志显示 `hn` 前 4 字节正确（"dasi"），后续被破坏为垃圾字节（null + 栈残留数据）。
+
+**为何 linuxvm/windowsvm 不受影响**: 不同平台/编译器的 ABI 约定不同，栈帧布局和寄存器分配
+影响悬垂指针是否被覆盖。linuxvm (aarch64-linux) 和 windowsvm (aarch64-windows) 恰好
+不受影响，但这是未定义行为，纯属运气。
+
+**修复** (`src/tcp.zig`):
+- `readUntilNull` → `readUntilNullBuf(fd, buf: []u8)` — 缓冲区由调用者提供
+- `socks4CheckAndReply` 和 `socks4Accept` 使用本地 `hn_buf` / `userid_buf`，
+  数据存在调用者栈帧中，`readUntilNullBuf` 返回后仍然有效
+- 消除了整个 `readUntilNull` 栈帧复用问题
+
+**影响文件**: `src/tcp.zig`（36 行变更，21 insertions / 15 deletions）
+
+**验证**: SOCKS4a 返回 0x5a，macvm exec 端到端通过
