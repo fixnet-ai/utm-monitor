@@ -883,7 +883,7 @@ fn handleUpgrade(
     };
     defer gpa.free(file_data);
 
-    bin_file.readPositionalAll(io, file_data, 0) catch |err| {
+    _ = bin_file.readPositionalAll(io, file_data, 0) catch |err| {
         std.log.err("[ipc-upgrade] read {s}: {}", .{ serve_path, err });
         sendError(ipc_conn, "ReadFailed");
         return;
