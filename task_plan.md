@@ -2,12 +2,12 @@
 
 ## 状态：全部完成 ✅
 
-**最新版本**: v0.13.1 — TCP listener FD_CLOEXEC + SO_REUSEADDR + upload 双 close 修复
+**最新版本**: v0.13.1 — SOCKS4a 栈悬垂指针修复 + 跨平台 socket I/O 完善
 
 - **分支**: `refac/layered-arch`
 - **源文件**: 20 → 17（10 删除 + 1 新增 testlib.zig）
-- **测试**: 150 执行 / 141 唯一测试 + 47 集成测试场景，全部通过
-- **真机验证**: linuxvm 5 轮 exec/upload/download 全通过，Guest PID 稳定无崩溃
+- **测试**: 155 执行 / 146 唯一测试（新增 5 个 tcp.zig 测试）+ 45 集成测试场景（9 套件），全部通过
+- **真机验证**: linuxvm + windowsvm + macvm exec/upload/download 全通过
 - **设计文档**: `refac.md`
 
 ## 架构概述
@@ -167,6 +167,13 @@ src/
 | 46 | 修复 upload 后 panic（handleUpload 双 close → use-after-free）| ✅ |
 | 47 | 修复 utmmd.bin 嵌入构建流程（按目标分目录 + comptime switch）| ✅ |
 | 48 | linuxvm E2E 真机验证（5 轮 exec/upload/download 全通过）| ✅ |
+| 49 | 修复 Windows SOCKS4a 拒绝（socks4Accept 悬垂栈指针 → socks4CheckAndReply）| ✅ |
+| 50 | 修复 Windows upload/download socket I/O（system.read/write → sockRead/sockWrite）| ✅ |
+| 51 | windowsvm E2E 全验证（exec + upload + download SHA256 一致）| ✅ |
+| 52 | 修复 macOS aarch64 SOCKS4a 拒绝（readUntilNull 栈悬垂指针 → readUntilNullBuf）| ✅ |
+| 53 | socks4Accept 悬垂指针修复（改为接受 allocator，堆分配 hostname）| ✅ |
+| 54 | 新增 socks4CheckAndReply × 2 + readUntilNullBuf × 3 单元测试 | ✅ |
+| 55 | 更新 tcp_frame 集成测试适配新 API | ✅ |
 
 ## 关键决策记录（续）
 
@@ -177,3 +184,6 @@ src/
 | 18 | tests/common.zig 复制 tcp.zig 的 socket 抽象 | 测试可执行文件独立编译，不依赖主二进制 |
 | 19 | `addr.listen()` 替代 `addr.bind()` + 手动 `fcntl(FD_CLOEXEC)` | `listen()` 原生支持 `reuse_address`；`fcntl` 防止 fork 子进程继承 listener socket |
 | 20 | handleUpload 移除 `defer file_pipe.close()` | 显式 close 已覆盖所有退出路径，defer 导致双 close → use-after-free panic |
+| 21 | `readUntilNull` → `readUntilNullBuf(fd, buf)` | 缓冲区由调用者提供，消除栈悬垂指针。macOS aarch64 ABI 导致 `std.mem.eql` 覆盖旧栈帧 |
+| 22 | `socks4Accept` 改为接受 allocator | 返回的 hostname 堆分配，调用者负责释放。消除 socks4Accept 自身的悬垂指针 |
+| 23 | 新增 `socks4CheckAndReply` + `readUntilNullBuf` 测试 | 之前关键路径零测试覆盖；两个函数都是 bug 高发区 |
