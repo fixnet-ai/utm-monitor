@@ -11,7 +11,45 @@
 
 ## 会话记录
 
-### 2026-07-29 (最新) — Phase 8：Windows 跨平台 Socket 抽象层修复
+### 2026-07-29 — Phase 9：E2E 真机 Bug 修复
+
+**成果**: 真机 E2E 验证发现并修复 2 个致命 bug（AddressInUse 崩溃循环 + upload 双 close panic），
+修复 utmmd.bin 嵌入构建流程。linuxvm 5 轮 exec/upload/download 全通过。
+
+| 任务 | 描述 | 状态 |
+|------|------|------|
+| Task 45 | 修复 AddressInUse 崩溃循环（TCP listener 缺 SO_REUSEADDR + FD_CLOEXEC）| ✅ |
+| Task 46 | 修复 upload 后 panic（handleUpload 双 close → use-after-free）| ✅ |
+| Task 47 | 修复 utmmd.bin 嵌入构建流程（按目标分目录 + comptime switch）| ✅ |
+| Task 48 | linuxvm E2E 真机验证（5 轮 exec/upload/download 全通过）| ✅ |
+
+**Bug 修复详情**:
+
+1. **AddressInUse 崩溃循环** (`src/tcp.zig`):
+   - 根因链：dpipe_shell fork() → 子进程继承 TCP listener socket（无 FD_CLOEXEC）→ upload panic → 孤儿子进程持有 TCP :2121 → 新 utmm 无法 bind → AddressInUse
+   - 修复：`addr.bind()` → `addr.listen()`（启用 `reuse_address: true`）+ `fcntl(F_SETFD, FD_CLOEXEC)`
+   - Zig 0.16.0 编译坑：`std.posix.F` 是 struct 非 enum（`@intCast`）、variadic fcntl 字面量需 `@as(c_int, ...)`、`Server` 替代 `Socket`
+   - 影响文件：`src/tcp.zig`、`tests/tcp_frame/main.zig`
+
+2. **Upload 双 close panic** (`src/guest.zig`):
+   - 根因：`handleUpload` 有 `defer file_pipe.close()` + 显式 `file_pipe.close()` → 第一次 close 释放 ctx 内存 → defer 的第二次 close 操作已释放内存 → 垃圾 fd → EBADF → recoverableOsBugDetected panic
+   - 修复：移除 `defer file_pipe.close()`（显式 close 已覆盖所有退出路径）
+   - 这是 AddressInUse 崩溃循环的直接触发因素
+
+3. **utmmd.bin 嵌入构建流程修复** (`build.zig` + `src/main.zig`):
+   - 问题：切换目标平台不重编 utmmd + `src/embed/` 无按平台分子目录 → 交叉编译覆盖错误 bin
+   - 修复：按目标分目录 `src/embed/{arch}-{os}/` + comptime switch 选择正确路径 + mkdir -p 子目录
+
+**真机验证**:
+- linuxvm (192.168.64.2) 5 轮测试（每轮 exec "uname -a" + upload test.txt + download test.txt），全部通过
+- Guest PID (6632) 全程稳定无崩溃
+- 验证修复有效：无 AddressInUse、无 upload panic、无 download 失败
+
+**关键决策**:
+- 决策 19：`addr.listen()` 替代 `addr.bind()` + 手动 `fcntl(FD_CLOEXEC)` — 原生支持 reuse_address
+- 决策 20：handleUpload 移除 `defer file_pipe.close()` — 显式 close 已覆盖所有退出路径
+
+### 2026-07-29 — Phase 8：Windows 跨平台 Socket 抽象层修复
 
 **成果**: 新增跨平台 socket I/O 抽象层（7 个 wrapper 函数），修复 x86-windows-gnu Winsock2 链接，
 8 交叉编译目标全部通过，部署 3 台真机验证通过。

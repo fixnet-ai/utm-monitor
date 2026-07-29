@@ -2,11 +2,12 @@
 
 ## 状态：全部完成 ✅
 
-**最新版本**: v0.13.1 — Windows 跨平台 socket 抽象层修复
+**最新版本**: v0.13.1 — TCP listener FD_CLOEXEC + SO_REUSEADDR + upload 双 close 修复
 
 - **分支**: `refac/layered-arch`
 - **源文件**: 20 → 17（10 删除 + 1 新增 testlib.zig）
-- **测试**: 150 执行 / 141 唯一测试 + 43 集成测试场景，全部通过
+- **测试**: 150 执行 / 141 唯一测试 + 47 集成测试场景，全部通过
+- **真机验证**: linuxvm 5 轮 exec/upload/download 全通过，Guest PID 稳定无崩溃
 - **设计文档**: `refac.md`
 
 ## 架构概述
@@ -158,6 +159,15 @@ src/
 | 43 | 8 交叉编译目标全部通过 | ✅ |
 | 44 | 部署 linuxvm + macvm + windowsvm 真机验证通过 | ✅ |
 
+### Phase 9: E2E 真机 Bug 修复 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 45 | 修复 AddressInUse 崩溃循环（TCP listener 缺 SO_REUSEADDR + FD_CLOEXEC）| ✅ |
+| 46 | 修复 upload 后 panic（handleUpload 双 close → use-after-free）| ✅ |
+| 47 | 修复 utmmd.bin 嵌入构建流程（按目标分目录 + comptime switch）| ✅ |
+| 48 | linuxvm E2E 真机验证（5 轮 exec/upload/download 全通过）| ✅ |
+
 ## 关键决策记录（续）
 
 | # | 决策 | 理由 |
@@ -165,3 +175,5 @@ src/
 | 16 | 跨平台 socket I/O 抽象层放在 tcp.zig（非独立文件）| 所有网络 I/O 的统一入口，避免分散 |
 | 17 | `callconv(.winapi)` 解决 x86 stdcall 名称修饰 | 32 位 Windows: `.winapi` = `.Stdcall`（`@n` 后缀），64 位: = `.C`（无修饰）|
 | 18 | tests/common.zig 复制 tcp.zig 的 socket 抽象 | 测试可执行文件独立编译，不依赖主二进制 |
+| 19 | `addr.listen()` 替代 `addr.bind()` + 手动 `fcntl(FD_CLOEXEC)` | `listen()` 原生支持 `reuse_address`；`fcntl` 防止 fork 子进程继承 listener socket |
+| 20 | handleUpload 移除 `defer file_pipe.close()` | 显式 close 已覆盖所有退出路径，defer 导致双 close → use-after-free panic |

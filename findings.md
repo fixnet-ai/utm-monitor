@@ -341,3 +341,77 @@ if (@intFromEnum(result) == @as(c_int, 0)) { ... }
 
 **编译时零开销**: 全部使用 `builtin.os.tag == .windows` comptime 分支，
 非目标平台的代码路径完全消除。
+
+---
+
+## Phase 9: E2E 真机 Bug 修复 — 研究发现
+
+### Finding 186: AddressInUse 崩溃循环 — 根因 FD_CLOEXEC 缺失
+
+**症状**: linuxvm 上 download 永远失败（exec+upload 成功），Guest 陷入崩溃循环：
+```
+utmm 启动 → bind TCP :2121 OK → 处理 exec（fork pty 子进程）→
+处理 upload → utmm crash → 新 utmm: LSA UDP :2121 OK, TCP :2121 AddressInUse →
+崩溃循环
+```
+
+**根因链**:
+```
+dpipe_shell fork() → 子进程继承 TCP listener socket (无 FD_CLOEXEC)
+→ upload 的 double-close bug 导致 utmm panic 崩溃
+→ 孤儿子进程（init 收养）仍持有 TCP :2121
+→ 新 utmm 无法 bind TCP → AddressInUse
+→ utmmd retry 循环（backoff 2s→60s）
+```
+
+**修复** (`src/tcp.zig`):
+1. `addr.bind()` → `addr.listen()` 启用 `reuse_address: true`（SO_REUSEADDR），加速 TIME_WAIT 恢复
+2. 通过 `fcntl(fd, F_SETFD, FD_CLOEXEC)` 防止子进程继承 listener socket
+
+**技术细节**:
+- Zig 0.16.0 `std.Io.net.IpAddress.listen()` 支持 `ListenOptions.reuse_address`
+- `std.posix.F` 在 0.16.0 中是 struct（非 enum），`GETFD`/`SETFD` 是 `comptime_int`，需 `@as(c_int, ...)` 转换
+- `std.c.fcntl` 是 variadic 函数，Zig 0.16.0 要求所有字面量参数强制类型转换
+- `Server` 类型 (`std.Io.net.Server`) 替代原始 `Socket`，拥有 `deinit()` 和 `accept()` → `Stream` 方法
+- `Server.accept()` 返回 `Stream`，其 `socket.handle` 等于 `socket_t`（`std.posix.fd_t == socket_t`）
+
+**影响文件**: `src/tcp.zig`、`tests/tcp_frame/main.zig`（字段 `socket` → `server`）
+
+### Finding 187: handleUpload 双 close → use-after-free panic
+
+**症状**: `handleUpload` 完成文件写入后 panic：
+```
+dpipe_file.zig:173 → writeFileCloseFn → file.close(io) → closeFd → recoverableOsBugDetected → unreachable
+```
+Host 端 upload 显示 "OK"（因 `close()` 前数据已写入），但 Guest 因 panic 崩溃。
+
+**根因**: `handleUpload` 中 `file_pipe.close()` 被调用两次：
+```zig
+defer file_pipe.close();   // line 1058 — 函数返回时执行
+// ... 读取 TCP 数据写入文件 ...
+file_pipe.close();          // line 1078 — 显式关闭
+// ↓ 函数返回时 defer 再次 close → ctx 已释放 → 垃圾 fd → BADF → panic
+```
+
+第一次 close 通过 `writeFileCloseFn` → `allocator.destroy(self)` 释放了 ctx 内存。
+defer 的第二次 close 对已释放的 ctx 操作：`self.file` 字段为垃圾值 → close 垃圾 fd → EBADF → panic。
+
+**修复** (`src/guest.zig`): 移除 `defer file_pipe.close()`。显式 `file_pipe.close()` 已覆盖所有退出路径（正常路径 + while-break 的 `remaining > 0` 路径）。
+
+**影响文件**: `src/guest.zig`（1 行删除）
+
+### Finding 188: utmmd.bin 嵌入构建流程修复
+
+**问题 1**: 切换目标平台时 utmmd 不会重新构建（copy_utmmd step 依赖 utmmd step，但 utmmd step 只在输出变化时重编）
+**问题 2**: `src/embed/` 无按平台分子目录 → 交叉编译不同目标时互相覆盖错误的 utmmd.bin
+
+**修复** (`build.zig`):
+- `src/embed/` 改为按目标分目录：`src/embed/{arch}-{os}/utmmd.bin`
+- 增加 `mkdir -p` 步骤确保子目录存在
+- SHA256 hash 同目录输出
+
+**修复** (`main.zig`):
+- `@embedFile` 使用 comptime switch 按 `builtin.cpu.arch` + `builtin.os.tag` 选择正确路径
+- Binary embed 各分支 coerces 到 `[]const u8`；SHA256 embed 各分支返回相同大小的 `*const [64:0]u8`
+
+**影响文件**: `build.zig`、`src/main.zig`（2 文件）
