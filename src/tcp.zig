@@ -370,10 +370,10 @@ pub fn socks4Connect(
 }
 
 /// 从已 accept 的 TCP socket 读取 SOCKS4a 请求。
-/// 返回目标 hostname + port。
 /// 读取 SOCKS4a 请求并检查 hostname 是否匹配。匹配则发送 OK 响应并返回 true，
-/// 否则发送拒绝响应并返回 false。hostname 比较在栈内存有效期内完成，
-/// 避免 readUntilNull 返回的栈指针在函数调用间失效。
+/// 否则发送拒绝响应并返回 false。
+/// 使用调用者提供的缓冲区避免栈悬垂指针 — readUntilNullBuf 将数据写入
+/// socks4CheckAndReply 的栈帧，保证整个比较过程内存有效。
 pub fn socks4CheckAndReply(fd: std.posix.socket_t, self_hostname: []const u8) !bool {
     // 读取固定头: VER(1) CMD(1) DSTPORT(2) DSTIP(4) = 8 bytes
     var hdr: [8]u8 = undefined;
@@ -388,14 +388,16 @@ pub fn socks4CheckAndReply(fd: std.posix.socket_t, self_hostname: []const u8) !b
 
     const dst_ip3 = hdr[7]; // SOCKS4a: DSTIP[3] != 0
 
-    // 跳过 USERID（null-terminated string）
-    _ = try readUntilNull(fd);
+    // 跳过 USERID（读入临时缓冲后丢弃）
+    var userid_buf: [256]u8 = undefined;
+    _ = try readUntilNullBuf(fd, userid_buf[0..]);
 
     // SOCKS4a: 如果 DSTIP[3] != 0，读取目标 hostname
     if (dst_ip3 != 0) {
-        const hn = try readUntilNull(fd);
+        var hn_buf: [MAX_HOSTNAME + 1]u8 = undefined;
+        const hn = try readUntilNullBuf(fd, hn_buf[0..]);
         if (hn.len == 0 or hn.len > MAX_HOSTNAME) return error.Socks4BadHostname;
-        // 立即比较 — hn 指向 readUntilNull 的栈缓冲区，在下一次函数调用前必须使用完
+        // hn 指向 hn_buf（在我们的栈帧中），调用后仍然有效
         if (std.mem.eql(u8, hn, self_hostname)) {
             socks4ReplyOk(fd);
             return true;
@@ -406,7 +408,10 @@ pub fn socks4CheckAndReply(fd: std.posix.socket_t, self_hostname: []const u8) !b
     return error.Socks4aRequired;
 }
 
-/// 读取 SOCKS4a 请求（仅用于测试 — 返回栈指针，调用者必须立即使用）。
+/// 读取 SOCKS4a 请求（仅用于测试）。
+/// 注意：返回的 Socks4Request.hostname 指向测试调用者的栈 — 测试必须立即使用，
+/// 不得跨函数调用保存。
+/// 生产代码请使用 socks4CheckAndReply。
 pub fn socks4Accept(fd: std.posix.socket_t) !Socks4Request {
     // 读取固定头: VER(1) CMD(1) DSTPORT(2) DSTIP(4) = 8 bytes
     var hdr: [8]u8 = undefined;
@@ -422,12 +427,14 @@ pub fn socks4Accept(fd: std.posix.socket_t) !Socks4Request {
     const dst_port = std.mem.readInt(u16, hdr[2..4], .big);
     const dst_ip3 = hdr[7]; // SOCKS4a: DSTIP[3] != 0
 
-    // 跳过 USERID（null-terminated string）
-    _ = try readUntilNull(fd);
+    // 跳过 USERID（读入临时缓冲后丢弃）
+    var userid_buf: [256]u8 = undefined;
+    _ = try readUntilNullBuf(fd, userid_buf[0..]);
 
     // SOCKS4a: 如果 DSTIP[3] != 0，读取目标 hostname
     if (dst_ip3 != 0) {
-        const hn = try readUntilNull(fd);
+        var hn_buf: [MAX_HOSTNAME + 1]u8 = undefined;
+        const hn = try readUntilNullBuf(fd, hn_buf[0..]);
         if (hn.len == 0 or hn.len > MAX_HOSTNAME) return error.Socks4BadHostname;
         return Socks4Request{ .hostname = hn, .port = dst_port };
     }
@@ -450,10 +457,9 @@ pub fn socks4ReplyRejected(fd: std.posix.socket_t) void {
 // SOCKS4a 辅助函数
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// 逐字节读取直到遇到 null 字节。返回不含 null 的内容。
-/// 返回的 buffer 仅在下一次调用 readUntilNull 前有效。
-fn readUntilNull(fd: std.posix.socket_t) ![]const u8 {
-    var buf: [MAX_HOSTNAME + 64]u8 = undefined;
+/// 逐字节读取直到遇到 null 字节。将数据写入调用者提供的 buf，返回实际内容切片。
+/// buf 必须足够大以容纳完整字段（建议至少 256 字节）。
+fn readUntilNullBuf(fd: std.posix.socket_t, buf: []u8) ![]const u8 {
     var pos: usize = 0;
     while (pos < buf.len) {
         var byte: u8 = undefined;
