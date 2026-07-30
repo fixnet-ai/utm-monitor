@@ -829,7 +829,8 @@ pub const Mesh = struct {
                 var pong: [11]u8 = undefined;
                 pong[0] = protocol.MESH_TYPE_PONG;
                 @memcpy(pong[1..7], &self.node_id);
-                std.mem.writeInt(u32, pong[7..11], self.nowMs(), .big);
+                // Preserve original ping timestamp for RTT calculation.
+                std.mem.writeInt(u32, pong[7..11], std.mem.readInt(u32, data[13..17], .big), .big);
                 self.socket.send(self.io, &from, &pong) catch {};
                 return;
             }
