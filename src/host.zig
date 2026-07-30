@@ -490,6 +490,10 @@ fn startHost(
     var mesh_opt: ?lsa.Mesh = null;
     var mesh_thread: ?std.Thread = null;
 
+    // Allocated copies for tunnelManager (set inside start_mesh block)
+    var host_ip_copy: []const u8 = &.{};
+    var host_hostname_copy: []const u8 = &.{};
+
     start_mesh: {
         // Get Host's own system info for node identification
         var host_info = guest.getSystemInfo(block_io, gpa) catch |err| {
@@ -593,11 +597,17 @@ fn startHost(
             "serving", "host", now_ms,
         );
 
+        // Allocate copies of host IP/hostname for tunnelManager (which outlives start_mesh block)
+        host_ip_copy = try gpa.dupe(u8, host_info.ip);
+        errdefer gpa.free(host_ip_copy);
+        host_hostname_copy = try gpa.dupe(u8, host_info.hostname);
+        errdefer gpa.free(host_hostname_copy);
+
     }
 
     // Spawn LSA manager thread — syncs LSA→guest table, triggers auto-upgrade.
     // Must spawn before the defer below so join() runs in correct order.
-    var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ block_io, gpa, &state, &mesh_opt });
+    var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy });
 
     // Spawn IPC server thread — Unix domain socket (POSIX) / named pipe (Windows).
     // Shares HostState and Mesh with the mesh networking layer.
@@ -798,7 +808,11 @@ fn tunnelManager(
     allocator: std.mem.Allocator,
     state: *GuestTable,
     mesh_opt: *?lsa.Mesh,
+    host_ip: []const u8,
+    host_hostname: []const u8,
 ) void {
+    defer allocator.free(host_ip);
+    defer allocator.free(host_hostname);
     // Pre-allocated list for LSA snapshots (reused across iterations).
     var snapshots: std.ArrayList(struct { node_id: lsa.NodeId, info_copy: []const u8 }) = .empty;
     defer {
@@ -882,7 +896,7 @@ fn tunnelManager(
             const changed = state.upsert(hostname, ip, target, mac_str, version, shell, status, role, @intCast(now_ms));
             if (changed and hostname.len > 0) {
                 state.setMeshMac(hostname, s.node_id);
-                syncHostsFromTable(io, allocator, state);
+                syncHosts(io, allocator, state, host_ip, host_hostname);
             }
 
             // ── Auto-upgrade: version mismatch → push ──
@@ -1091,70 +1105,35 @@ pub const GuestTable = struct {
     }
 };
 
-// /etc/hosts sync constants
-const MARKER_BEGIN = "# BEGIN UTM-MONITOR\n";
-const MARKER_END = "# END UTM-MONITOR\n";
+/// Sync /etc/hosts with all known guests + gateway entry. Uses lsa.updateHosts
+/// which does temp-file + atomic rename for safe concurrent writes.
+fn syncHosts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    state: *GuestTable,
+    gateway_ip: []const u8,
+    gateway_name: []const u8,
+) void {
+    var entries: std.ArrayList(lsa.HostEntry) = .empty;
+    defer entries.deinit(allocator);
 
-pub fn syncHostsFromTable(io: std.Io, allocator: std.mem.Allocator, table: *GuestTable) void {
-    const cwd = std.Io.Dir.cwd();
-    const root_dir = cwd.openDir(io, "/", .{}) catch {
-        std.log.err("[state] Cannot open root directory for /etc/hosts sync", .{});
-        return;
+    // Gateway entry first (Host's own IP for Host mode)
+    if (gateway_ip.len > 0 and gateway_name.len > 0) {
+        entries.append(allocator, .{ .ip = gateway_ip, .name = gateway_name }) catch return;
+    }
+
+    // Lock and collect all guest entries
+    state.mutex.lock(io) catch return;
+    defer state.mutex.unlock(io);
+    for (state.guests.items) |g| {
+        if (g.ip.len > 0 and g.hostname.len > 0) {
+            entries.append(allocator, .{ .ip = g.ip, .name = g.hostname }) catch continue;
+        }
+    }
+
+    lsa.updateHosts(io, allocator, "/etc/hosts", entries.items) catch |err| {
+        std.log.err("[host] updateHosts /etc/hosts: {}", .{err});
     };
-
-    var original: std.ArrayList(u8) = .empty;
-    defer original.deinit(allocator);
-
-    const file = root_dir.openFile(io, "etc/hosts", .{}) catch null;
-    if (file) |f| {
-        defer f.close(io);
-        const file_size = f.length(io) catch 0;
-        original.resize(allocator, @intCast(file_size)) catch return;
-        var rbuf: [4096]u8 = undefined;
-        var reader = f.reader(io, &rbuf);
-        reader.interface.readSliceAll(original.items) catch {};
-    }
-
-    var new_block: std.ArrayList(u8) = .empty;
-    defer new_block.deinit(allocator);
-    new_block.appendSlice(allocator, MARKER_BEGIN) catch return;
-    for (table.guests.items) |g| {
-        new_block.print(allocator, "{s} {s}.{s}.utm\n", .{ g.ip, g.hostname, g.target }) catch return;
-    }
-    new_block.appendSlice(allocator, MARKER_END) catch return;
-
-    const begin_pos = std.mem.indexOf(u8, original.items, MARKER_BEGIN);
-    const end_pos = if (begin_pos != null)
-        std.mem.indexOf(u8, original.items[begin_pos.?..], MARKER_END)
-    else
-        null;
-
-    const needs_newline = original.items.len > 0 and original.items[original.items.len - 1] != '\n';
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-
-    if (begin_pos != null and end_pos != null) {
-        const before = original.items[0..begin_pos.?];
-        const after = original.items[begin_pos.? + end_pos.? + MARKER_END.len ..];
-        output.appendSlice(allocator, before) catch return;
-        output.appendSlice(allocator, new_block.items) catch return;
-        output.appendSlice(allocator, after) catch return;
-    } else {
-        output.appendSlice(allocator, original.items) catch return;
-        if (needs_newline) output.appendSlice(allocator, "\n") catch return;
-        output.appendSlice(allocator, new_block.items) catch return;
-    }
-
-    const out_file = root_dir.createFile(io, "etc/hosts", .{ .truncate = true }) catch {
-        std.log.err("[state] Cannot write /etc/hosts (permission denied?)", .{});
-        return;
-    };
-    defer out_file.close(io);
-    var wbuf: [4096]u8 = undefined;
-    var writer = out_file.writer(io, &wbuf);
-    writer.interface.writeAll(output.items) catch {};
-    writer.interface.flush() catch {};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

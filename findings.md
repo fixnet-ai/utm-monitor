@@ -475,3 +475,74 @@ defer 的第二次 close 对已释放的 ctx 操作：`self.file` 字段为垃�
 
 **验证**: SOCKS4a 返回 0x5a，macvm exec 端到端通过。
 `zig build test` + `zig build test-integration` 全部通过（新增 5 个测试）
+
+---
+
+## Phase 19: /etc/hosts 同步统一 + hostname 规范化 — 研究发现
+
+### Finding 190: /etc/hosts 同步存在两套重复实现
+
+**发现**: 代码库中存在两套独立的 `/etc/hosts` 同步实现，使用不同的标记、不同的写入策略：
+
+| 维度 | `host.zig` `syncHostsFromTable()` | `lsa.zig` `updateHosts()` |
+|------|-----------------------------------|---------------------------|
+| 位置 | `host.zig:1098-1158` | `lsa.zig:1233-1365` |
+| 使用状态 | **生产中调用**（LSA 处理 loop） | **死代码**（仅测试调用） |
+| 写入安全 | 直接 truncate 覆写，崩溃不安全 | temp 文件 + 原子 rename，崩溃安全 |
+| 错误处理 | `void`，错误静默吞掉 | `!void`，错误传播给调用者 |
+| 标记检测 | 字节级子串（非行感知） | `findMarkerLine()` 行感知，容错空白 |
+| 空行累积 Bug | 存在 | 已修复（显式跳过尾部 \r\n） |
+| 路径 | 硬编码 `/etc/hosts` | 参数化 `file_path` |
+| 标记 | `# BEGIN UTM-MONITOR` / `# END UTM-MONITOR`（与 protocol 常量不同） | `protocol.HOSTS_MARKER_BEGIN` / `END` |
+| hostname 格式 | `{ip} {hostname}.{target}.utm`（FQDN + .utm 后缀） | `{ip}  {name}`（双空格，调用者提供） |
+| CLI `--hosts-file` | 不尊重 | 支持（未连线） |
+| CLI `--marker` | 不尊重 | 支持（未连线） |
+
+**结论**: `lsa.zig` 的实现全面优于 `host.zig`，应作为唯一实现源。`host.zig` 版本全部删除。
+
+### Finding 191: hostname 未做小写规范化
+
+**现状**: 系统中有 3 个 hostname 入口，均未做大小写规范化：
+
+| 入口 | 文件:行 | 行为 |
+|------|---------|------|
+| OS 主机名 | `guest.zig:369-379` | POSIX `gethostname()` / Windows `COMPUTERNAME`（全大写）— 原样存储 |
+| `--hostname` CLI | `main.zig:240-244` | 无校验、无规范 — 原样存储 |
+| `--exec/--upload/--download` target | `main.zig` | 原样传递到 `connectGuest()` |
+
+**所有比较使用 `std.mem.eql`（大小写敏感）**，分布在：
+- `GuestTable.indexOf()` → `findByHostname()` (host.zig)
+- `updateIp()` / `remove()` / `setMeshMac()` (host.zig)
+- `connectGuest()` ARP 恢复 (host.zig)
+- `socks4CheckAndReply()` SOCKS4a 握手 (tcp.zig)
+- IPC handlePing/Exec/Upload/Download (ipc.zig)
+- Auto-upgrade `LastUpgradeMap` (host.zig)
+
+**影响评估**:
+- Windows `COMPUTERNAME` 典型全大写（如 `DESKTOP-ABC123`），导致与其他系统交互时大小写不一致
+- `deriveNodeId()` 使用 DJB2 hash(hostname)，大小写变化 = 不同 NodeId（仅影响 peer-mesh 模式）
+- LSA node_info 字符串原样传输 hostname，不做规范化
+- MCP 工具 `vm` 参数大小写敏感——用户传 `"LinuxVM"` 会查不到 `"linuxvm"`
+
+**修复原则**: 在入口处统一转小写，所有内部比较自动一致。比较代码（`std.mem.eql`）无需改动。
+
+### Finding 192: Guest 端无 hosts 同步能力
+
+**发现**: Guest 端完全未实现 `/etc/hosts` 同步。Guest 运行完整 LSA mesh（广播 + 接收），但从不将节点信息写入 hosts 文件。
+
+**Guest 端关键能力**:
+- 通过 `detectUnixIp()`/`getWindowsIp()` 获取自身 IP
+- 通过 `getDefaultGateway()` (`guest.zig:499`) 获取默认网关 IP — **UTM 中 Host 即为网关**
+- 运行 `lsa.Mesh`（完整 LSA 节点表：neighbors + lsas + routes）
+- `--host-ip` CLI 参数已解析但**从未被 Guest 运行时读取**（休眠字段）
+
+**Gateway 条目设计方案**:
+- **Host 端**: `gateway` → 自身 IP（Host 自己的地址）
+- **Guest 端**: `gateway` → Host IP（即 `getDefaultGateway()` 返回值，UTM 中 Host = 网关）
+
+### Finding 193: FQDN .utm 后缀可能引发系统冲突
+
+**分析**: `syncHostsFromTable()` 生成的格式 `{hostname}.{target}.utm` 产生类似 `linuxvm.aarch64-linux-musl.utm` 的条目。`.utm` 不是 IANA 注册 TLD，在 `/etc/hosts` 中无害，但与某些软件的 FQDN 解析可能冲突。更重要的问题是：
+- `/etc/hosts` 条目本应是简单的 hostname→IP 映射，不需要伪造 FQDN
+- `{target}` 是编译目标标识（如 `aarch64-linux-musl`），与 hostname 无关
+- 去除后缀后可以简化 DNS/SSH 等工具的使用

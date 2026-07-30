@@ -138,7 +138,7 @@ pub const CliArgs = struct {
 };
 
 /// Parse command-line arguments
-pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
+pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !CliArgs {
     var cli = CliArgs{};
     var i: usize = 1;
 
@@ -171,13 +171,13 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             }
             if (i + 1 < args.len) {
                 i += 1;
-                cli.upload_target = args[i];
+                cli.upload_target = try std.ascii.allocLowerString(allocator, args[i]);
             }
         } else if (std.mem.eql(u8, arg, "--download")) {
             cli.cmd_download = true;
             if (i + 1 < args.len) {
                 i += 1;
-                cli.download_target = args[i];
+                cli.download_target = try std.ascii.allocLowerString(allocator, args[i]);
             }
             if (i + 1 < args.len) {
                 i += 1;
@@ -198,7 +198,7 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             cli.cmd_exec = true;
             if (i + 1 < args.len) {
                 i += 1;
-                cli.exec_target = args[i];
+                cli.exec_target = try std.ascii.allocLowerString(allocator, args[i]);
             }
             if (i + 1 < args.len) {
                 i += 1;
@@ -214,13 +214,13 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             cli.cmd_ping = true;
             if (i + 1 < args.len) {
                 i += 1;
-                cli.ping_target = args[i];
+                cli.ping_target = try std.ascii.allocLowerString(allocator, args[i]);
             }
         } else if (std.mem.eql(u8, arg, "--upgrade")) {
             cli.cmd_upgrade = true;
             if (i + 1 < args.len) {
                 i += 1;
-                cli.upgrade_target = args[i];
+                cli.upgrade_target = try std.ascii.allocLowerString(allocator, args[i]);
             }
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (i + 1 < args.len) {
@@ -240,7 +240,7 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
         } else if (std.mem.eql(u8, arg, "--hostname")) {
             if (i + 1 < args.len) {
                 i += 1;
-                cli.hostname = args[i];
+                cli.hostname = try std.ascii.allocLowerString(allocator, args[i]);
             } else fail.msg("arg", "--hostname requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--hosts-file")) {
             if (i + 1 < args.len) {
@@ -321,8 +321,9 @@ pub fn printHelp() void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    var cli = try parseArgs(args);
+    const allocator = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(allocator);
+    var cli = try parseArgs(allocator, args);
 
     // ── 1. --version: print and exit (no admin needed) ──
     if (cli.cmd_version) {
@@ -716,32 +717,33 @@ fn buildServiceArgs(alloc: std.mem.Allocator, cli: CliArgs, role: svc.ServiceRol
 
 test "parseArgs - default guest mode" {
     const args = &[_][:0]const u8{"utmm"};
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
     try std.testing.expect(!cli.is_host);
     try std.testing.expectEqual(protocol.DEFAULT_PORT, cli.port);
 }
 
 test "parseArgs - host mode" {
     const args = &[_][:0]const u8{ "utmm", "--host" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
     try std.testing.expect(cli.is_host);
 }
 
 test "parseArgs - custom port" {
     const args = &[_][:0]const u8{ "utmm", "--port", "9999" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
     try std.testing.expectEqual(@as(u16, 9999), cli.port);
 }
 
 test "parseArgs - management commands" {
     const args = &[_][:0]const u8{ "utmm", "--status" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
     try std.testing.expect(cli.cmd_status);
 }
 
 test "parseArgs - exec command" {
     const args = &[_][:0]const u8{ "utmm", "--exec", "mybox", "uptime" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
+    defer if (cli.exec_target) |t| std.testing.allocator.free(t);
     try std.testing.expect(cli.cmd_exec);
     try std.testing.expectEqualStrings("mybox", cli.exec_target.?);
     try std.testing.expectEqualStrings("uptime", cli.exec_cmd.?);
@@ -749,13 +751,14 @@ test "parseArgs - exec command" {
 
 test "parseArgs - hostname" {
     const args = &[_][:0]const u8{ "utmm", "--hostname", "my-custom-box" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
+    defer if (cli.hostname) |h| std.testing.allocator.free(h);
     try std.testing.expectEqualStrings("my-custom-box", cli.hostname.?);
 }
 
 test "parseArgs - version" {
     const args = &[_][:0]const u8{ "utmm", "--version" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
     try std.testing.expect(cli.cmd_version);
 }
 

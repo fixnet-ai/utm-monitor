@@ -1312,7 +1312,7 @@ pub fn updateHosts(
 
     // Atomic rename using the file's parent directory (not cwd, which may change).
     // For absolute paths like /etc/hosts, this opens /etc as the dir handle.
-    const parent_dir_path = std.fs.path.dirname(file_path) orelse "/";
+    const parent_dir_path = std.fs.path.dirname(file_path) orelse ".";
     const parent_dir = try std.Io.Dir.cwd().openDir(io, parent_dir_path, .{});
     defer parent_dir.close(io);
     const file_basename = std.fs.path.basename(file_path);

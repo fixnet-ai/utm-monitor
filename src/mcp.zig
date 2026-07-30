@@ -177,10 +177,15 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm, command");
             }
-            const vm = jsonGetString(args.?, "vm") orelse {
+            const vm_raw = jsonGetString(args.?, "vm") orelse {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing argument: vm");
             };
+            const vm = std.ascii.allocLowerString(gpa, vm_raw) catch {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Out of memory");
+            };
+            defer gpa.free(vm);
             const command = jsonGetString(args.?, "command") orelse {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing argument: command");
@@ -198,10 +203,15 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm");
             }
-            const vm = jsonGetString(args.?, "vm") orelse {
+            const vm_raw = jsonGetString(args.?, "vm") orelse {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing argument: vm");
             };
+            const vm = std.ascii.allocLowerString(gpa, vm_raw) catch {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Out of memory");
+            };
+            defer gpa.free(vm);
             const result = handleVmPing(gpa, io, port, vm) catch |err| {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32603, @errorName(err));
@@ -215,10 +225,15 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm, local_path");
             }
-            const vm = jsonGetString(args.?, "vm") orelse {
+            const vm_raw = jsonGetString(args.?, "vm") orelse {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing argument: vm");
             };
+            const vm = std.ascii.allocLowerString(gpa, vm_raw) catch {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Out of memory");
+            };
+            defer gpa.free(vm);
             const local_path = jsonGetString(args.?, "local_path") orelse {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing argument: local_path");
@@ -244,10 +259,15 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm, remote_path");
             }
-            const vm = jsonGetString(args.?, "vm") orelse {
+            const vm_raw = jsonGetString(args.?, "vm") orelse {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing argument: vm");
             };
+            const vm = std.ascii.allocLowerString(gpa, vm_raw) catch {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Out of memory");
+            };
+            defer gpa.free(vm);
             const remote_path = jsonGetString(args.?, "remote_path") orelse {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing argument: remote_path");

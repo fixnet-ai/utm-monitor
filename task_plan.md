@@ -2,12 +2,15 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.14.5 — ARP MAC→IP 反向发现 + 集成测试
+**最新版本**: v0.14.6 — /etc/hosts 同步统一 + hostname 规范化
 
 - **分支**: `refac/layered-arch`
 - **源文件**: 17 src + 11 test（10 集成测试 flat file + 1 common）
-- **测试**: 161 唯一单元测试 + 51 集成测试场景，全部通过
-- **真机验证**: linuxvm + windowsvm + macvm + winx64 — 4 台全 v0.14.4 ✅
+- **测试**: 161 唯一单元测试 + 59 集成测试场景，全部通过
+
+## 当前阶段: Phase 19 — /etc/hosts 同步统一 + hostname 规范化 ✅
+
+**目标**: 合并两套 hosts 同步实现到 `lsa.zig`，统一 hostname 为全小写（无 FQDN 后缀），Host/Guest 均增加 gateway 条目。
 - **ARP 恢复**: connectGuest 自动 ARP 重发现 + 10 集成测试覆盖 ✅
 
 ## 架构概述
@@ -411,3 +414,113 @@ src/
 | rediscoverIp empty MAC | 空串 → null | 边界条件 |
 | rediscoverIp same-IP | 不存在 MAC → null（验证路径）| 不变检测 |
 | lookupIp real macOS | 真实 `arp -a` 输出解析 | 系统集成 |
+
+### Phase 19: /etc/hosts 同步统一 + hostname 规范化 ✅
+
+**背景**: 见 findings.md Finding 190-193。两套独立 hosts 同步实现（host.zig 的 `syncHostsFromTable` 使用 `# BEGIN UTM-MONITOR` 标记 + FQDN `.utm` 后缀，lsa.zig 的 `updateHosts` 使用 `protocol.HOSTS_MARKER_BEGIN` 标记 + temp 文件原子 rename），后者实现更优但从未被调用。hostname 未做小写规范，Windows COMPUTERNAME 全大写致大小写不一致。Guest 端无 hosts 同步能力。FQDN `.utm` 后缀无实用价值且可能引发工具冲突。
+
+**涉及模块**:
+
+```
+调用关系：
+  host.zig (LSA 处理)          guest.zig (守护进程)
+       │                              │
+       ├─ lsa.updateHosts() ◄─────────┤
+       │  (唯一实现，位于 lsa.zig)      │
+       │  - temp 文件 + 原子 rename   │
+       │  - protocol.HOSTS_MARKER_*   │
+       │  - 参数化 file_path          │
+       │                              │
+       └─ entries: [                  └─ entries: [
+            {ip, hostname},                 {ip, hostname},
+            {ip, hostname}, ...             {host_ip, "gateway"},
+            {own_ip, "gateway"},        ]
+          ]                          host_ip ← getDefaultGateway()
+       own_ip ← 自身检测 IP                (UTM 中 Host=网关)
+```
+
+**hostname 规范化**:
+- 入口小写化：`guest.zig getSystemInfo()` / `main.zig --hostname` / `--exec` 等 target 参数 / `mcp.zig` vm 参数
+- hosts 条目：`{hostname}`（纯小写，无 `.utm` 后缀，无 `.target` 后缀）
+- 所有内部比较保持 `std.mem.eql`（无需改动，入口已统一）
+
+**Gateway 条目**:
+- Host `/etc/hosts`: `gateway` → 自身 IP
+- Guest `/etc/hosts`: `gateway` → Host IP（`getDefaultGateway()`）
+
+**受影响的比较/查找路径**（入口统一小写后自动修复，无需单独改动）:
+- `GuestTable.indexOf()` / `findByHostname()` / `upsert()` / `remove()` / `updateIp()` / `setMeshMac()`
+- `connectGuest()` ARP 恢复
+- `socks4CheckAndReply()` SOCKS4a 握手
+- IPC handlePing/Exec/Upload/Download
+- Auto-upgrade `LastUpgradeMap`
+- MCP tools vm_exec/vm_ping/vm_upload/vm_download
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 135 | 删除 `syncHostsFromTable()` 及 `MARKER_BEGIN`/`MARKER_END` 常量 | `src/host.zig` | ✅ ~65 行删除 |
+| 136 | LSA 处理 loop 中替换为 `lsa.updateHosts()` 调用 | `src/host.zig:880-886` | ✅ 新建 syncHosts() 从 GuestTable 构建 HostEntry + gateway |
+| 137 | `guestTcpLoop()` 中增加 hosts 同步线程 | `src/guest.zig` | ✅ 新建 guestHostsSync()，30s 周期，self+gateway |
+| 138 | `getSystemInfo()` hostname 小写化 | `src/guest.zig:369-379` | ✅ POSIX `gethostname()` / Windows `COMPUTERNAME` → toLower |
+| 139 | `--hostname` CLI 参数小写化 | `src/main.zig:240-244` | ✅ allocLowerString |
+| 140 | `--exec/--upload/--download/--ping/--upgrade` target 参数小写化 | `src/main.zig` | ✅ 6 个 target/hostname 参数 allocLowerString |
+| 141 | MCP `vm` 参数小写化 | `src/mcp.zig` | ✅ vm_exec/vm_ping/vm_upload/vm_download 入口 allocLowerString |
+| 142 | lsa.zig `updateHosts` dirname null fallback bug 修复 | `src/lsa.zig:1315` | ✅ `orelse "/"` → `orelse "."` |
+| 143 | 集成测试 hostname 引用适配 | `tests/` | ✅ 测试字符串已为小写 |
+| 144 | 新建 `tests/test_hosts.zig`：hosts 文件同步集成测试 | `tests/test_hosts.zig` | ✅ 8 场景 |
+| 145 | `tests/integration_test.zig` 注册 test_hosts 模块 | `tests/integration_test.zig` | ✅ |
+| 146 | zig build test + test-integration 验证 | - | ✅ 161 单测 + 59 集成，0 泄漏 |
+| 147 | 版本号 bump: 0.14.5 → 0.14.6 | `src/ver.txt` | ✅ |
+| 148 | 真机部署验证（Host + 4 VM） | - | 待执行 |
+
+**hosts 同步集成测试（`tests/test_hosts.zig`，8 场景）**:
+
+| # | 场景 | 验证点 |
+|---|------|--------|
+| 1 | 新建 hosts 文件（无旧标记） | 文件创建、标记格式、条目内容 |
+| 2 | 范围替换（已存在标记块） | 旧块替换为新块、块外内容保留不变 |
+| 3 | 重复写入无空行累积 | 连续 3 次 updateHosts → 文件末尾无多余空行 |
+| 4 | hostname 全小写 + 无 FQDN 后缀 | 条目格式 `{ip}  {hostname}`，无 `.target.utm` |
+| 5 | gateway 条目存在 | 验证 gateway IP = 传入的 gateway 地址 |
+| 6 | 原文件无标记块 → 追加 | 无标记块时追加到文件尾，确保尾换行 |
+| 7 | 空条目列表 | 传入空 entries → 仅标记块，无条目行 |
+| 8 | 特殊字符 hostname（连字符/数字） | `winx64`、`test-vm-01` 等合法 hostname 不损坏 |
+
+**预期 /etc/hosts 输出**:
+
+Host 端（macOS，IP 192.168.3.130）:
+```
+# UTM-MONITOR-BEGIN
+192.168.65.4  macvm
+192.168.64.6  linuxvm
+192.168.64.3  windowsvm
+192.168.3.108  winx64
+192.168.3.130  gateway
+# UTM-MONITOR-END
+```
+
+Guest 端（linuxvm，IP 192.168.64.6，Host IP 192.168.64.1）:
+```
+# UTM-MONITOR-BEGIN
+192.168.64.6  linuxvm
+192.168.64.1  gateway
+# UTM-MONITOR-END
+```
+
+**升级注意事项**:
+- 旧版标记 `# BEGIN UTM-MONITOR` / `# END UTM-MONITOR` 的 hosts 文件残留块不会被自动清理
+- 新版使用 `# UTM-MONITOR-BEGIN` / `# UTM-MONITOR-END`，新旧标记不冲突，旧块变成孤立注释
+- 首次部署后建议手动清理旧标记块：`sed -i '' '/# BEGIN UTM-MONITOR/,/# END UTM-MONITOR/d' /etc/hosts`
+- Windows `COMPUTERNAME` 全大写（如 `DESKTOP-ABC123`）→ 小写后 LSA 广播新 hostname，Host 端 `GuestTable.upsert()` 检测大小写不匹配 → 创建新条目而非更新旧条目，旧条目需手动 `GuestTable.remove()` 或等过期清理
+- `deriveNodeId()` hash 变更（peer-mesh 模式，非生产路径）
+
+### Phase 20: v0.14.6 真机部署验证 🚧
+
+| # | 任务 | 说明 |
+|---|------|------|
+| 149 | 编译所有目标平台 | `zig build -Doptimize=ReleaseSafe` × 各 target |
+| 150 | 部署到 4 台 VM | scp/upgrade → linuxvm, macvm, windowsvm, winx64 |
+| 151 | 验证 /etc/hosts 同步 | 检查各 VM 的 /etc/hosts 内容：hostname 小写、gateway 条目、无 .utm 后缀 |
+| 152 | 验证 exec/upload/download 功能正常 | CLI 管理命令功能回归 |
+| 153 | 验证 MCP stdio 功能正常 | AI agent 接口功能回归 |
+| 154 | 清理旧标记块 | 手动清理旧版 `# BEGIN/END UTM-MONITOR` 残留（如存在） |

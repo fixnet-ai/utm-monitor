@@ -21,6 +21,7 @@ const test_download = @import("test_download_e2e.zig");
 const test_upgrade = @import("test_upgrade_e2e.zig");
 const test_ipc = @import("test_ipc_e2e.zig");
 const test_arp = @import("test_arp.zig");
+const test_hosts = @import("test_hosts.zig");
 
 pub fn main(init: std.process.Init) !void {
     _ = init;
@@ -83,6 +84,10 @@ pub fn main(init: std.process.Init) !void {
 
     test_arp.test_arp(io, alloc, &runner) catch |err| {
         std.debug.print("test_arp 异常终止: {}\n", .{err});
+    };
+
+    test_hosts.test_hosts(io, alloc, &runner) catch |err| {
+        std.debug.print("test_hosts 异常终止: {}\n", .{err});
     };
 
     // ── Teardown ──

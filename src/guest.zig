@@ -365,17 +365,21 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
 
     const target = zigTarget();
 
-    // Get hostname
+    // Get hostname (lowercased for consistent comparison and hosts entries)
     const hostname: []const u8 = if (builtin.os.tag == .windows) blk: {
         const name_ptr = std.c.getenv("COMPUTERNAME");
-        if (name_ptr) |ptr| {
-            break :blk try allocator.dupe(u8, std.mem.span(ptr));
-        }
-        break :blk try allocator.dupe(u8, "unknown");
+        const raw = if (name_ptr) |ptr|
+            try allocator.dupe(u8, std.mem.span(ptr))
+        else
+            try allocator.dupe(u8, "unknown");
+        for (raw) |*c| c.* = std.ascii.toLower(c.*);
+        break :blk raw;
     } else blk: {
         var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
         const name = try std.posix.gethostname(&buf);
-        break :blk try allocator.dupe(u8, name);
+        const raw = try allocator.dupe(u8, name);
+        for (raw) |*c| c.* = std.ascii.toLower(c.*);
+        break :blk raw;
     };
 
     // Retry IP detection up to 5 times (1s apart) on all platforms.
@@ -689,6 +693,47 @@ test "zigTarget - valid format" {
 /// 2. TCP 监听端口 2121
 /// 3. accept 循环 → SOCKS4a 握手 → 处理命令
 /// 4. 每命令独立连接，命令结束即关闭
+
+/// Periodic /etc/hosts sync for Guest: self + gateway entries.
+/// Runs every 30 seconds to keep the hosts file current even if
+/// the Host IP changes (unlikely but possible in UTM networks).
+fn guestHostsSync(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    info: SystemInfo,
+    shutdown: ?*std.atomic.Value(bool),
+) void {
+    while (true) {
+        // Sleep first — no rush on initial startup
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(30), .awake) catch break;
+        if (shutdown) |s| {
+            if (s.load(.acquire)) break;
+        }
+
+        // Resolve gateway IP (Host IP in UTM network)
+        const gateway_ip = getDefaultGateway(io, allocator) catch |err| {
+            std.log.warn("[guest] hostsSync: getDefaultGateway failed: {}", .{err});
+            continue;
+        };
+        defer allocator.free(gateway_ip);
+
+        // Build entries: self + gateway
+        var entries: std.ArrayList(lsa.HostEntry) = .empty;
+        defer entries.deinit(allocator);
+
+        if (info.ip.len > 0 and info.hostname.len > 0) {
+            entries.append(allocator, .{ .ip = info.ip, .name = info.hostname }) catch continue;
+        }
+        if (gateway_ip.len > 0) {
+            entries.append(allocator, .{ .ip = gateway_ip, .name = "gateway" }) catch continue;
+        }
+
+        lsa.updateHosts(io, allocator, "/etc/hosts", entries.items) catch |err| {
+            std.log.warn("[guest] hostsSync: updateHosts /etc/hosts: {}", .{err});
+        };
+    }
+}
+
 pub fn guestTcpLoop(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -701,6 +746,7 @@ pub fn guestTcpLoop(
     var mesh_opt: ?lsa.Mesh = null;
     var mesh_thread: ?std.Thread = null;
     var mesh_socket_opt: ?std.Io.net.Socket = null;
+    var hosts_sync_thread: ?std.Thread = null;
 
     start_mesh: {
         var broadcast_addrs = getSubnetBroadcasts(allocator) catch |err| {
@@ -778,6 +824,11 @@ pub fn guestTcpLoop(
     }
 
     defer {
+        if (hosts_sync_thread) |t| {
+            // Signal shutdown to break the sleep loop, then join
+            if (shutdown) |s| s.store(true, .release);
+            t.join();
+        }
         if (mesh_thread) |t| {
             if (mesh_opt) |*m| m.signalShutdown();
             t.join();
@@ -792,6 +843,13 @@ pub fn guestTcpLoop(
     if (mesh_opt == null) {
         std.log.err("[guest] Mesh failed to start", .{});
         return error.MeshInitFailed;
+    }
+
+    // ── Periodic /etc/hosts sync ──
+    if (std.Thread.spawn(.{}, guestHostsSync, .{ io, allocator, info, shutdown })) |t| {
+        hosts_sync_thread = t;
+    } else |_| {
+        std.log.warn("[guest] hostsSync thread spawn failed", .{});
     }
 
     // ── TCP accept 循环 ──
