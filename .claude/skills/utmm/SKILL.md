@@ -28,8 +28,11 @@ Password for all VMs: `111`.
 cat src/ver.txt                     # check version
 zig build -Doptimize=ReleaseSafe    # native (Host)
 zig build -Doptimize=ReleaseSafe -Dtarget=<target>  # cross-compile
-zig build test && zig build test-integration   # must pass before deploy
 ```
+
+> **Zig 0.16.0**: `zig build test` may hang on macOS (`--listen=-` bug).
+> Workaround: `perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/test`
+> and same for `integration_test`. Both must pass (0 failures) before deploy.
 
 Cross-compile targets: `aarch64-linux-musl`, `x86_64-linux-musl`, `aarch64-macos`,
 `aarch64-windows`, `x86_64-windows`, `x86-windows-gnu` (and their x86-linux-musl,

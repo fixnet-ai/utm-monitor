@@ -10,6 +10,7 @@ differences, and deployment.
 - [Architecture](#architecture)
 - [Platform Differences](#platform-differences)
 - [Deployment Guide](#deployment-guide)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -417,3 +418,80 @@ utmm --exec winx64 "echo OK"
 utmm --upload /tmp/test.txt linuxvm        # upload test
 utmm --download linuxvm /opt/utmm/test.txt /tmp/dl.txt  # download test
 ```
+
+---
+
+## Troubleshooting
+
+### zig build test hangs on macOS
+
+**Symptom**: `zig build test` never completes, no error output.
+
+**Cause**: Zig 0.16.0 `--listen=-` test runner protocol bug on macOS.
+
+**Workaround** — run the compiled test binary directly:
+```bash
+# Unit tests
+perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/test 2>&1 | tail -5
+# Integration tests
+perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/integration_test 2>&1
+```
+
+### Hostname not resolving for winx64
+
+**Symptom**: `ssh: Could not resolve hostname winx64`.
+
+**Cause**: winx64 is on 192.168.3.x subnet, LSA UDP broadcast may not traverse
+subnets. `/etc/hosts` sync only covers VMs on the same broadcast domain.
+
+**Workaround**: Use the IP directly for SSH/scp operations targeting winx64:
+```bash
+ssh Administrator@192.168.3.108 '<command>'
+scp file.exe Administrator@192.168.3.108:C:/opt/utmm/
+```
+The `--status` / `--exec` / `--upload` / `--download` commands through the Host
+work correctly with hostname `winx64` — only direct SSH/scp is affected.
+
+### Windows service stop fails (sc.exe error 109)
+
+**Symptom**: `[SC] ControlService FAILED 109: The pipe has been ended.`
+
+**Cause**: The utmm process is in a bad state and the service control manager
+cannot communicate with it.
+
+**Workaround**: Kill the process directly before stopping the service:
+```bash
+ssh Administrator@windowsvm 'cmd /c "taskkill /F /IM utmm.exe & taskkill /F /IM utmmd.exe & sc.exe delete UTM-MonitorD"'
+```
+
+### Windows process verification
+
+**Symptom**: `tasklist /fi "imagename eq utmm.exe"` doesn't work in `cmd /c`
+remote commands.
+
+**Workaround**: Use `tasklist | findstr` instead:
+```bash
+ssh Administrator@windowsvm 'cmd /c "tasklist | findstr utmm || echo clean"'
+```
+
+### macOS launchctl throttling
+
+**Symptom**: `--install` fails with launchctl error after repeated bootout/bootstrap.
+
+**Cause**: macOS throttles rapid service bootstrap cycles.
+
+**Workaround**: Kill processes manually before running `--install`:
+```bash
+ssh root@macvm 'killall -9 utmm utmmd 2>/dev/null; sleep 1'
+scp utmm-new root@macvm:/opt/utmm/utmm-new
+ssh root@macvm 'cp /opt/utmm/utmm-new /opt/utmm/utmm && /opt/utmm/utmm --install --hostname macvm'
+```
+
+### pkill -f自杀 (Linux only)
+
+**Symptom**: Remote SSH command `pkill -9 -f utmm` kills the SSH session itself.
+
+**Cause**: `-f` matches the full command line. `bash -c 'pkill -9 -f utmm'`
+contains "utmm" so the parent bash is killed before the command completes.
+
+**Fix**: Always use `pkill -9 utmm` (match process name only, no `-f` flag).

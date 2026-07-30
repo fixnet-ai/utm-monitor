@@ -14,10 +14,16 @@ Use when user requests: "deploy" / "部署" / "上线" / "update all VMs" / "升
 
 ```bash
 cat src/ver.txt
-zig build test                    # 0 failures required
-zig build test-integration         # 0 failures required
 zig build -Doptimize=ReleaseSafe   # native (Host)
 ```
+
+> **Zig 0.16.0 note**: `zig build test` may hang on macOS (`--listen=-` protocol bug).
+> Run test binaries directly instead:
+> ```bash
+> perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/test 2>&1 | tail -3
+> perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/integration_test 2>&1
+> ```
+> Both must pass (0 failures) before proceeding.
 
 ### 2. Cross-Compile Guests
 

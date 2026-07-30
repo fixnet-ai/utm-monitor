@@ -16,9 +16,15 @@ External `sshpass` was removed in v0.14.7 — all remote SSH commands in Phase 1
 use `./zig-out/bin/utmm sshpass`. Must build native binary first:
 
 ```bash
-zig build test              # must pass, 0 failures
-zig build test-integration   # must pass, 0 failures
 zig build -Doptimize=ReleaseSafe   # native → zig-out/bin/utmm
+```
+
+**Testing** (Zig 0.16.0 `--listen=-` may hang — use direct binary workaround):
+```bash
+# Unit tests (must pass, 0 failures)
+perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/test 2>&1 | tail -3
+# Integration tests (must pass, 0 failures)
+perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/integration_test 2>&1 | tail -3
 ```
 
 ---
@@ -114,8 +120,8 @@ echo "winx64 cleaned"
 ps aux | grep -i utmm | grep -v grep || echo "Host clean"
 ./zig-out/bin/utmm sshpass -p 111 ssh root@macvm 'ps aux | grep -i utmm | grep -v grep || echo "macvm clean"'
 ./zig-out/bin/utmm sshpass -p 111 ssh root@linuxvm 'ps aux | grep -i utmm | grep -v grep || echo "linuxvm clean"'
-./zig-out/bin/utmm sshpass -p 111 ssh Administrator@windowsvm 'tasklist /fi "imagename eq utmm.exe" 2>nul'
-./zig-out/bin/utmm sshpass -p 111 ssh Administrator@winx64 'tasklist /fi "imagename eq utmm.exe" 2>nul'
+./zig-out/bin/utmm sshpass -p 111 ssh Administrator@windowsvm 'cmd /c "tasklist | findstr utmm || echo windowsvm clean"'
+./zig-out/bin/utmm sshpass -p 111 ssh Administrator@192.168.3.108 'cmd /c "tasklist | findstr utmm || echo winx64 clean"'
 ```
 
 ---

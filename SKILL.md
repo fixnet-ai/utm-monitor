@@ -61,8 +61,17 @@ utmm sshpass -e ssh ...             # read password from $SSHPASS
 cat src/ver.txt                     # check current version
 zig build -Doptimize=ReleaseSafe    # native (for Host)
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl  # cross-compile
-zig build test && zig build test-integration   # must pass before deployment
 ```
+
+**Testing**: `zig build test` may hang on macOS due to a Zig 0.16.0 `--listen=-` protocol bug.
+Workaround — run test binaries directly:
+```bash
+# Unit tests
+perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/test 2>&1 | tail -5
+# Integration tests
+perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/integration_test 2>&1
+```
+Both must pass (0 failures) before deployment.
 
 ### Deploy to Guest
 
@@ -87,8 +96,9 @@ ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --install --hostname <hos
 - **Windows SSH** does NOT handle `;` command chaining — use separate SSH calls
 - **Windows OpenSSH** must be enabled (`Add-WindowsCapability -Online -Name OpenSSH.Server`)
 - **LSA sync** takes ~10-15s after guest restart before it appears in `--status`
-- **Hostname resolution**: Host LSA syncs `/etc/hosts` — use `linuxvm`/`macvm`/`windowsvm`/`winx64` instead of IPs in all commands
+- **Hostname resolution**: Host LSA syncs `/etc/hosts` — use `linuxvm`/`macvm`/`windowsvm`/`winx64` instead of IPs in all commands. Note: `winx64` is on 192.168.3.x subnet and may not resolve via LSA sync — fall back to IP `192.168.3.108` if needed
 - **Build output naming**: cross-compiled binaries include version suffix (e.g. `utmm-aarch64-linux-0.14.7`)
+- **`utmm sshpass scp`** works for file copy to Guests — same password args as `utmm sshpass ssh`
 
 ## Skills for Specific Workflows
 
