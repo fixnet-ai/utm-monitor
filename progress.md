@@ -742,6 +742,45 @@ tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig
 
 ---
 
+### 2026-07-31 — v0.14.7：动态 ConPTY 加载 + 管道降级 + conpty 状态标记 + 文档审查
+
+**Task 190 — 动态 ConPTY 加载 + 管道降级**:
+- `src/sshpass.zig`：Windows ConPTY 函数指针类型 + LoadLibraryA/GetProcAddress 运行时解析
+- `resolveConpty()`：惰性初始化，仅检查一次，失败则 conpty_create/conpty_close 为 null
+- `windows.conptyAvailable()`：Guest 检测 ConPTY 是否可用
+- `runWindows()` 调度器：ConPTY 可用 → `runWindowsConpty()`；不可用 → `runWindowsPipe()`
+- `runWindowsConpty()`：原实现，使用动态加载的函数指针
+- `runWindowsPipe()`：新增管道降级模式，CreatePipe + 标准 STARTUPINFO
+- `buildCmdLine()`：从 runWindows 提取的命令行构建辅助函数
+
+**Task 191 — conpty 状态标记**:
+- `src/sshpass.zig`：模块级 `pub fn conptyAvailable()`（POSIX 恒返回 true）
+- `src/guest.zig`：LSA node_info 新增 `conpty:{s}` 字段（yes/no）
+- `src/host.zig`：
+  - 新增 `sshpass` import
+  - `GuestEntry` struct 新增 `conpty: []const u8`
+  - `upsert()` 新增 conpty 参数 + 比较 + 替换逻辑
+  - `deinit()`/`remove()` 新增 conpty 释放
+  - LSA 解析循环新增 `parseNodeInfoLine(line, "conpty")`
+  - Host node_info 新增 `conpty:{s}` 字段
+  - `cmdStatus()` 表头/行输出新增 ConPTY 列
+  - Host 自注册 upsert 包含 conpty
+  - 12 个测试 upsert 调用更新
+- `src/ipc.zig`：`ipcStatus()` JSON 新增 `"conpty"` 字段
+- 编译验证：native debug + 8/8 交叉编译目标全部通过 ✅
+- 单元测试：176/176 通过 ✅
+
+**Task 192 — 全面文档审查**:
+- `src/main.zig`：printHelp() sshpass 行展开为完整选项说明（-p/-f/-d/-e/-hV）+ ConPTY 自动检测提示
+- `src/sshpass.zig`：模块文档新增使用示例 + ConPTY 重要性说明
+- `CLAUDE.md`：Key capabilities 新增 sshpass 子命令条目
+- `README.md`：CLI Quick Start 新增 3 个 sshpass 示例；MCP section 新增 ConPTY 解释
+
+**关键教训**:
+- `@ptrCast` from `?*anyopaque` (align 1) to fn pointer (align 4) 在交叉编译（Windows）时才报错；原生构建通过不代表对齐正确
+- 动态 DLL 加载避免 Win32 @extern 强制依赖 — 老版本 Windows 缺少 API 时优雅降级而非崩溃
+- ConPTY 对 MCP SSH 操作至关重要 — `--status` 输出 conpty 字段让 AI agent 了解目标能力
+
 ## 历史摘要
 
 ### v0.12.2 及之前
