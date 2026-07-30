@@ -2,14 +2,13 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.14.3 — Auto-upgrade enabled + Windows API process management
+**最新版本**: v0.14.5 — ARP MAC→IP 反向发现 + 集成测试
 
 - **分支**: `refac/layered-arch`
-- **源文件**: 17 src + 10 test（9 集成测试 flat file + 1 common）
-- **测试**: 146 唯一单元测试 + 41 集成测试场景，全部通过
-- **真机验证**: linuxvm + windowsvm + macvm + winx64 — 4 台全 v0.14.3 ✅
-- **自动升级**: AUTO_UPGRADE=true ✅
-- **设计文档**: `refac.md`
+- **源文件**: 17 src + 11 test（10 集成测试 flat file + 1 common）
+- **测试**: 161 唯一单元测试 + 51 集成测试场景，全部通过
+- **真机验证**: linuxvm + windowsvm + macvm + winx64 — 4 台全 v0.14.4 ✅
+- **ARP 恢复**: connectGuest 自动 ARP 重发现 + 10 集成测试覆盖 ✅
 
 ## 架构概述
 
@@ -106,7 +105,7 @@ DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 | 9 | `cmdchan.zig` | TCP per-command 无需跨线程命令队列 |
 | 10 | `lock.zig` | → svc.zig 内联 flock/LockFileEx |
 
-## 最终文件清单（16 文件）
+## 最终文件清单（17 文件）
 
 ```
 src/
@@ -114,6 +113,7 @@ src/
 ├── protocol.zig      所有协议定义
 ├── fail.zig          快速失败
 ├── config.zig        配置持久化
+├── arp.zig           ARP 表读取（MAC→IP 反向发现）
 ├── lsa.zig           LSA + 节点表 + /etc/hosts
 ├── tcp.zig           帧协议 + SOCKS4 + 连接
 ├── dpipe.zig         DuplexPipe 接口 + relay
@@ -342,6 +342,9 @@ src/
 | 36 | `detectUnixIp()` 跳过 VM NAT 地址 | 新增 `isLikelyVmNat()` 检查 10.0.2.x (QEMU/VirtualBox) 和 192.168.122.x (libvirt)。多 NIC VM 优先选择非 NAT 接口，回退到第一个物理 NIC |
 | 37 | `upsert()` 检测 MAC 地址变化 | 新增 MAC 字段比对和更新逻辑。VM 重装后 MAC 变更可在 status 中正确显示 |
 | 38 | 全量注释清理 | 扫描并修复 src/ 下所有 KCP/HTTP/WebUI/tunnel manager/mesh relay 过时注释。main.zig (10+), host.zig (~15), mcp.zig (2), protocol.zig (1)。41/41 测试通过 |
+| 39 | ARP MAC→IP 反向发现 | 当 Guest IP 变化时（UTM 网络常见），Host 通过系统 ARP 表由已知 MAC 反查新 IP，自动恢复连接。跨平台实现：Linux `/proc/net/arp`、macOS `arp -a`、Windows `GetIpNetTable` |
+| 40 | 字节级 MAC 比较 | MAC 格式差异（LSA 补零 `9e:06` vs arp 不补零 `9e:6`）导致字符串比较失败。`parseMacBytes` + `macMatch` 用 `[6]u8` 字节数组比较，彻底消除格式依赖 |
+| 41 | ARP 集成测试覆盖补零差异 | 10 个集成测试覆盖 parseMacBytes/macMatch/rediscoverIp/lookupIp 全链路。`macMatch` 跨格式测试是核心回归防护：若未来有人改回字符串比较，测试立即失败 |
 
 ### Phase 16: v0.14.3 — 源码注释清理 ✅
 
@@ -355,3 +358,56 @@ src/
 | 118 | 全量 grep 扫描确认无残留过时引用 | ✅ |
 | 119 | zig build test + test-integration 验证 | ✅ |
 | 120 | progress.md + task_plan.md 更新 | ✅ |
+
+### Phase 17: v0.14.4 — ARP MAC→IP 反向发现 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 121 | 新建 `src/arp.zig`：跨平台 ARP 表读取（Linux `/proc/net/arp`、macOS `arp -a`、Windows `GetIpNetTable`）| ✅ |
+| 122 | `parseMacBytes` + `macMatch`：字节级 MAC 比较，解决 LSA 补零 vs arp 不补零格式差异 | ✅ |
+| 123 | `host.zig` 新增 `connectGuest()`：TCP 连接失败 → ARP 查 MAC → 更新 IP → 重试 | ✅ |
+| 124 | `host.zig` 新增 `GuestTable.updateIp()`：运行时更新 Guest IP | ✅ |
+| 125 | `ipc.zig` `handleExec`/`handleUpload`/`handleDownload` 统一使用 `connectGuest()` | ✅ |
+| 126 | `utmmd.zig` Zig 0.16.0 兼容修复（`Child.init` → `std.process.run`）| ✅ |
+| 127 | MCP 测试覆盖扩展（54 测试）| ✅ |
+| 128 | 4 台真机部署验证（macvm/linuxvm/windowsvm/winx64）| ✅ |
+
+**ARP 实现详情**：
+- `arp.zig`（~245 行）：平台特定 ARP 表查询
+  - Linux：`std.Io.Dir.cwd().openFile("/proc/net/arp")` + 逐行解析
+  - macOS：`std.process.run("arp -a")` + 括号/at/on 正则解析
+  - Windows：`extern "iphlpapi" GetIpNetTable` 原生 API
+- `parseMacBytes()`：冒号分隔 6 段 → `[6]u8`，`parseInt(u8, part, 16)` 自动处理补零
+- `macMatch()`：字节级比较，忽略 `9e:6` vs `9e:06` 差异
+- `rediscoverIp()`：`lookupIp(mac)` → 比对 current_ip → 相同返回 null
+
+**修复的关键 Bug**：
+1. MAC 格式不匹配：LSA 存 `9e:06:4f:79:db:fe`（补零），macOS `arp -a` 输出 `9e:6:4f:79:db:fe`（不补零）→ 字符串比较失败。修复：字节级比较。
+2. Windows `LoadLibraryA` 移除（Zig 0.16.0）→ 改用 `extern "iphlpapi"` 直接声明
+3. Windows `BOOL` 是 enum → `0` 改为 `.FALSE`
+4. Linux `std.fs.openFileAbsolute` 移除 → `std.Io.Dir.cwd().openFile(io, ...)`
+
+### Phase 18: v0.14.5 — ARP 集成测试 + 发布 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 129 | `src/arp.zig` `parseMacBytes`/`macMatch` 改为 pub + 新增 17 个单元测试 | ✅ |
+| 130 | `src/testlib.zig` 导出 arp 模块 | ✅ |
+| 131 | 新建 `tests/test_arp.zig`：10 个 ARP 集成测试场景 | ✅ |
+| 132 | `tests/integration_test.zig` 注册 test_arp 模块 | ✅ |
+| 133 | 修复 `lookupIpLinux` Zig 0.16.0 API（`openFileAbsolute` → `openFile` + `close(io)` + `readStreaming`）| ✅ |
+| 134 | v0.14.5 release：8 目标交叉编译 + utmm.zip + GitHub release | ✅ |
+
+**ARP 集成测试覆盖（10 场景）**：
+| 场景 | 内容 | 防护目标 |
+|------|------|---------|
+| parseMacBytes zero-padded | `9e:06:4f:79:db:fe` → 6 bytes | 解析回归 |
+| parseMacBytes non-zero-padded | `9e:6:4f:79:db:fe` → 6 bytes（相同）| 格式差异 |
+| parseMacBytes invalid | 非hex/4段/7段/空串 → null | 鲁棒性 |
+| macMatch cross-format | LSA 补零 vs arp 不补零 → 匹配 | **核心回归**：补零差异 |
+| macMatch different MAC | 不同 MAC → false | 误匹配 |
+| macMatch invalid hw | 空串/垃圾 → false | 鲁棒性 |
+| rediscoverIp bogus MAC | `ff:ff:ff:ff:ff:ff` → 调系统 ARP 表 | 完整调用链 |
+| rediscoverIp empty MAC | 空串 → null | 边界条件 |
+| rediscoverIp same-IP | 不存在 MAC → null（验证路径）| 不变检测 |
+| lookupIp real macOS | 真实 `arp -a` 输出解析 | 系统集成 |

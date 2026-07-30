@@ -45,11 +45,13 @@ pub fn macMatch(hw_str: []const u8, target: [6]u8) bool {
 // ── Linux: 解析 /proc/net/arp ─────────────────────────────────────────────────
 
 fn lookupIpLinux(allocator: std.mem.Allocator, target_bytes: [6]u8) !?[]const u8 {
-    const file = std.fs.openFileAbsolute("/proc/net/arp", .{ .mode = .read_only }) catch return null;
-    defer file.close();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const file = std.Io.Dir.cwd().openFile(io, "/proc/net/arp", .{ .mode = .read_only }) catch return null;
+    defer file.close(io);
 
     var buf: [4096]u8 = undefined;
-    const n = file.read(&buf) catch return null;
+    const n = file.readStreaming(io, &.{buf[0..]}) catch return null;
     if (n == 0) return null;
 
     var lines = std.mem.splitScalar(u8, buf[0..n], '\n');

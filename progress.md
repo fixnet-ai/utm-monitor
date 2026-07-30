@@ -3,13 +3,71 @@
 ## 当前状态
 
 - **分支**: `refac/layered-arch`
-- **版本**: v0.14.3（自动升级启用 + Windows API 进程管理）
-- **测试**: 146 唯一单元测试 + 41 集成测试场景，全部通过
-- **源文件**: 17 src + 10 test
+- **版本**: v0.14.5（ARP MAC→IP 反向发现 + 集成测试）
+- **测试**: 161 唯一单元测试 + 51 集成测试场景，全部通过
+- **源文件**: 17 src + 11 test
 - **8 交叉编译目标全部通过** ✅
-- **自动升级**: AUTO_UPGRADE=true（Host LSA 版本检测 + SOCKS4a 直推 + 120s 冷却）
+- **ARP 恢复**: connectGuest 自动 ARP 重发现 + 10 集成测试覆盖 ✅
 
 ## 会话记录
+
+### 2026-07-30 — v0.14.5：ARP 集成测试 + 发布
+
+**成果**：新增 10 个 ARP 集成测试场景；parseMacBytes/macMatch 改为 pub + 17 个单元测试；
+修复 Linux 交叉编译 `std.fs.openFileAbsolute` → `std.Io.Dir.cwd().openFile`；发布 v0.14.5。
+
+**ARP 集成测试**:
+- `tests/test_arp.zig`：10 个集成测试场景
+  - parseMacBytes 零补/不补/非法输入（3 场景）
+  - macMatch 跨格式匹配/不同 MAC/非法输入（3 场景）
+  - rediscoverIp 虚假 MAC/空 MAC/same-IP 逻辑（3 场景）
+  - lookupIp 真实 macOS ARP 表查询（1 场景）
+- `src/testlib.zig` 新增 arp 模块导出
+- `tests/integration_test.zig` 注册 test_arp 模块
+
+**Zig 0.16.0 兼容修复**:
+- `lookupIpLinux`：`std.fs.openFileAbsolute` → `std.Io.Dir.cwd().openFile(io, ...)`
+- `file.close()` → `file.close(io)`
+- `file.read(&buf)` → `file.readStreaming(io, &.{buf[0..]})`
+
+**发布**:
+- 版本号 bump：0.14.4 → 0.14.5
+- 8 交叉编译目标全部通过，utmm.zip 13MB
+- GitHub release: https://github.com/fixnet-ai/utm-monitor/releases/tag/v0.14.5
+
+**关键决策**:
+- 决策 41: ARP 集成测试覆盖补零差异 — macMatch 跨格式测试是核心回归防护
+
+### 2026-07-30 — v0.14.4：ARP MAC→IP 反向发现
+
+**成果**：实现跨平台 ARP 表查询，Guest IP 变化时自动通过 MAC 地址重发现新 IP 并恢复连接。
+
+**新建文件**:
+- `src/arp.zig`（~245 行）：平台特定 ARP 表读取
+  - Linux：解析 `/proc/net/arp` 文本格式
+  - macOS：`std.process.run("arp -a")` + 输出解析
+  - Windows：`extern "iphlpapi" GetIpNetTable` 原生 API
+- `parseMacBytes()` + `macMatch()`：字节数组 [6]u8 比较，解决补零差异
+
+**修改文件**:
+- `src/host.zig`：新增 `connectGuest()`（TCP 失败 → ARP 重发现 → 重试）、`GuestTable.updateIp()`
+- `src/ipc.zig`：handleExec/Upload/Download 统一使用 `connectGuest()`
+- `src/utmmd.zig`：Zig 0.16.0 兼容修复
+
+**修复的关键 Bug**:
+1. MAC 格式不匹配：LSA `9e:06:4f:79:db:fe` vs macOS arp `9e:6:4f:79:db:fe` → 字节级比较
+2. Windows `LoadLibraryA` 移除（Zig 0.16.0）→ `extern "iphlpapi"` 直接声明
+3. Windows `BOOL` enum → `0` 改为 `.FALSE`
+4. Linux `std.fs.openFileAbsolute` 移除 → `std.Io.Dir.cwd().openFile()`
+
+**测试验证**:
+- 所有 exec/upload/download 操作在 macvm + windowsvm 上通过
+- 41 集成测试 + 161 单元测试全部通过
+- ARP 恢复路径（IP 变化→ARP 重发现→重试）通过单元测试验证；真实 IP 变化尚未触发
+
+**关键决策**:
+- 决策 39: ARP MAC→IP 反向发现 — 当 Guest IP 变化时自动恢复连接
+- 决策 40: 字节级 MAC 比较 — 彻底消除补零差异
 
 ### 2026-07-30 — v0.14.3：自动升级启用 + Windows API 进程管理
 
