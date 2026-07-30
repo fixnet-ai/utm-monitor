@@ -454,7 +454,7 @@ src/
 - `socks4CheckAndReply()` SOCKS4a 握手
 - IPC handlePing/Exec/Upload/Download
 - Auto-upgrade `LastUpgradeMap`
-- MCP tools vm_exec/vm_ping/vm_upload/vm_download
+- MCP tools exec/ping/upload/download
 
 | # | 任务 | 文件 | 说明 |
 |---|------|------|------|
@@ -464,7 +464,7 @@ src/
 | 138 | `getSystemInfo()` hostname 小写化 | `src/guest.zig:369-379` | ✅ POSIX `gethostname()` / Windows `COMPUTERNAME` → toLower |
 | 139 | `--hostname` CLI 参数小写化 | `src/main.zig:240-244` | ✅ allocLowerString |
 | 140 | `--exec/--upload/--download/--ping/--upgrade` target 参数小写化 | `src/main.zig` | ✅ 6 个 target/hostname 参数 allocLowerString |
-| 141 | MCP `vm` 参数小写化 | `src/mcp.zig` | ✅ vm_exec/vm_ping/vm_upload/vm_download 入口 allocLowerString |
+| 141 | MCP `vm` 参数小写化 | `src/mcp.zig` | ✅ exec/ping/upload/download 入口 allocLowerString |
 | 142 | lsa.zig `updateHosts` dirname null fallback bug 修复 | `src/lsa.zig:1315` | ✅ `orelse "/"` → `orelse "."` |
 | 143 | 集成测试 hostname 引用适配 | `tests/` | ✅ 测试字符串已为小写 |
 | 144 | 新建 `tests/test_hosts.zig`：hosts 文件同步集成测试 | `tests/test_hosts.zig` | ✅ 8 场景 |

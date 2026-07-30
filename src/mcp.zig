@@ -1,7 +1,7 @@
 //! MCP stdio server — AI agent interface via stdin/stdout JSON-RPC 2.0.
 //!
-//! The utmm --mcp command starts a stdio MCP server. Tool calls (vm_status,
-//! vm_exec, vm_ping, vm_upload, vm_download) are translated to IPC commands
+//! The utmm --mcp command starts a stdio MCP server. Tool calls (status,
+//! exec, ping, upload, download) are translated to IPC commands
 //! against the local Host service via /var/run/utmm.sock, benefiting from
 //! auto-ensure (Phase 52).
 //!
@@ -25,7 +25,7 @@ const MAX_REQUEST_SIZE = 65536;
 const SERVER_INFO = "{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"utmm\",\"version\":\"__VERSION__\"},\"capabilities\":{\"tools\":{}}}";
 
 /// MCP tool definitions (JSON). Single-line for MCP stdio transport.
-const TOOLS_JSON = "[{\"name\":\"vm_status\",\"description\":\"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},{\"name\":\"vm_exec\",\"description\":\"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check vm_status first to see each VM's shell type, then write compatible commands.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)\"}},\"required\":[\"vm\",\"command\"]}},{\"name\":\"vm_ping\",\"description\":\"Ping a Guest over the mesh network to test connectivity and measure RTT. Returns JSON with hostname, MAC address, and rtt_ms.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"}},\"required\":[\"vm\"]}},{\"name\":\"vm_upload\",\"description\":\"Upload a file from the Host to a Guest VM. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"local_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Host filesystem\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Destination path on the Guest (e.g. /opt/utmm/file.txt). Defaults to /opt/utmm/<basename> (POSIX) or C:\\\\opt\\\\utmm\\\\<basename> (Windows) if omitted.\"}},\"required\":[\"vm\",\"local_path\"]}},{\"name\":\"vm_download\",\"description\":\"Download a file from a Guest VM to the Host. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Guest (e.g. /opt/utmm/core.dump)\"},\"local_path\":{\"type\":\"string\",\"description\":\"Local path on the Host to save the file. Defaults to ./<basename> if omitted.\"}},\"required\":[\"vm\",\"remote_path\"]}}]";
+const TOOLS_JSON = "[{\"name\":\"status\",\"description\":\"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},{\"name\":\"exec\",\"description\":\"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check status first to see each VM's shell type, then write compatible commands.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)\"}},\"required\":[\"vm\",\"command\"]}},{\"name\":\"ping\",\"description\":\"Ping a Guest over the mesh network to test connectivity and measure RTT. Returns JSON with hostname, MAC address, and rtt_ms.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"}},\"required\":[\"vm\"]}},{\"name\":\"upload\",\"description\":\"Upload a file from the Host to a Guest VM. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"local_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Host filesystem\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Destination path on the Guest (e.g. /opt/utmm/file.txt). Defaults to /opt/utmm/<basename> (POSIX) or C:\\\\opt\\\\utmm\\\\<basename> (Windows) if omitted.\"}},\"required\":[\"vm\",\"local_path\"]}},{\"name\":\"download\",\"description\":\"Download a file from a Guest VM to the Host. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Guest (e.g. /opt/utmm/core.dump)\"},\"local_path\":{\"type\":\"string\",\"description\":\"Local path on the Host to save the file. Defaults to ./<basename> if omitted.\"}},\"required\":[\"vm\",\"remote_path\"]}}]";
 
 /// MCP server entry point. Reads JSON-RPC from stdin, writes responses to stdout.
 pub fn run(io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
@@ -163,7 +163,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
 
         const args = jsonGetNestedObject(params, "arguments");
 
-        if (std.mem.eql(u8, tool_name, "vm_status")) {
+        if (std.mem.eql(u8, tool_name, "status")) {
             const result = handleVmStatus(gpa, io, port) catch |err| {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32603, @errorName(err));
@@ -172,7 +172,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
             return jsonBuildResponse(gpa, id_val, result);
         }
 
-        if (std.mem.eql(u8, tool_name, "vm_exec")) {
+        if (std.mem.eql(u8, tool_name, "exec")) {
             if (args == null) {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm, command");
@@ -198,7 +198,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
             return jsonBuildResponse(gpa, id_val, result);
         }
 
-        if (std.mem.eql(u8, tool_name, "vm_ping")) {
+        if (std.mem.eql(u8, tool_name, "ping")) {
             if (args == null) {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm");
@@ -220,7 +220,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
             return jsonBuildResponse(gpa, id_val, result);
         }
 
-        if (std.mem.eql(u8, tool_name, "vm_upload")) {
+        if (std.mem.eql(u8, tool_name, "upload")) {
             if (args == null) {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm, local_path");
@@ -254,7 +254,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
             return jsonBuildResponse(gpa, id_val, result);
         }
 
-        if (std.mem.eql(u8, tool_name, "vm_download")) {
+        if (std.mem.eql(u8, tool_name, "download")) {
             if (args == null) {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing arguments: vm, remote_path");
@@ -296,7 +296,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
     return jsonBuildError(gpa, id_val, -32601, "Method not found");
 }
 
-/// Handle vm_status via IPC.
+/// Handle status via IPC.
 fn handleVmStatus(gpa: std.mem.Allocator, io: std.Io, port: u16) ![]const u8 {
     _ = port; // IPC handler — port reserved for future use
     const json = try ipc_mod.ipcStatus(io, gpa);
@@ -307,7 +307,7 @@ fn handleVmStatus(gpa: std.mem.Allocator, io: std.Io, port: u16) ![]const u8 {
 /// Format a JSON guest list string into MCP content markdown.
 fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_str, .{ .allocate = .alloc_always }) catch |err| {
-        std.log.err("[mcp] vm_status JSON parse: {}", .{err});
+        std.log.err("[mcp] status JSON parse: {}", .{err});
         return error.StatusFailed;
     };
     defer parsed.deinit();
@@ -354,7 +354,7 @@ fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{text_json});
 }
 
-/// Handle vm_exec via IPC.
+/// Handle exec via IPC.
 fn handleVmExec(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, command: []const u8) ![]const u8 {
     _ = port; // IPC handler — port reserved for future use
     // Captures output in a fixed buffer
@@ -387,7 +387,7 @@ fn formatExecMCP(gpa: std.mem.Allocator, vm: []const u8, command: []const u8, ou
     );
 }
 
-/// Handle vm_ping via IPC.
+/// Handle ping via IPC.
 fn handleVmPing(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8) ![]const u8 {
     _ = port;
     const json = try ipc_mod.ipcPing(io, gpa, vm);
@@ -398,7 +398,7 @@ fn handleVmPing(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8) !
 /// Format ping JSON result into MCP content markdown.
 fn formatPingMCP(gpa: std.mem.Allocator, vm: []const u8, json_str: []const u8) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_str, .{ .allocate = .alloc_always }) catch |err| {
-        std.log.err("[mcp] vm_ping JSON parse: {}", .{err});
+        std.log.err("[mcp] ping JSON parse: {}", .{err});
         return error.PingFailed;
     };
     defer parsed.deinit();
@@ -423,7 +423,7 @@ fn formatPingMCP(gpa: std.mem.Allocator, vm: []const u8, json_str: []const u8) !
     );
 }
 
-/// Handle vm_upload via IPC.
+/// Handle upload via IPC.
 fn handleVmUpload(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, local_path: []const u8, remote_path: []const u8) ![]const u8 {
     _ = port;
     try ipc_mod.ipcUpload(io, gpa, vm, local_path, remote_path);
@@ -441,7 +441,7 @@ fn handleVmUpload(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8,
     );
 }
 
-/// Handle vm_download via IPC.
+/// Handle download via IPC.
 fn handleVmDownload(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, remote_path: []const u8, local_path: []const u8) ![]const u8 {
     _ = port;
 
@@ -767,11 +767,11 @@ test "processRequest: tools/list" {
 
     // Should contain all 5 tools
     try std.testing.expect(std.mem.indexOf(u8, result, "\"result\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "vm_status") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "vm_exec") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "vm_ping") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "vm_upload") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "vm_download") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"ping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"upload\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"download\"") != null);
 }
 
 test "processRequest: notifications/initialized (notification, no id)" {
@@ -1083,11 +1083,11 @@ test "SERVER_INFO contains required fields" {
 }
 
 test "TOOLS_JSON lists all 5 tools" {
-    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "vm_status") != null);
-    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "vm_exec") != null);
-    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "vm_ping") != null);
-    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "vm_upload") != null);
-    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "vm_download") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"ping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"upload\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"download\"") != null);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1148,11 +1148,11 @@ test "runWithPipe: initialize → ping → tools/list → notifications/initiali
     // (notifications/initialized between ping and tools/list is a no-id
     // notification → processRequest returns "" → skipped by runWithPipe)
     try std.testing.expect(std.mem.indexOf(u8, line3, "\"id\":3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line3, "vm_status") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line3, "vm_exec") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line3, "vm_ping") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line3, "vm_upload") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line3, "vm_download") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "\"name\":\"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "\"name\":\"exec\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "\"name\":\"ping\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "\"name\":\"upload\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "\"name\":\"download\"") != null);
 
     // Verify the tools/list response is in MCP list_tools format
     try std.testing.expect(std.mem.indexOf(u8, line3, "\"tools\"") != null);
@@ -1257,7 +1257,7 @@ test "tools/list response: each tool has required MCP fields" {
     // Must have exactly 5 tools
     try std.testing.expectEqual(@as(usize, 5), tools_arr.items.len);
 
-    const expected_tools = [_][]const u8{ "vm_status", "vm_exec", "vm_ping", "vm_upload", "vm_download" };
+    const expected_tools = [_][]const u8{ "status", "exec", "ping", "upload", "download" };
     for (expected_tools) |expected_name| {
         var found = false;
         for (tools_arr.items) |tool_val| {
@@ -1279,7 +1279,7 @@ test "tools/list response: each tool has required MCP fields" {
     }
 }
 
-test "tools/list: vm_exec requires vm and command" {
+test "tools/list: exec requires vm and command" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1296,7 +1296,7 @@ test "tools/list: vm_exec requires vm and command" {
     const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
     for (tools.items) |tool_val| {
         const tool = tool_val.object;
-        if (std.mem.eql(u8, tool.get("name").?.string, "vm_exec")) {
+        if (std.mem.eql(u8, tool.get("name").?.string, "exec")) {
             const schema = tool.get("inputSchema").?.object;
             const required = schema.get("required").?.array;
             try std.testing.expectEqual(@as(usize, 2), required.items.len);
@@ -1311,7 +1311,7 @@ test "tools/list: vm_exec requires vm and command" {
     }
 }
 
-test "tools/list: vm_upload requires vm and local_path" {
+test "tools/list: upload requires vm and local_path" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1328,7 +1328,7 @@ test "tools/list: vm_upload requires vm and local_path" {
     const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
     for (tools.items) |tool_val| {
         const tool = tool_val.object;
-        if (std.mem.eql(u8, tool.get("name").?.string, "vm_upload")) {
+        if (std.mem.eql(u8, tool.get("name").?.string, "upload")) {
             const schema = tool.get("inputSchema").?.object;
             const required = schema.get("required").?.array;
             try std.testing.expectEqual(@as(usize, 2), required.items.len);
@@ -1339,7 +1339,7 @@ test "tools/list: vm_upload requires vm and local_path" {
     }
 }
 
-test "tools/list: vm_download requires vm and remote_path" {
+test "tools/list: download requires vm and remote_path" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1356,7 +1356,7 @@ test "tools/list: vm_download requires vm and remote_path" {
     const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
     for (tools.items) |tool_val| {
         const tool = tool_val.object;
-        if (std.mem.eql(u8, tool.get("name").?.string, "vm_download")) {
+        if (std.mem.eql(u8, tool.get("name").?.string, "download")) {
             const schema = tool.get("inputSchema").?.object;
             const required = schema.get("required").?.array;
             try std.testing.expectEqual(@as(usize, 2), required.items.len);
@@ -1367,7 +1367,7 @@ test "tools/list: vm_download requires vm and remote_path" {
     }
 }
 
-test "tools/list: vm_ping requires vm only" {
+test "tools/list: ping requires vm only" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1384,7 +1384,7 @@ test "tools/list: vm_ping requires vm only" {
     const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
     for (tools.items) |tool_val| {
         const tool = tool_val.object;
-        if (std.mem.eql(u8, tool.get("name").?.string, "vm_ping")) {
+        if (std.mem.eql(u8, tool.get("name").?.string, "ping")) {
             const schema = tool.get("inputSchema").?.object;
             const required = schema.get("required").?.array;
             try std.testing.expectEqual(@as(usize, 1), required.items.len);
@@ -1394,7 +1394,7 @@ test "tools/list: vm_ping requires vm only" {
     }
 }
 
-test "tools/list: vm_status requires no arguments" {
+test "tools/list: status requires no arguments" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1411,7 +1411,7 @@ test "tools/list: vm_status requires no arguments" {
     const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
     for (tools.items) |tool_val| {
         const tool = tool_val.object;
-        if (std.mem.eql(u8, tool.get("name").?.string, "vm_status")) {
+        if (std.mem.eql(u8, tool.get("name").?.string, "status")) {
             const schema = tool.get("inputSchema").?.object;
             const required = schema.get("required").?.array;
             try std.testing.expectEqual(@as(usize, 0), required.items.len);

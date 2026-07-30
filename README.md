@@ -26,11 +26,11 @@ MCP protocol:
 
 | Tool | Description |
 |------|-------------|
-| `vm_status` | List all nodes (Host + Guests): hostname, role, IP, OS/arch, version, status, shell type |
-| `vm_exec` | Execute commands via TCP per-command connection. Each exec opens a fresh pty session |
-| `vm_ping` | Ping a guest over the mesh — test connectivity and measure RTT |
-| `vm_upload` | Upload a file from Host to Guest via TCP/SOCKS4 (SHA256 verified) |
-| `vm_download` | Download a file from Guest to Host via TCP/SOCKS4 (SHA256 verified) |
+| `status` | List all nodes (Host + Guests): hostname, role, IP, OS/arch, version, status, shell type |
+| `exec` | Execute commands via TCP per-command connection. Each exec opens a fresh pty session |
+| `ping` | Ping a guest over the mesh — test connectivity and measure RTT |
+| `upload` | Upload a file from Host to Guest via TCP/SOCKS4 (SHA256 verified) |
+| `download` | Download a file from Guest to Host via TCP/SOCKS4 (SHA256 verified) |
 
 Example prompts your AI agent can handle:
 - "Check the status of all my machines"

@@ -18,7 +18,7 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
 - **Per-command pty**: Each exec opens a fresh pty session via `posix_openpt` (POSIX)
   / `CreatePipe` (Windows). `MDELIM:$?\n` exit-code markers embedded in pty output.
 - **MCP stdio**: AI agents control machines via `utmm --mcp` (stdio JSON-RPC).
-  `vm_status` / `vm_exec` / `vm_ping` / `vm_upload` / `vm_download` tools. Benefits from
+  `status` / `exec` / `ping` / `upload` / `download` tools. Benefits from
   auto-ensure — if Host service is down, `--mcp` auto-starts it, so the recovery
   flow is never broken.
 - **utmmd supervisor**: Lightweight supervisor daemon manages utmm lifecycle
