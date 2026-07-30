@@ -12,6 +12,7 @@ const lsa = @import("lsa.zig");
 const tcp = @import("tcp.zig");
 const svc = @import("svc.zig");
 const arp = @import("arp.zig");
+const sshpass = @import("sshpass.zig");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     return runWithIo(init.io, init.gpa, cli, null);
@@ -111,7 +112,7 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         }
     }.fmt;
 
-    std.debug.print("\n{s: <6} {s: <16} {s: <18} {s: <16} {s: <18} {s: <10} {s: <10} {s: <8} {s}\n", .{ "Role", "Hostname", "Target", "IP", "MAC", "Version", "Status", "Shell", "Last" });
+    std.debug.print("\n{s: <6} {s: <16} {s: <18} {s: <16} {s: <18} {s: <10} {s: <10} {s: <8} {s: <7} {s}\n", .{ "Role", "Hostname", "Target", "IP", "MAC", "Version", "Status", "Shell", "ConPTY", "Last" });
     std.debug.print("{s:-<120}\n", .{""});
     for (guests.items) |guest_val| {
         const g = switch (guest_val) {
@@ -126,6 +127,7 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         const version = protocol.jsonGetString(g, "version") orelse "?";
         const status = protocol.jsonGetString(g, "status") orelse "?";
         const shell = protocol.jsonGetString(g, "shell") orelse "?";
+        const conpty = protocol.jsonGetString(g, "conpty") orelse "?";
         // Parse last_seen from JSON integer
         var last_seen: i64 = 0;
         if (g.get("last_seen")) |v| {
@@ -142,7 +144,7 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
             @as(i64, @intCast(@divTrunc(now_ms - last_seen, 86400_000)))
         else
             @as(i64, 0);
-        std.debug.print("{s: <6} {s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s: <10} {s: <8}", .{ role, hostname, target, ip, mac, version, status, shell });
+        std.debug.print("{s: <6} {s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s: <10} {s: <8} {s: <7}", .{ role, hostname, target, ip, mac, version, status, shell, conpty });
         if (rel_val > 0) {
             std.debug.print(" {d}{s}\n", .{ rel_val, rel });
         } else {
@@ -560,8 +562,8 @@ fn startHost(
 
         // Build node_info for LSA (Mesh.init() appends epoch internally)
         const node_info = std.fmt.allocPrint(gpa,
-            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:host\nstatus:serving",
-            .{ host_info.hostname, host_info.ip, host_info.target, protocol.VERSION, host_info.shell },
+            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nconpty:{s}\nrole:host\nstatus:serving",
+            .{ host_info.hostname, host_info.ip, host_info.target, protocol.VERSION, host_info.shell, if (sshpass.conptyAvailable()) "yes" else "no" },
         ) catch |err| {
             std.log.err("[host] Mesh node_info alloc: {}", .{err});
             mesh_socket.close(mesh_io);
@@ -594,6 +596,7 @@ fn startHost(
         _ = state.upsert(
             host_info.hostname, host_info.ip, host_info.target,
             host_info.mac, protocol.VERSION, host_info.shell,
+            if (sshpass.conptyAvailable()) "yes" else "no",
             "serving", "host", now_ms,
         );
 
@@ -870,6 +873,7 @@ fn tunnelManager(
             var mac_str: []const u8 = "";
             var status: []const u8 = "";
             var role: []const u8 = "";
+            var conpty: []const u8 = "";
 
             var line_it = std.mem.splitScalar(u8, s.info_copy, '\n');
             while (line_it.next()) |line| {
@@ -880,6 +884,7 @@ fn tunnelManager(
                 if (parseNodeInfoLine(line, "shell")) |v| shell = v;
                 if (parseNodeInfoLine(line, "status")) |v| status = v;
                 if (parseNodeInfoLine(line, "role")) |v| role = v;
+                if (parseNodeInfoLine(line, "conpty")) |v| conpty = v;
             }
 
             if (hostname.len == 0 or ip.len == 0) continue;
@@ -893,7 +898,7 @@ fn tunnelManager(
 
             // Upsert to guest table and set mesh MAC
             const now_ms = @as(i64, @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms)));
-            const changed = state.upsert(hostname, ip, target, mac_str, version, shell, status, role, @intCast(now_ms));
+            const changed = state.upsert(hostname, ip, target, mac_str, version, shell, conpty, status, role, @intCast(now_ms));
             if (changed and hostname.len > 0) {
                 state.setMeshMac(hostname, s.node_id);
                 syncHosts(io, allocator, state, host_ip, host_hostname);
@@ -949,6 +954,7 @@ pub const GuestEntry = struct {
     mac: []const u8,
     version: []const u8,
     shell: []const u8,
+    conpty: []const u8,
     status: []const u8,
     last_seen: i64,
     mesh_mac: ?[6]u8 = null,
@@ -977,6 +983,7 @@ pub const GuestTable = struct {
             self.allocator.free(entry.mac);
             self.allocator.free(entry.version);
             if (entry.shell.len > 0) self.allocator.free(entry.shell);
+            if (entry.conpty.len > 0) self.allocator.free(entry.conpty);
             if (entry.status.len > 0) self.allocator.free(entry.status);
             if (entry.role.len > 0) self.allocator.free(entry.role);
         }
@@ -1005,6 +1012,7 @@ pub const GuestTable = struct {
         mac: []const u8,
         version: []const u8,
         shell: []const u8,
+        conpty: []const u8,
         status: []const u8,
         role: []const u8,
         last_seen: i64,
@@ -1019,6 +1027,7 @@ pub const GuestTable = struct {
             if (!std.mem.eql(u8, existing.target, target)) changed = true;
             if (!std.mem.eql(u8, existing.version, version)) changed = true;
             if (!std.mem.eql(u8, existing.shell, shell)) changed = true;
+            if (!std.mem.eql(u8, existing.conpty, conpty)) changed = true;
             if (!std.mem.eql(u8, existing.status, status)) changed = true;
             if (!std.mem.eql(u8, existing.role, role)) changed = true;
             if (!std.mem.eql(u8, existing.mac, mac)) changed = true;
@@ -1038,6 +1047,10 @@ pub const GuestTable = struct {
             if (!std.mem.eql(u8, existing.shell, shell)) {
                 if (existing.shell.len > 0) self.allocator.free(existing.shell);
                 existing.shell = self.allocator.dupe(u8, shell) catch existing.shell;
+            }
+            if (!std.mem.eql(u8, existing.conpty, conpty)) {
+                if (existing.conpty.len > 0) self.allocator.free(existing.conpty);
+                existing.conpty = self.allocator.dupe(u8, conpty) catch existing.conpty;
             }
             if (!std.mem.eql(u8, existing.status, status)) {
                 if (existing.status.len > 0) self.allocator.free(existing.status);
@@ -1062,6 +1075,7 @@ pub const GuestTable = struct {
             .mac = self.allocator.dupe(u8, mac) catch mac,
             .version = self.allocator.dupe(u8, version) catch version,
             .shell = if (shell.len > 0) self.allocator.dupe(u8, shell) catch shell else "",
+            .conpty = if (conpty.len > 0) self.allocator.dupe(u8, conpty) catch conpty else "",
             .status = if (status.len > 0) self.allocator.dupe(u8, status) catch status else "",
             .role = if (role.len > 0) self.allocator.dupe(u8, role) catch role else "guest",
             .last_seen = last_seen,
@@ -1080,6 +1094,7 @@ pub const GuestTable = struct {
         self.allocator.free(entry.mac);
         self.allocator.free(entry.version);
         if (entry.shell.len > 0) self.allocator.free(entry.shell);
+        if (entry.conpty.len > 0) self.allocator.free(entry.conpty);
         if (entry.status.len > 0) self.allocator.free(entry.status);
         if (entry.role.len > 0) self.allocator.free(entry.role);
     }
@@ -1162,7 +1177,7 @@ test "GuestTable upsert and findByHostname" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "serving", "guest", 1000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "serving", "guest", 1000);
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
 
     const found = table.findByHostname("linuxvm");
@@ -1181,8 +1196,8 @@ test "GuestTable upsert updates existing guest" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
-    const changed = table.upsert("linuxvm", "192.168.64.3", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.14.0", "/bin/zsh", "serving", "guest", 2000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "", "guest", 1000);
+    const changed = table.upsert("linuxvm", "192.168.64.3", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.14.0", "/bin/zsh", "yes", "serving", "guest", 2000);
 
     try std.testing.expect(changed);
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
@@ -1200,9 +1215,9 @@ test "GuestTable upsert detects MAC change" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "", "guest", 1000);
     // Change only the MAC address — should be detected
-    const changed = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "11:22:33:44:55:66", "0.13.0", "/bin/bash", "", "guest", 2000);
+    const changed = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "11:22:33:44:55:66", "0.13.0", "/bin/bash", "yes", "", "guest", 2000);
 
     try std.testing.expect(changed);
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
@@ -1216,8 +1231,8 @@ test "GuestTable upsert no-change returns false" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "serving", "guest", 1000);
-    const changed = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "serving", "guest", 1000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "serving", "guest", 1000);
+    const changed = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "serving", "guest", 1000);
 
     try std.testing.expect(!changed);
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
@@ -1228,8 +1243,8 @@ test "GuestTable remove" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
-    _ = table.upsert("macvm", "192.168.64.4", "aarch64-macos", "11:22:33:44:55:66", "0.13.0", "/bin/zsh", "", "guest", 2000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "", "guest", 1000);
+    _ = table.upsert("macvm", "192.168.64.4", "aarch64-macos", "11:22:33:44:55:66", "0.13.0", "/bin/zsh", "yes", "", "guest", 2000);
     try std.testing.expectEqual(@as(usize, 2), table.guests.items.len);
 
     table.remove("linuxvm");
@@ -1245,7 +1260,7 @@ test "GuestTable setMeshMac" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "", "guest", 1000);
     try std.testing.expect(table.guests.items[0].mesh_mac == null);
 
     const mac: [6]u8 = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
@@ -1261,7 +1276,7 @@ test "GuestTable findByHostname after update" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("winx64", "192.168.3.1", "x86_64-windows", "ff:ee:dd:cc:bb:aa", "0.13.0", "cmd.exe", "upgrading", "guest", 3000);
+    _ = table.upsert("winx64", "192.168.3.1", "x86_64-windows", "ff:ee:dd:cc:bb:aa", "0.13.0", "cmd.exe", "yes", "upgrading", "guest", 3000);
 
     const found = table.findByHostname("winx64").?;
     try std.testing.expectEqualStrings("cmd.exe", found.shell);
@@ -1275,7 +1290,7 @@ test "GuestTable updateIp" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "", "guest", 1000);
 
     // updateIp: change IP
     try std.testing.expect(table.updateIp("linuxvm", "192.168.64.99"));

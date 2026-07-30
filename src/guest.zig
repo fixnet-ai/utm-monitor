@@ -16,6 +16,7 @@ const shm = @import("shm.zig");
 const dpipe = @import("dpipe.zig");
 const dpipe_shell = @import("dpipe_shell.zig");
 const dpipe_file = @import("dpipe_file.zig");
+const sshpass = @import("sshpass.zig");
 
 // libc network interface enumeration (getifaddrs)
 const in_addr = extern struct { s_addr: u32 };
@@ -803,8 +804,8 @@ pub fn guestTcpLoop(
             };
 
         const node_info = std.fmt.allocPrint(allocator,
-            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:serving",
-            .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
+            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nconpty:{s}\nrole:guest\nstatus:serving",
+            .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell, if (sshpass.conptyAvailable()) "yes" else "no" },
         ) catch |err| {
             std.log.err("[guest] node_info alloc: {}", .{err});
             mesh_socket.close(mesh_io);

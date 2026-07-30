@@ -644,8 +644,17 @@ const posix = if (is_posix) struct {
 } else struct {}; // Windows: no posix namespace
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Windows 实现（ConPTY: CreatePseudoConsole）
+// Windows 实现（ConPTY: CreatePseudoConsole / 管道降级 fallback）
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// ConPTY API (CreatePseudoConsole) 仅在 Windows 10 1809 (build 17763) 及之后可用。
+// 老版本 Windows 不支持 ConPTY，sshpass 降级为纯管道模式：
+//   - ConPTY 路径：子进程（ssh.exe）认为自己连着一个真正的控制台 → 交互式提示 → 密码注入
+//   - 管道降级：直接用 CreatePipe 连接 stdin/stdout → 仍可匹配提示 → 注入密码
+//     （Windows OpenSSH 客户端在非 TTY 模式下会从 stdin 读取密码）
+//
+// ConPTY 可用性通过 LoadLibraryA/GetProcAddress 运行时检测，避免 @extern 在
+// 老版本 Windows 上导致 DLL 加载失败。
 
 const windows = if (builtin.os.tag == .windows) struct {
     const w = std.os.windows;
@@ -683,18 +692,40 @@ const windows = if (builtin.os.tag == .windows) struct {
         *const fn (lpApplicationName: ?[*:0]const u16, lpCommandLine: [*:0]u16, lpProcessAttributes: ?*w.SECURITY_ATTRIBUTES, lpThreadAttributes: ?*w.SECURITY_ATTRIBUTES, bInheritHandles: BOOL, dwCreationFlags: DWORD, lpEnvironment: ?LPVOID, lpCurrentDirectory: ?[*:0]const u16, lpStartupInfo: *w.STARTUPINFOW, lpProcessInformation: *PROCESS_INFORMATION) callconv(.winapi) BOOL,
         .{ .name = "CreateProcessW", .library_name = "kernel32" },
     );
-    const CreatePseudoConsole = @extern(
-        *const fn (size: COORD, hInput: HANDLE, hOutput: HANDLE, dwFlags: DWORD, phPC: *HANDLE) callconv(.winapi) HRESULT,
-        .{ .name = "CreatePseudoConsole", .library_name = "kernel32" },
+
+    // ── ConPTY 函数指针类型（运行时动态解析，老版本 Windows 不可用）──
+    const ConptyCreateFn = *const fn (size: COORD, hInput: HANDLE, hOutput: HANDLE, dwFlags: DWORD, phPC: *HANDLE) callconv(.winapi) HRESULT;
+    const ConptyCloseFn = *const fn (hPC: HANDLE) callconv(.winapi) void;
+
+    // ── kernel32 动态加载支持 ──
+    const LoadLibraryA = @extern(
+        *const fn (lpLibFileName: [*:0]const u8) callconv(.winapi) ?std.os.windows.HMODULE,
+        .{ .name = "LoadLibraryA", .library_name = "kernel32" },
     );
-    const ClosePseudoConsole = @extern(
-        *const fn (hPC: HANDLE) callconv(.winapi) void,
-        .{ .name = "ClosePseudoConsole", .library_name = "kernel32" },
+    const GetProcAddress = @extern(
+        *const fn (hModule: std.os.windows.HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque,
+        .{ .name = "GetProcAddress", .library_name = "kernel32" },
     );
-    const ResizePseudoConsole = @extern(
-        *const fn (hPC: HANDLE, size: COORD) callconv(.winapi) HRESULT,
-        .{ .name = "ResizePseudoConsole", .library_name = "kernel32" },
-    );
+
+    /// 运行时检测 ConPTY 是否可用。
+    /// Windows 10 1809 (build 17763) 之前 CreatePseudoConsole 不存在于 kernel32.dll。
+    var conpty_checked: bool = false;
+    var conpty_create: ?ConptyCreateFn = null;
+    var conpty_close: ?ConptyCloseFn = null;
+
+    fn resolveConpty() void {
+        if (conpty_checked) return;
+        conpty_checked = true;
+        const h = LoadLibraryA("kernel32.dll") orelse return;
+        conpty_create = @ptrCast(@alignCast(GetProcAddress(h, "CreatePseudoConsole")));
+        conpty_close = @ptrCast(@alignCast(GetProcAddress(h, "ClosePseudoConsole")));
+    }
+
+    /// Guest 检测：ConPTY 是否可用（供 LSA node_info 上报）。
+    pub fn conptyAvailable() bool {
+        resolveConpty();
+        return conpty_create != null and conpty_close != null;
+    }
     const GetExitCodeProcess = @extern(
         *const fn (hProcess: HANDLE, lpExitCode: *DWORD) callconv(.winapi) BOOL,
         .{ .name = "GetExitCodeProcess", .library_name = "kernel32" },
@@ -733,28 +764,137 @@ const windows = if (builtin.os.tag == .windows) struct {
 
     const c = @This();
 
-    fn runWindows(allocator: std.mem.Allocator, sp_args: SshpassArgs, cmd_args: []const []const u8) ExitCode {
-        // 构建命令行（将所有参数用空格连接）
+    /// 构建 Windows 命令行 UTF-16 字符串（所有参数空格连接，含引号处理）。
+    /// 调用者拥有返回的 cmd_utf16（需 defer allocator.free）。
+    fn buildCmdLine(allocator: std.mem.Allocator, cmd_args: []const []const u8) ![]u16 {
         var cmdline_buf: std.ArrayList(u8) = .empty;
         defer cmdline_buf.deinit(allocator);
         for (cmd_args, 0..) |carg, idx| {
-            if (idx > 0) cmdline_buf.append(allocator, ' ') catch return .runtime_error;
-            // 如果包含空格则加引号
+            if (idx > 0) try cmdline_buf.append(allocator, ' ');
             const needs_quote = std.mem.indexOfAny(u8, carg, " \t") != null;
-            if (needs_quote) cmdline_buf.append(allocator, '"') catch return .runtime_error;
-            cmdline_buf.appendSlice(allocator, carg) catch return .runtime_error;
-            if (needs_quote) cmdline_buf.append(allocator, '"') catch return .runtime_error;
+            if (needs_quote) try cmdline_buf.append(allocator, '"');
+            try cmdline_buf.appendSlice(allocator, carg);
+            if (needs_quote) try cmdline_buf.append(allocator, '"');
         }
-        cmdline_buf.append(allocator, 0) catch return .runtime_error;
+        try cmdline_buf.append(allocator, 0);
 
-        // UTF-8 → UTF-16
         const cmd_u8 = cmdline_buf.items;
-        const cmd_utf16 = allocator.alloc(u16, cmd_u8.len) catch return .runtime_error;
-        defer allocator.free(cmd_utf16);
-        const utf16_len = std.unicode.utf8ToUtf16Le(cmd_utf16, cmd_u8[0 .. cmd_u8.len - 1]) catch return .runtime_error;
+        const cmd_utf16 = try allocator.alloc(u16, cmd_u8.len);
+        errdefer allocator.free(cmd_utf16);
+        const utf16_len = try std.unicode.utf8ToUtf16Le(cmd_utf16, cmd_u8[0 .. cmd_u8.len - 1]);
         cmd_utf16[utf16_len] = 0;
+        return cmd_utf16;
+    }
 
-        // 创建管道：ConPTY ↔ 父进程通信
+    /// 管道降级模式（老版本 Windows，无 ConPTY）。
+    /// 直接用 CreatePipe 连接子进程 stdin/stdout，仍可匹配 SSH 提示并注入密码。
+    /// Windows OpenSSH 客户端在非 TTY 模式下会从 stdin 读取密码。
+    fn runWindowsPipe(allocator: std.mem.Allocator, sp_args: SshpassArgs, cmd_args: []const []const u8) ExitCode {
+        const cmd_utf16 = buildCmdLine(allocator, cmd_args) catch return .runtime_error;
+        defer allocator.free(cmd_utf16);
+
+        var sa: w.SECURITY_ATTRIBUTES = .{
+            .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
+            .bInheritHandle = @enumFromInt(1),
+            .lpSecurityDescriptor = null,
+        };
+
+        // 子进程 stdin 管道（父进程写入密码）
+        var stdin_read: HANDLE = undefined;
+        var stdin_write: HANDLE = undefined;
+        if (@intFromEnum(CreatePipe(&stdin_read, &stdin_write, &sa, 0)) == 0) return .runtime_error;
+        defer _ = CloseHandle(stdin_read);
+        _ = SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
+
+        // 子进程 stdout 管道（父进程读取输出）
+        var stdout_read: HANDLE = undefined;
+        var stdout_write: HANDLE = undefined;
+        if (@intFromEnum(CreatePipe(&stdout_read, &stdout_write, &sa, 0)) == 0) return .runtime_error;
+        defer _ = CloseHandle(stdout_write);
+        _ = SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+
+        // 使用标准 STARTUPINFO（非 ConPTY 的 EXTENDED_STARTUPINFO）
+        var startup_info: w.STARTUPINFOW = std.mem.zeroes(w.STARTUPINFOW);
+        startup_info.cb = @sizeOf(w.STARTUPINFOW);
+        startup_info.hStdInput = stdin_read;
+        startup_info.hStdOutput = stdout_write;
+        startup_info.hStdError = stdout_write;
+        startup_info.dwFlags = @as(DWORD, @bitCast(@as(c_ulong, 0x100))); // STARTF_USESTDHANDLES
+
+        var pi: PROCESS_INFORMATION = undefined;
+        const create_result = CreateProcessW(
+            null,
+            @as([*:0]u16, @ptrCast(cmd_utf16.ptr)),
+            null,
+            null,
+            @enumFromInt(1), // inherit handles
+            0, // 无特殊 flag
+            null,
+            null,
+            &startup_info,
+            &pi,
+        );
+        if (@intFromEnum(create_result) == 0) return .runtime_error;
+        defer _ = CloseHandle(pi.hThread);
+        defer _ = CloseHandle(pi.hProcess);
+
+        // 关闭子进程端的句柄
+        _ = CloseHandle(stdin_read);
+        _ = CloseHandle(stdout_write);
+
+        // 读取/写入循环（与 ConPTY 路径相同的 prompt 匹配逻辑）
+        var prevmatch: bool = false;
+        var state1: usize = 0;
+        var state2: usize = 0;
+        var state3: usize = 0;
+        var state4: usize = 0;
+        var terminate: i32 = 0;
+
+        var tmp_buf: [40]u8 = undefined;
+        const Sleep = @extern(*const fn (dwMilliseconds: DWORD) callconv(.winapi) void, .{ .name = "Sleep", .library_name = "kernel32" });
+
+        while (true) {
+            var exit_code: DWORD = 0;
+            _ = GetExitCodeProcess(pi.hProcess, &exit_code);
+            if (exit_code != 259) break; // 259 = STILL_ACTIVE
+
+            var bytes_read: DWORD = 0;
+            const read_ok = ReadFile(stdout_read, &tmp_buf, @intCast(tmp_buf.len), &bytes_read, null);
+            if (@intFromEnum(read_ok) != 0 and bytes_read > 0) {
+                const data = tmp_buf[0..@intCast(bytes_read)];
+
+                // 透传到父进程 stdout
+                var written: DWORD = 0;
+                const stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE) orelse return .runtime_error;
+                _ = WriteFile(stdout_handle, data.ptr, @intCast(data.len), &written, null);
+
+                const ret = handleoutputWindows(
+                    &sp_args, &prevmatch, &state1, &state2, &state3, &state4,
+                    data, stdin_write,
+                );
+                if (ret != 0) { terminate = ret; break; }
+            } else {
+                Sleep(50);
+            }
+        }
+
+        if (terminate > 0) {
+            _ = TerminateProcess(pi.hProcess, @as(w.UINT, @intCast(terminate)));
+            return @enumFromInt(@as(u8, @intCast(terminate)));
+        }
+
+        var final_exit: DWORD = 0;
+        _ = GetExitCodeProcess(pi.hProcess, &final_exit);
+        return @enumFromInt(@as(u8, @truncate(final_exit)));
+    }
+
+    /// ConPTY 模式（Windows 10 1809+）。
+    /// CreatePseudoConsole → child process thinks it's connected to a real console
+    /// → interactive password prompts work naturally.
+    fn runWindowsConpty(allocator: std.mem.Allocator, sp_args: SshpassArgs, cmd_args: []const []const u8) ExitCode {
+        const cmd_utf16 = buildCmdLine(allocator, cmd_args) catch return .runtime_error;
+        defer allocator.free(cmd_utf16);
+
         var sa: w.SECURITY_ATTRIBUTES = .{
             .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
             .bInheritHandle = @enumFromInt(1),
@@ -765,31 +905,26 @@ const windows = if (builtin.os.tag == .windows) struct {
         var in_write: HANDLE = undefined;
         if (@intFromEnum(CreatePipe(&in_read, &in_write, &sa, 0)) == 0) return .runtime_error;
         defer _ = CloseHandle(in_read);
-        // 不继承 write 端
         _ = SetHandleInformation(in_write, HANDLE_FLAG_INHERIT, 0);
 
         var out_read: HANDLE = undefined;
         var out_write: HANDLE = undefined;
         if (@intFromEnum(CreatePipe(&out_read, &out_write, &sa, 0)) == 0) return .runtime_error;
         defer _ = CloseHandle(out_write);
-        // 不继承 read 端
         _ = SetHandleInformation(out_read, HANDLE_FLAG_INHERIT, 0);
 
-        // 创建 ConPTY（80x25 默认大小）
+        // 动态解析的 ConPTY 函数指针（resolveConpty 已在调度前调用）
         const conpty_size = COORD{ .X = 80, .Y = 25 };
         var hpc: HANDLE = undefined;
-        const hr = CreatePseudoConsole(conpty_size, in_read, out_write, PSEUDOCONSOLE_INHERIT_CURSOR, &hpc);
-        if (hr != 0) return .runtime_error; // HRESULT 0 = S_OK
-        defer ClosePseudoConsole(hpc);
+        const hr = conpty_create.?(conpty_size, in_read, out_write, PSEUDOCONSOLE_INHERIT_CURSOR, &hpc);
+        if (hr != 0) return .runtime_error;
+        defer conpty_close.?(hpc);
 
-        // 为 CreateProcess 准备 STARTUPINFOEX
         var startup_info: w.STARTUPINFOW = std.mem.zeroes(w.STARTUPINFOW);
         startup_info.cb = @sizeOf(w.STARTUPINFOW);
 
         var pi: PROCESS_INFORMATION = undefined;
-        // ConPTY 需要用 InitializeProcThreadAttributeList 设置 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 
-        // 分配属性列表空间
         var attr_list_buf: [1024]u8 align(@alignOf(u64)) = [_]u8{0} ** 1024;
 
         const InitializeProcThreadAttributeList = @extern(
@@ -807,7 +942,6 @@ const windows = if (builtin.os.tag == .windows) struct {
 
         const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x00020016;
 
-        // 初始化和设置属性列表
         var attr_size: usize = @sizeOf(@TypeOf(attr_list_buf));
         if (@intFromEnum(InitializeProcThreadAttributeList(@ptrCast(&attr_list_buf), 1, 0, &attr_size)) == 0) {
             return .runtime_error;
@@ -815,44 +949,31 @@ const windows = if (builtin.os.tag == .windows) struct {
         defer DeleteProcThreadAttributeList(@ptrCast(&attr_list_buf));
 
         if (@intFromEnum(UpdateProcThreadAttribute(
-            @ptrCast(&attr_list_buf),
-            0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            @ptrCast(&hpc),
-            @sizeOf(HANDLE),
-            null,
-            null,
+            @ptrCast(&attr_list_buf), 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            @ptrCast(&hpc), @sizeOf(HANDLE), null, null,
         )) == 0) {
             return .runtime_error;
         }
 
-        // 设置 STARTUPINFOEX
         startup_info.cb = @sizeOf(w.STARTUPINFOW);
 
-        // 创建进程
         const create_result = CreateProcessW(
             null,
             @as([*:0]u16, @ptrCast(cmd_utf16.ptr)),
-            null,
-            null,
-            @enumFromInt(1), // inherit handles
+            null, null,
+            @enumFromInt(1),
             EXTENDED_STARTUPINFO_PRESENT,
-            null,
-            null,
+            null, null,
             &startup_info,
             &pi,
         );
-        if (@intFromEnum(create_result) == 0) {
-            return .runtime_error;
-        }
+        if (@intFromEnum(create_result) == 0) return .runtime_error;
         defer _ = CloseHandle(pi.hThread);
         defer _ = CloseHandle(pi.hProcess);
 
-        // 关闭不需要的管道端
         _ = CloseHandle(in_read);
         _ = CloseHandle(out_write);
 
-        // 读取/写入循环
         var prevmatch: bool = false;
         var state1: usize = 0;
         var state2: usize = 0;
@@ -861,41 +982,28 @@ const windows = if (builtin.os.tag == .windows) struct {
         var terminate: i32 = 0;
 
         var tmp_buf: [40]u8 = undefined;
+        const Sleep = @extern(*const fn (dwMilliseconds: DWORD) callconv(.winapi) void, .{ .name = "Sleep", .library_name = "kernel32" });
 
         while (true) {
-            // 检查子进程是否已退出
             var exit_code: DWORD = 0;
             _ = GetExitCodeProcess(pi.hProcess, &exit_code);
-            if (exit_code != 259) break; // 259 = STILL_ACTIVE
+            if (exit_code != 259) break;
 
-            // 从 ConPTY stdout 读取
             var bytes_read: DWORD = 0;
             const read_ok = ReadFile(out_read, &tmp_buf, @intCast(tmp_buf.len), &bytes_read, null);
             if (@intFromEnum(read_ok) != 0 and bytes_read > 0) {
                 const data = tmp_buf[0..@intCast(bytes_read)];
 
-                // 透传到父进程 stdout
                 var written: DWORD = 0;
                 const stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE) orelse return .runtime_error;
                 _ = WriteFile(stdout_handle, data.ptr, @intCast(data.len), &written, null);
 
                 const ret = handleoutputWindows(
-                    &sp_args,
-                    &prevmatch,
-                    &state1,
-                    &state2,
-                    &state3,
-                    &state4,
-                    data,
-                    in_write,
+                    &sp_args, &prevmatch, &state1, &state2, &state3, &state4,
+                    data, in_write,
                 );
-                if (ret != 0) {
-                    terminate = ret;
-                    break;
-                }
+                if (ret != 0) { terminate = ret; break; }
             } else {
-                // 无数据可用，短暂睡眠
-                const Sleep = @extern(*const fn (dwMilliseconds: DWORD) callconv(.winapi) void, .{ .name = "Sleep", .library_name = "kernel32" });
                 Sleep(50);
             }
         }
@@ -905,10 +1013,19 @@ const windows = if (builtin.os.tag == .windows) struct {
             return @enumFromInt(@as(u8, @intCast(terminate)));
         }
 
-        // 再次获取最终退出码
         var final_exit: DWORD = 0;
         _ = GetExitCodeProcess(pi.hProcess, &final_exit);
         return @enumFromInt(@as(u8, @truncate(final_exit)));
+    }
+
+    /// runWindows 调度器：检测 ConPTY 可用性，选择最优路径。
+    fn runWindows(allocator: std.mem.Allocator, sp_args: SshpassArgs, cmd_args: []const []const u8) ExitCode {
+        resolveConpty();
+        if (conpty_create != null and conpty_close != null) {
+            return runWindowsConpty(allocator, sp_args, cmd_args);
+        } else {
+            return runWindowsPipe(allocator, sp_args, cmd_args);
+        }
     }
 
     fn handleoutputWindows(
@@ -1047,6 +1164,18 @@ const windows = if (builtin.os.tag == .windows) struct {
         }
     }
 } else struct {};
+
+/// Guest 检测：平台是否支持 PTY 密码注入。
+/// - POSIX：始终返回 true（posix_openpt 在所有现代系统上可用）。
+/// - Windows：动态检测 CreatePseudoConsole API 是否存在（需 Win10 1809+）。
+/// 供 Guest/Host 在 LSA node_info 中上报 conpty 标记。
+pub fn conptyAvailable() bool {
+    if (builtin.os.tag == .windows) {
+        windows.resolveConpty();
+        return windows.conpty_create != null and windows.conpty_close != null;
+    }
+    return true; // POSIX always has PTY
+}
 
 const is_windows = builtin.os.tag == .windows;
 
