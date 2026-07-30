@@ -312,17 +312,20 @@ fn isLikelyVmNat(bytes: [4]u8) bool {
     return false;
 }
 
+/// Physical NIC IP address and interface name detected by detectUnixIp.
+const IpInfo = struct { ip: []const u8, iface_name: []const u8 };
+
 /// One-stop system info collection: hostname + IP + MAC + target.
 /// Enumerate physical NICs via getifaddrs(), prefer non-NAT addresses
 /// (skip known VM NAT ranges like 10.0.2.x, 192.168.122.x).
 /// Returns the first non-NAT physical IPv4, or the first physical IPv4 if all
 /// are in NAT ranges. Returns null if no suitable interface found.
-fn detectUnixIp(allocator: std.mem.Allocator) !?struct { ip: []const u8, iface_name: []const u8 } {
+fn detectUnixIp(allocator: std.mem.Allocator) !?IpInfo {
     var ifap: ?*ifaddrs = undefined;
     if (getifaddrs(&ifap) != 0) return null;
     defer freeifaddrs(ifap);
 
-    var fallback: ?struct { ip: []const u8, iface_name: []const u8 } = null;
+    var fallback: ?IpInfo = null;
 
     var current: ?*ifaddrs = ifap;
     while (current) |ifa| : (current = ifa.ifa_next) {

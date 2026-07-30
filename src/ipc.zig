@@ -1529,10 +1529,10 @@ test "ipc upload header byte-by-byte parsing boundary" {
 
     // 在 header 后面追加一些模拟文件数据（4 字节"file content"标记）
     const extra: [4]u8 = .{ 0xDE, 0xAD, 0xBE, 0xEF };
-    var full_msg = std.ArrayList(u8).init(std.testing.allocator);
-    defer full_msg.deinit();
-    try full_msg.appendSlice(header_only);
-    try full_msg.appendSlice(&extra);
+    var full_msg: std.ArrayList(u8) = .empty;
+    defer full_msg.deinit(std.testing.allocator);
+    try full_msg.appendSlice(std.testing.allocator, header_only);
+    try full_msg.appendSlice(std.testing.allocator, &extra);
 
     // 写入完整消息（header + file data）到 socket
     _ = tcp_mod.sockWrite(nbp.b, full_msg.items.ptr, full_msg.items.len);

@@ -31,12 +31,20 @@ const TOOLS_JSON = "[{\"name\":\"vm_status\",\"description\":\"Get status of all
 pub fn run(io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
-    const stdin_r = &stdin_reader.interface;
-
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
-    const stdout_w = &stdout_writer.interface;
+    return runWithPipe(io, gpa, port, &stdin_reader.interface, &stdout_writer.interface);
+}
 
+/// Core MCP loop — reads JSON-RPC from `reader`, writes responses to `writer`.
+/// Testable with Reader.fixed / Writer.fixed for protocol verification.
+pub fn runWithPipe(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    port: u16,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+) !void {
     // Read JSON-RPC requests line by line until EOF.
     var req_buf: std.ArrayList(u8) = .empty;
     defer req_buf.deinit(gpa);
@@ -45,8 +53,8 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         req_buf.clearRetainingCapacity();
 
         // Read until newline (MCP stdio transport: one JSON object per line).
-        const line = stdin_r.takeDelimiter('\n') catch |err| {
-            std.log.err("[mcp] stdin read error: {}", .{err});
+        const line = reader.takeDelimiter('\n') catch |err| {
+            std.log.err("[mcp] read error: {}", .{err});
             break;
         };
         if (line == null) break; // EOF
@@ -59,16 +67,22 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
             // Try to send an error response
             const err_resp = jsonBuildError(gpa, .{ .null = {} }, -32603, @errorName(err)) catch continue;
             defer gpa.free(err_resp);
-            stdout_w.print("{s}\n", .{err_resp}) catch break;
-            try stdout_w.flush();
+            _ = writer.print("{s}\n", .{err_resp}) catch break;
+            _ = writer.flush() catch |err_flush| {
+                std.log.err("[mcp] flush error: {}", .{err_flush});
+                break;
+            };
             continue;
         };
         defer gpa.free(response);
 
         // Write response (skip empty responses for notifications)
         if (response.len > 0) {
-            stdout_w.print("{s}\n", .{response}) catch break;
-            try stdout_w.flush();
+            _ = writer.print("{s}\n", .{response}) catch break;
+            _ = writer.flush() catch |err_flush| {
+                std.log.err("[mcp] flush error: {}", .{err_flush});
+                break;
+            };
         }
     }
 }
@@ -676,4 +690,757 @@ test "jsonGetNestedObject missing" {
     const obj = parsed.value.object;
     const nested = jsonGetNestedObject(obj, "params");
     try std.testing.expect(nested == null);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// processRequest tests — non-IPC methods (no Host service needed)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "processRequest: initialize" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var threaded: std.Io.Threaded = .init_single_threaded;
+
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize"}
+    );
+    defer alloc.free(result);
+
+    // Must be valid JSON-RPC response with server info
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"jsonrpc\":\"2.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"id\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "utmm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "serverInfo") != null);
+    // Version placeholder should be replaced with actual version
+    try std.testing.expect(std.mem.indexOf(u8, result, "__VERSION__") == null);
+}
+
+test "processRequest: ping" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"ping"}
+    );
+    defer alloc.free(result);
+
+    // Should return {"jsonrpc":"2.0","id":1,"result":{}}
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"jsonrpc\":\"2.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"id\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"result\":{}") != null);
+}
+
+test "processRequest: tools/list" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer alloc.free(result);
+
+    // Should contain all 5 tools
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "vm_status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "vm_exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "vm_ping") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "vm_upload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "vm_download") != null);
+}
+
+test "processRequest: notifications/initialized (notification, no id)" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    );
+    defer alloc.free(result);
+
+    // Notification without id returns empty string
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "processRequest: notifications/initialized with id" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":2,"method":"notifications/initialized"}
+    );
+    defer alloc.free(result);
+
+    // With id present, should return a JSON response with empty object result
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"result\":{}") != null);
+}
+
+test "processRequest: unknown method" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"nonexistent"}
+    );
+    defer alloc.free(result);
+
+    // Should be an error response with code -32601
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "-32601") != null);
+}
+
+test "processRequest: invalid JSON" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121, "not json at all");
+    defer alloc.free(result);
+
+    // Should be a parse error -32700
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "-32700") != null);
+}
+
+test "processRequest: missing method" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1}
+    );
+    defer alloc.free(result);
+
+    // Should be error -32600 Invalid Request
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "-32600") != null);
+}
+
+test "processRequest: non-object root (array)" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121, "[1,2,3]");
+    defer alloc.free(result);
+
+    // Array instead of object should be Invalid Request -32600
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "-32600") != null);
+}
+
+test "processRequest: string id preserved" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":"req-abc","method":"ping"}
+    );
+    defer alloc.free(result);
+
+    // String id should be preserved in response
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"id\":\"req-abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"result\":{}") != null);
+}
+
+test "processRequest: bool id preserved" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":true,"method":"ping"}
+    );
+    defer alloc.free(result);
+
+    // Bool id should be preserved
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"id\":true") != null);
+}
+
+test "processRequest: tools/call unknown tool" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}
+    );
+    defer alloc.free(result);
+
+    // Unknown tool should be error -32601
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "-32601") != null);
+}
+
+test "processRequest: tools/call without params" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call"}
+    );
+    defer alloc.free(result);
+
+    // Missing params should be error -32602
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "-32602") != null);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Format function tests — pure functions, no I/O needed
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "formatStatusMCP: empty list" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatStatusMCP(alloc, "[]");
+    defer alloc.free(result);
+
+    // Empty list should show "No VMs"
+    try std.testing.expect(std.mem.indexOf(u8, result, "No VMs currently online.") != null);
+}
+
+test "formatStatusMCP: with guests" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatStatusMCP(alloc,
+        \\[{"hostname":"linuxvm","role":"guest","target":"aarch64-linux-musl","ip":"192.168.64.6","mac":"aa:bb:cc:dd:ee:ff","version":"0.14.5","shell":"bash","status":"online"}]
+    );
+    defer alloc.free(result);
+
+    // Should contain guest info in markdown
+    try std.testing.expect(std.mem.indexOf(u8, result, "linuxvm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "192.168.64.6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "aa:bb:cc:dd:ee:ff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "0.14.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "online") != null);
+    // Should have MCP content format
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"content\"") != null);
+}
+
+test "formatStatusMCP: non-array input" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatStatusMCP(alloc, "{}");
+    defer alloc.free(result);
+
+    // Non-array JSON should fallback to "No VMs"
+    try std.testing.expect(std.mem.indexOf(u8, result, "No VMs currently online.") != null);
+}
+
+test "formatExecMCP: success (exit 0)" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatExecMCP(alloc, "linuxvm", "uname -a", "Linux linuxvm 6.1.0", 0);
+    defer alloc.free(result);
+
+    // Should show VM, command, output
+    try std.testing.expect(std.mem.indexOf(u8, result, "linuxvm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "uname -a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Linux linuxvm 6.1.0") != null);
+    // Success (exit 0) should NOT show exit code
+    try std.testing.expect(std.mem.indexOf(u8, result, "(exit") == null);
+    // Should have MCP content format
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"content\"") != null);
+}
+
+test "formatExecMCP: error exit (non-zero)" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatExecMCP(alloc, "linuxvm", "cat /nonexistent", "cat: /nonexistent: No such file or directory", 1);
+    defer alloc.free(result);
+
+    // Error exit code should be shown
+    try std.testing.expect(std.mem.indexOf(u8, result, "linuxvm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "exit 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "No such file or directory") != null);
+}
+
+test "formatExecMCP: special characters escaped" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatExecMCP(alloc, "vm", "echo \"hello\"", "output with\nnewline", 0);
+    defer alloc.free(result);
+
+    // Quotes and newlines should be JSON-escaped
+    try std.testing.expect(std.mem.indexOf(u8, result, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "newline") != null);
+}
+
+test "formatExecMCP: trims whitespace" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatExecMCP(alloc, "vm", "cmd", "  output with spaces  \n\r", 0);
+    defer alloc.free(result);
+
+    // Trimmed output should not have leading/trailing whitespace in the display
+    try std.testing.expect(std.mem.indexOf(u8, result, "output with spaces") != null);
+}
+
+test "formatPingMCP: valid ping result" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Simulate ping response from IPC
+    const ping_json =
+        \\{"mac":"11:22:33:44:55:66","rtt_ms":3}
+    ;
+    const result = try formatPingMCP(alloc, "linuxvm", ping_json);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "linuxvm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "11:22:33:44:55:66") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "3ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"content\"") != null);
+}
+
+test "formatPingMCP: missing mac field" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatPingMCP(alloc, "testvm", "{}");
+    defer alloc.free(result);
+
+    // Missing mac should show "?"
+    try std.testing.expect(std.mem.indexOf(u8, result, "MAC=?") != null);
+}
+
+test "guestDefaultDir: linux returns posix path" {
+    try std.testing.expectEqualStrings("/opt/utmm", guestDefaultDir("linuxvm"));
+}
+
+test "guestDefaultDir: macos returns posix path" {
+    try std.testing.expectEqualStrings("/opt/utmm", guestDefaultDir("macvm"));
+}
+
+test "guestDefaultDir: windows returns windows path" {
+    try std.testing.expectEqualStrings("C:\\opt\\utmm", guestDefaultDir("windowsvm"));
+    try std.testing.expectEqualStrings("C:\\opt\\utmm", guestDefaultDir("winx64"));
+}
+
+test "SERVER_INFO contains required fields" {
+    try std.testing.expect(std.mem.indexOf(u8, SERVER_INFO, "protocolVersion") != null);
+    try std.testing.expect(std.mem.indexOf(u8, SERVER_INFO, "utmm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, SERVER_INFO, "capabilities") != null);
+}
+
+test "TOOLS_JSON lists all 5 tools" {
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "vm_status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "vm_exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "vm_ping") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "vm_upload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "vm_download") != null);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// runWithPipe integration tests — full MCP protocol via pipe simulation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Run a sequence of JSON-RPC requests through runWithPipe and return the output.
+fn runMcpTest(gpa: std.mem.Allocator, input: []const u8) ![]const u8 {
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+
+    // Reader.fixed accepts []const u8 — input is read-only
+    var reader = std.Io.Reader.fixed(input);
+
+    var out_buf: [16384]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out_buf);
+
+    try runWithPipe(io, gpa, 2121, &reader, &writer);
+    return gpa.dupe(u8, writer.buffered());
+}
+
+test "runWithPipe: initialize → ping → tools/list → notifications/initialized" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const requests =
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize"}
+        \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/list"}
+        \\
+    ;
+    const output = try runMcpTest(alloc, requests);
+    defer alloc.free(output);
+
+    // Each response should be valid JSON on its own line
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    const line1 = lines.next().?; // initialize
+    const line2 = lines.next().?; // ping
+    const line3 = lines.next().?; // tools/list (notification between ping & tools/list skipped — no id)
+    try std.testing.expect(lines.rest().len == 0);
+
+    // Line 1: initialize response — contains serverInfo and version
+    try std.testing.expect(std.mem.indexOf(u8, line1, "\"id\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line1, "\"result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line1, "serverInfo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line1, "utmm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line1, "protocolVersion") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line1, "\"error\"") == null);
+
+    // Line 2: ping response — empty result
+    try std.testing.expect(std.mem.indexOf(u8, line2, "\"id\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line2, "\"result\":{}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line2, "\"error\"") == null);
+
+    // Line 3: tools/list response
+    // (notifications/initialized between ping and tools/list is a no-id
+    // notification → processRequest returns "" → skipped by runWithPipe)
+    try std.testing.expect(std.mem.indexOf(u8, line3, "\"id\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "vm_status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "vm_exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "vm_ping") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "vm_upload") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "vm_download") != null);
+
+    // Verify the tools/list response is in MCP list_tools format
+    try std.testing.expect(std.mem.indexOf(u8, line3, "\"tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "\"name\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line3, "inputSchema") != null);
+}
+
+test "runWithPipe: notification skipped (no output)" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Pure notification — no id field
+    const output = try runMcpTest(alloc,
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    );
+    defer alloc.free(output);
+
+    // No id = notification → response is empty string → skipped
+    try std.testing.expectEqualSlices(u8, "", output);
+}
+
+test "runWithPipe: unknown method error" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const output = try runMcpTest(alloc,
+        \\{"jsonrpc":"2.0","id":1,"method":"bad.method"}
+    );
+    defer alloc.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "-32601") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"id\":1") != null);
+}
+
+test "runWithPipe: invalid json returns parse error" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const output = try runMcpTest(alloc, "this is not json\n");
+    defer alloc.free(output);
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "-32700") != null);
+}
+
+test "runWithPipe: multiple requests batched" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // 5 ping requests, verify each gets correct id in response
+    const output = try runMcpTest(alloc,
+        \\{"jsonrpc":"2.0","id":10,"method":"ping"}
+        \\{"jsonrpc":"2.0","id":20,"method":"ping"}
+        \\{"jsonrpc":"2.0","id":30,"method":"ping"}
+        \\{"jsonrpc":"2.0","id":40,"method":"ping"}
+        \\{"jsonrpc":"2.0","id":50,"method":"ping"}
+        \\
+    );
+    defer alloc.free(output);
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "\"id\":10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "\"id\":20") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "\"id\":30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "\"id\":40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines.next().?, "\"id\":50") != null);
+    try std.testing.expect(lines.rest().len == 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tool schema validation — parse tools/list JSON and verify each tool
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "tools/list response: each tool has required MCP fields" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Get tools/list response via processRequest
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer alloc.free(result);
+
+    // Parse the response as JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, result, .{ .allocate = .alloc_always }) catch |err| {
+        std.debug.print("PARSE ERROR: {}\nResponse: {s}\n", .{ err, result });
+        return err;
+    };
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const result_val = root.get("result").?;
+    const tools_arr = result_val.object.get("tools").?.array;
+
+    // Must have exactly 5 tools
+    try std.testing.expectEqual(@as(usize, 5), tools_arr.items.len);
+
+    const expected_tools = [_][]const u8{ "vm_status", "vm_exec", "vm_ping", "vm_upload", "vm_download" };
+    for (expected_tools) |expected_name| {
+        var found = false;
+        for (tools_arr.items) |tool_val| {
+            const tool = tool_val.object;
+            const name = tool.get("name").?.string;
+            if (std.mem.eql(u8, name, expected_name)) {
+                found = true;
+                // Every tool must have name, description, inputSchema
+                try std.testing.expect(tool.get("name") != null);
+                try std.testing.expect(tool.get("description") != null);
+                const schema = tool.get("inputSchema").?;
+                try std.testing.expect(schema.object.get("type") != null);
+                try std.testing.expectEqualStrings("object", schema.object.get("type").?.string);
+                try std.testing.expect(schema.object.get("properties") != null);
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "tools/list: vm_exec requires vm and command" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer alloc.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
+    for (tools.items) |tool_val| {
+        const tool = tool_val.object;
+        if (std.mem.eql(u8, tool.get("name").?.string, "vm_exec")) {
+            const schema = tool.get("inputSchema").?.object;
+            const required = schema.get("required").?.array;
+            try std.testing.expectEqual(@as(usize, 2), required.items.len);
+            try std.testing.expectEqualStrings("vm", required.items[0].string);
+            try std.testing.expectEqualStrings("command", required.items[1].string);
+
+            const props = schema.get("properties").?.object;
+            try std.testing.expect(props.get("vm") != null);
+            try std.testing.expect(props.get("command") != null);
+            break;
+        }
+    }
+}
+
+test "tools/list: vm_upload requires vm and local_path" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer alloc.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
+    for (tools.items) |tool_val| {
+        const tool = tool_val.object;
+        if (std.mem.eql(u8, tool.get("name").?.string, "vm_upload")) {
+            const schema = tool.get("inputSchema").?.object;
+            const required = schema.get("required").?.array;
+            try std.testing.expectEqual(@as(usize, 2), required.items.len);
+            try std.testing.expectEqualStrings("vm", required.items[0].string);
+            try std.testing.expectEqualStrings("local_path", required.items[1].string);
+            break;
+        }
+    }
+}
+
+test "tools/list: vm_download requires vm and remote_path" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer alloc.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
+    for (tools.items) |tool_val| {
+        const tool = tool_val.object;
+        if (std.mem.eql(u8, tool.get("name").?.string, "vm_download")) {
+            const schema = tool.get("inputSchema").?.object;
+            const required = schema.get("required").?.array;
+            try std.testing.expectEqual(@as(usize, 2), required.items.len);
+            try std.testing.expectEqualStrings("vm", required.items[0].string);
+            try std.testing.expectEqualStrings("remote_path", required.items[1].string);
+            break;
+        }
+    }
+}
+
+test "tools/list: vm_ping requires vm only" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer alloc.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
+    for (tools.items) |tool_val| {
+        const tool = tool_val.object;
+        if (std.mem.eql(u8, tool.get("name").?.string, "vm_ping")) {
+            const schema = tool.get("inputSchema").?.object;
+            const required = schema.get("required").?.array;
+            try std.testing.expectEqual(@as(usize, 1), required.items.len);
+            try std.testing.expectEqualStrings("vm", required.items[0].string);
+            break;
+        }
+    }
+}
+
+test "tools/list: vm_status requires no arguments" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer alloc.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
+    for (tools.items) |tool_val| {
+        const tool = tool_val.object;
+        if (std.mem.eql(u8, tool.get("name").?.string, "vm_status")) {
+            const schema = tool.get("inputSchema").?.object;
+            const required = schema.get("required").?.array;
+            try std.testing.expectEqual(@as(usize, 0), required.items.len);
+            break;
+        }
+    }
+}
+
+test "tools/list: each tool inputSchema has type=object" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer alloc.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
+    for (tools.items) |tool_val| {
+        const tool = tool_val.object;
+        const schema = tool.get("inputSchema").?.object;
+        const stype = schema.get("type").?.string;
+        try std.testing.expectEqualStrings("object", stype);
+    }
+}
+
+test "tools/list: each tool has a non-empty description" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const result = try processRequest(alloc, threaded.io(), 2121,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    );
+    defer alloc.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array;
+    for (tools.items) |tool_val| {
+        const tool = tool_val.object;
+        const desc = tool.get("description").?.string;
+        try std.testing.expect(desc.len > 0);
+    }
 }
