@@ -262,9 +262,9 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
     return jsonBuildError(gpa, id_val, -32601, "Method not found");
 }
 
-/// Handle vm_status via IPC. HTTP handler preserved for future WebUI.
+/// Handle vm_status via IPC.
 fn handleVmStatus(gpa: std.mem.Allocator, io: std.Io, port: u16) ![]const u8 {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const json = try ipc_mod.ipcStatus(io, gpa);
     defer gpa.free(json);
     return formatStatusMCP(gpa, json);
@@ -320,10 +320,10 @@ fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{text_json});
 }
 
-/// Handle vm_exec via IPC. HTTP handler preserved for future WebUI.
+/// Handle vm_exec via IPC.
 fn handleVmExec(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, command: []const u8) ![]const u8 {
-    _ = port; // HTTP handlers preserved for future WebUI
-    // IPC-only — capture output in a fixed buffer
+    _ = port; // IPC handler — port reserved for future use
+    // Captures output in a fixed buffer
     var output_buf: [65536]u8 = undefined;
     var output_writer: std.Io.Writer = .fixed(&output_buf);
     const exit_code = try ipc_mod.ipcExec(io, gpa, vm, command, &output_writer);

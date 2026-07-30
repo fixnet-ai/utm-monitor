@@ -341,3 +341,17 @@ src/
 | 35 | `sc.exe stop` 不可靠 → 不杀 utmmd.exe | utmmd 应通过服务管理器停止；killAllUtmm 只杀 utmm.exe 是正确的设计 |
 | 36 | `detectUnixIp()` 跳过 VM NAT 地址 | 新增 `isLikelyVmNat()` 检查 10.0.2.x (QEMU/VirtualBox) 和 192.168.122.x (libvirt)。多 NIC VM 优先选择非 NAT 接口，回退到第一个物理 NIC |
 | 37 | `upsert()` 检测 MAC 地址变化 | 新增 MAC 字段比对和更新逻辑。VM 重装后 MAC 变更可在 status 中正确显示 |
+| 38 | 全量注释清理 | 扫描并修复 src/ 下所有 KCP/HTTP/WebUI/tunnel manager/mesh relay 过时注释。main.zig (10+), host.zig (~15), mcp.zig (2), protocol.zig (1)。41/41 测试通过 |
+
+### Phase 16: v0.14.3 — 源码注释清理 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 113 | main.zig 注释更新（模块 doc、字段 doc、help text、行内注释）| ✅ |
+| 114 | host.zig 注释更新（HTTP handlers、tunnel manager、pushUpgrade doc）| ✅ |
+| 115 | mcp.zig 注释更新（handleVmStatus、handleVmExec）| ✅ |
+| 116 | protocol.zig KCP 过时注释重写 | ✅ |
+| 117 | guest.zig 注释审计（无需修改）| ✅ |
+| 118 | 全量 grep 扫描确认无残留过时引用 | ✅ |
+| 119 | zig build test + test-integration 验证 | ✅ |
+| 120 | progress.md + task_plan.md 更新 | ✅ |

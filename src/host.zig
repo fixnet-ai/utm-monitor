@@ -69,14 +69,14 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
-    // IPC-only — HTTP handlers preserved for future WebUI
+    // IPC handler
     const json_str = try ipc_mod.ipcStatus(block_io, gpa);
     defer gpa.free(json_str);
 
-    // Parse JSON and print table (same as HTTP path)
+    // Parse JSON and print table
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_str, .{ .allocate = .alloc_always }) catch |err| {
         std.debug.print("[status] JSON parse error: {}\n", .{err});
         return err;
@@ -373,20 +373,20 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
 }
 
 fn cmdPing(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8) !void {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
-    // IPC-only — HTTP handlers preserved for future WebUI
+    // IPC handler
     const json = try ipc_mod.ipcPing(block_io, gpa, target);
     defer gpa.free(json);
     std.debug.print("{s}\n", .{json});
 }
 
 fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, cmd: []const u8) !void {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
-    // IPC-only — HTTP handlers preserved for future WebUI
+    // IPC handler
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(block_io, &stdout_buf);
     const stdout_iface = &stdout_writer.interface;
@@ -400,7 +400,7 @@ fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
 }
 
 fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, local_file: []const u8) !void {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
     const basename = std.fs.path.basename(local_file);
@@ -412,7 +412,7 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
 
     std.debug.print("[upload] Uploading {s} -> {s} ({s})...\n", .{ local_file, target, dest });
 
-    // IPC-only — HTTP handlers preserved for future WebUI
+    // IPC handler
     try ipc_mod.ipcUpload(block_io, gpa, target, local_file, dest);
     std.debug.print("[upload] OK\n", .{});
 }
@@ -428,12 +428,12 @@ fn cmdUpgrade(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []con
 }
 
 fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, remote_file: []const u8, local_path: []const u8) !void {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
     std.debug.print("[download] Downloading {s} from {s} -> {s}...\n", .{ remote_file, target, local_path });
 
-    // IPC-only — HTTP handlers preserved for future WebUI
+    // IPC handler
     // Write to temp file first, then rename atomically
     var rand_bytes: [8]u8 = undefined;
     block_io.random(&rand_bytes);
@@ -594,7 +594,7 @@ fn startHost(
 
     }
 
-    // Spawn tunnel manager thread — syncs LSA→guest table, connects tunnels.
+    // Spawn LSA manager thread — syncs LSA→guest table, triggers auto-upgrade.
     // Must spawn before the defer below so join() runs in correct order.
     var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ block_io, gpa, &state, &mesh_opt });
 
@@ -665,7 +665,7 @@ const AUTO_UPGRADE_COOLDOWN_MS: i64 = 120_000; // 2 minutes
 const LastUpgradeMap = std.StringHashMap(i64);
 
 /// Push an upgrade binary to a Guest.  Used by both manual --upgrade (IPC)
-/// and automatic version-mismatch detection (tunnelManager).
+/// and automatic version-mismatch detection (LSA manager).
 /// Returns an error string on failure (caller does NOT own), or null on success.
 pub fn pushUpgrade(
     io: std.Io,

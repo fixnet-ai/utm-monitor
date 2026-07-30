@@ -97,6 +97,37 @@ Windows upload 路径分隔符修复；SKILL 版本号批量更新；清理旧�
 - CLAUDE.md：macvm IP 192.168.64.4 → 192.168.65.4，windowsvm 192.168.65.2 → 192.168.64.3
 - SKILL.md：全部 macvm/windowsvm 命令中的 IP 相应更新
 
+### 2026-07-30 — 源码注释清理
+
+**成果**: 全面扫描并修复 src/ 下所有过时/错误注释。KCP、HTTP/WebUI、tunnel manager、
+mesh relay 等 v0.13.0 后已删除的功能在注释中仍大量残留，现已全部修正。
+
+**修改详情**:
+
+- **`src/main.zig`**（10+ 处）:
+  - 模块 doc：`"Automatic VM IP sync tool"` → `"Remote machine management via TCP/SOCKS4a"`
+  - `port` 字段 doc：`"Mesh UDP port"` → `"TCP listen + UDP LSA port"`
+  - `host_ip` 字段 doc：`"Host IP for Guest HTTP client"` → `"Host IP override for Guest"`
+  - `serve_dir` 字段 doc：`"HTTP serve directory"` → `"Binary serve directory for Host upgrade push"`
+  - `--serve-dir` help text：同上 HTTP→binary
+  - `--ping` help text：删除 `"relayed"`
+  - 行 ~453：`"bind the HTTP port"` → `"bind the IPC socket"`
+  - 删除过时中文注释
+
+- **`src/host.zig`**（~15 处）:
+  - 12 处 `"HTTP handlers preserved for future WebUI"` → `"IPC handler"`
+  - `"Parse JSON and print table (same as HTTP path)"` → `"Parse JSON and print table"`
+  - `"Spawn tunnel manager thread"` → `"Spawn LSA manager thread"`
+  - `pushUpgrade` doc：`"tunnelManager"` → `"LSA manager"`
+
+- **`src/mcp.zig`**（2 处）:
+  - `handleVmStatus`/`handleVmExec` doc：删除 `"HTTP handler preserved for future WebUI"`
+
+- **`src/protocol.zig`**（1 处）:
+  - KCP 隧道过时注释重写为当前 TCP/SOCKS4a wire protocol 描述
+
+**验证**: `zig build test` + `zig build test-integration`（41/41 通过）— 纯注释变更，无代码逻辑修改。
+
 ### 2026-07-30 — linuxvm 重建与文档更新
 
 **背景**: linuxvm 的 `Linux.utm` bundle 从磁盘消失，UTM 显示 phantom "started" 状态但无实际进程。

@@ -147,10 +147,10 @@ test "deploymentFilename - unknown target" {
 // String fields: null-terminated. Binary fields: 4-byte BE length prefix + data.
 // Integer fields: 4-byte BE.
 //
-// Previously carried over KCP tunnel (v0.11.0–v0.13.0). Now carried over TCP/SOCKS4
-// via tcp frame protocol (v0.14.0+).
+// Wire protocol message types — carried over TCP/SOCKS4a via tcp frame protocol.
+// Formerly over KCP tunnels (v0.11.0–v0.13.0), now over TCP per-command connections.
 
-/// Tunnel protocol message types (inner payload inside tcp frames).
+/// Wire protocol message types (inner payload inside tcp frames).
 /// These flow over TCP/SOCKS4 connections — not directly on UDP :2121.
 pub const MsgType = enum(u8) {
     // Host → Guest commands

@@ -1,9 +1,11 @@
-//! UTM Monitor — Automatic VM IP sync tool
+//! UTM Monitor — Remote machine management via TCP/SOCKS4a.
 //!
-//! Guest mode (default): mesh LSA + TCP/SOCKS4 connection to Host
-//! Host mode (--host): ensures Host service is running
+//! Guest mode (default): LSA mesh broadcast + TCP listener on port 2121.
+//!   Host connects to Guest via SOCKS4a proxy for exec/upload/download.
+//! Host mode (--host): LSA node table + IPC socket for CLI/MCP commands.
 //!
 //! Self-copy model: binary copies itself to canonical path /opt/utmm/utmm[.exe].
+//! Service lifecycle managed by utmmd supervisor (shm heartbeat + crash recovery).
 //! All operations (except --version/--help) require root/Administrator.
 
 const std = @import("std");
@@ -77,15 +79,15 @@ comptime {
 pub const CliArgs = struct {
     /// Whether in Host mode
     is_host: bool = false,
-    /// Mesh UDP port (Host mode)
+    /// TCP listen + UDP LSA port (Host and Guest, default 2121)
     port: u16 = protocol.DEFAULT_PORT,
-    /// Mesh UDP port for LSA broadcast
+    /// LSA broadcast UDP port (may differ from `port` for testing)
     mesh_port: u16 = protocol.DEFAULT_PORT,
-    /// Direct peer mesh address for local testing
+    /// Direct peer LSA address for local testing (skip broadcast)
     peer_mesh: ?[]const u8 = null,
     /// Guest hostname (default: auto-detect)
     hostname: ?[]const u8 = null,
-    /// Host IP for Guest HTTP client (default: auto-detect via default gateway)
+    /// Host IP override for Guest (default: auto-detect via default gateway)
     host_ip: ?[]const u8 = null,
     /// hosts file path (host side)
     hosts_file: []const u8 = if (builtin.os.tag == .windows)
@@ -96,7 +98,7 @@ pub const CliArgs = struct {
     marker: []const u8 = protocol.HOSTS_MARKER_BEGIN,
     /// Log file path
     log_file: ?[]const u8 = null,
-    /// HTTP serve directory for Host (--serve-dir), default: exe directory
+    /// Binary serve directory for Host upgrade push (--serve-dir), default: exe directory
     serve_dir: ?[]const u8 = null,
     /// Run as daemon via service manager (--svc, set by service configs)
     is_svc: bool = false,
@@ -291,14 +293,14 @@ pub fn printHelp() void {
         \\Host options:
         \\  --port PORT         Service port (default 2121)
         \\  --hosts-file PATH   hosts file path (default /etc/hosts)
-        \\  --serve-dir PATH    HTTP serve directory (default: exe directory)
+        \\  --serve-dir PATH    Binary serve directory for upgrade push (default: exe directory)
         \\  --marker TAG        Marker comment text (default "UTM-MONITOR")
         \\  --log-file PATH     Log file path
         \\
         \\Management commands (require Host service running):
         \\  --status            Query all online guest status
         \\  --deploy [TARGET]   Cross-compile, SCP, install & verify guest(s)
-        \\  --ping TARGET       Ping a guest via mesh (Host→Guest or relayed)
+        \\  --ping TARGET       Ping a guest via LSA mesh (Host→Guest)
         \\  --exec TARGET CMD   Execute command on target guest
         \\  --upload FILE VM    Upload a file to Guest VM
         \\  --download VM REMOTE LOCAL  Download file from Guest VM
@@ -449,9 +451,8 @@ pub fn main(init: std.process.Init) !void {
             and !cli.cmd_deploy and !cli.cmd_upgrade) {
             return;
         }
-        // If the service was just started, give it time to bind the HTTP port
-        // before the management command connects. Service managers return before
-        // the process has fully initialized.
+        // If the service was just started, give it time to bind the IPC socket
+        // and begin LSA broadcast before the management command connects.
         if (!was_running) {
             std.Io.sleep(init.io, std.Io.Duration.fromSeconds(1), .awake) catch {};
         }
@@ -459,7 +460,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ── 8. Management commands ──
     if (cli.cmd_status or cli.cmd_exec or cli.cmd_ping or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.cmd_deploy or cli.cmd_upgrade) {
-        cli.is_host = false; // management commands don't need --host
+        cli.is_host = false; // reset: Host ensured above, run() just dispatches commands
         try host_mod.run(init, cli);
         return;
     }
@@ -759,7 +760,7 @@ test "parseArgs - version" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Admin privilege check (曾 priv.zig)
+// Admin privilege check
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Check whether the current process has admin/root privileges.
