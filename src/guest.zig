@@ -365,20 +365,24 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
 
     const target = zigTarget();
 
-    // Get hostname (lowercased for consistent comparison and hosts entries)
-    const hostname: []const u8 = if (builtin.os.tag == .windows) blk: {
-        const name_ptr = std.c.getenv("COMPUTERNAME");
-        const raw = if (name_ptr) |ptr|
-            try allocator.dupe(u8, std.mem.span(ptr))
-        else
-            try allocator.dupe(u8, "unknown");
+    // Get hostname (lowercased, FQDN suffix like .local stripped for consistency)
+    const hostname: []const u8 = blk: {
+        const raw = if (builtin.os.tag == .windows) blk2: {
+            const name_ptr = std.c.getenv("COMPUTERNAME");
+            break :blk2 if (name_ptr) |ptr|
+                try allocator.dupe(u8, std.mem.span(ptr))
+            else
+                try allocator.dupe(u8, "unknown");
+        } else blk2: {
+            var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+            const name = try std.posix.gethostname(&buf);
+            break :blk2 try allocator.dupe(u8, name);
+        };
+        // Lowercase + strip FQDN suffix (e.g. "LAPTOP.local" → "laptop")
         for (raw) |*c| c.* = std.ascii.toLower(c.*);
-        break :blk raw;
-    } else blk: {
-        var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-        const name = try std.posix.gethostname(&buf);
-        const raw = try allocator.dupe(u8, name);
-        for (raw) |*c| c.* = std.ascii.toLower(c.*);
+        if (std.mem.indexOfScalar(u8, raw, '.')) |dot_pos| {
+            break :blk raw[0..dot_pos];
+        }
         break :blk raw;
     };
 
@@ -728,8 +732,12 @@ fn guestHostsSync(
             entries.append(allocator, .{ .ip = gateway_ip, .name = "gateway" }) catch continue;
         }
 
-        lsa.updateHosts(io, allocator, "/etc/hosts", entries.items) catch |err| {
-            std.log.warn("[guest] hostsSync: updateHosts /etc/hosts: {}", .{err});
+        const hosts_path = if (builtin.os.tag == .windows)
+            "C:\\Windows\\System32\\drivers\\etc\\hosts"
+        else
+            "/etc/hosts";
+        lsa.updateHosts(io, allocator, hosts_path, entries.items) catch |err| {
+            std.log.warn("[guest] hostsSync: updateHosts {s}: {}", .{ hosts_path, err });
         };
     }
 }

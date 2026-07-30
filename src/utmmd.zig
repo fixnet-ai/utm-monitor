@@ -218,6 +218,8 @@ fn startUtmmPosix(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.S
     shm_ptr.utmm_pid = @intCast(pid);
     shm_ptr.svc_heartbeat = shm.nowMs(io);
     shm_ptr.restart_count += 1;
+    shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
+    shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.pending);
     std.log.info("[utmmd] utmm started, pid={d}", .{pid});
     return @intCast(pid);
 }
@@ -258,6 +260,8 @@ fn startUtmmWin(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.Shm
     shm_ptr.utmm_pid = pi.dwProcessId;
     shm_ptr.svc_heartbeat = shm.nowMs(io);
     shm_ptr.restart_count += 1;
+    shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
+    shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.pending);
     std.log.info("[utmmd] utmm started, pid={d}", .{pi.dwProcessId});
     return UtmmProcessWin{ .handle = pi.hProcess, .pid = pi.dwProcessId };
 }
@@ -588,6 +592,7 @@ fn monitorUtmm(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
             },
             .restart => {
                 shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.accepted);
+                shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
                 killProcess(proc);
                 return .restart;
             },

@@ -71,6 +71,9 @@ pub fn parseDiscoveryVersion(data: []const u8) ?[]const u8 {
 /// /etc/hosts marker block
 pub const HOSTS_MARKER_BEGIN = "# UTM-MONITOR-BEGIN";
 pub const HOSTS_MARKER_END = "# UTM-MONITOR-END";
+// 旧版标记（v0.14.5 及之前），updateHosts 会自动清理
+pub const HOSTS_MARKER_BEGIN_OLD = "# BEGIN UTM-MONITOR";
+pub const HOSTS_MARKER_END_OLD = "# END UTM-MONITOR";
 
 /// Program version number — embedded at compile time, displayed in --status.
 /// Sourced from ver.txt at compile time via @embedFile.

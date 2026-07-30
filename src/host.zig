@@ -1122,11 +1122,13 @@ fn syncHosts(
         entries.append(allocator, .{ .ip = gateway_ip, .name = gateway_name }) catch return;
     }
 
-    // Lock and collect all guest entries
+    // Lock and collect all guest entries (skip Host itself — already added as gateway above)
     state.mutex.lock(io) catch return;
     defer state.mutex.unlock(io);
     for (state.guests.items) |g| {
         if (g.ip.len > 0 and g.hostname.len > 0) {
+            // Skip Host's own entry added at line 594 to avoid duplicate with gateway entry
+            if (gateway_ip.len > 0 and std.mem.eql(u8, g.ip, gateway_ip)) continue;
             entries.append(allocator, .{ .ip = g.ip, .name = g.hostname }) catch continue;
         }
     }

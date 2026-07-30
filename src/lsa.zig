@@ -1245,19 +1245,48 @@ pub fn updateHosts(
     };
     defer allocator.free(original);
 
+    // ── 清理旧版标记块（v0.14.5 及之前的 # BEGIN UTM-MONITOR / # END UTM-MONITOR）──
+    // 在写入新块之前，先去除原内容中的旧标记块，避免双块并存。
+    var cleaned: std.ArrayList(u8) = .empty;
+    defer cleaned.deinit(allocator);
+    try cleaned.ensureTotalCapacity(allocator, original.len);
+    {
+        const old_begin = protocol.HOSTS_MARKER_BEGIN_OLD;
+        const old_end = protocol.HOSTS_MARKER_END_OLD;
+        const old_bpos = findMarkerLine(original, old_begin);
+        const old_epos = if (old_bpos != null)
+            findMarkerLine(original[old_bpos.? + old_begin.len ..], old_end)
+        else
+            null;
+        if (old_bpos != null and old_epos != null) {
+            const ob = old_bpos.?;
+            const oe = ob + old_begin.len + old_epos.? + old_end.len;
+            var aoe = oe;
+            while (aoe < original.len and (original[aoe] == '\r' or original[aoe] == '\n')) {
+                aoe += 1;
+            }
+            try cleaned.appendSlice(allocator, original[0..ob]);
+            if (aoe < original.len) {
+                try cleaned.appendSlice(allocator, original[aoe..]);
+            }
+        } else {
+            try cleaned.appendSlice(allocator, original);
+        }
+    }
+
     const begin_line = protocol.HOSTS_MARKER_BEGIN;
     const end_line = protocol.HOSTS_MARKER_END;
 
     // Build new content via range replacement
     var new_content: std.ArrayList(u8) = .empty;
     defer new_content.deinit(allocator);
-    try new_content.ensureTotalCapacity(allocator, original.len + 512);
+    try new_content.ensureTotalCapacity(allocator, cleaned.items.len + 512);
 
-    // Find marker block boundaries in the original content.
+    // Find marker block boundaries in the cleaned content.
     // We look for lines that match the begin/end markers (after trimming whitespace).
-    const begin_pos = findMarkerLine(original, begin_line);
+    const begin_pos = findMarkerLine(cleaned.items, begin_line);
     const end_pos = if (begin_pos != null)
-        findMarkerLine(original[begin_pos.? + begin_line.len ..], end_line)
+        findMarkerLine(cleaned.items[begin_pos.? + begin_line.len ..], end_line)
     else
         null;
 
@@ -1267,12 +1296,12 @@ pub fn updateHosts(
 
         // Find end of the END-marker line (skip past trailing \r\n)
         var actual_end = block_end;
-        while (actual_end < original.len and (original[actual_end] == '\r' or original[actual_end] == '\n')) {
+        while (actual_end < cleaned.items.len and (cleaned.items[actual_end] == '\r' or cleaned.items[actual_end] == '\n')) {
             actual_end += 1;
         }
 
         // Copy content before the marker block
-        try new_content.appendSlice(allocator, original[0..block_start]);
+        try new_content.appendSlice(allocator, cleaned.items[0..block_start]);
 
         // Write new block
         try new_content.appendSlice(allocator, begin_line);
@@ -1284,12 +1313,12 @@ pub fn updateHosts(
         try new_content.append(allocator, '\n');
 
         // Copy content after the marker block
-        if (actual_end < original.len) {
-            try new_content.appendSlice(allocator, original[actual_end..]);
+        if (actual_end < cleaned.items.len) {
+            try new_content.appendSlice(allocator, cleaned.items[actual_end..]);
         }
     } else {
         // No marker block exists — copy original and append new block
-        try new_content.appendSlice(allocator, original);
+        try new_content.appendSlice(allocator, cleaned.items);
 
         // Ensure trailing newline before appending block
         if (new_content.items.len > 0 and new_content.items[new_content.items.len - 1] != '\n') {
