@@ -32,6 +32,12 @@ MCP protocol:
 | `upload` | Upload a file from Host to Guest via TCP/SOCKS4 (SHA256 verified) |
 | `download` | Download a file from Guest to Host via TCP/SOCKS4 (SHA256 verified) |
 
+> **ConPTY**: `--status` shows each node's ConPTY support (`yes`/`no`). On Windows,
+> ConPTY (pseudo-terminal) enables SSH password authentication and interactive
+> command execution. If a Windows VM shows `conpty:no`, it's running an older
+> Windows build (< 10.0.17763) — SSH operations fall back to pipe mode, which
+> may have reduced compatibility. POSIX (Linux/macOS) always reports `conpty:yes`.
+
 Example prompts your AI agent can handle:
 - "Check the status of all my machines"
 - "linuxvm is slow — check CPU, memory, and disk IO"
@@ -66,6 +72,11 @@ utmm --deploy linuxvm  # Deploy single guest
 
 # Push upgrade to Guest (no SSH needed)
 utmm --upgrade linuxvm
+
+# Non-interactive SSH (built-in sshpass)
+utmm sshpass -p '111' ssh root@192.168.64.2 'uname -a'
+utmm sshpass -f ~/.ssh/vm_pass ssh root@macvm 'ls -la'
+utmm sshpass -e ssh Administrator@windowsvm 'tasklist'  # reads SSHPASS env var
 
 # File transfer
 utmm --upload build.zip linuxvm

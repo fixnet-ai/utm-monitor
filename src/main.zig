@@ -319,7 +319,17 @@ pub fn printHelp() void {
         \\  --gen-init PLATFORM Generate auto-start script (linux/macos/windows)
         \\  --version           Show version info
         \\
-        \\  sshpass [OPTS] CMD   Non-interactive SSH password authentication
+        \\
+        \\  sshpass [-p PASS|-f FILE|-d FD|-e] [-hV] command [args...]
+        \\                    Non-interactive SSH password authentication
+        \\                    -p PASS   Password from command line
+        \\                    -f FILE   Password from file (first line)
+        \\                    -d FD     Password from file descriptor
+        \\                    -e        Password from SSHPASS env var
+        \\                    -h        Show help and exit
+        \\                    -V        Print version and exit
+        \\                    ConPTY (Windows pseudo-terminal) support detected
+        \\                    automatically — important for MCP SSH operations
         \\
         \\NOTE: All operations require root/Administrator privileges.
         \\  sshpass does not require root privileges.

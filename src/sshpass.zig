@@ -2,9 +2,19 @@
 //
 // 100% CLI-compatible with the original sshpass(1) C utility.
 // POSIX: posix_openpt → fork → pselect → prompt-matching → password injection.
-// Windows: CreatePseudoConsole (ConPTY, requires Windows 10 1809+).
+// Windows: CreatePseudoConsole (ConPTY, requires Windows 10 1809+),
+// with automatic pipe fallback on older Windows builds (< 17763).
 //
 // Usage: utmm sshpass [-p password | -f file | -d fd | -e] [-hV] command [args...]
+//
+// Examples:
+//   utmm sshpass -p '123456' ssh root@192.168.1.1 'ls -la'
+//   utmm sshpass -f ~/.ssh/pass ssh user@server 'uptime'
+//   utmm sshpass -e ssh admin@host 'cat /proc/cpuinfo'   # reads SSHPASS env var
+//
+// ConPTY support is critical for MCP/CLI SSH operations on Windows.
+// Use conptyAvailable() to detect support — reported in LSA node_info
+// and visible in utmm --status output.
 
 const std = @import("std");
 const builtin = @import("builtin");

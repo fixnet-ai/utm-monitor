@@ -17,6 +17,11 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
   overwrite. Upgrade = scp new binary + `--install`. Zero shell commands.
 - **Per-command pty**: Each exec opens a fresh pty session via `posix_openpt` (POSIX)
   / `CreatePipe` (Windows). `MDELIM:$?\n` exit-code markers embedded in pty output.
+- **sshpass subcommand**: Built-in non-interactive SSH password authentication
+  (`utmm sshpass -p PASS ssh user@host cmd`). 100% CLI compatible with standalone
+  sshpass. POSIX uses PTY, Windows uses ConPTY (dynamic load) with pipe fallback
+  for older Windows builds (< 17763). ConPTY support is reported in `--status`
+  output — critical for MCP SSH operations.
 - **MCP stdio**: AI agents control machines via `utmm --mcp` (stdio JSON-RPC).
   `status` / `exec` / `ping` / `upload` / `download` tools. Benefits from
   auto-ensure — if Host service is down, `--mcp` auto-starts it, so the recovery
