@@ -56,7 +56,7 @@ utmm --upload build.zip linuxvm
 utmm --download linuxvm /var/log/app.log ./app.log
 
 # Non-interactive SSH (built-in sshpass)
-utmm sshpass -p '111' ssh root@192.168.64.2 'uname -a'
+utmm sshpass -p '111' ssh root@linuxvm 'uname -a'
 utmm sshpass -f ~/.ssh/pass ssh user@server 'uptime'      # password from file
 utmm sshpass -e ssh admin@host 'cmd'                        # password from SSHPASS env
 
@@ -86,6 +86,12 @@ utmm --ping linuxvm
 | `ping` | Ping a Guest over the mesh network and measure RTT |
 | `upload` | Upload file from Host to Guest (TCP/SOCKS4, SHA256 verified) |
 | `download` | Download file from Guest to Host (TCP/SOCKS4, SHA256 verified) |
+
+**Beyond MCP**: When the Guest daemon is down or not yet installed (bootstrap,
+recovery, pre-install setup), the built-in `utmm sshpass` fills the gap. It works
+on **Linux, macOS, and Windows** — ConPTY dynamic loading gives Windows the same
+SSH scripting power as Unix. AI agents use it directly from the shell alongside
+MCP tools, not through the JSON-RPC channel.
 
 Example prompts your AI agent can handle:
 - "Check the status of all my machines"
