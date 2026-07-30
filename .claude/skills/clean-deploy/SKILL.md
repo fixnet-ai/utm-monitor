@@ -199,6 +199,7 @@ Record results in `progress.md`:
 - **Hostname resolution**: all commands use hostnames (linuxvm/macvm/windowsvm/winx64) — the Host's
   LSA `/etc/hosts` sync provides DNS-free name resolution. If a hostname doesn't resolve during
   wipe (e.g. first-time setup), use the IP from the VM table in `SKILL.md`.
+  **Known issue**: `winx64` (192.168.3.x subnet) may not resolve via LSA sync — use IP `192.168.3.108` if `ssh: Could not resolve hostname winx64`.
 - **Irreversible** — wipes all configs, logs, history. Dev/test only.
 - **Windows OpenSSH** must be pre-enabled on Guests
 - **mkdir after wipe** — `/opt/utmm` is deleted during wipe; use `New-Item` on Windows

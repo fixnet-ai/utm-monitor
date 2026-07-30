@@ -1,3 +1,53 @@
+## Clean Deploy Test v0.14.7 (第二轮 — 修复后 skill 验证)
+
+**时间**: 2026-07-31 04:13-04:15
+
+### 测试环境
+- **版本**: v0.14.7
+- **测试方法**: 修复后的 `.claude/skills/clean-deploy/SKILL.md`（Phase 0 Build → Phase 1 Wipe → Phase 2 Cross-Compile → Phase 3 Deploy → Phase 4 Test）
+
+### 测试结果
+
+| Test | linuxvm | macvm | windowsvm | winx64 |
+|------|---------|-------|-----------|--------|
+| --exec | ✅ | ✅ | ✅ | ✅ |
+| --upload | ✅ | ✅ | ✅ | ✅ |
+| --download | ✅ | ✅ | ✅ | ✅ |
+| --ping | ✅ (2ms) | ✅ (1ms) | ✅ (1ms) | ✅ (6ms) |
+| SHA256 | ✅ | ✅ | ✅ | ✅ |
+
+**总评**: 4/4 VM 全部通过，所有 SHA256 校验一致。176 单元测试 + 59 集成测试全部通过。
+
+### 发现的问题
+
+1. **winx64 hostname 不解析** — `ssh: Could not resolve hostname winx64`
+   - 原因: winx64 在 192.168.3.x 子网，LSA UDP 广播可能不跨子网，/etc/hosts 无法同步
+   - 影响: clean-deploy 中对 winx64 的 sshpass 命令需用 IP（192.168.3.108）
+   - 建议: skill 中为 winx64 保留 IP 备选，或增加 winx64 的 /etc/hosts 同步机制
+
+2. **Windows sc.exe stop 失效** — `[SC] ControlService FAILED 109: The pipe has been ended.`
+   - 当 utmm 进程状态异常时 sc.exe 无法停止，需 `taskkill /F` 兜底
+   - skill 中的 wipe 流程已包含 taskkill 步骤，合理
+
+3. **utmm sshpass scp 可用** — 验证了 `utmm sshpass -p 111 scp ...` 可正常工作
+   - POSIX Guest 和 Windows Guest 均成功
+
+4. **Zig 0.16.0 `--listen=-` 协议 bug** — `zig build test` 卡死
+   - Workaround: 直接运行 `.zig-cache/o/<hash>/test` 二进制（已验证可行）
+   - 两轮测试均遇到此问题，建议在 SKILL.md/deploy skill 中记录此 workaround
+
+5. **Windows `tasklist /fi` 在 cmd /c 下需转义** — `/fi "imagename eq utmm.exe"` 中的引号
+   在 `cmd /c` 中会丢失，建议改为 `tasklist | findstr utmm`
+
+### 与上轮对比
+
+| 问题 | 上轮状态 | 本轮状态 |
+|------|---------|---------|
+| skill linuxvm IP 错误 | ❌ 192.168.64.2 | ✅ 已修复 |
+| skill pkill -f 自杀 | ❌ 存在 | ✅ 已修复 |
+| skill sshpass 引用 | ❌ 裸 sshpass | ✅ utmm sshpass |
+| skill Windows mkdir | ❌ 不可靠 | ✅ 已修复 |
+| winx64 hostname | — 未测试（上轮用 IP） | ❌ 新发现 |
 # Progress: 分层架构重构
 
 ## 当前状态
