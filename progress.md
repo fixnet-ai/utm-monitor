@@ -46,6 +46,35 @@ Windows upload 路径分隔符修复；SKILL 版本号批量更新；清理旧�
 - `zig build test-integration` 41/41 通过 ✅
 - 8 交叉编译目标全部通过 ✅
 
+### 2026-07-30 — v0.14.3 Clean Deploy 全量验证
+
+**成果**: 完整的"清空—构建—部署—测试"裸机部署循环，4 台 VM 全 v0.14.3，
+16 项功能测试（exec/upload/download/ping × 4）全部通过，SHA256 跨平台一致。
+
+**测试结果**:
+
+| 测试项 | linuxvm | macvm | windowsvm | winx64 |
+|--------|---------|-------|-----------|--------|
+| --exec | ✅ | ✅ | ✅ | ✅ |
+| --upload | ✅ | ✅ | ✅ | ✅ |
+| --download | ✅ | ✅ | ✅ | ✅ |
+| --ping | ✅ (2ms) | ✅ (1ms) | ✅ (1ms) | ✅ (5ms) |
+
+**构建验证**:
+- `zig build test` 全部通过 ✅
+- `zig build test-integration` 41/41 通过，0 泄漏 ✅
+- 4 交叉编译目标全部通过 ✅
+
+**踩坑记录**:
+1. macvm IP 变化：192.168.64.4 → 192.168.65.4（SSH host key 也变了，需 StrictHostKeyChecking=no）
+2. windowsvm IP 变化：192.168.65.2 → 192.168.64.3
+3. macvm UTM stop/start 后网络需 ~30s 才恢复
+4. SKILL.md + CLAUDE.md 中 macvm/windowsvm 旧 IP 已更正
+
+**文档更新**:
+- CLAUDE.md：macvm IP 192.168.64.4 → 192.168.65.4，windowsvm 192.168.65.2 → 192.168.64.3
+- SKILL.md：全部 macvm/windowsvm 命令中的 IP 相应更新
+
 ### 2026-07-30 — linuxvm 重建与文档更新
 
 **背景**: linuxvm 的 `Linux.utm` bundle 从磁盘消失，UTM 显示 phantom "started" 状态但无实际进程。
