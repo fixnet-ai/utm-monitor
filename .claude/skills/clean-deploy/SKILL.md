@@ -14,9 +14,9 @@ UTM Monitor 的完整流程。每次执行后总结问题点和可改进之处�
 
 | VM | Hostname | Target | IP | User | Password | Remote Dir | OS |
 |----|----------|--------|----|------|--------|------------|-----|
-| macOS | macvm | aarch64-macos | 192.168.64.4 | root | 111 | /opt/utmm | macOS |
+| macOS | macvm | aarch64-macos | 192.168.65.4 | root | 111 | /opt/utmm | macOS |
 | Linux | linuxvm | aarch64-linux-musl | 192.168.64.6 | root | 111 | /opt/utmm | Linux |
-| Windows | windowsvm | aarch64-windows | 192.168.65.2 | Administrator | 111 | C:\opt\utmm | Windows |
+| Windows | windowsvm | aarch64-windows | 192.168.64.3 | Administrator | 111 | C:\opt\utmm | Windows |
 | Windows | winx64 | x86_64-windows | 192.168.3.108 | Administrator | 111 | C:\opt\utmm | Windows |
 
 ## 实战踩坑记录
@@ -79,7 +79,7 @@ sudo rm -f /var/run/utmm.sock
 
 ```bash
 # 注意：bootout 会重设 disabled flag，之后需要重新 enable
-sshpass -p 111 ssh root@192.168.64.4 '
+sshpass -p 111 ssh root@192.168.65.4 '
 launchctl enable system/com.utmmd 2>/dev/null
 launchctl bootout system/com.utmmd 2>/dev/null || true
 launchctl enable system/com.utmmd 2>/dev/null
@@ -127,7 +127,7 @@ echo "linuxvm cleaned"
 
 ```bash
 # windowsvm
-sshpass -p 111 ssh Administrator@192.168.65.2 'powershell -Command "
+sshpass -p 111 ssh Administrator@192.168.64.3 'powershell -Command "
 sc.exe stop UTM-MonitorD 2>$null; sc.exe delete UTM-MonitorD 2>$null;
 Get-Process -Name utmm -ErrorAction SilentlyContinue | Stop-Process -Force;
 Get-Process -Name utmmd -ErrorAction SilentlyContinue | Stop-Process -Force;
@@ -154,9 +154,9 @@ echo "winx64 cleaned"
 ps aux | grep -i utmm | grep -v grep || echo "Host clean"
 
 # 确认各 Guest 无 utmm 进程
-sshpass -p 111 ssh root@192.168.64.4 'ps aux | grep -i utmm | grep -v grep || echo "macvm clean"'
+sshpass -p 111 ssh root@192.168.65.4 'ps aux | grep -i utmm | grep -v grep || echo "macvm clean"'
 sshpass -p 111 ssh root@192.168.64.6 'ps aux | grep -i utmm | grep -v grep || echo "linuxvm clean"'
-sshpass -p 111 ssh Administrator@192.168.65.2 'tasklist /fi "imagename eq utmm.exe" 2>nul & tasklist /fi "imagename eq utmmd.exe" 2>nul || echo "windowsvm clean"'
+sshpass -p 111 ssh Administrator@192.168.64.3 'tasklist /fi "imagename eq utmm.exe" 2>nul & tasklist /fi "imagename eq utmmd.exe" 2>nul || echo "windowsvm clean"'
 sshpass -p 111 ssh Administrator@192.168.3.108 'tasklist /fi "imagename eq utmm.exe" 2>nul & tasklist /fi "imagename eq utmmd.exe" 2>nul || echo "winx64 clean"'
 ```
 
@@ -212,20 +212,20 @@ sshpass -p 111 ssh root@192.168.64.6 'chmod +x /opt/utmm/utmm-new && /opt/utmm/u
 
 ```bash
 # 创建目标目录
-sshpass -p 111 ssh root@192.168.64.4 'mkdir -p /opt/utmm'
+sshpass -p 111 ssh root@192.168.65.4 'mkdir -p /opt/utmm'
 
 # scp 二进制
-sshpass -p 111 scp zig-out/bin/utmm-aarch64-macos-0.14.2 root@192.168.64.4:/opt/utmm/utmm-new
-sshpass -p 111 ssh root@192.168.64.4 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname macvm'
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-macos-0.14.2 root@192.168.65.4:/opt/utmm/utmm-new
+sshpass -p 111 ssh root@192.168.65.4 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname macvm'
 ```
 
 #### 3.4 部署 Windows VM
 
 ```bash
 # windowsvm — mkdir + scp + ssh install
-sshpass -p 111 ssh Administrator@192.168.65.2 'mkdir C:\opt\utmm 2>nul'
-sshpass -p 111 scp zig-out/bin/utmm-aarch64-windows-0.14.2.exe Administrator@192.168.65.2:C:/opt/utmm/utmm-new.exe
-sshpass -p 111 ssh Administrator@192.168.65.2 'C:\opt\utmm\utmm-new.exe --install --hostname windowsvm'
+sshpass -p 111 ssh Administrator@192.168.64.3 'mkdir C:\opt\utmm 2>nul'
+sshpass -p 111 scp zig-out/bin/utmm-aarch64-windows-0.14.2.exe Administrator@192.168.64.3:C:/opt/utmm/utmm-new.exe
+sshpass -p 111 ssh Administrator@192.168.64.3 'C:\opt\utmm\utmm-new.exe --install --hostname windowsvm'
 
 # winx64
 sshpass -p 111 ssh Administrator@192.168.3.108 'mkdir C:\opt\utmm 2>nul'
