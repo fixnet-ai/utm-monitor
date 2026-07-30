@@ -4,206 +4,126 @@
 
 **Remote debugging sidekick — VMs and physical machines, one command away.**
 
-Check processes, read logs, attach debuggers, profile performance on any machine
-running the Guest agent. Virtual or bare-metal — Linux, macOS, Windows. No SSH,
-no IP tracking, no context switching. Just `utmm --exec linuxvm "..."` and you're in.
+Single Zig binary, dual mode (Guest agent + Host controller). Check processes,
+read logs, transfer files on any machine — Linux, macOS, Windows. No SSH daemon
+required at runtime. AI agents get the same capabilities through MCP stdio.
 
-**MCP integration** (`utmm --mcp`) lets AI coding agents do the same — debug across
-platforms through natural language. No daemon required — auto-ensure boots the Host
-if needed.
+## Core Capabilities
 
-**Mesh network & Zero config** ties everything together under the hood. Guests
-auto-discover the Host over the local network — no fixed IPs, no DNS, no manual
-wiring. A Linux VM on a bridge, a Windows laptop on Wi-Fi, a Raspberry Pi on
-Ethernet — they all show up alongside the Host in `utmm --status` with role, version,
-status, and last-seen time.
+- **Streaming exec** — per-command pty shell on any Guest. Real-time output,
+  exit code, no timeout. `MDELIM` markers handled transparently.
+- **File transfer** — upload/download with SHA256 verification and atomic writes.
+- **sshpass built-in** — non-interactive SSH password auth, 100% CLI-compatible
+  with the standalone `sshpass` tool. POSIX PTY + Windows ConPTY (dynamic load
+  with pipe fallback on older Windows).
+- **MCP stdio** — AI agents control machines via `utmm --mcp`. Five tools:
+  `status`, `exec`, `ping`, `upload`, `download`. Auto-ensures Host on first use.
+- **LSA mesh zero-config** — Guests auto-discover Host over the local network.
+  No fixed IPs, no DNS. `/etc/hosts` kept in sync automatically.
+- **Self-copy install** — single `--install` handles stop→kill→copy→start.
+  Upgrade = scp + `--install`. No shell scripts, no package managers.
+- **utmmd supervisor** — lightweight daemon manages utmm lifecycle via shared
+  memory: heartbeat, crash recovery (exponential backoff), binary upgrade coordination.
+- **8 cross-compilation targets** — aarch64/x86_64/x86 × linux-musl/macos/windows.
+  Zero runtime dependencies.
 
-## AI Agent Experience
+## Architecture
 
-Same capabilities, natural language. `utmm --mcp` provides five MCP tools over stdio
-for Claude Code and other agents — the complete CLI command set exposed through the
-MCP protocol:
+```
+                         ┌── MCP stdio ← AI Agent
+Guest (macvm)    ──TCP──┐
+Guest (linuxvm)  ──TCP──┤──→ Host IPC socket ──┼── CLI
+Guest (windows)  ──TCP──┘
+                         │   (LSA auto-discovery)
+Guest ←── LSA broadcast (UDP :2121) ──┘
 
-| Tool | Description |
-|------|-------------|
-| `status` | List all nodes (Host + Guests): hostname, role, IP, OS/arch, version, status, shell type |
-| `exec` | Execute commands via TCP per-command connection. Each exec opens a fresh pty session |
-| `ping` | Ping a guest over the mesh — test connectivity and measure RTT |
-| `upload` | Upload a file from Host to Guest via TCP/SOCKS4 (SHA256 verified) |
-| `download` | Download a file from Guest to Host via TCP/SOCKS4 (SHA256 verified) |
-
-> **ConPTY**: `--status` shows each node's ConPTY support (`yes`/`no`). On Windows,
-> ConPTY (pseudo-terminal) enables SSH password authentication and interactive
-> command execution. If a Windows VM shows `conpty:no`, it's running an older
-> Windows build (< 10.0.17763) — SSH operations fall back to pipe mode, which
-> may have reduced compatibility. POSIX (Linux/macOS) always reports `conpty:yes`.
-
-Example prompts your AI agent can handle:
-- "Check the status of all my machines"
-- "linuxvm is slow — check CPU, memory, and disk IO"
-- "Attach lldb to my program on macvm, set a breakpoint at main, and show the backtrace"
-- "Upload the new build to all machines and restart the service"
-- "Download the core dump from linuxvm and analyze the crash"
+Each machine: utmmd ──shm── utmm    (supervisor + worker)
+```
 
 ## CLI Quick Start
 
 ```bash
-# Ping any machine over the mesh — test connectivity
-utmm --ping linuxvm     # {"hostname":"linuxvm","mac":"16:a0:6c:...","rtt_ms":10}
+# Check health across all machines
+utmm --status      # Host + all Guests: hostname, role, IP, target, version, status, shell, ConPTY
 
-# Peek inside any machine — instantly
+# Execute commands on any Guest (pty shell, streaming output)
 utmm --exec linuxvm "ps aux | grep myapp"
 utmm --exec macvm "tail -50 /var/log/system.log"
 utmm --exec windowsvm "tasklist | findstr myapp"
 
-# Debug crashes — attach debugger, set breakpoints, get backtraces
-utmm --exec linuxvm "gdb -batch -ex 'bt full' -p $(pgrep myapp)"
-utmm --exec macvm "lldb -o 'bt all' -o quit -p $(pgrep myapp)"
-
-# Each exec opens a fresh pty — no state persists across calls
-utmm --exec linuxvm "cd /opt/myapp && source ./venv/bin/activate && pip list"
-
-# Check health across all machines with one command
-utmm --status      # Host + all guests: role, version, status, last seen
-
-# One-shot deploy to all machines
-utmm --deploy      # Build + SCP + SSH install to all guests
-utmm --deploy linuxvm  # Deploy single guest
-
-# Push upgrade to Guest (no SSH needed)
-utmm --upgrade linuxvm
+# File transfer
+utmm --upload build.zip linuxvm
+utmm --download linuxvm /var/log/app.log ./app.log
 
 # Non-interactive SSH (built-in sshpass)
 utmm sshpass -p '111' ssh root@192.168.64.2 'uname -a'
-utmm sshpass -f ~/.ssh/vm_pass ssh root@macvm 'ls -la'
-utmm sshpass -e ssh Administrator@windowsvm 'tasklist'  # reads SSHPASS env var
+utmm sshpass -f ~/.ssh/pass ssh user@server 'uptime'      # password from file
+utmm sshpass -e ssh admin@host 'cmd'                        # password from SSHPASS env
 
-# File transfer
-utmm --upload build.zip linuxvm
-utmm --download linuxvm core ./core.dump
+# Push upgrade to Guest
+utmm --upgrade linuxvm
+
+# One-shot deploy to all machines
+utmm --deploy
+utmm --deploy linuxvm
+
+# Mesh ping
+utmm --ping linuxvm
 ```
 
-## One-Time Setup
+> **ConPTY**: On Windows, `--status` shows `conpty:yes/no` for each node.
+> Windows < 10.0.17763 lacks the ConPTY API — sshpass falls back to pipe mode.
+> POSIX always reports `conpty:yes`. This is critical for MCP SSH operations.
 
-The install script detects your OS and architecture, downloads the latest
-release, and installs `utmm` as a system service (auto-start on boot). It
-prompts for hostname and mode (Host or Guest) — no manual steps needed.
+## MCP Integration
 
-Root / Administrator privileges are required.
+`utmm --mcp` provides five tools over stdio JSON-RPC 2.0 for AI coding agents.
 
-**POSIX (Linux / macOS):**
+| Tool | Description |
+|------|-------------|
+| `status` | List all nodes: hostname, role, IP, OS/arch, MAC, version, status, shell, ConPTY |
+| `exec` | Execute a shell command on any Guest via per-command pty |
+| `ping` | Ping a Guest over the mesh network and measure RTT |
+| `upload` | Upload file from Host to Guest (TCP/SOCKS4, SHA256 verified) |
+| `download` | Download file from Guest to Host (TCP/SOCKS4, SHA256 verified) |
+
+Example prompts your AI agent can handle:
+- "Check the status of all my machines"
+- "linuxvm is slow — check CPU, memory, and disk IO"
+- "Upload the new build to all Guests and restart the service"
+- "Download the core dump from linuxvm and analyze the crash"
+
+See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
+(message format, request/response examples).
+
+## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sudo sh
+# One-shot install (downloads binary + installs as system service)
+curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sudo bash
+# Windows (PowerShell as Administrator):
+# Invoke-WebRequest -Uri https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.bat -OutFile install.bat
+# .\install.bat
 ```
 
-**Windows (Administrator terminal):**
-
-```batch
-curl -fsSLo %TEMP%\install.bat https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.bat && %TEMP%\install.bat
-```
-
-**Offline install:** download `utmm.zip` from the
-[latest release](https://github.com/fixnet-ai/utm-monitor/releases/latest),
-extract to the target machine, then run the bundled `install.sh` or `install.bat`.
-
-**Manual install** (no automation): see the comments at the top of
-[install.sh](install.sh) for the few manual commands needed.
-
-**Register with AI Agent** — use the Claude Code CLI (recommended):
+## Build
 
 ```bash
-claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp
+zig build                          # Native debug build → zig-out/bin/utmm
+zig build -Doptimize=ReleaseSafe   # ReleaseSafe
+zig build test                     # Unit tests
+zig build test-integration         # Integration tests
+
+# Cross-compile (ReleaseSafe required for deployment)
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
+# ... plus x86_64 and x86 variants for all three platforms (8 targets total)
 ```
 
-> **Note:** `--scope user` registers at user level in `~/.claude.json`, available
-> across all projects. Default `--scope local` is project-only.
-> Use `claude mcp list` to verify.
-> See [mcp.json.example](mcp.json.example) for manual config and troubleshooting.
+**Requirements**: Zig 0.16.0, macOS build host (other hosts may work, untested).
 
-## CLI Reference
+## Full Reference
 
-```bash
-utmm --status                      # All nodes at a glance (Host + guests, role/status/version/last seen)
-utmm --ping linuxvm                # Ping a guest (Host→Guest mesh ping, returns JSON)
-utmm --exec linuxvm "uname -a"     # Command (streaming output, no timeout)
-utmm --exec linuxvm "gdb ..."      # Attach debugger
-utmm --exec macvm "lldb ..."       # Same on macOS
-utmm --exec windowsvm "dir"        # Windows commands too
-utmm --upload build.zip linuxvm    # Push a build (raw binary)
-utmm --download linuxvm core ./    # Pull a core dump (streaming binary)
-utmm --deploy [<vm>]              # Build + SCP + SSH deploy to all guests (or single)
-utmm --upgrade <vm>                # Push upgrade binary to Guest VM
-utmm --version                     # Print version
-```
-
-## How It Works
-
-The Host manages Guests through **TCP per-command connections** via SOCKS4a proxy
-(UTM network). Each exec, upload, or download opens a fresh TCP connection,
-completes the operation, and closes — no persistent tunnels. LSA (Link State
-Advertisement) broadcasts over UDP port 2121 handle topology discovery and
-version detection. CLI commands and MCP talk to the Host through a local IPC
-socket (`/var/run/utmm.sock` on POSIX, named pipe on Windows) — no HTTP.
-
-```
-Guest (linuxvm)      ──TCP/SOCKS4──┐
-Guest (macvm)        ──TCP/SOCKS4──┤──→ Host ── IPC socket ── CLI (--status, --exec, --ping)
-Guest (windowsvm)    ──TCP/SOCKS4──┤          ── deploy + upgrade (push model)
-                         ┌── LSA broadcast (UDP:2121) ──┘  (topology + version detection)
-                         │
-AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
-```
-
-- **Streaming exec**: output flows in real time through TCP connection via IPC socket,
-  with exit code sent as binary trailer. No JSON wrapping, no timeout.
-  Upload/download use direct TCP streaming (no chunking needed — TCP provides
-  reliable ordered delivery).
-- **Self-copy install**: binary copies itself to canonical path `/opt/utmm/utmm` (POSIX)
-  or `C:\opt\utmm\utmm.exe` (Windows). utmmd supervisor manages utmm's lifecycle
-  (spawn, monitor, crash recovery) via shared memory heartbeat.
-  `--install` = unconditional force overwrite. Upgrade = scp new binary + `--install`.
-  Zero shell commands.
-- **Host-initiated upgrade** (v0.14.0+): `utmm --upgrade <vm>` pushes new binary
-  directly to Guest via SOCKS4a TCP (push model). `utmm --deploy` automates
-  compilation + serve-dir maintenance.
-- **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
-- **Single UDP port 2121** for LSA mesh networking.
-  MCP and CLI use local IPC socket (stdio for MCP, Unix domain socket for CLI) — no TCP/HTTP ports needed.
-- **Auto IP tracking**: Host syncs Guest IPs to `/etc/hosts` — hostnames always resolve
-- **Cross-platform**: macOS, Linux, Windows — both Host and Guest (aarch64, x86_64, x86)
-- **Per-command fresh shell**: each exec opens a new pty session — no cd/export
-  persistence across commands. Simpler model matching independent TCP connections.
-- **TCP reliable transport**: frame protocol with 1-byte type + payload over TCP/SOCKS4a.
-  Per-command connections — no persistent tunnels, no cross-thread shared state.
-
-## Upgrade
-
-**`--upgrade` (v0.14.0+):** push binary to Guest via SOCKS4a TCP (push model).
-```bash
-utmm --upgrade linuxvm              # Push latest binary to Guest
-```
-
-**`--deploy` (fastest, v0.11.18+):** cross-compile, SCP, and SSH install + copy to serve-dir in one command.
-```bash
-sudo utmm --deploy                # All guests
-sudo utmm --deploy linuxvm        # Single guest
-```
-Requires `sshpass` on the Host. Validates binary type (ELF/Mach-O/PE) before copying.
-Also copies compiled binaries to serve-dir (`/opt/utmm/`) for future `--upgrade` use.
-
-**Offline/manual:** download `utmm.zip` from the
-[latest release](https://github.com/fixnet-ai/utm-monitor/releases/latest),
-extract, and run `./utmm --install --hostname <name>`.
-
-## Docs
-
-| Document | For |
-|----------|-----|
-| [SKILL.md](.claude/skills/utmm/SKILL.md) | AI agent instructions (MCP tool details, workflows) |
-| [MANUAL.md](.claude/skills/utmm/MANUAL.md) | Full user manual (architecture, deployment, troubleshooting) |
-| [mcp.json.example](mcp.json.example) | MCP configuration with Claude Code install guide |
-
-## License
-
-MIT
+See [MANUAL.md](MANUAL.md) for the complete CLI reference, MCP protocol
+messages, architecture deep-dive, platform differences, and deployment guide.
