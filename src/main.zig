@@ -1,9 +1,11 @@
-//! UTM Monitor — Automatic VM IP sync tool
+//! UTM Monitor — Remote machine management via TCP/SOCKS4a.
 //!
-//! Guest mode (default): mesh LSA + TCP/SOCKS4 connection to Host
-//! Host mode (--host): ensures Host service is running
+//! Guest mode (default): LSA mesh broadcast + TCP listener on port 2121.
+//!   Host connects to Guest via SOCKS4a proxy for exec/upload/download.
+//! Host mode (--host): LSA node table + IPC socket for CLI/MCP commands.
 //!
 //! Self-copy model: binary copies itself to canonical path /opt/utmm/utmm[.exe].
+//! Service lifecycle managed by utmmd supervisor (shm heartbeat + crash recovery).
 //! All operations (except --version/--help) require root/Administrator.
 
 const std = @import("std");
@@ -15,13 +17,54 @@ const svc = @import("svc.zig");
 const fail = @import("fail.zig");
 const mcp = @import("mcp.zig");
 const shm = @import("shm.zig");
+const sshpass = @import("sshpass.zig");
 
 /// Embedded utmmd binary — compiled at build time, extracted at install time.
-const utmmd_bin = @embedFile("embed/utmmd.bin");
+/// Target-specific: embed/{arch}-{os}/utmmd.bin, selected at comptime via builtin.
+const utmmd_bin: []const u8 = switch (builtin.cpu.arch) {
+    .aarch64 => switch (builtin.os.tag) {
+        .linux => @as([]const u8, @embedFile("embed/aarch64-linux/utmmd.bin")),
+        .macos => @as([]const u8, @embedFile("embed/aarch64-macos/utmmd.bin")),
+        .windows => @as([]const u8, @embedFile("embed/aarch64-windows/utmmd.bin")),
+        else => @compileError("unsupported OS for aarch64: " ++ @tagName(builtin.os.tag)),
+    },
+    .x86_64 => switch (builtin.os.tag) {
+        .linux => @as([]const u8, @embedFile("embed/x86_64-linux/utmmd.bin")),
+        .macos => @as([]const u8, @embedFile("embed/x86_64-macos/utmmd.bin")),
+        .windows => @as([]const u8, @embedFile("embed/x86_64-windows/utmmd.bin")),
+        else => @compileError("unsupported OS for x86_64: " ++ @tagName(builtin.os.tag)),
+    },
+    .x86 => switch (builtin.os.tag) {
+        .linux => @as([]const u8, @embedFile("embed/x86-linux/utmmd.bin")),
+        .windows => @as([]const u8, @embedFile("embed/x86-windows/utmmd.bin")),
+        else => @compileError("unsupported OS for x86: " ++ @tagName(builtin.os.tag)),
+    },
+    else => @compileError("unsupported arch: " ++ @tagName(builtin.cpu.arch)),
+};
 
 /// SHA256 hex string of the embedded utmmd binary (64 chars, pre-computed by build.zig).
 /// Used to determine whether the installed utmmd needs updating.
-const utmmd_sha256_hex: [:0]const u8 = @embedFile("embed/utmmd.sha256");
+/// Target-specific: embed/{arch}-{os}/utmmd.sha256, selected at comptime via builtin.
+const utmmd_sha256_hex: [:0]const u8 = switch (builtin.cpu.arch) {
+    .aarch64 => switch (builtin.os.tag) {
+        .linux => @embedFile("embed/aarch64-linux/utmmd.sha256"),
+        .macos => @embedFile("embed/aarch64-macos/utmmd.sha256"),
+        .windows => @embedFile("embed/aarch64-windows/utmmd.sha256"),
+        else => @compileError("unsupported OS for aarch64: " ++ @tagName(builtin.os.tag)),
+    },
+    .x86_64 => switch (builtin.os.tag) {
+        .linux => @embedFile("embed/x86_64-linux/utmmd.sha256"),
+        .macos => @embedFile("embed/x86_64-macos/utmmd.sha256"),
+        .windows => @embedFile("embed/x86_64-windows/utmmd.sha256"),
+        else => @compileError("unsupported OS for x86_64: " ++ @tagName(builtin.os.tag)),
+    },
+    .x86 => switch (builtin.os.tag) {
+        .linux => @embedFile("embed/x86-linux/utmmd.sha256"),
+        .windows => @embedFile("embed/x86-windows/utmmd.sha256"),
+        else => @compileError("unsupported OS for x86: " ++ @tagName(builtin.os.tag)),
+    },
+    else => @compileError("unsupported arch: " ++ @tagName(builtin.cpu.arch)),
+};
 
 comptime {
     _ = @import("lsa.zig");
@@ -29,6 +72,7 @@ comptime {
     _ = @import("tcp.zig");
     _ = @import("mcp.zig");
     _ = @import("host.zig");
+    _ = @import("sshpass.zig");
     _ = svc;
     _ = fail;
 }
@@ -37,15 +81,15 @@ comptime {
 pub const CliArgs = struct {
     /// Whether in Host mode
     is_host: bool = false,
-    /// Mesh UDP port (Host mode)
+    /// TCP listen + UDP LSA port (Host and Guest, default 2121)
     port: u16 = protocol.DEFAULT_PORT,
-    /// Mesh UDP port for LSA broadcast
+    /// LSA broadcast UDP port (may differ from `port` for testing)
     mesh_port: u16 = protocol.DEFAULT_PORT,
-    /// Direct peer mesh address for local testing
+    /// Direct peer LSA address for local testing (skip broadcast)
     peer_mesh: ?[]const u8 = null,
     /// Guest hostname (default: auto-detect)
     hostname: ?[]const u8 = null,
-    /// Host IP for Guest HTTP client (default: auto-detect via default gateway)
+    /// Host IP override for Guest (default: auto-detect via default gateway)
     host_ip: ?[]const u8 = null,
     /// hosts file path (host side)
     hosts_file: []const u8 = if (builtin.os.tag == .windows)
@@ -54,16 +98,10 @@ pub const CliArgs = struct {
         "/etc/hosts",
     /// hosts marker comment text
     marker: []const u8 = protocol.HOSTS_MARKER_BEGIN,
-    /// Config file path
-    config_path: ?[]const u8 = null,
     /// Log file path
     log_file: ?[]const u8 = null,
-    /// HTTP serve directory for Host (--serve-dir), default: exe directory
+    /// Binary serve directory for Host upgrade push (--serve-dir), default: exe directory
     serve_dir: ?[]const u8 = null,
-    /// Whether to save config
-    save_config: bool = false,
-    /// Enable automatic upgrade (Guest→Host version matching via LSA)
-    auto_upgrade: bool = false,
     /// Run as daemon via service manager (--svc, set by service configs)
     is_svc: bool = false,
 
@@ -83,12 +121,13 @@ pub const CliArgs = struct {
     cmd_ping: bool = false,
     ping_target: ?[]const u8 = null,
 
-    // Verify health-check command
-    cmd_verify: bool = false,
-
     // Deploy command
     cmd_deploy: bool = false,
     deploy_target: ?[]const u8 = null,
+
+    // Upgrade command
+    cmd_upgrade: bool = false,
+    upgrade_target: ?[]const u8 = null,
 
     // Upload/download commands
     cmd_upload: bool = false,
@@ -98,12 +137,21 @@ pub const CliArgs = struct {
     download_target: ?[]const u8 = null,
     download_remote: ?[]const u8 = null,
     download_local: ?[]const u8 = null,
+
+    // sshpass subcommand
+    cmd_sshpass: bool = false,
 };
 
 /// Parse command-line arguments
-pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
+pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !CliArgs {
     var cli = CliArgs{};
     var i: usize = 1;
+
+    // sshpass 子命令检测（必须在其他选项之前，因为 sshpass 有自己的参数解析）
+    if (args.len > 1 and std.mem.eql(u8, args[1], "sshpass")) {
+        cli.cmd_sshpass = true;
+        return cli;
+    }
 
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -134,13 +182,13 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             }
             if (i + 1 < args.len) {
                 i += 1;
-                cli.upload_target = args[i];
+                cli.upload_target = try std.ascii.allocLowerString(allocator, args[i]);
             }
         } else if (std.mem.eql(u8, arg, "--download")) {
             cli.cmd_download = true;
             if (i + 1 < args.len) {
                 i += 1;
-                cli.download_target = args[i];
+                cli.download_target = try std.ascii.allocLowerString(allocator, args[i]);
             }
             if (i + 1 < args.len) {
                 i += 1;
@@ -161,14 +209,12 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             cli.cmd_exec = true;
             if (i + 1 < args.len) {
                 i += 1;
-                cli.exec_target = args[i];
+                cli.exec_target = try std.ascii.allocLowerString(allocator, args[i]);
             }
             if (i + 1 < args.len) {
                 i += 1;
                 cli.exec_cmd = args[i];
             }
-        } else if (std.mem.eql(u8, arg, "--verify")) {
-            cli.cmd_verify = true;
         } else if (std.mem.eql(u8, arg, "--deploy")) {
             cli.cmd_deploy = true;
             if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "--")) {
@@ -179,12 +225,14 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
             cli.cmd_ping = true;
             if (i + 1 < args.len) {
                 i += 1;
-                cli.ping_target = args[i];
+                cli.ping_target = try std.ascii.allocLowerString(allocator, args[i]);
             }
-        } else if (std.mem.eql(u8, arg, "--save-config")) {
-            cli.save_config = true;
-        } else if (std.mem.eql(u8, arg, "--auto-upgrade")) {
-            cli.auto_upgrade = true;
+        } else if (std.mem.eql(u8, arg, "--upgrade")) {
+            cli.cmd_upgrade = true;
+            if (i + 1 < args.len) {
+                i += 1;
+                cli.upgrade_target = try std.ascii.allocLowerString(allocator, args[i]);
+            }
         } else if (std.mem.eql(u8, arg, "--port")) {
             if (i + 1 < args.len) {
                 i += 1;
@@ -203,7 +251,7 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
         } else if (std.mem.eql(u8, arg, "--hostname")) {
             if (i + 1 < args.len) {
                 i += 1;
-                cli.hostname = args[i];
+                cli.hostname = try std.ascii.allocLowerString(allocator, args[i]);
             } else fail.msg("arg", "--hostname requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--hosts-file")) {
             if (i + 1 < args.len) {
@@ -220,11 +268,6 @@ pub fn parseArgs(args: []const [:0]const u8) !CliArgs {
                 i += 1;
                 cli.marker = args[i];
             } else fail.msg("arg", "--marker requires a value", .{});
-        } else if (std.mem.eql(u8, arg, "--config")) {
-            if (i + 1 < args.len) {
-                i += 1;
-                cli.config_path = args[i];
-            } else fail.msg("arg", "--config requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--log-file")) {
             if (i + 1 < args.len) {
                 i += 1;
@@ -261,25 +304,35 @@ pub fn printHelp() void {
         \\Host options:
         \\  --port PORT         Service port (default 2121)
         \\  --hosts-file PATH   hosts file path (default /etc/hosts)
-        \\  --serve-dir PATH    HTTP serve directory (default: exe directory)
+        \\  --serve-dir PATH    Binary serve directory for upgrade push (default: exe directory)
         \\  --marker TAG        Marker comment text (default "UTM-MONITOR")
-        \\  --config PATH       Config file path
         \\  --log-file PATH     Log file path
-        \\  --save-config       Save current parameters to config file
-        \\  --auto-upgrade      Enable automatic Guest→Host version matching via LSA
         \\
         \\Management commands (require Host service running):
         \\  --status            Query all online guest status
-        \\  --verify            Health check: status + ping + exec echo for all guests
         \\  --deploy [TARGET]   Cross-compile, SCP, install & verify guest(s)
-        \\  --ping TARGET       Ping a guest via mesh (Host→Guest or relayed)
+        \\  --ping TARGET       Ping a guest via LSA mesh (Host→Guest)
         \\  --exec TARGET CMD   Execute command on target guest
         \\  --upload FILE VM    Upload a file to Guest VM
         \\  --download VM REMOTE LOCAL  Download file from Guest VM
+        \\  --upgrade VM        Push upgrade binary to Guest VM
         \\  --gen-init PLATFORM Generate auto-start script (linux/macos/windows)
         \\  --version           Show version info
         \\
+        \\
+        \\  sshpass [-p PASS|-f FILE|-d FD|-e] [-hV] command [args...]
+        \\                    Non-interactive SSH password authentication
+        \\                    -p PASS   Password from command line
+        \\                    -f FILE   Password from file (first line)
+        \\                    -d FD     Password from file descriptor
+        \\                    -e        Password from SSHPASS env var
+        \\                    -h        Show help and exit
+        \\                    -V        Print version and exit
+        \\                    ConPTY (Windows pseudo-terminal) support detected
+        \\                    automatically — important for MCP SSH operations
+        \\
         \\NOTE: All operations require root/Administrator privileges.
+        \\  sshpass does not require root privileges.
         \\  POSIX: sudo utmm ...
         \\  Windows: Run as Administrator
         \\
@@ -292,8 +345,9 @@ pub fn printHelp() void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    var cli = try parseArgs(args);
+    const allocator = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(allocator);
+    var cli = try parseArgs(allocator, args);
 
     // ── 1. --version: print and exit (no admin needed) ──
     if (cli.cmd_version) {
@@ -307,7 +361,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // ── 3. Admin privilege check — required for everything below ──
+    // ── 3. sshpass: non-interactive SSH authentication (no admin needed) ──
+    if (cli.cmd_sshpass) {
+        sshpass.main(allocator, args);
+    }
+
+    // ── 4. Admin privilege check — required for everything below ──
     if (!isAdmin()) {
         if (builtin.os.tag == .windows) {
             std.debug.print(
@@ -325,7 +384,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    // ── 4. --svc: spawned by utmmd supervisor ──
+    // ── 5. --svc: spawned by utmmd supervisor ──
     // utmmd creates shared memory before spawning us. Open it and register
     // our PID so utmmd can monitor our heartbeat.
     if (cli.is_svc) {
@@ -362,7 +421,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // ── 5. --install: force install service ──
+    // ── 6. --install: force install service ──
     // Extract utmmd (the supervisor daemon) to canonical path, then
     // force-install it as the system service. utmmd manages utmm's lifecycle.
     if (cli.cmd_install) {
@@ -378,19 +437,19 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // ── 6. --uninstall: remove service ──
+    // ── 7. --uninstall: remove service ──
     if (cli.cmd_uninstall) {
         try svc.uninstall(init.io, init.gpa);
         return;
     }
 
-    // ── 7. Ensure Host service for --host and management commands ──
+    // ── 8. Ensure Host service for --host and management commands ──
     // --status, --exec, --upload, --download all need the Host daemon (IPC socket).
     // Auto-start it if not running so users and AI agents can go directly
     // from "utmm --exec vm cmd" without a separate "utmm --host" step.
     const needs_host = cli.is_host or cli.cmd_status or cli.cmd_exec or cli.cmd_ping
-        or cli.cmd_upload or cli.cmd_download or cli.is_mcp or cli.cmd_verify
-        or cli.cmd_deploy;
+        or cli.cmd_upload or cli.cmd_download or cli.is_mcp
+        or cli.cmd_deploy or cli.cmd_upgrade;
     if (needs_host) {
         const was_running = svc.isRunning(init.io, init.gpa, .host);
         var extra_args = try buildServiceArgs(init.gpa, cli, .host);
@@ -399,7 +458,7 @@ pub fn main(init: std.process.Init) !void {
             extra_args.deinit(init.gpa);
         }
 
-        if (svc.shouldUpdateUtmmd(init.io, init.gpa, .host, extra_args.items, utmmd_sha256_hex)) {
+        if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
             // 3a path: utmmd needs update — extract + full forceInstall
             try extractUtmmd(init.io, init.gpa);
             svc.forceInstall(init.io, init.gpa, .host, extra_args.items);
@@ -407,7 +466,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (!was_running) {
             // 3b path: utmmd unchanged, just start the service (skip reinstall)
             std.log.info("[main] utmmd unchanged, starting service directly", .{});
-            svc.start(init.io, init.gpa, .host) catch |err| {
+            svc.start(init.io, init.gpa, .host, extra_args.items) catch |err| {
                 std.log.err("[main] start failed: {} — falling back to ensure", .{err});
                 extractUtmmdIfMissing(init.io, init.gpa) catch {};
                 svc.ensure(init.io, init.gpa, .host, extra_args.items);
@@ -418,32 +477,31 @@ pub fn main(init: std.process.Init) !void {
         // --host alone (no management command): ensure + exit
         if (cli.is_host and !cli.cmd_status and !cli.cmd_exec and !cli.cmd_ping
             and !cli.cmd_upload and !cli.cmd_download
-            and !cli.cmd_gen_init and !cli.save_config and !cli.is_mcp
-            and !cli.cmd_verify and !cli.cmd_deploy) {
+            and !cli.cmd_gen_init and !cli.is_mcp
+            and !cli.cmd_deploy and !cli.cmd_upgrade) {
             return;
         }
-        // If the service was just started, give it time to bind the HTTP port
-        // before the management command connects. Service managers return before
-        // the process has fully initialized.
+        // If the service was just started, give it time to bind the IPC socket
+        // and begin LSA broadcast before the management command connects.
         if (!was_running) {
             std.Io.sleep(init.io, std.Io.Duration.fromSeconds(1), .awake) catch {};
         }
     }
 
-    // ── 8. Management commands ──
-    if (cli.cmd_status or cli.cmd_exec or cli.cmd_ping or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.save_config or cli.cmd_verify or cli.cmd_deploy) {
-        cli.is_host = false; // management commands don't need --host
+    // ── 9. Management commands ──
+    if (cli.cmd_status or cli.cmd_exec or cli.cmd_ping or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.cmd_deploy or cli.cmd_upgrade) {
+        cli.is_host = false; // reset: Host ensured above, run() just dispatches commands
         try host_mod.run(init, cli);
         return;
     }
 
-    // ── 9. --mcp: stdio MCP server (Host service already ensured above) ──
+    // ── 10. --mcp: stdio MCP server (Host service already ensured above) ──
     if (cli.is_mcp) {
         try mcp.run(init.io, init.gpa, cli.port);
         return;
     }
 
-    // ── 10. Default: ensure Guest service is running ──
+    // ── 11. Default: ensure Guest service is running ──
     {
         const was_running = svc.isRunning(init.io, init.gpa, .guest);
         var extra_args_guest = try buildServiceArgs(init.gpa, cli, .guest);
@@ -452,7 +510,7 @@ pub fn main(init: std.process.Init) !void {
             extra_args_guest.deinit(init.gpa);
         }
 
-        if (svc.shouldUpdateUtmmd(init.io, init.gpa, .guest, extra_args_guest.items, utmmd_sha256_hex)) {
+        if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
             // 3a path: utmmd needs update — extract + full forceInstall
             try extractUtmmd(init.io, init.gpa);
             svc.forceInstall(init.io, init.gpa, .guest, extra_args_guest.items);
@@ -460,7 +518,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (!was_running) {
             // 3b path: utmmd unchanged, just start the service (skip reinstall)
             std.log.info("[main] utmmd unchanged, starting guest service directly", .{});
-            svc.start(init.io, init.gpa, .guest) catch |err| {
+            svc.start(init.io, init.gpa, .guest, extra_args_guest.items) catch |err| {
                 std.log.err("[main] start failed: {} — falling back to ensure", .{err});
                 extractUtmmdIfMissing(init.io, init.gpa) catch {};
                 svc.ensure(init.io, init.gpa, .guest, extra_args_guest.items);
@@ -515,6 +573,14 @@ fn extractUtmmd(io: std.Io, alloc: std.mem.Allocator) !void {
         };
     }
 
+    // On Windows, if utmmd.exe is running (e.g. old service not cleanly stopped),
+    // the rename below fails with AccessDenied. Kill utmmd first via Toolhelp API.
+    if (builtin.os.tag == .windows) {
+        svc.killUtmmd();
+        // Brief sleep so the OS releases the file lock.
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+    }
+
     // Atomic rename tmp → dest
     std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), dest, io) catch |err| {
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
@@ -537,6 +603,15 @@ fn extractUtmmd(io: std.Io, alloc: std.mem.Allocator) !void {
                 }
             }
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        } else if (builtin.os.tag == .windows and err == error.AccessDenied) {
+            // Retry once after killing utmmd — file may still be locked briefly
+            std.log.warn("[main] extractUtmmd rename AccessDenied after killUtmmd, retrying...", .{});
+            svc.killUtmmd();
+            std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {};
+            std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), dest, io) catch |err2| {
+                std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+                fail.err("extractUtmmd/rename-retry", err2);
+            };
         } else {
             fail.err("extractUtmmd/rename", err);
         }
@@ -671,32 +746,33 @@ fn buildServiceArgs(alloc: std.mem.Allocator, cli: CliArgs, role: svc.ServiceRol
 
 test "parseArgs - default guest mode" {
     const args = &[_][:0]const u8{"utmm"};
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
     try std.testing.expect(!cli.is_host);
     try std.testing.expectEqual(protocol.DEFAULT_PORT, cli.port);
 }
 
 test "parseArgs - host mode" {
     const args = &[_][:0]const u8{ "utmm", "--host" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
     try std.testing.expect(cli.is_host);
 }
 
 test "parseArgs - custom port" {
     const args = &[_][:0]const u8{ "utmm", "--port", "9999" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
     try std.testing.expectEqual(@as(u16, 9999), cli.port);
 }
 
 test "parseArgs - management commands" {
     const args = &[_][:0]const u8{ "utmm", "--status" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
     try std.testing.expect(cli.cmd_status);
 }
 
 test "parseArgs - exec command" {
     const args = &[_][:0]const u8{ "utmm", "--exec", "mybox", "uptime" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
+    defer if (cli.exec_target) |t| std.testing.allocator.free(t);
     try std.testing.expect(cli.cmd_exec);
     try std.testing.expectEqualStrings("mybox", cli.exec_target.?);
     try std.testing.expectEqualStrings("uptime", cli.exec_cmd.?);
@@ -704,18 +780,19 @@ test "parseArgs - exec command" {
 
 test "parseArgs - hostname" {
     const args = &[_][:0]const u8{ "utmm", "--hostname", "my-custom-box" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
+    defer if (cli.hostname) |h| std.testing.allocator.free(h);
     try std.testing.expectEqualStrings("my-custom-box", cli.hostname.?);
 }
 
 test "parseArgs - version" {
     const args = &[_][:0]const u8{ "utmm", "--version" };
-    const cli = try parseArgs(args);
+    const cli = try parseArgs(std.testing.allocator, args);
     try std.testing.expect(cli.cmd_version);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Admin privilege check (曾 priv.zig)
+// Admin privilege check
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Check whether the current process has admin/root privileges.

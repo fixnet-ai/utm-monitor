@@ -110,6 +110,7 @@ pub const Request = enum(u8) {
     upload = 0x04,
     download = 0x05,
     version = 0x06,
+    upgrade = 0x07,
 };
 
 /// IPC response types (Host daemon → CLI/MCP)
@@ -243,7 +244,7 @@ pub const Connection = struct {
 
     /// Read exactly `len` bytes into `buf`.
     /// Returns the number of bytes read, or an error.
-    fn readFull(self: Connection, buf: []u8) !usize {
+    pub fn readFull(self: Connection, buf: []u8) !usize {
         _ = &self;
         if (builtin.os.tag == .windows) {
             // Use ReadFile for named pipe
@@ -256,18 +257,25 @@ pub const Connection = struct {
             }
             return nread;
         } else {
-            return @intCast(std.posix.system.read(self.fd, buf.ptr, buf.len));
+            // 使用 tcp.sockRead 处理非阻塞 socket 的 EAGAIN 重试
+            const tcp_mod = @import("tcp.zig");
+            const n = tcp_mod.sockRead(self.fd, buf.ptr, buf.len);
+            if (n < 0) return error.ReadFailed;
+            return @intCast(n);
         }
     }
 
     /// Write all bytes in `buf` to the socket/pipe.
-    fn writeAll(self: Connection, buf: []const u8) !void {
+    pub fn writeAll(self: Connection, buf: []const u8) !void {
         _ = &self;
         if (builtin.os.tag == .windows) {
             var written: windows.DWORD = 0;
             _ = windows.WriteFile(self.fd, buf.ptr, @intCast(buf.len), &written, null);
         } else {
-            _ = std.posix.system.write(self.fd, buf.ptr, buf.len);
+            // 使用 tcp.sockWrite 处理非阻塞 socket 的 EAGAIN 重试
+            const tcp_mod = @import("tcp.zig");
+            const n = tcp_mod.sockWrite(self.fd, buf.ptr, buf.len);
+            if (n < 0) return error.WriteFailed;
         }
     }
 };
@@ -482,6 +490,7 @@ fn handleConnection(
         .ping => handlePing(io, gpa, state_ptr, mesh_ptr, conn, payload.items),
         .download => handleDownload(io, gpa, state_ptr, conn, payload.items),
         .version => handleVersion(conn),
+        .upgrade => handleUpgrade(io, gpa, state_ptr, mesh_ptr, conn, payload.items),
         .upload => unreachable, // handled above
     }
 }
@@ -513,8 +522,8 @@ fn handleStatus(io: std.Io, gpa: std.mem.Allocator, state_ptr: *anyopaque, conn:
     for (state.guests.items) |g| {
         if (!first) json.appendSlice(gpa, ",") catch return;
         first = false;
-        json.print(gpa, "{{\"hostname\":\"{s}\",\"role\":\"{s}\",\"target\":\"{s}\",\"ip\":\"{s}\",\"mac\":\"{s}\",\"version\":\"{s}\",\"shell\":\"{s}\",\"status\":\"{s}\",\"last_seen\":{d}}}", .{
-            g.hostname, g.role, g.target, g.ip, g.mac, g.version, g.shell, g.status, g.last_seen,
+        json.print(gpa, "{{\"hostname\":\"{s}\",\"role\":\"{s}\",\"target\":\"{s}\",\"ip\":\"{s}\",\"mac\":\"{s}\",\"version\":\"{s}\",\"shell\":\"{s}\",\"conpty\":\"{s}\",\"status\":\"{s}\",\"last_seen\":{d}}}", .{
+            g.hostname, g.role, g.target, g.ip, g.mac, g.version, g.shell, g.conpty, g.status, g.last_seen,
         }) catch return;
     }
     json.appendSlice(gpa, "]") catch return;
@@ -609,23 +618,23 @@ fn handleExec(
         return;
     };
 
-    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
-    const tcp_mod = @import("tcp.zig");
+    const host_mod = @import("host.zig");
+    const state = @as(*host_mod.GuestTable, @ptrCast(@alignCast(state_ptr)));
     const ptcl = @import("protocol.zig");
 
-    // Look up guest IP
+    // Per-command TCP connection (with ARP recovery)
+    var tcp_conn = host_mod.connectGuest(io, gpa, state, vm) catch |err| {
+        std.log.err("[ipc-exec] TCP connect to {s} failed: {}", .{ vm, err });
+        sendError(conn, if (err == error.GuestNotFound) "GuestNotFound" else "GuestNotConnected");
+        return;
+    };
+    defer tcp_conn.deinit();
+
+    // Look up guest for shell (needed for buildCmdWithMarker)
     const guest = state.findByHostname(vm) orelse {
         sendError(conn, "GuestNotFound");
         return;
     };
-
-    // Per-command TCP connection
-    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
-        std.log.err("[ipc-exec] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(conn, "GuestNotConnected");
-        return;
-    };
-    defer tcp_conn.deinit();
 
     // Generate cmd_id
     const cmd_id = std.fmt.allocPrint(gpa, "exec_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds}) catch {
@@ -745,20 +754,15 @@ fn handleUpload(
         return;
     };
 
-    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
+    const host_mod = @import("host.zig");
+    const state = @as(*host_mod.GuestTable, @ptrCast(@alignCast(state_ptr)));
     const tcp_mod = @import("tcp.zig");
     const ptcl = @import("protocol.zig");
 
-    // Look up guest IP
-    const guest = state.findByHostname(vm) orelse {
-        sendError(ipc_conn, "GuestNotFound");
-        return;
-    };
-
-    // Per-command TCP connection
-    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
+    // Per-command TCP connection (with ARP recovery)
+    var tcp_conn = host_mod.connectGuest(io, gpa, state, vm) catch |err| {
         std.log.err("[ipc-upload] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(ipc_conn, "GuestNotConnected");
+        sendError(ipc_conn, if (err == error.GuestNotFound) "GuestNotFound" else "GuestNotConnected");
         return;
     };
     defer tcp_conn.deinit();
@@ -792,7 +796,7 @@ fn handleUpload(
         };
         if (n == 0) break;
 
-        _ = std.posix.system.write(tcp_conn.fd, file_buf[0..n].ptr, n);
+        _ = tcp_mod.sockWrite(tcp_conn.fd, file_buf[0..n].ptr, n);
         total_sent += @intCast(n);
     }
 
@@ -820,6 +824,38 @@ fn handleUpload(
     ipc_conn.writeAll(&ok_buf) catch {};
 }
 
+/// Host→Guest 直推升级：读取 serve-dir 二进制 → SOCKS4a → upgrade_cmd → 流式推送
+fn handleUpgrade(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    state_ptr: *anyopaque,
+    _: *anyopaque, // mesh_ptr — unused for upgrade
+    ipc_conn: Connection,
+    header: []const u8,
+) void {
+    var pos: usize = 0;
+    const vm = readString(header, &pos) orelse {
+        sendError(ipc_conn, "InvalidRequest: missing vm");
+        return;
+    };
+
+    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
+    const host_mod = @import("host.zig");
+
+    const err_msg = host_mod.pushUpgrade(io, gpa, state, vm);
+    if (err_msg) |msg| {
+        std.log.err("[ipc-upgrade] {s}: {s}", .{ vm, msg });
+        sendError(ipc_conn, msg);
+        return;
+    }
+
+    // Send OK response
+    var ok_buf: [1]u8 = undefined;
+    ok_buf[0] = @intFromEnum(Response.ok);
+    ipc_conn.writeAll(&ok_buf) catch {};
+    std.log.info("[ipc-upgrade] {s} pushed (fire-and-forget)", .{vm});
+}
+
 fn handleDownload(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -837,20 +873,15 @@ fn handleDownload(
         return;
     };
 
-    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
+    const host_mod = @import("host.zig");
+    const state = @as(*host_mod.GuestTable, @ptrCast(@alignCast(state_ptr)));
     const tcp_mod = @import("tcp.zig");
     const ptcl = @import("protocol.zig");
 
-    // Look up guest IP
-    const guest = state.findByHostname(vm) orelse {
-        sendError(conn, "GuestNotFound");
-        return;
-    };
-
-    // Per-command TCP connection
-    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
+    // Per-command TCP connection (with ARP recovery)
+    var tcp_conn = host_mod.connectGuest(io, gpa, state, vm) catch |err| {
         std.log.err("[ipc-download] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(conn, "GuestNotConnected");
+        sendError(conn, if (err == error.GuestNotFound) "GuestNotFound" else "GuestNotConnected");
         return;
     };
     defer tcp_conn.deinit();
@@ -878,7 +909,7 @@ fn handleDownload(
     // Receive raw file bytes (unframed — guest sends raw bytes after download_cmd)
     var rbuf: [65536]u8 = undefined;
     while (true) {
-        const nr = std.posix.system.read(tcp_conn.fd, rbuf[0..].ptr, rbuf.len);
+        const nr = tcp_mod.sockRead(tcp_conn.fd, rbuf[0..].ptr, rbuf.len);
         if (nr <= 0) break; // EOF or error
 
         const data = rbuf[0..@intCast(nr)];
@@ -1219,6 +1250,45 @@ pub fn ipcUpload(io: std.Io, gpa: std.mem.Allocator, vm: []const u8, local_path:
     }
 }
 
+/// Push upgrade binary to a Guest via the Host daemon.
+pub fn ipcUpgrade(io: std.Io, gpa: std.mem.Allocator, vm: []const u8) !void {
+    // Connect to Host daemon IPC socket
+    var conn = try clientConnect(io);
+    defer conn.close();
+
+    // Build request: [Request.upgrade][vm\0]
+    var req_buf: [256]u8 = undefined;
+    var req = std.ArrayList(u8).fromOwnedSlice(&req_buf);
+    req.items.len = 0;
+    req.appendAssumeCapacity(@intFromEnum(Request.upgrade));
+    try writeString(&req, vm);
+    try conn.writeAll( req.items);
+
+    // Close write half so server knows the request is complete
+    if (builtin.os.tag != .windows) {
+        _ = std.posix.system.shutdown(conn.fd, std.posix.SHUT.WR);
+    }
+
+    // Read response
+    var resp: std.ArrayList(u8) = .empty;
+    defer resp.deinit(gpa);
+    try clientReadAll(conn, gpa, &resp);
+
+    var pos: usize = 0;
+    const type_byte = readByte(resp.items, &pos) orelse return error.IpcProtocolError;
+    const rtype: Response = @enumFromInt(type_byte);
+
+    switch (rtype) {
+        .ok => {},
+        .err => {
+            const msg = readString(resp.items, &pos) orelse "UnknownError";
+            std.log.err("[ipc] upgrade error: {s}", .{msg});
+            return error.IpcError;
+        },
+        else => return error.IpcProtocolError,
+    }
+}
+
 /// Download a file from a Guest via the Host daemon.
 /// Streams file data to `file_writer`, verifies SHA256 hash.
 /// Returns the number of bytes received.
@@ -1338,5 +1408,238 @@ pub fn ipcVersion(io: std.Io, gpa: std.mem.Allocator) ![]const u8 {
             return error.IpcError;
         },
         else => return error.IpcProtocolError,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Tests — IPC Connection 在非阻塞 socket 上的 EAGAIN 回归测试
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Bug 背景：macOS 上 Io.net 创建的非阻塞 socket（kqueue）在 system.read()
+// 无数据时返回 EAGAIN。旧代码（Connection.readFull/writeAll）直接用 system.read/write，
+// 不重试 EAGAIN，导致 IPC 通信间歇性失败。
+
+test "ipc Connection.readFull handles EAGAIN on non-blocking socket" {
+    if (builtin.os.tag == .windows) return; // Windows IPC 用命名管道，非 socket
+
+    const tcp_mod = @import("tcp.zig");
+    const nbp = try tcp_mod.makeNonBlockingPair();
+    defer {
+        tcp_mod.sockClose(nbp.a);
+        tcp_mod.sockClose(nbp.b);
+    }
+
+    // 在另一端写入数据
+    const test_data = "ipc_eagain_test";
+    _ = tcp_mod.sockWrite(nbp.b, test_data.ptr, test_data.len);
+
+    // Connection.readFull 在非阻塞 socket 上应正确读取（内部 sockRead 重试 EAGAIN）
+    var conn = Connection{ .fd = nbp.a };
+    var buf: [32]u8 = undefined;
+    const n = try conn.readFull(buf[0..test_data.len]);
+    try std.testing.expectEqual(test_data.len, n);
+    try std.testing.expectEqualStrings(test_data, buf[0..n]);
+}
+
+test "ipc Connection.writeAll does not lose data on non-blocking socket" {
+    if (builtin.os.tag == .windows) return;
+
+    const tcp_mod = @import("tcp.zig");
+    const nbp = try tcp_mod.makeNonBlockingPair();
+    defer {
+        tcp_mod.sockClose(nbp.a);
+        tcp_mod.sockClose(nbp.b);
+    }
+
+    // 写入数据到非阻塞 socket
+    const test_data = "writeall_test";
+    var conn = Connection{ .fd = nbp.a };
+    try conn.writeAll(test_data);
+
+    // 另一端读取验证
+    var buf: [32]u8 = undefined;
+    const n = tcp_mod.sockRead(nbp.b, buf[0..].ptr, buf.len);
+    try std.testing.expect(test_data.len <= n);
+    try std.testing.expectEqualStrings(test_data, buf[0..test_data.len]);
+}
+
+test "ipc Connection.readFull byte-by-byte on non-blocking socket" {
+    if (builtin.os.tag == .windows) return;
+
+    const tcp_mod = @import("tcp.zig");
+    const nbp = try tcp_mod.makeNonBlockingPair();
+    defer {
+        tcp_mod.sockClose(nbp.a);
+        tcp_mod.sockClose(nbp.b);
+    }
+
+    // 模拟 handleConnection 中 upload header 的逐字节读取模式
+    const header = "vm_name\x00/path/to/file\x00";
+    _ = tcp_mod.sockWrite(nbp.b, header.ptr, header.len);
+
+    var conn = Connection{ .fd = nbp.a };
+    var hdr_buf: [64]u8 = undefined;
+    var hdr_pos: usize = 0;
+    while (hdr_pos < header.len) {
+        const n = try conn.readFull(hdr_buf[hdr_pos..hdr_pos+1]);
+        if (n == 0) break;
+        hdr_pos += n;
+    }
+    try std.testing.expectEqual(header.len, hdr_pos);
+    try std.testing.expectEqualStrings(header, hdr_buf[0..hdr_pos]);
+}
+
+// 完整模拟 handleConnection upload 路径的逐字节 header 解析
+// Header 格式: [vm\0][path\0][hash\0][file_size:4B]
+// 验证 byte-by-byte 循环能在正确的边界停止（不消费文件数据字节）
+test "ipc upload header byte-by-byte parsing boundary" {
+    if (builtin.os.tag == .windows) return;
+
+    const tcp_mod = @import("tcp.zig");
+    const nbp = try tcp_mod.makeNonBlockingPair();
+    defer {
+        tcp_mod.sockClose(nbp.a);
+        tcp_mod.sockClose(nbp.b);
+    }
+
+    const test_vm = "linuxvm";
+    const test_path = "/opt/utmm/test.bin";
+    const test_hash = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2";
+    const test_filesize: u32 = 1024;
+
+    // 构建完整 header（不含 type byte — handleConnection 已消费 type byte）
+    var header_buf: [256]u8 = undefined;
+    var w = std.ArrayList(u8).fromOwnedSlice(&header_buf);
+    w.items.len = 0;
+    try writeString(&w, test_vm);
+    try writeString(&w, test_path);
+    try writeString(&w, test_hash);
+    try writeU32(&w, test_filesize);
+    const header_only = w.items;
+
+    // 在 header 后面追加一些模拟文件数据（4 字节"file content"标记）
+    const extra: [4]u8 = .{ 0xDE, 0xAD, 0xBE, 0xEF };
+    var full_msg: std.ArrayList(u8) = .empty;
+    defer full_msg.deinit(std.testing.allocator);
+    try full_msg.appendSlice(std.testing.allocator, header_only);
+    try full_msg.appendSlice(std.testing.allocator, &extra);
+
+    // 写入完整消息（header + file data）到 socket
+    _ = tcp_mod.sockWrite(nbp.b, full_msg.items.ptr, full_msg.items.len);
+    _ = std.posix.system.shutdown(nbp.b, std.posix.SHUT.WR);
+
+    // 服务器端：逐字节读取直到解析出完整 header
+    var conn = Connection{ .fd = nbp.a };
+    var hdr_buf: [1400]u8 = undefined;
+    var hdr_pos: usize = 0;
+    while (hdr_pos < hdr_buf.len) {
+        const n = conn.readFull(hdr_buf[hdr_pos..hdr_pos+1]) catch break;
+        if (n == 0) break;
+        hdr_pos += n;
+        if (hdr_pos > 70) {
+            var pos: usize = 0;
+            if (readString(hdr_buf[0..hdr_pos], &pos) == null) continue;
+            if (readString(hdr_buf[0..hdr_pos], &pos) == null) continue;
+            if (readString(hdr_buf[0..hdr_pos], &pos) == null) continue;
+            if (pos + 4 <= hdr_pos) break;
+        }
+    }
+
+    // 验证：hdr_pos 必须恰好等于 header_only.len（未消费任何文件数据字节）
+    try std.testing.expectEqual(header_only.len, hdr_pos);
+
+    // 验证 header 内容正确解析
+    var pos: usize = 0;
+    const parsed_vm = readString(hdr_buf[0..hdr_pos], &pos).?;
+    const parsed_path = readString(hdr_buf[0..hdr_pos], &pos).?;
+    const parsed_hash = readString(hdr_buf[0..hdr_pos], &pos).?;
+    const parsed_size = readU32(hdr_buf[0..hdr_pos], &pos).?;
+
+    try std.testing.expectEqualStrings(test_vm, parsed_vm);
+    try std.testing.expectEqualStrings(test_path, parsed_path);
+    try std.testing.expectEqualStrings(test_hash, parsed_hash);
+    try std.testing.expectEqual(test_filesize, parsed_size);
+
+    // 验证：剩余的文件数据仍然可读，且内容正确
+    var remaining: [4]u8 = undefined;
+    const nr = try conn.readFull(remaining[0..4]);
+    try std.testing.expectEqual(@as(usize, 4), nr);
+    try std.testing.expectEqual(extra[0], remaining[0]);
+    try std.testing.expectEqual(extra[1], remaining[1]);
+    try std.testing.expectEqual(extra[2], remaining[2]);
+    try std.testing.expectEqual(extra[3], remaining[3]);
+}
+
+// 验证 upload header 中 hash 字符串不含 null（64 位 hex chars + null）
+// 极端情况：hash 可能在第 64 位是 0x00（hash 字节值为 0）
+// 这时 readString 会错误地提前截断 hash
+test "ipc upload header hash contains null bytes" {
+    if (builtin.os.tag == .windows) return;
+
+    // 构造一个 hash 字符串，其中一个 hex 字符对应字节值 0
+    // 如 "00" 编码后是 "00"（ASCII '0','0'），不会产生 null 字节
+    // 但十六进制字符串本身可以包含 null 吗？不能——全都是 ASCII hex 字符
+    // 真正的问题是：sha256_hex 是 [64]u8（不含 null terminator）
+    // writeString 会追加 null，但 hex string 本身不包含 null
+    //
+    // 边界测试：vary file_size 来验证 byte-by-byte 循环
+    // 对于正确检测 file_size 的不同值（大端法 4 字节包含 null 字节时）
+
+    const tcp_mod = @import("tcp.zig");
+    const nbp = try tcp_mod.makeNonBlockingPair();
+    defer {
+        tcp_mod.sockClose(nbp.a);
+        tcp_mod.sockClose(nbp.b);
+    }
+
+    // file_size = 0x00000000 → 4 字节全是 0x00！
+    // file_size = 0x00000001 → 前 3 字节是 0x00，第 4 字节是 0x01
+    // file_size = 0x00000100 → 第 2-3 字节是 0x00
+    // 这些情况 byte-by-byte 循环必须正确处理
+
+    const cases = [_]u32{ 0, 1, 256, 65536, 0xFFFFFFFF };
+    for (cases) |file_size| {
+        // 构建 header
+        var hdr: [256]u8 = undefined;
+        var wb = std.ArrayList(u8).fromOwnedSlice(&hdr);
+        wb.items.len = 0;
+        try writeString(&wb, "testvm");
+        try writeString(&wb, "/tmp/f");
+        try writeString(&wb, "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2a3b4c5d6a7b8c9d0e1f2"); // 64 hex
+        try writeU32(&wb, file_size);
+        const hdr_only = wb.items;
+
+        _ = tcp_mod.sockWrite(nbp.b, hdr_only.ptr, hdr_only.len);
+
+        var conn = Connection{ .fd = nbp.a };
+        var hdr_buf: [1400]u8 = undefined;
+        var hdr_pos: usize = 0;
+        while (hdr_pos < hdr_buf.len) {
+            const n = conn.readFull(hdr_buf[hdr_pos..hdr_pos+1]) catch break;
+            if (n == 0) break;
+            hdr_pos += n;
+            if (hdr_pos > 70) {
+                var pos2: usize = 0;
+                if (readString(hdr_buf[0..hdr_pos], &pos2) == null) continue;
+                if (readString(hdr_buf[0..hdr_pos], &pos2) == null) continue;
+                if (readString(hdr_buf[0..hdr_pos], &pos2) == null) continue;
+                if (pos2 + 4 <= hdr_pos) break;
+            }
+        }
+
+        // 验证 header 边界正确
+        try std.testing.expectEqual(hdr_only.len, hdr_pos);
+
+        // 解析并验证
+        var pos: usize = 0;
+        const vm = readString(hdr_buf[0..hdr_pos], &pos).?;
+        const path = readString(hdr_buf[0..hdr_pos], &pos).?;
+        const hash = readString(hdr_buf[0..hdr_pos], &pos).?;
+        const size = readU32(hdr_buf[0..hdr_pos], &pos).?;
+
+        try std.testing.expectEqualStrings("testvm", vm);
+        try std.testing.expectEqualStrings("/tmp/f", path);
+        try std.testing.expectEqual(@as(usize, 64), hash.len);
+        try std.testing.expectEqual(file_size, size);
     }
 }

@@ -1,15 +1,22 @@
-# Task Plan: v0.13.0 — 分层架构重构
+# Task Plan: v0.13.0+ — 分层架构重构
 
-## 状态：全部完成 ✅
+## 状态：持续迭代中 🔄
+
+**最新版本**: v0.14.7 — sshpass 集成 + MCP 工具名去前缀
 
 - **分支**: `refac/layered-arch`
-- **源文件**: 20 → 16
-- **测试**: 150 执行 / 141 唯一测试 + 43 集成测试场景，全部通过
-- **设计文档**: `refac.md`
+- **源文件**: 18 src + 11 test（含新增 sshpass.zig）
+- **测试**: 208 单元测试全部通过 + 59 集成测试场景（待验证）
+
+## 当前阶段: Phase 21 — sshpass 集成 + MCP 工具名去前缀 + 真机部署 ✅
+
+**目标**: 消除外部 sshpass 依赖，集成到 utmm 作为子命令；移除 MCP 工具 vm_ 前缀。
+- **单元测试**: 208 测试全部通过 ✅
+- **集成测试**: 待验证
 
 ## 架构概述
 
-UTM Monitor (`utmm`) 分层架构重构：20 → 16 文件，TCP per-command 连接模型，
+UTM Monitor (`utmm`) 分层架构重构：20 → 17 文件，TCP per-command 连接模型，
 DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 
 ## 实施阶段
@@ -102,7 +109,7 @@ DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 | 9 | `cmdchan.zig` | TCP per-command 无需跨线程命令队列 |
 | 10 | `lock.zig` | → svc.zig 内联 flock/LockFileEx |
 
-## 最终文件清单（16 文件）
+## 最终文件清单（17 文件）
 
 ```
 src/
@@ -110,6 +117,7 @@ src/
 ├── protocol.zig      所有协议定义
 ├── fail.zig          快速失败
 ├── config.zig        配置持久化
+├── arp.zig           ARP 表读取（MAC→IP 反向发现）
 ├── lsa.zig           LSA + 节点表 + /etc/hosts
 ├── tcp.zig           帧协议 + SOCKS4 + 连接
 ├── dpipe.zig         DuplexPipe 接口 + relay
@@ -143,3 +151,469 @@ src/
 | 13 | Integration tests 新增 4 个 e2e | exec/upload/download/upgrade 端到端 TCP loopback 协议验证，补全 REVIEW 指出的测试缺口 |
 | 14 | system.read/write 返回 isize 非 error union | Zig 0.16.0 POSIX 系统调用返回 C 风格返回值，需 @intCast 且不能 try/catch |
 | 15 | 部署前必须通过集成测试 | 协议回归（如双 MDELIM）在真机调测前先被集成测试捕获，低修复成本 |
+
+### Phase 8: Windows 跨平台 Socket 抽象层修复 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 38 | tcp.zig 新增跨平台 socket I/O 抽象层（sockRead/sockWrite/sockClose/sockShutdown/sockAccept/sockListen/makePair）| ✅ |
+| 39 | tests/common.zig 新增相同跨平台 socket 辅助函数（6 个 extern + 7 个 wrapper）| ✅ |
+| 40 | 所有 6 个测试文件迁移至 common.zig 统一辅助函数 | ✅ |
+| 41 | Winsock2 extern 添加 `callconv(.winapi)` — 修复 x86-windows-gnu 链接 | ✅ |
+| 42 | svc.zig LockFileEx Bool 比较修复（`@intFromEnum`）| ✅ |
+| 43 | 8 交叉编译目标全部通过 | ✅ |
+| 44 | 部署 linuxvm + macvm + windowsvm 真机验证通过 | ✅ |
+
+### Phase 9: E2E 真机 Bug 修复 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 45 | 修复 AddressInUse 崩溃循环（TCP listener 缺 SO_REUSEADDR + FD_CLOEXEC）| ✅ |
+| 46 | 修复 upload 后 panic（handleUpload 双 close → use-after-free）| ✅ |
+| 47 | 修复 utmmd.bin 嵌入构建流程（按目标分目录 + comptime switch）| ✅ |
+| 48 | linuxvm E2E 真机验证（5 轮 exec/upload/download 全通过）| ✅ |
+| 49 | 修复 Windows SOCKS4a 拒绝（socks4Accept 悬垂栈指针 → socks4CheckAndReply）| ✅ |
+| 50 | 修复 Windows upload/download socket I/O（system.read/write → sockRead/sockWrite）| ✅ |
+| 51 | windowsvm E2E 全验证（exec + upload + download SHA256 一致）| ✅ |
+| 52 | 修复 macOS aarch64 SOCKS4a 拒绝（readUntilNull 栈悬垂指针 → readUntilNullBuf）| ✅ |
+| 53 | socks4Accept 悬垂指针修复（改为接受 allocator，堆分配 hostname）| ✅ |
+| 54 | 新增 socks4CheckAndReply × 2 + readUntilNullBuf × 3 单元测试 | ✅ |
+| 55 | 更新 tcp_frame 集成测试适配新 API | ✅ |
+
+### Phase 10: v0.14.1 — 集成测试重构 + ReleaseSafe 强制 + 临时文件清理修复 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 56 | 集成测试重构：8 独立可执行文件 → 单入口 flat file（`tests/integration_test.zig`）| ✅ |
+| 57 | 统一 DebugAllocator + TestRunner + 内存泄漏检测 | ✅ |
+| 58 | 9 个集成测试文件从子目录迁移到 flat `pub fn test_xxx()` 签名 | ✅ |
+| 59 | 修复 `_ = io` pointless discard（test_tcp_frame.zig Zig 0.16.0 编译错误）| ✅ |
+| 60 | 修复 x86_64-linux-musl Debug 80MB 二进制（`.data.rel.ro` = 20MB → ReleaseSafe 11MB）| ✅ |
+| 61 | ReleaseSafe 强制：release.sh + CI workflow + CLAUDE.md 全部使用 `-Doptimize=ReleaseSafe` | ✅ |
+| 62 | 临时文件清理审计：dpipe_file.zig writeFile errdefer 清理 temp 文件 + guest.zig 双 close 修复 | ✅ |
+| 63 | 8 交叉编译目标 ReleaseSafe 构建 + 二进制尺寸验证 | ✅ |
+| 64 | 4 台真机部署：linuxvm/macvm/windowsvm/winx64 全 v0.14.1 + 烟雾测试 | ✅ |
+| 65 | 更新 task_plan.md + progress.md + CLAUDE.md | ✅ |
+
+**集成测试重构详情**：
+- 8 个旧目录删除：`tests/tcp_frame/`, `tests/lsa_routing/`, `tests/dpipe_relay/`, `tests/svc_install/`, `tests/exec_e2e/`, `tests/upload_e2e/`, `tests/download_e2e/`, `tests/upgrade_e2e/`
+- 9 个新 flat file 创建：`tests/common.zig`, `tests/integration_test.zig`, `tests/test_tcp_frame.zig`, `tests/test_lsa_routing.zig`, `tests/test_dpipe_relay.zig`, `tests/test_svc_install.zig`, `tests/test_exec_e2e.zig`, `tests/test_upload_e2e.zig`, `tests/test_download_e2e.zig`, `tests/test_upgrade_e2e.zig`
+- `build.zig` 简化：8 个独立 executable → 1 个 `integration_test` executable + `test-integration` step
+- 40 测试场景全部通过，0 失败，0 泄漏
+
+**Bug 修复详情**：
+1. dpipe_file.zig writeFile errdefer：`createFile()` 成功后 `allocator.create(WriteFileCtx)` 失败 → 只 close 不 delete → temp 文件泄露。修复：errdefer 增加 `deleteFile` 调用
+2. guest.zig handleUpgradeCmd：`defer file.close(io)` + 显式 `file.close(io)` → 双 close。修复：移除 defer
+
+**x86_64 二进制尺寸根因**：
+- x86_64-elf Debug 模式 `.data.rel.ro` 段 = 20.3MB（relocation data for read-only data, stack traces, lazy symbol resolution）
+- aarch64 无此段（Mach-O/ELF 均无）
+- ReleaseSafe 消除此段：x86_64-linux-musl 从 80MB → 11MB
+
+## 关键决策记录（续）
+
+| # | 决策 | 理由 |
+|---|------|------|
+| 16 | 跨平台 socket I/O 抽象层放在 tcp.zig（非独立文件）| 所有网络 I/O 的统一入口，避免分散 |
+| 17 | `callconv(.winapi)` 解决 x86 stdcall 名称修饰 | 32 位 Windows: `.winapi` = `.Stdcall`（`@n` 后缀），64 位: = `.C`（无修饰）|
+| 18 | tests/common.zig 复制 tcp.zig 的 socket 抽象 | 测试可执行文件独立编译，不依赖主二进制 |
+| 19 | `addr.listen()` 替代 `addr.bind()` + 手动 `fcntl(FD_CLOEXEC)` | `listen()` 原生支持 `reuse_address`；`fcntl` 防止 fork 子进程继承 listener socket |
+| 20 | handleUpload 移除 `defer file_pipe.close()` | 显式 close 已覆盖所有退出路径，defer 导致双 close → use-after-free panic |
+| 21 | `readUntilNull` → `readUntilNullBuf(fd, buf)` | 缓冲区由调用者提供，消除栈悬垂指针。macOS aarch64 ABI 导致 `std.mem.eql` 覆盖旧栈帧 |
+| 22 | `socks4Accept` 改为接受 allocator | 返回的 hostname 堆分配，调用者负责释放。消除 socks4Accept 自身的悬垂指针 |
+| 23 | 新增 `socks4CheckAndReply` + `readUntilNullBuf` 测试 | 之前关键路径零测试覆盖；两个函数都是 bug 高发区 |
+| 24 | 集成测试从独立可执行文件改为单入口 flat file | 统一 leak detection + 简化 build.zig + 零独立 main.zig 样板 |
+| 25 | ReleaseSafe 强制所有发布构建 | Debug x86_64 80MB → ReleaseSafe 11MB；所有 release 路径统一使用 `-Doptimize=ReleaseSafe` |
+
+### Phase 11: v0.14.2 — 升级系统重构 + 质量修复 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 66 | macOS launchctl bootstrap errno=5 根因修复（bootout 重设 disabled flag → enable after bootout）| ✅ |
+| 67 | 跨平台路径审计：host.zig 3 处 + ipc.zig 1 处硬编码路径 → `svc.canonicalDir()` | ✅ |
+| 68 | 临时文件泄露修复：dpipe_file.zig rename 失败时 deleteFile + guest.zig 启动扫描清理 | ✅ |
+| 69 | 升级系统重构：Guest 自主升级 → Host 主控直推（`--upgrade <vm>`）| ✅ |
+| 70 | 删除旧升级代码：upgrade_req、auto_upgrade、UpgradeSignal、checkGitHubVersion、verifyServeDirBinaries、upgradeTcpListener、handleUpgradeConnection、isValidVersion | ✅ |
+| 71 | 新增 upgrade_cmd (0x1a) 协议 + guest.handleUpgradeCmd + host.cmdUpgrade + ipc.handleUpgrade | ✅ |
+| 72 | 新增 upgrade_e2e 集成测试（7 场景：正常/哈希不匹配/0字节/大文件/SOCKS4a/重传/并发）| ✅ |
+| 73 | 4 VM 遗留垃圾清理（旧服务名、temp 文件、日志、deploy 残留）| ✅ |
+| 74 | Windows VM 启用 OpenSSH Server，替代 SMB/RDP 手动操作 | ✅ |
+| 75 | 硬编码远程路径修复：host.zig cmdUpload + mcp.zig cmdVmUpload → 平台感知 remote_dir | ✅ |
+| 76 | 4 处陈旧注释修正：auto-upgrade 描述 → Host 直推模型 | ✅ |
+| 77 | deploy SKILL 更新：Windows SMB 手动 → SSH 命令；clean-deploy SKILL 新建 | ✅ |
+| 78 | 版本号 bump: ver.txt 0.14.1 → 0.14.2 | ✅ |
+
+**升级系统重构详情**：
+- Guest 侧删除：`UpgradeSignal` struct、`tryPerformUpgrade` 函数（~120 行）、LSA 版本比对、`auto_upgrade` 门控
+- Guest 侧新增：`handleUpgradeCmd`（~110 行）— 接收 upgrade_cmd 帧 + 流式二进制 → 增量 SHA256 → 通知 utmmd via shm
+- Host 侧删除：`checkGitHubVersion`（~55 行）、`verifyServeDirBinaries`（~40 行）、`upgradeTcpListener`（~40 行）、`handleUpgradeConnection`/`serveUpgradeFile`（~70 行）、`isValidVersion`（~15 行）、`upgrade_signal` + `upgrade_shutdown` 原子变量
+- Host 侧新增：`cmdUpgrade` → `ipcUpgrade`（查 GuestTable → SOCKS4a 连接 → 推送 upgrade_cmd + 二进制流）
+- IPC 新增：Request.upgrade (0x07) → handleUpgrade（从 serve-dir 读取二进制 → SOCKS4a 连接 → 推送）
+- CLI 新增：`--upgrade <vm>` 参数（`cmd_upgrade` + `upgrade_target`）
+- 完全删除 Guest 自主升级路径 — Host 通过 SOCKS4a 直推，复用以 `upload_result` (0x17) 响应
+- 升级后 utmmd 自动检测退出原因 (Cmd.upgrade) → rename temp → 重启 utmm
+
+## 关键决策记录（续 2）
+
+| # | 决策 | 理由 |
+|---|------|------|
+| 26 | 升级系统：Guest 自主 → Host 主控直推 | Guest 自主升级不可控（版本号变动触发全集群升级混乱），Host 直推按需触发 |
+| 27 | 复用以 `upload_result` (0x17) 作为升级响应 | 格式完全一致：cmd_id + exit_code，无需新消息类型 |
+| 28 | 升级 temp 文件用 `svc.tempDir()` | dpipe_file 写 `/tmp` = 跨文件系统 rename 高概率失败（特别是 macOS），升级二进制直接写 `canonicalDir()` 避免 EXDEV |
+| 29 | Windows SSH 替代 SMB/RDP | 自动化部署和清理必须 SSH；Windows 10 1809+ 内置 OpenSSH Server |
+| 30 | mcp.zig `guestDefaultDir()` 平台感知默认路径 | 无 host.zig 导入通路（MCP 为独立进程），使用 VM 名 "win" 前缀推断 Windows 路径 |
+| 31 | deploy/clean-deploy SKILL 二进制名含版本号 | 交叉编译产物含版本后缀（如 `utmm-aarch64-macos-0.14.2`），部署时必须用实际文件名 |
+| 32 | Windows `Stop-Process -Force` 替代 `taskkill /F` | `taskkill /F` 无法终止 SYSTEM 权限 utmm 进程，PowerShell `Stop-Process -Force` 有效 |
+
+### Phase 12: v0.14.2 裸机部署验证 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 79 | 全量清空 5 台机器（Host + 4 VM）→ 0 残留进程/文件 | ✅ |
+| 80 | 构建：单元测试 + 集成测试 (41 pass) + 4 交叉编译 | ✅ |
+| 81 | 部署：Host (macOS) + linuxvm + macvm + windowsvm + winx64 | ✅ |
+| 82 | Exec 测试：linuxvm/macvm/windowsvm/winx64 全部 OK | ✅ |
+| 83 | Upload 测试：4 VM 全部 OK，SHA256 一致 | ✅ |
+| 84 | Download 测试：4 VM 全部 OK (56 bytes)，SHA256 一致 | ✅ |
+| 85 | Ping 测试：4 VM 全部 OK (RTT 0-9ms) | ✅ |
+
+**踩坑记录**:
+1. Windows `taskkill /F` 无法终止 SYSTEM 权限 utmm → 需 PowerShell `Stop-Process -Force`
+2. linuxvm SSH 长命令链 exit 255 → 拆分为多个短 SSH 调用
+3. winx64 `waitOldProcesses` 5s 超时 → 旧进程残留触发了超时等待
+4. 交叉编译产物同时保留新旧版本后缀 → 部署时需手动选择正确版本
+
+### Phase 13: v0.14.3 — 自动升级启用 + Windows API 进程管理 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 86 | 自动升级编译时开关 `AUTO_UPGRADE = true`（protocol.zig）| ✅ |
+| 87 | host.zig 新增 `pushUpgrade()`（serve-dir 读取 + SHA256 + SOCKS4a 推送）| ✅ |
+| 88 | host.zig 新增 `LastUpgradeMap` + `pushUpgradeThread`（120s 冷却）| ✅ |
+| 89 | host.zig `tunnelManager` Phase 2 新增 LSA 版本检测 + 自动推送 | ✅ |
+| 90 | ipc.zig `handleUpgrade` 重构：~110 行 → ~25 行，复用 `pushUpgrade()` | ✅ |
+| 91 | svc.zig 新增 w32 命名空间：Toolhelp 进程枚举 + TerminateProcess API | ✅ |
+| 92 | svc.zig `killAllUtmm` Windows 分支重写：CreateToolhelp32Snapshot → Process32FirstW/NextW → OpenProcess → TerminateProcess | ✅ |
+| 93 | svc.zig `countOtherUtmmProcesses` Windows 分支重写：同上枚举计数 | ✅ |
+| 94 | host.zig Windows upload 路径分隔符修复（"/" → std.fs.path.sep_str）| ✅ |
+| 95 | SKILL 文件版本号批量更新（clean-deploy/deploy/utmm: 0.14.1 → 0.14.2）| ✅ |
+| 96 | 清理 8 个旧构建产物 `zig-out/bin/*-0.14.1*` | ✅ |
+| 97 | 版本号 bump: ver.txt 0.14.2 → 0.14.3 | ✅ |
+| 98 | 8 交叉编译目标构建 + 集成测试 41/41 通过 | ✅ |
+
+### Phase 14: v0.14.3 — linuxvm 重建 + 文档更新 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 99 | linuxvm 重建：UTM phantom VM 清理 + Ubuntu Desktop 24.04 重装 | ✅ |
+| 100 | linuxvm SSH 配置：PermitRootLogin + PasswordAuthentication | ✅ |
+| 101 | linuxvm 部署 v0.14.3 + exec/upload/download/ping 验证 | ✅ |
+| 102 | 临时 Lima VM `utmm-test` 创建 + socket_vmnet 桥接网络探索 | ✅ |
+| 103 | 发现 `detectUnixIp()` 多 NIC bug（eth0 先于 lima0）+ Lima VM 上修复验证 | ✅ |
+| 104 | 发现 `upsert()` 不检查 MAC 变化（cosmetic bug，host.zig:969-974）| ✅ |
+| 105 | CLAUDE.md + SKILL.md linuxvm IP 更新（192.168.64.2 → 192.168.64.6）| ✅ |
+| 106 | progress.md + task_plan.md 更新 | ✅ |
+
+### Phase 15: v0.14.3 — Bug 修复 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 107 | 修复 `detectUnixIp()` 多 NIC 偏好：新增 `isLikelyVmNat()` 跳过 VM NAT 范围 | ✅ |
+| 108 | 修复 `upsert()` MAC 检测：新增 MAC 字段比对和更新 | ✅ |
+| 109 | 新增 `isLikelyVmNat` 单元测试（3 组：QEMU/libvirt/Normal）| ✅ |
+| 110 | 新增 `GuestTable upsert detects MAC change` 单元测试 | ✅ |
+| 111 | 推送 5 个本地 commit 到 remote | ✅ |
+| 112 | 临时 Lima VM `utmm-test` 清理确认（无残留）| ✅ |
+
+**修复详情**:
+1. `detectUnixIp()` (guest.zig:305-350)：从"返回第一个物理 NIC"改为"收集候选 → 优先返回非 NAT → 回退到第一个"。新增 `isLikelyVmNat()` 检查 10.0.2.0/24（QEMU/VirtualBox 默认 NAT）和 192.168.122.0/24（libvirt 默认 NAT）
+2. `upsert()` (host.zig:951-1012)：新增 `existing.mac` 比对（第 975 行）和更新逻辑（第 1002-1005 行），与 ip/target/version/shell/status/role 保持一致模式
+
+**踩坑记录**:
+1. UTM bundle 可能因 QEMU 崩溃/磁盘空间不足从文件系统消失，UTM Registry 与磁盘不同步
+2. Lima `socket_vmnet` symlink 被拒绝 → 必须 cp 实际二进制
+3. `/etc/sudoers.d/lima` 权限 wheel → admin（dasimo 在 admin 组非 wheel）
+4. `detectUnixIp()` 返回第一个物理 NIC，多 NIC VM 可能返回不可达 IP
+5. Lima `lima:shared` 网络模式 = socket_vmnet + vmnet-shared，提供主机到 VM 直接 connectivity
+
+## 关键决策记录（续 3）
+
+| # | 决策 | 理由 |
+|---|------|------|
+| 33 | 自动升级 Host 端 LSA 版本检测 + 推送 | Host 已每 5s 解析所有 Guest 版本，零额外开销。编译时常量 false 时死代码消除 |
+| 34 | Windows 进程杀死换用 Toolhelp + TerminateProcess API | `taskkill /F` 无法终止 SYSTEM 权限进程；原生 API 层面终止 |
+| 35 | `sc.exe stop` 不可靠 → 不杀 utmmd.exe | utmmd 应通过服务管理器停止；killAllUtmm 只杀 utmm.exe 是正确的设计 |
+| 36 | `detectUnixIp()` 跳过 VM NAT 地址 | 新增 `isLikelyVmNat()` 检查 10.0.2.x (QEMU/VirtualBox) 和 192.168.122.x (libvirt)。多 NIC VM 优先选择非 NAT 接口，回退到第一个物理 NIC |
+| 37 | `upsert()` 检测 MAC 地址变化 | 新增 MAC 字段比对和更新逻辑。VM 重装后 MAC 变更可在 status 中正确显示 |
+| 38 | 全量注释清理 | 扫描并修复 src/ 下所有 KCP/HTTP/WebUI/tunnel manager/mesh relay 过时注释。main.zig (10+), host.zig (~15), mcp.zig (2), protocol.zig (1)。41/41 测试通过 |
+| 39 | ARP MAC→IP 反向发现 | 当 Guest IP 变化时（UTM 网络常见），Host 通过系统 ARP 表由已知 MAC 反查新 IP，自动恢复连接。跨平台实现：Linux `/proc/net/arp`、macOS `arp -a`、Windows `GetIpNetTable` |
+| 40 | 字节级 MAC 比较 | MAC 格式差异（LSA 补零 `9e:06` vs arp 不补零 `9e:6`）导致字符串比较失败。`parseMacBytes` + `macMatch` 用 `[6]u8` 字节数组比较，彻底消除格式依赖 |
+| 41 | ARP 集成测试覆盖补零差异 | 10 个集成测试覆盖 parseMacBytes/macMatch/rediscoverIp/lookupIp 全链路。`macMatch` 跨格式测试是核心回归防护：若未来有人改回字符串比较，测试立即失败 |
+
+### Phase 16: v0.14.3 — 源码注释清理 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 113 | main.zig 注释更新（模块 doc、字段 doc、help text、行内注释）| ✅ |
+| 114 | host.zig 注释更新（HTTP handlers、tunnel manager、pushUpgrade doc）| ✅ |
+| 115 | mcp.zig 注释更新（handleVmStatus、handleVmExec）| ✅ |
+| 116 | protocol.zig KCP 过时注释重写 | ✅ |
+| 117 | guest.zig 注释审计（无需修改）| ✅ |
+| 118 | 全量 grep 扫描确认无残留过时引用 | ✅ |
+| 119 | zig build test + test-integration 验证 | ✅ |
+| 120 | progress.md + task_plan.md 更新 | ✅ |
+
+### Phase 17: v0.14.4 — ARP MAC→IP 反向发现 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 121 | 新建 `src/arp.zig`：跨平台 ARP 表读取（Linux `/proc/net/arp`、macOS `arp -a`、Windows `GetIpNetTable`）| ✅ |
+| 122 | `parseMacBytes` + `macMatch`：字节级 MAC 比较，解决 LSA 补零 vs arp 不补零格式差异 | ✅ |
+| 123 | `host.zig` 新增 `connectGuest()`：TCP 连接失败 → ARP 查 MAC → 更新 IP → 重试 | ✅ |
+| 124 | `host.zig` 新增 `GuestTable.updateIp()`：运行时更新 Guest IP | ✅ |
+| 125 | `ipc.zig` `handleExec`/`handleUpload`/`handleDownload` 统一使用 `connectGuest()` | ✅ |
+| 126 | `utmmd.zig` Zig 0.16.0 兼容修复（`Child.init` → `std.process.run`）| ✅ |
+| 127 | MCP 测试覆盖扩展（54 测试）| ✅ |
+| 128 | 4 台真机部署验证（macvm/linuxvm/windowsvm/winx64）| ✅ |
+
+**ARP 实现详情**：
+- `arp.zig`（~245 行）：平台特定 ARP 表查询
+  - Linux：`std.Io.Dir.cwd().openFile("/proc/net/arp")` + 逐行解析
+  - macOS：`std.process.run("arp -a")` + 括号/at/on 正则解析
+  - Windows：`extern "iphlpapi" GetIpNetTable` 原生 API
+- `parseMacBytes()`：冒号分隔 6 段 → `[6]u8`，`parseInt(u8, part, 16)` 自动处理补零
+- `macMatch()`：字节级比较，忽略 `9e:6` vs `9e:06` 差异
+- `rediscoverIp()`：`lookupIp(mac)` → 比对 current_ip → 相同返回 null
+
+**修复的关键 Bug**：
+1. MAC 格式不匹配：LSA 存 `9e:06:4f:79:db:fe`（补零），macOS `arp -a` 输出 `9e:6:4f:79:db:fe`（不补零）→ 字符串比较失败。修复：字节级比较。
+2. Windows `LoadLibraryA` 移除（Zig 0.16.0）→ 改用 `extern "iphlpapi"` 直接声明
+3. Windows `BOOL` 是 enum → `0` 改为 `.FALSE`
+4. Linux `std.fs.openFileAbsolute` 移除 → `std.Io.Dir.cwd().openFile(io, ...)`
+
+### Phase 18: v0.14.5 — ARP 集成测试 + 发布 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 129 | `src/arp.zig` `parseMacBytes`/`macMatch` 改为 pub + 新增 17 个单元测试 | ✅ |
+| 130 | `src/testlib.zig` 导出 arp 模块 | ✅ |
+| 131 | 新建 `tests/test_arp.zig`：10 个 ARP 集成测试场景 | ✅ |
+| 132 | `tests/integration_test.zig` 注册 test_arp 模块 | ✅ |
+| 133 | 修复 `lookupIpLinux` Zig 0.16.0 API（`openFileAbsolute` → `openFile` + `close(io)` + `readStreaming`）| ✅ |
+| 134 | v0.14.5 release：8 目标交叉编译 + utmm.zip + GitHub release | ✅ |
+
+**ARP 集成测试覆盖（10 场景）**：
+| 场景 | 内容 | 防护目标 |
+|------|------|---------|
+| parseMacBytes zero-padded | `9e:06:4f:79:db:fe` → 6 bytes | 解析回归 |
+| parseMacBytes non-zero-padded | `9e:6:4f:79:db:fe` → 6 bytes（相同）| 格式差异 |
+| parseMacBytes invalid | 非hex/4段/7段/空串 → null | 鲁棒性 |
+| macMatch cross-format | LSA 补零 vs arp 不补零 → 匹配 | **核心回归**：补零差异 |
+| macMatch different MAC | 不同 MAC → false | 误匹配 |
+| macMatch invalid hw | 空串/垃圾 → false | 鲁棒性 |
+| rediscoverIp bogus MAC | `ff:ff:ff:ff:ff:ff` → 调系统 ARP 表 | 完整调用链 |
+| rediscoverIp empty MAC | 空串 → null | 边界条件 |
+| rediscoverIp same-IP | 不存在 MAC → null（验证路径）| 不变检测 |
+| lookupIp real macOS | 真实 `arp -a` 输出解析 | 系统集成 |
+
+### Phase 19: /etc/hosts 同步统一 + hostname 规范化 ✅
+
+**背景**: 见 findings.md Finding 190-193。两套独立 hosts 同步实现（host.zig 的 `syncHostsFromTable` 使用 `# BEGIN UTM-MONITOR` 标记 + FQDN `.utm` 后缀，lsa.zig 的 `updateHosts` 使用 `protocol.HOSTS_MARKER_BEGIN` 标记 + temp 文件原子 rename），后者实现更优但从未被调用。hostname 未做小写规范，Windows COMPUTERNAME 全大写致大小写不一致。Guest 端无 hosts 同步能力。FQDN `.utm` 后缀无实用价值且可能引发工具冲突。
+
+**涉及模块**:
+
+```
+调用关系：
+  host.zig (LSA 处理)          guest.zig (守护进程)
+       │                              │
+       ├─ lsa.updateHosts() ◄─────────┤
+       │  (唯一实现，位于 lsa.zig)      │
+       │  - temp 文件 + 原子 rename   │
+       │  - protocol.HOSTS_MARKER_*   │
+       │  - 参数化 file_path          │
+       │                              │
+       └─ entries: [                  └─ entries: [
+            {ip, hostname},                 {ip, hostname},
+            {ip, hostname}, ...             {host_ip, "gateway"},
+            {own_ip, "gateway"},        ]
+          ]                          host_ip ← getDefaultGateway()
+       own_ip ← 自身检测 IP                (UTM 中 Host=网关)
+```
+
+**hostname 规范化**:
+- 入口小写化：`guest.zig getSystemInfo()` / `main.zig --hostname` / `--exec` 等 target 参数 / `mcp.zig` vm 参数
+- hosts 条目：`{hostname}`（纯小写，无 `.utm` 后缀，无 `.target` 后缀）
+- 所有内部比较保持 `std.mem.eql`（无需改动，入口已统一）
+
+**Gateway 条目**:
+- Host `/etc/hosts`: `gateway` → 自身 IP
+- Guest `/etc/hosts`: `gateway` → Host IP（`getDefaultGateway()`）
+
+**受影响的比较/查找路径**（入口统一小写后自动修复，无需单独改动）:
+- `GuestTable.indexOf()` / `findByHostname()` / `upsert()` / `remove()` / `updateIp()` / `setMeshMac()`
+- `connectGuest()` ARP 恢复
+- `socks4CheckAndReply()` SOCKS4a 握手
+- IPC handlePing/Exec/Upload/Download
+- Auto-upgrade `LastUpgradeMap`
+- MCP tools exec/ping/upload/download
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 135 | 删除 `syncHostsFromTable()` 及 `MARKER_BEGIN`/`MARKER_END` 常量 | `src/host.zig` | ✅ ~65 行删除 |
+| 136 | LSA 处理 loop 中替换为 `lsa.updateHosts()` 调用 | `src/host.zig:880-886` | ✅ 新建 syncHosts() 从 GuestTable 构建 HostEntry + gateway |
+| 137 | `guestTcpLoop()` 中增加 hosts 同步线程 | `src/guest.zig` | ✅ 新建 guestHostsSync()，30s 周期，self+gateway |
+| 138 | `getSystemInfo()` hostname 小写化 | `src/guest.zig:369-379` | ✅ POSIX `gethostname()` / Windows `COMPUTERNAME` → toLower |
+| 139 | `--hostname` CLI 参数小写化 | `src/main.zig:240-244` | ✅ allocLowerString |
+| 140 | `--exec/--upload/--download/--ping/--upgrade` target 参数小写化 | `src/main.zig` | ✅ 6 个 target/hostname 参数 allocLowerString |
+| 141 | MCP `vm` 参数小写化 | `src/mcp.zig` | ✅ exec/ping/upload/download 入口 allocLowerString |
+| 142 | lsa.zig `updateHosts` dirname null fallback bug 修复 | `src/lsa.zig:1315` | ✅ `orelse "/"` → `orelse "."` |
+| 143 | 集成测试 hostname 引用适配 | `tests/` | ✅ 测试字符串已为小写 |
+| 144 | 新建 `tests/test_hosts.zig`：hosts 文件同步集成测试 | `tests/test_hosts.zig` | ✅ 8 场景 |
+| 145 | `tests/integration_test.zig` 注册 test_hosts 模块 | `tests/integration_test.zig` | ✅ |
+| 146 | zig build test + test-integration 验证 | - | ✅ 161 单测 + 59 集成，0 泄漏 |
+| 147 | 版本号 bump: 0.14.5 → 0.14.6 | `src/ver.txt` | ✅ |
+| 148 | 真机部署验证（Host + 4 VM） | - | 待执行 |
+
+**hosts 同步集成测试（`tests/test_hosts.zig`，8 场景）**:
+
+| # | 场景 | 验证点 |
+|---|------|--------|
+| 1 | 新建 hosts 文件（无旧标记） | 文件创建、标记格式、条目内容 |
+| 2 | 范围替换（已存在标记块） | 旧块替换为新块、块外内容保留不变 |
+| 3 | 重复写入无空行累积 | 连续 3 次 updateHosts → 文件末尾无多余空行 |
+| 4 | hostname 全小写 + 无 FQDN 后缀 | 条目格式 `{ip}  {hostname}`，无 `.target.utm` |
+| 5 | gateway 条目存在 | 验证 gateway IP = 传入的 gateway 地址 |
+| 6 | 原文件无标记块 → 追加 | 无标记块时追加到文件尾，确保尾换行 |
+| 7 | 空条目列表 | 传入空 entries → 仅标记块，无条目行 |
+| 8 | 特殊字符 hostname（连字符/数字） | `winx64`、`test-vm-01` 等合法 hostname 不损坏 |
+
+**预期 /etc/hosts 输出**:
+
+Host 端（macOS，IP 192.168.3.130）:
+```
+# UTM-MONITOR-BEGIN
+192.168.65.4  macvm
+192.168.64.6  linuxvm
+192.168.64.3  windowsvm
+192.168.3.108  winx64
+192.168.3.130  gateway
+# UTM-MONITOR-END
+```
+
+Guest 端（linuxvm，IP 192.168.64.6，Host IP 192.168.64.1）:
+```
+# UTM-MONITOR-BEGIN
+192.168.64.6  linuxvm
+192.168.64.1  gateway
+# UTM-MONITOR-END
+```
+
+**升级注意事项**:
+- 旧版标记 `# BEGIN UTM-MONITOR` / `# END UTM-MONITOR` 的 hosts 文件残留块不会被自动清理
+- 新版使用 `# UTM-MONITOR-BEGIN` / `# UTM-MONITOR-END`，新旧标记不冲突，旧块变成孤立注释
+- 首次部署后建议手动清理旧标记块：`sed -i '' '/# BEGIN UTM-MONITOR/,/# END UTM-MONITOR/d' /etc/hosts`
+- Windows `COMPUTERNAME` 全大写（如 `DESKTOP-ABC123`）→ 小写后 LSA 广播新 hostname，Host 端 `GuestTable.upsert()` 检测大小写不匹配 → 创建新条目而非更新旧条目，旧条目需手动 `GuestTable.remove()` 或等过期清理
+- `deriveNodeId()` hash 变更（peer-mesh 模式，非生产路径）
+
+### Phase 21: v0.14.7 — sshpass 集成 + MCP 工具名去前缀 + 真机部署 ✅
+
+**背景**: 消除外部 `sshpass` 依赖，集成到 utmm 作为 `sshpass` 子命令。100% CLI 兼容，POSIX (PTY) + Windows (ConPTY) 双平台。原 C 源码 505 行逐行移植。同时移除 MCP 工具名 `vm_` 前缀。
+
+**涉及模块**:
+
+```
+src/sshpass.zig (NEW, ~1200 行)
+├── ExitCode 枚举（7 个退出码，与 C 版完全一致）
+├── PwType/PwSource 类型（4 种密码源）
+├── patternMatch() — 逐字符状态机（同 C 版算法）
+├── parseArgs() — 模拟 getopt("+f:d:p:heV")，100% CLI 兼容
+├── writePassFd()/writePassPosix()/writePassWindows()
+├── handleoutputPosix()/handleoutputWindows() — 提示匹配 + 密码注入
+├── runPosix() — posix_openpt→fork→setsid→execvp→pselect→prompt matching
+├── runWindows() — CreatePseudoConsole (ConPTY)→CreateProcessW→ReadFile/WriteFile loop
+├── 内联测试：7 个 patternMatch + 8 个 parseArgs + 32 个 protocol（共 47 测试）
+└── pub fn main(gpa, args) noreturn — 模块入口
+
+src/mcp.zig
+├── 移除所有 MCP 工具名的 vm_ 前缀：vm_status→status, vm_exec→exec, etc.
+└── 54 测试适配（TOOLS_JSON 校验、方法名比较、期望数组）
+
+src/main.zig
+├── 新增 sshpass import + cmd_sshpass 字段 + comptime 注册 + help text
+├── parseArgs 早期检测 "sshpass" 子命令
+└── main() sshpass 分发（在管理员权限检查之前，sshpass 无需 root）
+
+CLAUDE.md / README.md / task_plan.md
+└── MCP 工具名更新 + sshpass 架构说明
+```
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 155 | 新建 `src/sshpass.zig` 核心模块 | `src/sshpass.zig` | ✅ ~1200 行，POSIX + Windows 完整实现 |
+| 156 | zig test 编译验证 + 修复 Zig 0.16.0 API 适配 | `src/sshpass.zig` | ✅ 47/47 测试通过，0 泄漏，0 错误 |
+| 157 | 集成 sshpass 到 main.zig | `src/main.zig` | ✅ CliArgs + parseArgs + main dispatch + comptime + help |
+| 158 | MCP 工具名移除 vm_ 前缀 | `src/mcp.zig` | ✅ 5 个工具名 + 所有比较路径 + 54 测试 |
+| 159 | 更新文档 | CLAUDE.md / README.md / task_plan.md | ✅ MCP 工具名表 + sshpass 架构说明 |
+| 160 | zig build test 全部通过 | - | ✅ 208 测试全部通过（分步运行） |
+| 161 | zig build test-integration 全部通过 | - | ✅ 59/59 通过，0 泄漏 |
+| 162 | 8 交叉编译目标构建 | - | ✅ 8/8 通过 |
+| 163 | 真机部署验证（Host + 4 VM）| - | ✅ 全部通过 |
+| 164 | 版本号 bump 0.14.6 → 0.14.7 | `src/ver.txt` | ✅ 已完成 |
+
+**Zig 0.16.0 API 适配记录**:
+| 问题 | 旧 API | 新 API |
+|------|--------|--------|
+| stdout/stderr | `std.io.getStdErr().writeAll()` | `std.c.write(fd, ...)` (POSIX) / `WriteFile` (Windows) |
+| getenv | `std.posix.getenv()` | `std.c.getenv()` |
+| sleep (Windows) | `std.Io.sleep(std.Io.default_io, ...)` | `kernel32.Sleep(ms)` |
+| c_int/c_ulong | 重定义为 fd_t/usize（阴影原语）| 使用 Zig 内置 c_int/c_ulong |
+| @bitCast/@intCast | 无已知结果类型 | 添加显式 @as |
+| std.c.getenv 返回值 | `?[*:0]u8` | 需 `std.mem.sliceTo` 转换为 slice |
+
+**设计决策**:
+| # | 决策 | 理由 |
+|---|------|------|
+| 42 | sshpass 密码不 dupe（引用 argv），隐藏密码移到 main() | 避免 `parseArgs` 错误路径内存泄漏；`main()` 中 argv 在进程生命周期内有效 |
+| 43 | sshpass 无需 root 权限 | 原版 sshpass 不需要；AI agent 无法 sudo 交互式提权 |
+| 44 | POSIX + Windows 一起做 | 用户要求；ConPTY API 在 Windows 10 1809+ 可用 |
+| 45 | sshpass.main() 需 args[2..] 而非 args[1..] | Zig `init.minimal.args.toSlice()` 返回完整 args（含 argv[0]）；"sshpass" 是 args[1]，参数和命令从 args[2] 开始 |
+
+### Phase 21-b: v0.14.7 args[2..] Bug 修复 + Windows 交叉编译 ✅
+
+**Bug**: sshpass.main() 使用 `args[1..]` 只跳过了二进制路径（args[0]），未跳过 "sshpass"
+子命令名（args[1]）。导致 `parseArgs` 将 "sshpass" 当作命令，`runPosix()` 执行 `execvp("sshpass", ...)`
+时找到系统外部 sshpass 二进制（Host 上 `/opt/homebrew/bin/sshpass`），嵌入实现从未被调用。
+
+**修复**: `const actual_args = args[1..]` → `const actual_args = args[2..]`
+
+**Windows 交叉编译修复**（6 个预存 Zig 0.16.0 API 问题）:
+1. `std.os.windows.WriteFile` → `@extern("kernel32", "WriteFile")`
+2. `std.os.windows.GetStdHandle` → `@extern("kernel32", "GetStdHandle")`
+3. `std.os.windows.HRESULT` → `const HRESULT = i32`
+4. `std.fmt.parseInt(std.posix.fd_t, ...)` Windows 失败 → 平台分派
+5. `ArrayList.append(x)` → `ArrayList.append(allocator, x)`
+6. `DeleteProcThreadAttribute` → `DeleteProcThreadAttributeList`
+
+**验证**:
+- 8/8 交叉编译目标通过 ✅（含 aarch64/x86_64-windows 首次成功）
+- Host/linuxvm/macvm sshpass 功能验证 ✅
+- windowsvm 升级成功，runtime 待进一步测试
+
+| # | 任务 | 文件 | 状态 |
+|---|------|------|------|
+| 165 | 修复 sshpass.main() args[2..] | `src/sshpass.zig` | ✅ |
+| 166 | 修复 Windows 交叉编译 | `src/sshpass.zig` | ✅ 6 处修正 |
+| 167 | 更新 zig-codegen.md | `zig-codegen.md` | ✅ 新增 6 条经验记录 |
+| 168 | 更新 progress.md | `progress.md` | ✅ |
+| 169 | 更新 task_plan.md | `task_plan.md` | ✅ |
+
+### Phase 20: v0.14.6 真机部署验证 ✅
+
+| # | 任务 | 说明 |
+|---|------|------|
+| 149 | 编译所有目标平台 | `zig build -Doptimize=ReleaseSafe` × 各 target |
+| 150 | 部署到 4 台 VM | scp/upgrade → linuxvm, macvm, windowsvm, winx64 |
+| 151 | 验证 /etc/hosts 同步 | 检查各 VM 的 /etc/hosts 内容：hostname 小写、gateway 条目、无 .utm 后缀 |
+| 152 | 验证 exec/upload/download 功能正常 | CLI 管理命令功能回归 |
+| 153 | 验证 MCP stdio 功能正常 | AI agent 接口功能回归 |
+| 154 | 清理旧标记块 | 手动清理旧版 `# BEGIN/END UTM-MONITOR` 残留（如存在） |

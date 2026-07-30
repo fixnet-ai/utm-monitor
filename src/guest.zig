@@ -16,13 +16,7 @@ const shm = @import("shm.zig");
 const dpipe = @import("dpipe.zig");
 const dpipe_shell = @import("dpipe_shell.zig");
 const dpipe_file = @import("dpipe_file.zig");
-
-/// Shared signal between udpDiscoveryListener (background thread) and
-/// wsAnnounceLoop (main thread). When the UDP listener detects a version
-/// mismatch from the Host broadcast, it sets `needed` to true.
-pub const UpgradeSignal = struct {
-    needed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-};
+const sshpass = @import("sshpass.zig");
 
 // libc network interface enumeration (getifaddrs)
 const in_addr = extern struct { s_addr: u32 };
@@ -309,14 +303,30 @@ fn getMacAddress(io: std.Io, allocator: std.mem.Allocator, iface_name: []const u
     return allocator.dupe(u8, "00:00:00:00:00:00");
 }
 
-/// One-stop system info collection: hostname + IP + MAC + target
-/// Enumerate physical NICs via getifaddrs(), return the first valid IPv4 address.
-/// Returns null if no suitable interface found (getifaddrs failure, no IPv4 on
-/// any physical NIC, or all addresses are 0.0.0.0 / loopback).
-fn detectUnixIp(allocator: std.mem.Allocator) !?struct { ip: []const u8, iface_name: []const u8 } {
+/// Check if an IPv4 address is in a known VM NAT range (QEMU/VirtualBox default).
+/// These addresses are typically unreachable from the Host on multi-NIC VMs.
+fn isLikelyVmNat(bytes: [4]u8) bool {
+    // 10.0.2.0/24 — QEMU user-mode networking / VirtualBox NAT default
+    if (bytes[0] == 10 and bytes[1] == 0 and bytes[2] == 2) return true;
+    // 192.168.122.0/24 — libvirt default NAT
+    if (bytes[0] == 192 and bytes[1] == 168 and bytes[2] == 122) return true;
+    return false;
+}
+
+/// Physical NIC IP address and interface name detected by detectUnixIp.
+const IpInfo = struct { ip: []const u8, iface_name: []const u8 };
+
+/// One-stop system info collection: hostname + IP + MAC + target.
+/// Enumerate physical NICs via getifaddrs(), prefer non-NAT addresses
+/// (skip known VM NAT ranges like 10.0.2.x, 192.168.122.x).
+/// Returns the first non-NAT physical IPv4, or the first physical IPv4 if all
+/// are in NAT ranges. Returns null if no suitable interface found.
+fn detectUnixIp(allocator: std.mem.Allocator) !?IpInfo {
     var ifap: ?*ifaddrs = undefined;
     if (getifaddrs(&ifap) != 0) return null;
     defer freeifaddrs(ifap);
+
+    var fallback: ?IpInfo = null;
 
     var current: ?*ifaddrs = ifap;
     while (current) |ifa| : (current = ifa.ifa_next) {
@@ -337,8 +347,18 @@ fn detectUnixIp(allocator: std.mem.Allocator) !?struct { ip: []const u8, iface_n
         const ip = try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
         const iface_name = try allocator.dupe(u8, name);
         std.debug.print("[guest] Physical NIC {s}: {s}\n", .{ name, ip });
-        return .{ .ip = ip, .iface_name = iface_name };
+
+        // Return immediately if this is a non-NAT address (preferred)
+        if (!isLikelyVmNat(bytes)) {
+            return .{ .ip = ip, .iface_name = iface_name };
+        }
+        // Otherwise save as fallback and keep scanning for a better interface
+        if (fallback == null) {
+            fallback = .{ .ip = ip, .iface_name = iface_name };
+        }
     }
+    // All physical NICs are in VM NAT ranges — return the first one as fallback
+    if (fallback) |fb| return fb;
     return null;
 }
 
@@ -346,17 +366,25 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
 
     const target = zigTarget();
 
-    // Get hostname
-    const hostname: []const u8 = if (builtin.os.tag == .windows) blk: {
-        const name_ptr = std.c.getenv("COMPUTERNAME");
-        if (name_ptr) |ptr| {
-            break :blk try allocator.dupe(u8, std.mem.span(ptr));
+    // Get hostname (lowercased, FQDN suffix like .local stripped for consistency)
+    const hostname: []const u8 = blk: {
+        const raw = if (builtin.os.tag == .windows) blk2: {
+            const name_ptr = std.c.getenv("COMPUTERNAME");
+            break :blk2 if (name_ptr) |ptr|
+                try allocator.dupe(u8, std.mem.span(ptr))
+            else
+                try allocator.dupe(u8, "unknown");
+        } else blk2: {
+            var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+            const name = try std.posix.gethostname(&buf);
+            break :blk2 try allocator.dupe(u8, name);
+        };
+        // Lowercase + strip FQDN suffix (e.g. "LAPTOP.local" → "laptop")
+        for (raw) |*c| c.* = std.ascii.toLower(c.*);
+        if (std.mem.indexOfScalar(u8, raw, '.')) |dot_pos| {
+            break :blk raw[0..dot_pos];
         }
-        break :blk try allocator.dupe(u8, "unknown");
-    } else blk: {
-        var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-        const name = try std.posix.gethostname(&buf);
-        break :blk try allocator.dupe(u8, name);
+        break :blk raw;
     };
 
     // Retry IP detection up to 5 times (1s apart) on all platforms.
@@ -623,6 +651,26 @@ test "isPhysicalInterface - loopback excluded" {
     try std.testing.expect(!isPhysicalInterface("lo"));
 }
 
+test "isLikelyVmNat - QEMU/VirtualBox default" {
+    try std.testing.expect(isLikelyVmNat(.{ 10, 0, 2, 15 }));
+    // IPs on 10.0.2.0/24 should match
+    try std.testing.expect(isLikelyVmNat(.{ 10, 0, 2, 1 }));
+    try std.testing.expect(isLikelyVmNat(.{ 10, 0, 2, 254 }));
+}
+
+test "isLikelyVmNat - libvirt default" {
+    try std.testing.expect(isLikelyVmNat(.{ 192, 168, 122, 1 }));
+    try std.testing.expect(isLikelyVmNat(.{ 192, 168, 122, 100 }));
+}
+
+test "isLikelyVmNat - non-NAT addresses" {
+    try std.testing.expect(!isLikelyVmNat(.{ 192, 168, 64, 6 }));
+    try std.testing.expect(!isLikelyVmNat(.{ 192, 168, 105, 2 }));
+    try std.testing.expect(!isLikelyVmNat(.{ 192, 168, 5, 15 }));
+    try std.testing.expect(!isLikelyVmNat(.{ 172, 16, 0, 1 }));
+    try std.testing.expect(!isLikelyVmNat(.{ 10, 1, 0, 1 }));
+}
+
 test "zigTarget - valid format" {
     const target = zigTarget();
     try std.testing.expect(target.len > 0);
@@ -644,18 +692,61 @@ test "zigTarget - valid format" {
 // Guest TCP 主循环（替代 meshSessionLoop）
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Guest TCP 服务 — TCP + SOCKS4 + tcpf 替代 KCP tunnel。
+/// Guest TCP 服务 — TCP listener + dpipe relay，每命令独立连接。
 ///
-/// 1. 启动 LSA/UDP 发现线程（mesh.zig）
+/// 1. 启动 LSA/UDP 发现线程（lsa.zig）
 /// 2. TCP 监听端口 2121
 /// 3. accept 循环 → SOCKS4a 握手 → 处理命令
 /// 4. 每命令独立连接，命令结束即关闭
+
+/// Periodic /etc/hosts sync for Guest: self + gateway entries.
+/// Runs every 30 seconds to keep the hosts file current even if
+/// the Host IP changes (unlikely but possible in UTM networks).
+fn guestHostsSync(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    info: SystemInfo,
+    shutdown: ?*std.atomic.Value(bool),
+) void {
+    while (true) {
+        // Sleep first — no rush on initial startup
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(30), .awake) catch break;
+        if (shutdown) |s| {
+            if (s.load(.acquire)) break;
+        }
+
+        // Resolve gateway IP (Host IP in UTM network)
+        const gateway_ip = getDefaultGateway(io, allocator) catch |err| {
+            std.log.warn("[guest] hostsSync: getDefaultGateway failed: {}", .{err});
+            continue;
+        };
+        defer allocator.free(gateway_ip);
+
+        // Build entries: self + gateway
+        var entries: std.ArrayList(lsa.HostEntry) = .empty;
+        defer entries.deinit(allocator);
+
+        if (info.ip.len > 0 and info.hostname.len > 0) {
+            entries.append(allocator, .{ .ip = info.ip, .name = info.hostname }) catch continue;
+        }
+        if (gateway_ip.len > 0) {
+            entries.append(allocator, .{ .ip = gateway_ip, .name = "gateway" }) catch continue;
+        }
+
+        const hosts_path = if (builtin.os.tag == .windows)
+            "C:\\Windows\\System32\\drivers\\etc\\hosts"
+        else
+            "/etc/hosts";
+        lsa.updateHosts(io, allocator, hosts_path, entries.items) catch |err| {
+            std.log.warn("[guest] hostsSync: updateHosts {s}: {}", .{ hosts_path, err });
+        };
+    }
+}
+
 pub fn guestTcpLoop(
     io: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
-    upgrade: *UpgradeSignal,
-    auto_upgrade: bool,
     mesh_port: u16,
     peer_mesh: ?[]const u8,
     shutdown: ?*std.atomic.Value(bool),
@@ -664,6 +755,7 @@ pub fn guestTcpLoop(
     var mesh_opt: ?lsa.Mesh = null;
     var mesh_thread: ?std.Thread = null;
     var mesh_socket_opt: ?std.Io.net.Socket = null;
+    var hosts_sync_thread: ?std.Thread = null;
 
     start_mesh: {
         var broadcast_addrs = getSubnetBroadcasts(allocator) catch |err| {
@@ -712,8 +804,8 @@ pub fn guestTcpLoop(
             };
 
         const node_info = std.fmt.allocPrint(allocator,
-            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:guest\nstatus:serving",
-            .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell },
+            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nconpty:{s}\nrole:guest\nstatus:serving",
+            .{ info.hostname, info.ip, info.target, protocol.VERSION, info.shell, if (sshpass.conptyAvailable()) "yes" else "no" },
         ) catch |err| {
             std.log.err("[guest] node_info alloc: {}", .{err});
             mesh_socket.close(mesh_io);
@@ -721,7 +813,7 @@ pub fn guestTcpLoop(
             break :start_mesh;
         };
 
-        mesh_opt = lsa.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, if (auto_upgrade) &upgrade.needed else null, broadcast_addrs, getSubnetBroadcasts) catch |err| {
+        mesh_opt = lsa.Mesh.init(allocator, node_id, node_info, mesh_socket, mesh_io, broadcast_addrs, getSubnetBroadcasts) catch |err| {
             std.log.err("[guest] Mesh init: {}", .{err});
             allocator.free(node_info);
             mesh_socket.close(mesh_io);
@@ -741,6 +833,11 @@ pub fn guestTcpLoop(
     }
 
     defer {
+        if (hosts_sync_thread) |t| {
+            // Signal shutdown to break the sleep loop, then join
+            if (shutdown) |s| s.store(true, .release);
+            t.join();
+        }
         if (mesh_thread) |t| {
             if (mesh_opt) |*m| m.signalShutdown();
             t.join();
@@ -755,6 +852,13 @@ pub fn guestTcpLoop(
     if (mesh_opt == null) {
         std.log.err("[guest] Mesh failed to start", .{});
         return error.MeshInitFailed;
+    }
+
+    // ── Periodic /etc/hosts sync ──
+    if (std.Thread.spawn(.{}, guestHostsSync, .{ io, allocator, info, shutdown })) |t| {
+        hosts_sync_thread = t;
+    } else |_| {
+        std.log.warn("[guest] hostsSync thread spawn failed", .{});
     }
 
     // ── TCP accept 循环 ──
@@ -774,14 +878,6 @@ pub fn guestTcpLoop(
             }
         }
 
-        // 检查升级信号（仅 auto_upgrade 启用时）
-        if (auto_upgrade and upgrade.needed.load(.acquire)) {
-            upgrade.needed.store(false, .release);
-            if (mesh_opt) |*m| {
-                tryPerformUpgrade(io, allocator, info, m, mesh_port);
-            }
-        }
-
         // Accept SOCKS4 连接
         var conn = listener.accept(info.hostname) catch |err| {
             if (err == error.WouldBlock) continue;
@@ -795,127 +891,6 @@ pub fn guestTcpLoop(
             std.log.err("[guest] handleOneCommand: {}", .{err});
         };
         conn.deinit();
-    }
-}
-
-/// 尝试执行自动升级：连接 Host TCP → 发送 upgrade_req → 接收二进制 → 保存 → 通知 utmmd。
-/// 所有错误被捕获并记录，不会导致主循环崩溃。
-fn tryPerformUpgrade(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    info: SystemInfo,
-    mesh: *lsa.Mesh,
-    mesh_port: u16,
-) void {
-    std.log.info("[guest] upgrade signal detected, starting auto-upgrade", .{});
-
-    // ── 1. 从 LSA 数据库查找 Host IP ──
-    var host_ip: ?[]const u8 = null;
-    defer if (host_ip) |h| allocator.free(h);
-
-    {
-        mesh.lsas_mutex.lock(mesh.io) catch {
-            std.log.warn("[guest] upgrade: failed to lock LSA database", .{});
-            return;
-        };
-        defer mesh.lsas_mutex.unlock(mesh.io);
-
-        var it = mesh.lsas.iterator();
-        while (it.next()) |entry| {
-            const ni = entry.value_ptr.node_info;
-            if (std.mem.indexOf(u8, ni, "role:host") != null) {
-                if (std.mem.indexOf(u8, ni, "ip:")) |ip_start| {
-                    const ip_line = ni[ip_start + 3 ..];
-                    const ip_end = std.mem.indexOfScalar(u8, ip_line, '\n') orelse ip_line.len;
-                    host_ip = allocator.dupe(u8, ip_line[0..ip_end]) catch null;
-                }
-                break;
-            }
-        }
-    }
-
-    const hip = host_ip orelse {
-        std.log.warn("[guest] upgrade: no Host IP found in LSA database", .{});
-        return;
-    };
-    std.log.info("[guest] upgrade: connecting to Host {s}:{d}", .{ hip, mesh_port });
-
-    // ── 2. 连接 Host TCP（直连，不走 SOCKS4a） ──
-    const host_addr = std.Io.net.IpAddress.parse(hip, mesh_port) catch |err| {
-        std.log.warn("[guest] upgrade: parse Host addr: {}", .{err});
-        return;
-    };
-    const stream = host_addr.connect(io, .{ .mode = .stream }) catch |err| {
-        std.log.warn("[guest] upgrade: connect to Host: {}", .{err});
-        return;
-    };
-    defer stream.close(io);
-    const fd = stream.socket.handle;
-
-    // ── 3. 发送 upgrade_req ──
-    const cmd_id = std.fmt.allocPrint(allocator, "upgrade_{d}", .{
-        std.Io.Timestamp.now(io, .real).nanoseconds,
-    }) catch return;
-    defer allocator.free(cmd_id);
-
-    const frame = protocol.buildUpgradeReq(allocator, cmd_id, info.target) catch |err| {
-        std.log.err("[guest] upgrade: buildUpgradeReq: {}", .{err});
-        return;
-    };
-    defer allocator.free(frame);
-
-    tcp.sendFrame(fd, frame) catch |err| {
-        std.log.err("[guest] upgrade: send upgrade_req: {}", .{err});
-        return;
-    };
-    std.log.info("[guest] upgrade: sent upgrade_req target={s}", .{info.target});
-
-    // ── 4. 接收二进制流，保存到临时文件 ──
-    const tmp_path = "/opt/utmm/utmm.new";
-    // 先清理可能残留的旧 temp 文件
-    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-
-    const tmp_file = std.Io.Dir.cwd().createFile(io, tmp_path, .{
-        .permissions = @enumFromInt(0o755),
-    }) catch |err| {
-        std.log.err("[guest] upgrade: create temp file {s}: {}", .{ tmp_path, err });
-        return;
-    };
-
-    var rbuf: [65536]u8 = undefined;
-    var total_bytes: usize = 0;
-    while (true) {
-        const nr = std.posix.system.read(fd, &rbuf, rbuf.len);
-        if (nr < 0) {
-            std.log.err("[guest] upgrade: read error at {d} bytes", .{total_bytes});
-            tmp_file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            return;
-        }
-        if (nr == 0) break; // EOF — Host closed after sending binary
-        tmp_file.writeStreamingAll(io, rbuf[0..@intCast(nr)]) catch |err| {
-            std.log.err("[guest] upgrade: write temp file: {}", .{err});
-            tmp_file.close(io);
-            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-            return;
-        };
-        total_bytes += @intCast(nr);
-    }
-    tmp_file.close(io);
-
-    std.log.info("[guest] upgrade: received {d} bytes → {s}", .{ total_bytes, tmp_path });
-
-    // ── 5. 通过 shm 通知 utmmd 执行升级 ──
-    if (shm.open()) |h| {
-        defer shm.detach(h);
-        h.cmd = @intFromEnum(shm.Cmd.upgrade);
-        @memset(&h.cmd_data, 0);
-        const copy_len = @min(tmp_path.len, h.cmd_data.len - 1);
-        @memcpy(h.cmd_data[0..copy_len], tmp_path[0..copy_len]);
-        h.utmm_state = @intFromEnum(shm.UtmmState.stopping);
-        std.log.info("[guest] upgrade: utmmd signalled, exiting for restart", .{});
-    } else |err| {
-        std.log.err("[guest] upgrade: shm.open failed: {}", .{err});
     }
 }
 
@@ -953,6 +928,9 @@ fn handleOneCommand(
         },
         @intFromEnum(protocol.MsgType.download_cmd) => {
             try handleDownload(io, allocator, conn, payload);
+        },
+        @intFromEnum(protocol.MsgType.upgrade_cmd) => {
+            try handleUpgradeCmd(io, allocator, conn, payload);
         },
         else => {
             std.log.info("[guest] Unknown msg type: {d}", .{msg_type});
@@ -1055,14 +1033,14 @@ fn handleUpload(
         _ = conn.sendAndFlush(resp, 0) catch {};
         return;
     };
-    defer file_pipe.close();
+    // defer file_pipe.close(); — 在 line 1078 显式关闭，避免双 close
 
     // 从 TCP 直接读取原始字节（无帧协议）→ 写入 file_pipe
     var buf: [65536]u8 = undefined;
     var remaining: u32 = cmd.file_size;
     while (remaining > 0) {
         const to_read = @min(buf.len, remaining);
-        const nr = std.posix.system.read(conn.fd, buf[0..to_read].ptr, to_read);
+        const nr = tcp.sockRead(conn.fd, buf[0..to_read].ptr, to_read);
         if (nr <= 0) {
             std.log.err("[guest] upload: short read ({d} remaining)", .{remaining});
             break;
@@ -1082,6 +1060,120 @@ fn handleUpload(
     const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, exit_code) catch return;
     defer allocator.free(resp);
     _ = conn.sendAndFlush(resp, 0) catch {};
+}
+
+/// 处理 upgrade_cmd（Host→Guest 直推升级）：接收二进制流 → SHA256 校验 → 通知 utmmd。
+///
+/// 使用随机临时文件名（如 /opt/utmm/.utmm-<random>）避免并发冲突，
+/// 校验通过后由 utmmd 负责原子 rename 到最终路径。
+fn handleUpgradeCmd(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    conn: *tcp.Connection,
+    payload: []const u8,
+) !void {
+    const cmd = protocol.parseUpgradeCmd(payload) orelse {
+        std.log.err("[guest] parseUpgradeCmd failed", .{});
+        return;
+    };
+
+    std.log.info("[guest] upgrade: cmd_id={s} target={s} size={d}", .{ cmd.cmd_id, cmd.target, cmd.file_size });
+
+    // 生成随机临时文件名，避免并发升级冲突
+    var rand_bytes: [8]u8 = undefined;
+    io.random(&rand_bytes);
+    var temp_hex: [16]u8 = undefined;
+    for (rand_bytes, 0..) |b, j| {
+        temp_hex[j * 2] = "0123456789abcdef"[b >> 4];
+        temp_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}/.utmm-{s}", .{ svc.tempDir(), &temp_hex });
+    defer allocator.free(tmp_path);
+
+    // 创建临时文件（随机文件名，无需预先清理）
+    var write_buf: [65536]u8 = undefined;
+    const tmp_file = if (@import("builtin").os.tag != .windows)
+        std.Io.Dir.cwd().createFile(io, tmp_path, .{ .permissions = @enumFromInt(0o755) })
+    else
+        std.Io.Dir.cwd().createFile(io, tmp_path, .{});
+    const file = tmp_file catch |err| {
+        std.log.err("[guest] upgrade: create temp file {s}: {}", .{ tmp_path, err });
+        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+        defer allocator.free(resp);
+        _ = conn.sendAndFlush(resp, 0) catch {};
+        return;
+    };
+
+    // 增量 SHA256 计算
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var remaining: u32 = cmd.file_size;
+    while (remaining > 0) {
+        const to_read = @min(write_buf.len, remaining);
+        const nr = tcp.sockRead(conn.fd, &write_buf, to_read);
+        if (nr <= 0) {
+            std.log.err("[guest] upgrade: short read ({d} remaining)", .{remaining});
+            break;
+        }
+        const slice = write_buf[0..@intCast(nr)];
+        hasher.update(slice);
+        _ = file.writeStreamingAll(io, slice) catch |err| {
+            std.log.err("[guest] upgrade: write temp file: {}", .{err});
+            break;
+        };
+        remaining -= @intCast(nr);
+    }
+
+    // 关闭文件（之后仅通过路径操作，避免 double-close）
+    file.close(io);
+
+    if (remaining != 0) {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+        defer allocator.free(resp);
+        _ = conn.sendAndFlush(resp, 0) catch {};
+        return;
+    }
+
+    // SHA256 校验
+    var computed_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&computed_hash);
+
+    // 比较 hex - cmd.sha256_hex 是 64 字符的 hex 字符串
+    var hex_buf: [64]u8 = undefined;
+    for (computed_hash, 0..) |byte, i| {
+        const h = "0123456789abcdef";
+        hex_buf[i * 2] = h[byte >> 4];
+        hex_buf[i * 2 + 1] = h[byte & 0x0f];
+    }
+    const hash_ok = std.mem.eql(u8, cmd.sha256_hex, &hex_buf);
+    if (!hash_ok) {
+        std.log.err("[guest] upgrade: SHA256 mismatch", .{});
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+        defer allocator.free(resp);
+        _ = conn.sendAndFlush(resp, 0) catch {};
+        return;
+    }
+
+    std.log.info("[guest] upgrade: SHA256 verified, {d} bytes → {s}", .{ cmd.file_size, tmp_path });
+
+    // 发送成功响应
+    const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
+    defer allocator.free(resp);
+    _ = conn.sendAndFlush(resp, 0) catch {};
+
+    // 通过 shm 通知 utmmd 执行升级（utmmd 负责 rename temp → 最终路径）
+    if (shm.open()) |h| {
+        defer shm.detach(h);
+        h.cmd = @intFromEnum(shm.Cmd.upgrade);
+        @memset(&h.cmd_data, 0);
+        const copy_len = @min(tmp_path.len, h.cmd_data.len - 1);
+        @memcpy(h.cmd_data[0..copy_len], tmp_path[0..copy_len]);
+        h.utmm_state = @intFromEnum(shm.UtmmState.stopping);
+        std.log.info("[guest] upgrade: utmmd signalled, exiting for restart", .{});
+    } else |err| {
+        std.log.err("[guest] upgrade: shm.open failed: {}", .{err});
+    }
 }
 
 /// 处理 download：dpipe_file.readFile → 原始字节流发送到 TCP。
@@ -1115,7 +1207,7 @@ fn handleDownload(
         };
         if (nr == 0) break; // EOF
 
-        _ = std.posix.system.write(conn.fd, buf[0..nr].ptr, nr);
+        _ = tcp.sockWrite(conn.fd, buf[0..nr].ptr, nr);
     }
 
     std.log.info("[guest] download complete: {s}", .{cmd.path});
@@ -1135,7 +1227,37 @@ pub fn guestRun(init: std.process.Init, cli: @import("main.zig").CliArgs) !void 
 /// shutdown is an optional atomic flag — when set (Windows service stop), the
 /// mesh session loop exits cleanly so the SCM receives STOPPED instead of a
 /// broken pipe error.
+/// 启动时清理残留的临时文件（升级/上传失败遗留）。
+/// 扫描 canonicalDir 和 tempDir，删除 `.utmm-*` 和 `.utmm-upgrade-*` 前缀的文件。
+fn cleanupStaleTempFiles(io: std.Io, alloc: std.mem.Allocator) void {
+    const dirs = [_][]const u8{ svc.canonicalDir(), svc.tempDir() };
+    const prefixes = [_][]const u8{ ".utmm-upgrade-", ".utmm-" };
+
+    for (dirs) |dir_path| {
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch continue;
+        defer dir.close(io);
+
+        var walker = dir.walk(alloc) catch continue;
+        defer walker.deinit();
+
+        while (walker.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const name = entry.basename;
+            for (prefixes) |prefix| {
+                if (std.mem.startsWith(u8, name, prefix)) {
+                    dir.deleteFile(io, name) catch {};
+                    std.log.debug("[guest] cleanup: removed stale {s}/{s}", .{ dir_path, name });
+                    break;
+                }
+            }
+        }
+    }
+}
+
 pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
+    // 启动时清理残留 temp 文件（升级失败/Crash 遗留）
+    cleanupStaleTempFiles(io, gpa);
+
     // Collect system information (sync, uses blocking Io for process.run etc.)
     var sysinfo = try getSystemInfo(io, gpa);
     defer {
@@ -1175,8 +1297,5 @@ pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig
     }
 
     // TCP session loop — per-command TCP connections with SOCKS4 handshake.
-    // UpgradeSignal allows mesh LSA version check to signal the main loop
-    // when a version mismatch is detected from Host broadcast.
-    var upgrade_signal = UpgradeSignal{};
-    try guestTcpLoop(io, gpa, sysinfo, &upgrade_signal, cli.auto_upgrade, cli.mesh_port, cli.peer_mesh, shutdown);
+    try guestTcpLoop(io, gpa, sysinfo, cli.mesh_port, cli.peer_mesh, shutdown);
 }

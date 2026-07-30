@@ -26,11 +26,17 @@ MCP protocol:
 
 | Tool | Description |
 |------|-------------|
-| `vm_status` | List all nodes (Host + Guests): hostname, role, IP, OS/arch, version, status, shell type |
-| `vm_exec` | Execute commands. Shell session persists — cd, export survive across calls |
-| `vm_ping` | Ping a guest over the mesh — test connectivity and measure RTT |
-| `vm_upload` | Upload a file from Host to Guest via KCP tunnel (SHA256 verified) |
-| `vm_download` | Download a file from Guest to Host via KCP tunnel (SHA256 verified) |
+| `status` | List all nodes (Host + Guests): hostname, role, IP, OS/arch, version, status, shell type |
+| `exec` | Execute commands via TCP per-command connection. Each exec opens a fresh pty session |
+| `ping` | Ping a guest over the mesh — test connectivity and measure RTT |
+| `upload` | Upload a file from Host to Guest via TCP/SOCKS4 (SHA256 verified) |
+| `download` | Download a file from Guest to Host via TCP/SOCKS4 (SHA256 verified) |
+
+> **ConPTY**: `--status` shows each node's ConPTY support (`yes`/`no`). On Windows,
+> ConPTY (pseudo-terminal) enables SSH password authentication and interactive
+> command execution. If a Windows VM shows `conpty:no`, it's running an older
+> Windows build (< 10.0.17763) — SSH operations fall back to pipe mode, which
+> may have reduced compatibility. POSIX (Linux/macOS) always reports `conpty:yes`.
 
 Example prompts your AI agent can handle:
 - "Check the status of all my machines"
@@ -54,17 +60,23 @@ utmm --exec windowsvm "tasklist | findstr myapp"
 utmm --exec linuxvm "gdb -batch -ex 'bt full' -p $(pgrep myapp)"
 utmm --exec macvm "lldb -o 'bt all' -o quit -p $(pgrep myapp)"
 
-# Shell state persists — cd, export, venv survive across calls
-utmm --exec linuxvm "cd /opt/myapp && source venv/bin/activate && pip list"
-utmm --exec linuxvm "pwd"     # /opt/myapp — still there
+# Each exec opens a fresh pty — no state persists across calls
+utmm --exec linuxvm "cd /opt/myapp && source ./venv/bin/activate && pip list"
 
 # Check health across all machines with one command
 utmm --status      # Host + all guests: role, version, status, last seen
-utmm --verify      # Health matrix: status + ping + exec echo per guest
 
 # One-shot deploy to all machines
 utmm --deploy      # Build + SCP + SSH install to all guests
 utmm --deploy linuxvm  # Deploy single guest
+
+# Push upgrade to Guest (no SSH needed)
+utmm --upgrade linuxvm
+
+# Non-interactive SSH (built-in sshpass)
+utmm sshpass -p '111' ssh root@192.168.64.2 'uname -a'
+utmm sshpass -f ~/.ssh/vm_pass ssh root@macvm 'ls -la'
+utmm sshpass -e ssh Administrator@windowsvm 'tasklist'  # reads SSHPASS env var
 
 # File transfer
 utmm --upload build.zip linuxvm
@@ -113,7 +125,6 @@ claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp
 
 ```bash
 utmm --status                      # All nodes at a glance (Host + guests, role/status/version/last seen)
-utmm --verify                      # Health check matrix: status + ping + exec per guest
 utmm --ping linuxvm                # Ping a guest (Host→Guest mesh ping, returns JSON)
 utmm --exec linuxvm "uname -a"     # Command (streaming output, no timeout)
 utmm --exec linuxvm "gdb ..."      # Attach debugger
@@ -122,66 +133,64 @@ utmm --exec windowsvm "dir"        # Windows commands too
 utmm --upload build.zip linuxvm    # Push a build (raw binary)
 utmm --download linuxvm core ./    # Pull a core dump (streaming binary)
 utmm --deploy [<vm>]              # Build + SCP + SSH deploy to all guests (or single)
+utmm --upgrade <vm>                # Push upgrade binary to Guest VM
 utmm --version                     # Print version
 ```
 
 ## How It Works
 
-The Host manages Guests through a **mesh network over UDP port 2121**. Each Guest
-maintains a persistent KCP tunnel to the Host. LSA (Link State Advertisement)
-broadcasts handle topology discovery and version detection. CLI commands and MCP
-talk to the Host through a local IPC socket (`/var/run/utmm.sock` on POSIX,
-named pipe on Windows) — no HTTP.
+The Host manages Guests through **TCP per-command connections** via SOCKS4a proxy
+(UTM network). Each exec, upload, or download opens a fresh TCP connection,
+completes the operation, and closes — no persistent tunnels. LSA (Link State
+Advertisement) broadcasts over UDP port 2121 handle topology discovery and
+version detection. CLI commands and MCP talk to the Host through a local IPC
+socket (`/var/run/utmm.sock` on POSIX, named pipe on Windows) — no HTTP.
 
 ```
-Guest (linuxvm)      ──KCP/Mesh──┐
-Guest (macvm)        ──KCP/Mesh──┤──→ Host ── IPC socket ── CLI (--status, --exec, --ping)
-Guest (windowsvm)    ──KCP/Mesh──┤          ── Binary serve (KCP upgrade_req)
-Guest (raspigw, LAN) ──KCP/Mesh──┘
-                         ┌── LSA broadcast discovery ───┘   (topology + version detection)
+Guest (linuxvm)      ──TCP/SOCKS4──┐
+Guest (macvm)        ──TCP/SOCKS4──┤──→ Host ── IPC socket ── CLI (--status, --exec, --ping)
+Guest (windowsvm)    ──TCP/SOCKS4──┤          ── deploy + upgrade (push model)
+                         ┌── LSA broadcast (UDP:2121) ──┘  (topology + version detection)
                          │
 AI Agent ── utmm --mcp (stdio) ──→ auto-ensure → IPC socket
 ```
 
-- **Streaming exec**: output flows in real time through KCP tunnel via IPC socket,
+- **Streaming exec**: output flows in real time through TCP connection via IPC socket,
   with exit code sent as binary trailer. No JSON wrapping, no timeout.
-  Upload/download use chunked stream (1200B MSS-aligned blocks, one per KCP
-  segment — no fragmentation).
-- **Self-copy install**: binary extracts utmmd supervisor to `/opt/utmm/utmmd` (POSIX)
-  or `C:\opt\utmm\utmmd.exe` (Windows) and registers it as the system service.
-  utmmd manages utmm's lifecycle (spawn, monitor, crash recovery).
+  Upload/download use direct TCP streaming (no chunking needed — TCP provides
+  reliable ordered delivery).
+- **Self-copy install**: binary copies itself to canonical path `/opt/utmm/utmm` (POSIX)
+  or `C:\opt\utmm\utmm.exe` (Windows). utmmd supervisor manages utmm's lifecycle
+  (spawn, monitor, crash recovery) via shared memory heartbeat.
   `--install` = unconditional force overwrite. Upgrade = scp new binary + `--install`.
   Zero shell commands.
-- **Guest-initiated auto-upgrade** (v0.12.0+): Guest detects Host version change via
-  LSA broadcast, downloads new binary through KCP tunnel, and signals utmmd
-  via shared memory to restart with the new binary. Host never pushes upgrades.
+- **Host-initiated upgrade** (v0.14.0+): `utmm --upgrade <vm>` pushes new binary
+  directly to Guest via SOCKS4a TCP (push model). `utmm --deploy` automates
+  compilation + serve-dir maintenance.
 - **Single binary, zero dependencies**: no Node.js, Python, SSH, or curl at runtime
-- **Single port**: 2121 for mesh networking (UDP only — LSA + KCP tunnel).
-  MCP and CLI use local IPC socket (stdio/stdin for MCP, Unix domain socket for CLI) — no port needed.
+- **Single UDP port 2121** for LSA mesh networking.
+  MCP and CLI use local IPC socket (stdio for MCP, Unix domain socket for CLI) — no TCP/HTTP ports needed.
 - **Auto IP tracking**: Host syncs Guest IPs to `/etc/hosts` — hostnames always resolve
 - **Cross-platform**: macOS, Linux, Windows — both Host and Guest (aarch64, x86_64, x86)
-- **Persistent shell session**: shell state survives across `--exec` calls (pty model)
-- **Reliable transport**: KCP ARQ protocol matching C reference — sliding window,
-  congestion control, fast retransmit, window probing
+- **Per-command fresh shell**: each exec opens a new pty session — no cd/export
+  persistence across commands. Simpler model matching independent TCP connections.
+- **TCP reliable transport**: frame protocol with 1-byte type + payload over TCP/SOCKS4a.
+  Per-command connections — no persistent tunnels, no cross-thread shared state.
 
 ## Upgrade
 
-**`--deploy` (fastest, v0.11.18+):** cross-compile, SCP, and SSH install in one command.
+**`--upgrade` (v0.14.0+):** push binary to Guest via SOCKS4a TCP (push model).
+```bash
+utmm --upgrade linuxvm              # Push latest binary to Guest
+```
+
+**`--deploy` (fastest, v0.11.18+):** cross-compile, SCP, and SSH install + copy to serve-dir in one command.
 ```bash
 sudo utmm --deploy                # All guests
 sudo utmm --deploy linuxvm        # Single guest
 ```
 Requires `sshpass` on the Host. Validates binary type (ELF/Mach-O/PE) before copying.
-
-**Online machines:** re-run the install script — it upgrades in place.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sudo sh
-```
-
-**Guest auto-upgrade (hands-free):** Guests detect a Host version change via
-LSA broadcast, download the new binary through the KCP tunnel, and signal
-utmmd to restart with the new binary. No human intervention needed.
+Also copies compiled binaries to serve-dir (`/opt/utmm/`) for future `--upgrade` use.
 
 **Offline/manual:** download `utmm.zip` from the
 [latest release](https://github.com/fixnet-ai/utm-monitor/releases/latest),

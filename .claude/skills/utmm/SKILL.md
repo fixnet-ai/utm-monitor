@@ -1,243 +1,230 @@
-# UTM Monitor Skill — VM Management via MCP
+# UTM Monitor Skill — build, deploy, daily ops
 
-## Available VMs
+UTM Monitor (`utmm`) remote debugging sidekick. Single Zig binary, dual mode.
+This skill covers the full cycle: build → deploy → verify → daily use.
 
-| VM | Hostname | OS/Arch | IP | Shell |
-|----|----------|---------|----|-------|
-| macOS VM | macvm | aarch64-macos | 192.168.64.4 | zsh |
-| Linux VM | linuxvm | aarch64-linux-musl | 192.168.64.2 | bash |
-| Windows VM (ARM) | windowsvm | aarch64-windows | 192.168.65.2 | cmd.exe |
-| Windows (x64) | winx64 | x86_64-windows | 192.168.3.108 | cmd.exe |
+## VM Table
 
-Credentials: root/111 (POSIX), Administrator/111 (Windows). App path: `/opt/utmm/` (POSIX), `C:\opt\utmm\` (Windows).
+| VM | Hostname | Target | IP | User | Password |
+|----|----------|--------|----|------|----------|
+| Linux | linuxvm | aarch64-linux-musl | 192.168.64.2 | root | 111 |
+| macOS | macvm | aarch64-macos | 192.168.64.4 | root | 111 |
+| Windows ARM | windowsvm | aarch64-windows | 192.168.65.2 | Administrator | 111 |
+| Windows x64 | winx64 | x86_64-windows | 192.168.3.108 | Administrator | 111 |
 
-## Architecture
+## Architecture (v0.14.x)
 
-UTM Monitor is a single binary with two modes. The Host manages Guests through a
-**mesh network over UDP port 2121** — LSA (Link State Advertisement) for topology
-discovery, KCP (reliable ARQ) tunnels for command execution and file transfer.
-CLI and MCP talk to the Host through a local **IPC socket** (`/var/run/utmm.sock`
-on POSIX, named pipe on Windows) — no HTTP involved.
+```
+Host (local macOS) ──UDP :2121 LSA──→ Guests (linuxvm, macvm, windowsvm, winx64)
+                  ──TCP :2121 exec/upload/download──→ Guests
+CLI/MCP ──IPC socket /var/run/utmm.sock──→ Host daemon
+```
 
-MCP is the complete CLI command set exposed through the MCP protocol over stdio.
-All five management commands have corresponding MCP tools.
+- **Single binary**: `utmm` embeds `utmmd` supervisor
+- **Guest**: TCP listener + LSA broadcast, per-command pty shell
+- **Host**: UDP LSA mesh + IPC socket + TCP SOCKS4a to guests
+- **Single service per machine**: `com.utmmd` (macOS), `utmmd` (Linux), `UTM-MonitorD` (Windows)
+- **Canonical path**: `/opt/utmm/utmm` (POSIX), `C:\opt\utmm\utmm.exe` (Windows)
 
-## MCP Tools
-
-### `vm_status` — List all machines
-
-Returns all nodes including the Host: hostname, role (host/guest), target (OS/arch),
-IP, MAC, version, shell, and status (serving/upgrading). No arguments required.
-
-### `vm_exec` — Execute command on target VM
-
-- `vm`: hostname (linuxvm, macvm, windowsvm, winx64)
-- `command`: shell command to execute
-- **Shell persists**: `cd`, `export`, venv activation survive across calls. Each KCP
-  tunnel connection = one shell session.
-- Output is streaming; returns when command completes.
-
-### `vm_ping` — Ping a Guest over mesh
-
-- `vm`: hostname
-- Returns hostname, MAC address, and RTT in milliseconds.
-- Direct ping (Host→Guest) and relayed ping (Guest→Guest via Host) both supported.
-
-### `vm_upload` — Upload file to Guest
-
-- `vm`: hostname
-- `local_path`: path to file on Host filesystem
-- `remote_path` (optional): destination path on Guest. Defaults to `/opt/utmm/<basename>`.
-- Transfer via KCP tunnel with SHA256 verification, 1200B MSS-aligned chunks.
-
-### `vm_download` — Download file from Guest
-
-- `vm`: hostname
-- `remote_path`: path to file on Guest
-- `local_path` (optional): local path on Host to save. Defaults to `./<basename>`.
-- Transfer via KCP tunnel with SHA256 verification.
-
-## CLI Commands
-
-All management commands communicate with the Host daemon via IPC socket
-(`/var/run/utmm.sock`). The CLI auto-ensures the Host service if not running.
+## 1. Build
 
 ```bash
-# Status and health
-sudo utmm --status                              # List Host + all guests (role, status, version, last seen)
-sudo utmm --verify                              # Health check matrix: status + ping + exec echo per guest
-sudo utmm --ping <vm>                           # Ping a guest via mesh
-# Remote execution
-sudo utmm --exec <vm> "<command>"               # Execute on target VM
-sudo utmm --upload <local-file> <vm>            # Upload file (remote defaults to /opt/utmm/<basename>)
-sudo utmm --download <vm> <remote-path> <local> # Download file
-# Deploy
-sudo utmm --deploy [<vm>]                       # Build + SCP + SSH install to all guests (or single)
-# Maintenance
-sudo utmm --gen-init linux                      # Generate systemd service template
-utmm --version                                  # Print version (no root needed)
+# Read current version
+cat src/ver.txt
+
+# Native build (for local Host)
+zig build -Doptimize=ReleaseSafe
+# → zig-out/bin/utmm (Mach-O arm64 on Apple Silicon)
+
+# Cross-compile for targets (guest deployment)
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl    # linuxvm
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos         # macvm
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows       # windowsvm
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows        # winx64
+
+# Output naming: utmm-{target}-{version}
+# e.g. zig-out/bin/utmm-aarch64-linux-0.14.2
+
+# Run tests
+zig build test
+zig build test-integration
 ```
 
-Build from source:
+## 2. Deploy
+
+### 2.1 Host (local macOS)
 
 ```bash
-zig build                                      # Native build
-zig build -Dtarget=aarch64-linux-musl          # Cross-compile for target
-zig build test                                 # Run all tests
+zig build -Doptimize=ReleaseSafe
+sudo zig-out/bin/utmm --host --install
+# Verify: sudo zig-out/bin/utmm --status
 ```
 
-## Shell Syntax by Platform
+`--host --install` auto-starts utmmd. If Host was previously running, it stops old processes, self-copies, and restarts — one command.
 
-### Linux (bash)
-```bash
-# Standard bash — POSIX utilities available
-ps aux | grep myapp
-export VAR=value && echo $VAR
-cd /opt/myapp && ls
-```
-
-### macOS (zsh)
-```bash
-# Standard zsh — BSD utilities
-ps aux | grep myapp
-export VAR=value && echo $VAR
-cd /opt/myapp && ls
-```
-
-### Windows (cmd.exe, UTF-8 forced)
-```cmd
-tasklist | findstr myapp
-set VAR=value && echo %VAR%
-cd C:\opt\myapp && dir
-type file.txt
-```
-
-## Core Workflows
-
-### Health Check
-
-**Quick check (all-in-one):**
-```bash
-sudo utmm --verify
-# Prints pass/fail matrix: status + ping + exec echo for each guest
-# Exit 0 = all healthy, exit 1 = any check failed
-```
-
-**Detailed inspection:**
-```
-vm_status → check all nodes (Host+Guest) online + role + status + version match
-If any guest missing → check Host service: sudo utmm --host
-```
-
-### Network Connectivity Test
-```
-vm_ping vm=linuxvm    → hostname, MAC, rtt_ms
-vm_ping vm=windowsvm  → hostname, MAC, rtt_ms
-```
-Direct ping (Host→Guest) and relayed ping (Guest→Guest via Host) both supported.
-
-### Cross-Platform Testing
-```
-vm_exec vm=linuxvm command="uname -a; cat /etc/os-release"
-vm_exec vm=macvm command="uname -a; sw_vers"
-vm_exec vm=windowsvm command="ver; systeminfo | findstr /B /C:"OS Name""
-```
-
-### Debugging Workflow
-```
-1. vm_exec vm=<vm> command="ps aux | grep myapp"       → find PID
-2. vm_exec vm=<vm> command="gdb -p <pid> -batch -ex 'bt full'"  → backtrace
-3. vm_exec vm=<vm> command="tail -100 /var/log/myapp.log"       → recent logs
-```
-
-### File Transfer
-```
-vm_upload vm=linuxvm local_path=./build.zip remote_path=/opt/utmm/build.zip
-vm_download vm=linuxvm remote_path=/opt/utmm/core.dump local_path=./core.dump
-```
-
-### Deploy / Upgrade
-
-**One-shot deploy (build + SCP + SSH install, v0.11.18+):**
-```bash
-sudo utmm --deploy                    # Cross-compile + deploy to all guests
-sudo utmm --deploy linuxvm            # Deploy single guest
-```
-Requires `sshpass` on the Host. Windows targets print manual steps (SCP/SSH not
-available on Windows by default). Automatically validates binary type (ELF/Mach-O/PE)
-before cross-compiling to prevent wrong-platform deployment errors.
-
-**Manual deploy:**
-```bash
-# One-line install (POSIX)
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sudo sh
-# Windows (Administrator terminal)
-curl -fsSLo %TEMP%\install.bat https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.bat && %TEMP%\install.bat
-```
-
-For offline/manual install, see the comments in [install.sh](install.sh).
-
-### Auto-Upgrade (v0.11.14+)
-Guests automatically upgrade when Host version changes:
-1. Guest detects version mismatch via LSA (every 2s)
-2. Guest sends `upgrade_req` via KCP tunnel, Host responds with chunked binary
-3. Guest saves binary to temp, runs `--install --hostname <name>` to complete
-4. Host never pushes upgrades — fully Guest-initiated
-
-**Bootstrap note**: v0.11.13 and earlier Guests cannot auto-upgrade. Deploy once
-manually to v0.11.14+ before auto-upgrade works.
-
-**Verification**: `sudo utmm --status` shows each node's version — all should match Host
-version after auto-upgrade completes (typically within seconds of Host restart).
-
-### Multi-VM Network Test
-```
-vm_exec vm=linuxvm command="ping -c 2 macvm"
-vm_exec vm=macvm command="ping -c 2 windowsvm"
-```
-
-## Service Management
+### 2.2 Linux Guest (linuxvm)
 
 ```bash
-# Check service status (via vm_exec or SSH)
-sudo launchctl list | grep utmm          # macOS
-sudo systemctl status utmm-guest         # Linux
-sc query UTM-Monitor-Guest               # Windows
+V=$(cat src/ver.txt)
+BIN="zig-out/bin/utmm-aarch64-linux-${V}"
 
-# Reinstall (new binary already on disk)
-sudo /opt/utmm/utmm --install --hostname <name>    # Guest
-sudo /opt/utmm/utmm --host --install               # Host
-
-# Uninstall
-sudo utmm --uninstall
+# Copy + install (one SSH, --install handles stop→kill→copy→start)
+scp "$BIN" root@192.168.64.2:/opt/utmm/utmm-new
+ssh root@192.168.64.2 "/opt/utmm/utmm-new --install --hostname linuxvm"
 ```
 
-## Host Paths
+`--install` auto-kills old processes (may wait up to 5s), self-copies to `/opt/utmm/utmm`, and restarts utmmd. If the old process won't die, pre-kill manually:
 
-| Path | Purpose |
-|------|---------|
-| `/opt/utmm/utmm` (POSIX) / `C:\opt\utmm\utmm.exe` (Windows) | Binary |
-| `/opt/utmm/` | Serve directory (binaries, logs) |
-| `/var/run/utmm.sock` (POSIX) / `\\.\pipe\utmm` (Windows) | IPC socket |
-| `/etc/hosts` | Host-synced guest hostnames |
+```bash
+ssh root@192.168.64.2 "systemctl stop utmmd; pkill -9 utmm utmmd; sleep 1"
+# then run --install
+```
 
-## Troubleshooting
+**Clean uninstall** (bare metal reset):
+```bash
+ssh root@192.168.64.2 "systemctl stop utmmd; pkill -9 utmm utmmd; sleep 1; rm -f /opt/utmm/utmm /opt/utmm/utmmd /etc/systemd/system/utmmd.service; systemctl daemon-reload"
+```
 
-| Symptom | Check |
-|---------|-------|
-| Guest not in `--status` | Host service running? KCP tunnel established? LSA visible? |
-| `vm_exec` timeout | Guest KCP tunnel alive? Check keepalive dead_link |
-| All exec checks failing | Run `sudo utmm --verify` to isolate: status (LSA), ping (mesh reachability), exec (tunnel+shell) |
-| Service won't start | Re-run install script or `--install` to force reinstall; check retry limit (3 count) |
-| Binary at wrong path | Run from any path — `--install` auto-copies to canonical path |
-| Wrong binary type deployed | `--deploy` and `selfCopy` now validate ELF/Mach-O/PE magic numbers before execution |
-| Guest not auto-upgrading | Check `sudo utmm --status` for version mismatch. Verify Guest can reach Host via mesh LSA. Older Guests (pre v0.11.14) need one manual upgrade via install script. |
-| Auto-upgrade stuck | Guest idle? v0.11.14+ checks every 1s in command loop. Restart Guest if stuck. |
-| macOS launchctl bootstrap errno=2 | Known intermittent issue. Use `sudo launchctl kickstart -k system/com.utmm.host` or bootout+bootstrap sequence. |
+### 2.3 macOS Guest (macvm)
 
-## Limitations
+```bash
+V=$(cat src/ver.txt)
+BIN="zig-out/bin/utmm-aarch64-macos-${V}"
 
-- Windows cmd.exe: no `grep`/`tail` built-in. Use `findstr`, PowerShell, or install busybox.
-- Shell session lives for KCP tunnel lifetime. Tunnel disconnect → fresh shell on reconnect.
-- No file editing — upload/download for file transfer.
-- Exec output is streaming; `vm_exec` returns when command completes (no timeout).
+# macOS --install may fail if launchctl is throttled.
+# Safest: kill all first, then install.
+scp "$BIN" root@192.168.64.4:/opt/utmm/utmm-new
+ssh root@192.168.64.4 "killall -9 utmm utmmd 2>/dev/null; sleep 1; cp /opt/utmm/utmm-new /opt/utmm/utmm; /opt/utmm/utmm --install --hostname macvm"
+```
+
+**Why this order**: macOS launchctl throttles repeated bootout/bootstrap within a short window — returns "Input/output error" and refuses to load. Killing processes first avoids the bootout step in --install from hanging 5s. If install still fails, manually start utmmd:
+```bash
+ssh root@192.168.64.4 "nohup /opt/utmm/utmmd --role guest &>/dev/null &"
+```
+
+**Clean uninstall** (bare metal reset):
+```bash
+ssh root@192.168.64.4 "launchctl bootout system/com.utmmd 2>/dev/null; killall -9 utmm utmmd 2>/dev/null; sleep 1; rm -f /opt/utmm/utmm /opt/utmm/utmmd /Library/LaunchDaemons/com.utmmd.plist /var/run/utmm.sock"
+```
+
+### 2.4 Windows Guest (windowsvm / winx64)
+
+Windows SSH (OpenSSH) does NOT handle `;` command chaining. Run commands one at a time.
+
+**Clean install from bare metal:**
+```bash
+# 1. Copy binary
+scp "zig-out/bin/utmm-aarch64-windows-${V}.exe" Administrator@192.168.65.2:C:/opt/utmm/utmm-new.exe
+
+# 2. Kill old processes (if any — harmless on first install)
+ssh Administrator@192.168.65.2 "taskkill /F /IM utmm.exe"
+ssh Administrator@192.168.65.2 "taskkill /F /IM utmmd.exe"
+
+# 3. Install
+ssh Administrator@192.168.65.2 "C:/opt/utmm/utmm-new.exe --install --hostname windowsvm"
+```
+
+**If `--install` fails with AccessDenied**: utmmd.exe is locking the file. Kill utmmd.exe first, then retry.
+
+**winx64** — same pattern, different binary:
+```bash
+scp "zig-out/bin/utmm-x86_64-windows-${V}.exe" Administrator@192.168.3.108:C:/opt/utmm/utmm-new.exe
+ssh Administrator@192.168.3.108 "taskkill /F /IM utmm.exe"
+ssh Administrator@192.168.3.108 "taskkill /F /IM utmmd.exe"
+ssh Administrator@192.168.3.108 "C:/opt/utmm/utmm-new.exe --install --hostname winx64"
+```
+
+**Clean uninstall** (bare metal reset):
+```bash
+ssh Administrator@192.168.65.2 "taskkill /F /IM utmm.exe"
+ssh Administrator@192.168.65.2 "taskkill /F /IM utmmd.exe"
+ssh Administrator@192.168.65.2 "sc delete UTM-MonitorD"
+ssh Administrator@192.168.65.2 "del /F C:\opt\utmm\utmm.exe C:\opt\utmm\utmmd.exe"
+```
+
+## 3. Verify
+
+```bash
+# Status — instant snapshot of all nodes
+sudo zig-out/bin/utmm --status
+
+# Per-VM exec smoke test
+sudo zig-out/bin/utmm --exec linuxvm "uname -a"
+sudo zig-out/bin/utmm --exec macvm "uname -a"
+sudo zig-out/bin/utmm --exec windowsvm "ver"
+sudo zig-out/bin/utmm --exec winx64 "ver"
+```
+
+Healthy output shows: version match across all guests, `serving` status, Last seen `now`.
+
+## 4. Daily Ops
+
+All commands connect to Host daemon via IPC socket (`/var/run/utmm.sock`). If Host is not running, they auto-start it.
+
+```bash
+# Status
+sudo utmm --status
+
+# Execute command on guest (pty shell, streaming output)
+sudo utmm --exec <vm> "<command>"
+# Examples:
+sudo utmm --exec linuxvm "ps aux | grep myapp"
+sudo utmm --exec windowsvm "tasklist | findstr myapp"
+sudo utmm --exec macvm "tail -50 /var/log/system.log"
+
+# Upload file (Host → Guest, SHA256 verified)
+sudo utmm --upload <local-file> <vm>
+# Example: sudo utmm --upload ./build.zip linuxvm
+# Defaults to /opt/utmm/<basename> on guest.
+# For custom path: sudo utmm --upload ./build.zip linuxvm:/tmp/build.zip
+
+# Download file (Guest → Host, SHA256 verified)
+sudo utmm --download <vm> <remote-path> <local-path>
+# Example: sudo utmm --download linuxvm /var/log/app.log ./app.log
+
+# Version (no root needed)
+utmm --version
+```
+
+### Shell syntax by platform
+
+| Guest | Shell | Example |
+|-------|-------|---------|
+| linuxvm | `/bin/bash` | `export FOO=bar && echo $FOO` |
+| macvm | `/bin/zsh` | `cd /tmp && pwd` |
+| windowsvm / winx64 | `cmd.exe` (UTF-8) | `set VAR=value && echo %VAR%` |
+
+### Key behaviors
+
+- **Per-command shell**: each exec opens a fresh pty. No `cd`/`export` persistence across execs.
+- **Streaming output**: output flows in real time, no timeout. Exit code returned as binary trailer.
+- **No concurrent exec**: multiple `--exec` calls from one terminal will interleave output. Run sequentially.
+
+## 5. Upgrade Flow
+
+```bash
+# 1. Build new version
+zig build -Doptimize=ReleaseSafe
+# bump src/ver.txt if needed
+
+# 2. Reinstall Host (local)
+sudo zig-out/bin/utmm --host --install
+
+# 3. Deploy to guests (see §2 per platform)
+# scp + --install is the reliable path.
+
+# 4. Verify all guests show new version
+sudo zig-out/bin/utmm --status
+```
+
+## 6. Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---------|-------------|--------|
+| Guest not in `--status` | Service not running on guest | SSH to guest, verify utmmd is running, reinstall |
+| `--exec` returns `GuestNotFound` | Hostname mismatch | Check `--status` for actual guest hostname; use that name in CLI commands. |
+| macOS `--install` bootstrap fails (exit 5) | launchctl throttle | `killall -9 utmm utmmd` first, then `--install` |
+| Windows `--install` AccessDenied | utmmd.exe locking file | `taskkill /F /IM utmmd.exe` first, then `--install` |
+| `--status` returns `IpcNotRunning` | Host daemon just started, IPC not yet ready | Wait 2-3s and retry |
+| Linux `--install` waits 5s | old process not responding to SIGTERM | Pre-kill with `pkill -9 utmm utmmd` before install |
+| Exec output shows `MDELIM:N` | Exit code marker in output | Normal — Host strips this internally, should not be visible |

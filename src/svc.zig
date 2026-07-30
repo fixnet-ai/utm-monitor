@@ -151,7 +151,8 @@ const InstallLock = struct {
             .OffsetHigh = 0,
             .hEvent = null,
         };
-        if (LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped) == 0) {
+        const result = LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &overlapped);
+        if (@intFromEnum(result) == @as(c_int, 0)) {
             _ = CloseHandle(h);
             std.log.err("[svc] install-lock: LockFileEx failed", .{});
             return error.LockFailed;
@@ -173,6 +174,61 @@ const InstallLock = struct {
         _ = CloseHandle(win_handle);
     }
 };
+// ─── Windows: Toolhelp process enumeration API (replace tasklist/taskkill) ───
+
+const w32 = struct {
+    const DWORD = std.os.windows.DWORD;
+    const BOOL = std.os.windows.BOOL;
+    const HANDLE = std.os.windows.HANDLE;
+
+    const TH32CS_SNAPPROCESS: DWORD = 0x00000002;
+    const PROCESS_TERMINATE: DWORD = 0x0001;
+
+    const PROCESSENTRY32W = extern struct {
+        dwSize: DWORD,
+        cntUsage: DWORD,
+        th32ProcessID: DWORD,
+        th32DefaultHeapID: usize,
+        th32ModuleID: DWORD,
+        cntThreads: DWORD,
+        th32ParentProcessID: DWORD,
+        pcPriClassBase: i32,
+        dwFlags: DWORD,
+        szExeFile: [260]u16,
+    };
+
+    extern "kernel32" fn CreateToolhelp32Snapshot(dwFlags: DWORD, th32ProcessID: DWORD) callconv(.winapi) HANDLE;
+    extern "kernel32" fn Process32FirstW(hSnapshot: HANDLE, lppe: *PROCESSENTRY32W) callconv(.winapi) BOOL;
+    extern "kernel32" fn Process32NextW(hSnapshot: HANDLE, lppe: *PROCESSENTRY32W) callconv(.winapi) BOOL;
+    extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) callconv(.winapi) BOOL;
+    extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+
+    /// Case-insensitive match against "utmm.exe" in UTF-16LE.
+    fn isUtmmExe(name: [*]const u16) bool {
+        const target = [_]u16{ 'u', 't', 'm', 'm', '.', 'e', 'x', 'e' };
+        var i: usize = 0;
+        while (name[i] != 0 and i < target.len) : (i += 1) {
+            const c = name[i];
+            const lower: u16 = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+            if (lower != target[i]) return false;
+        }
+        return i == target.len and name[i] == 0;
+    }
+
+    /// Case-insensitive match against "utmmd.exe" in UTF-16LE.
+    fn isUtmmdExe(name: [*]const u16) bool {
+        const target = [_]u16{ 'u', 't', 'm', 'm', 'd', '.', 'e', 'x', 'e' };
+        var i: usize = 0;
+        while (name[i] != 0 and i < target.len) : (i += 1) {
+            const c = name[i];
+            const lower: u16 = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+            if (lower != target[i]) return false;
+        }
+        return i == target.len and name[i] == 0;
+    }
+};
+
 const protocol = @import("protocol.zig");
 
 /// Canonical install path for utmm (the managed process).
@@ -210,6 +266,19 @@ pub fn canonicalPath() []const u8 {
 pub fn canonicalDir() []const u8 {
     if (builtin.os.tag == .windows) return "C:\\opt\\utmm";
     return "/opt/utmm";
+}
+
+/// Return the system temporary directory.
+/// On POSIX: $TMPDIR or /tmp.
+/// On Windows: %TEMP%, %TMP%, or C:\Windows\Temp.
+pub fn tempDir() [:0]const u8 {
+    if (builtin.os.tag == .windows) {
+        if (std.c.getenv("TEMP")) |td| return std.mem.span(td);
+        if (std.c.getenv("TMP")) |td| return std.mem.span(td);
+        return "C:\\Windows\\Temp";
+    }
+    if (std.c.getenv("TMPDIR")) |td| return std.mem.span(td);
+    return "/tmp";
 }
 
 /// Return the canonical install path for utmmd (the supervisor daemon).
@@ -311,7 +380,7 @@ pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) bool 
             // launchctl load (legacy) may have started it without launchd
             // tracking the PID properly. pgrep catches this case.
             if (runCmdCheckExit(alloc, io, &[_][]const u8{
-                "pgrep", "-f", "/opt/utmm/utmmd",
+                "pgrep", "-f", CANONICAL_SVC_PATH_POSIX,
             })) {
                 break :blk true;
             }
@@ -460,9 +529,12 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
     // Without bootout, bootstrap fails with errno=5/17 when the service
     // label is already registered — even if not running.
     bootoutMacOS(alloc, io, name);
-    // Bootstrap (also starts via RunAtLoad=true). Best-effort: bootstrap
-    // may fail due to launchd throttle (EIO on recently-booted-out labels)
-    // or transient errors. start() handles the full retry + fallback chain.
+    // Enable again after bootout — bootout re-sets the disabled flag on
+    // the label, causing subsequent bootstrap to fail with errno=5
+    // (Input/output error). This is the root cause of the recurring
+    // "bootstrap errno=5" issue on macOS, especially after repeated
+    // install/upgrade cycles.
+    _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
     _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path });
 
     std.log.info("[svc] macOS service {s} installed", .{name});
@@ -684,17 +756,40 @@ pub fn uninstall(io: std.Io, alloc: std.mem.Allocator) !void {
 /// Start utmmd directly as a background process (no launchd/systemd/SCM).
 /// Fallback for environments where the service manager is unavailable or
 /// restricted (e.g. UTM macOS VMs with SIP-enforced launchd limits).
-fn startDirect(alloc: std.mem.Allocator, io: std.Io, role: ServiceRole) !void {
+fn startDirect(alloc: std.mem.Allocator, io: std.Io, role: ServiceRole, extra_args: []const []const u8) !void {
     const svc_path = canonicalSvcPath();
     const role_str = if (role == .host) "host" else "guest";
-    // Append & so the shell backgrounds the process and returns immediately.
-    // runCmd waits for the shell to exit, which with & happens instantly.
-    const cmd = try std.fmt.allocPrint(alloc, "{s} --role {s} > /var/log/utmmd.log 2>&1 &", .{ svc_path, role_str });
+
+    // Build command with role + all extra args (--hostname, --port, etc.).
+    // These are the same args embedded in the service config; startDirect
+    // bypasses the service manager so we must pass them explicitly.
+    var cmd_buf: std.ArrayListAligned(u8, null) = .empty;
+    defer cmd_buf.deinit(alloc);
+    try cmd_buf.appendSlice(alloc, svc_path);
+    try cmd_buf.appendSlice(alloc, " --role ");
+    try cmd_buf.appendSlice(alloc, role_str);
+    for (extra_args) |a| {
+        try cmd_buf.append(alloc, ' ');
+        try cmd_buf.appendSlice(alloc, a);
+    }
+    try cmd_buf.appendSlice(alloc, " > /var/log/utmmd.log 2>&1 &");
+    const cmd = try cmd_buf.toOwnedSlice(alloc);
     defer alloc.free(cmd);
     std.log.info("[svc] starting utmmd directly: {s}", .{cmd});
 
     if (builtin.os.tag == .windows) {
-        _ = runCmd(alloc, io, &[_][]const u8{ "cmd", "/c", "start", "/b", svc_path, "--role", role_str });
+        // Windows: cmd /c start /b <path> --role <role> <extra_args...>
+        var win_args = std.ArrayListAligned([]const u8, null).init(alloc);
+        defer win_args.deinit();
+        try win_args.append(alloc, "cmd");
+        try win_args.append(alloc, "/c");
+        try win_args.append(alloc, "start");
+        try win_args.append(alloc, "/b");
+        try win_args.append(alloc, svc_path);
+        try win_args.append(alloc, "--role");
+        try win_args.append(alloc, role_str);
+        for (extra_args) |a| try win_args.append(alloc, a);
+        _ = runCmd(alloc, io, win_args.items);
     } else {
         _ = runCmd(alloc, io, &[_][]const u8{ "sh", "-c", cmd });
     }
@@ -703,7 +798,7 @@ fn startDirect(alloc: std.mem.Allocator, io: std.Io, role: ServiceRole) !void {
 }
 
 /// Start the service.
-pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
+pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) !void {
     const name = svcName();
     switch (builtin.os.tag) {
         .macos => {
@@ -725,6 +820,8 @@ pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
                 std.log.info("[svc] kickstart failed, re-registering service...", .{});
                 _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
                 bootoutMacOS(alloc, io, name);
+                // Enable after bootout — bootout re-sets the disabled flag.
+                _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name });
                 std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
 
                 const plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{name});
@@ -757,10 +854,11 @@ pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
                 }
                 if (!bootstrapped) {
                     // launchd bootstrap unavailable — start utmmd directly.
-                    // Common in UTM macOS VMs where bootstrap may fail with
-                    // "5: Input/output error" due to shm creation issues.
+                    // Most commonly caused by the service being in "disabled"
+                    // state in launchd (errno=5 Input/output error). The
+                    // startDirect fallback bypasses launchd entirely.
                     std.log.warn("[svc] bootstrap failed, starting utmmd directly...", .{});
-                    try startDirect(alloc, io, role);
+                    try startDirect(alloc, io, role, extra_args);
                     launched_via_launchd = false;
                 }
             }
@@ -811,9 +909,50 @@ pub fn stop(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) !void {
         .windows => {
             if (!runCmd(alloc, io, &[_][]const u8{ "sc", "stop", name })) {
                 std.log.warn("[svc] stop {s}: sc stop returned non-zero (may not be running)", .{name});
+                // sc.exe stop can fail if the service was already deleted.
+                // Fall back to terminating utmmd.exe directly via Toolhelp API.
+                killUtmmd();
             }
         },
         else => {},
+    }
+}
+
+/// Kill utmmd.exe on Windows using Toolhelp + TerminateProcess.
+/// Public so that extractUtmmd in main.zig can call it when rename
+/// fails with AccessDenied (old utmmd.exe locks the file).
+pub fn killUtmmd() void {
+    if (builtin.os.tag != .windows) return;
+
+    const snap = w32.CreateToolhelp32Snapshot(w32.TH32CS_SNAPPROCESS, 0);
+    if (snap == std.os.windows.INVALID_HANDLE_VALUE) {
+        std.log.err("[svc] killUtmmd: CreateToolhelp32Snapshot failed", .{});
+        return;
+    }
+    defer _ = w32.CloseHandle(snap);
+
+    var pe = std.mem.zeroInit(w32.PROCESSENTRY32W, .{});
+    pe.dwSize = @intCast(@sizeOf(w32.PROCESSENTRY32W));
+
+    if (@intFromEnum(w32.Process32FirstW(snap, &pe)) == 0) return;
+
+    var killed: usize = 0;
+    while (true) {
+        if (w32.isUtmmdExe(&pe.szExeFile)) {
+            std.log.info("[svc] killUtmmd: killing PID {d}", .{pe.th32ProcessID});
+            const h = w32.OpenProcess(w32.PROCESS_TERMINATE, .FALSE, pe.th32ProcessID) orelse {
+                std.log.warn("[svc] killUtmmd: OpenProcess(PID {d}) failed", .{pe.th32ProcessID});
+                if (@intFromEnum(w32.Process32NextW(snap, &pe)) == 0) break;
+                continue;
+            };
+            _ = w32.TerminateProcess(h, 1);
+            _ = w32.CloseHandle(h);
+            killed += 1;
+        }
+        if (@intFromEnum(w32.Process32NextW(snap, &pe)) == 0) break;
+    }
+    if (killed > 0) {
+        std.log.info("[svc] killUtmmd: killed {d} utmmd process(es)", .{killed});
     }
 }
 
@@ -858,33 +997,34 @@ fn killAllUtmm(io: std.Io, alloc: std.mem.Allocator) !void {
             }
         },
         .windows => {
-            // Enumerate PIDs with tasklist; fall back to taskkill /im if unavailable.
-            const out = runCmdStdout(alloc, io, &[_][]const u8{
-                "tasklist", "/fi", "imagename eq utmm.exe", "/fo", "csv", "/nh",
-            }) orelse {
-                std.log.warn("[svc] tasklist failed, falling back to taskkill /im", .{});
-                runCmdQuiet(alloc, io, &[_][]const u8{ "taskkill", "/f", "/im", "utmm.exe" });
+            // Enumerate utmm.exe via Toolhelp snapshot → OpenProcess+TerminateProcess.
+            // Native API works even on SYSTEM-privileged processes where taskkill /F fails.
+            const snap = w32.CreateToolhelp32Snapshot(w32.TH32CS_SNAPPROCESS, 0);
+            if (snap == std.os.windows.INVALID_HANDLE_VALUE) {
+                std.log.err("[svc] killAllUtmm: CreateToolhelp32Snapshot failed", .{});
                 return;
-            };
-            defer alloc.free(out);
+            }
+            defer _ = w32.CloseHandle(snap);
+
+            var pe = std.mem.zeroInit(w32.PROCESSENTRY32W, .{});
+            pe.dwSize = @intCast(@sizeOf(w32.PROCESSENTRY32W));
+
+            if (@intFromEnum(w32.Process32FirstW(snap, &pe)) == 0) return;
+
             var killed: usize = 0;
-            var iter = std.mem.tokenizeScalar(u8, out, '\n');
-            while (iter.next()) |line| {
-                const trimmed = std.mem.trim(u8, line, " \r");
-                if (trimmed.len < 2) continue;
-                // CSV format: "utmm.exe","1234","Console","1","12,345 K"
-                var csv_iter = std.mem.splitScalar(u8, trimmed, ',');
-                _ = csv_iter.next(); // skip image name
-                const pid_field = csv_iter.next() orelse continue;
-                const pid_str = std.mem.trim(u8, pid_field, " \"\r");
-                const pid = std.fmt.parseInt(u32, pid_str, 10) catch continue;
-                if (pid == my_pid) {
-                    std.log.debug("[svc] killAllUtmm: skipping own PID {d}", .{pid});
-                    continue;
+            while (true) {
+                if (w32.isUtmmExe(&pe.szExeFile) and pe.th32ProcessID != my_pid) {
+                    std.log.info("[svc] killAllUtmm: killing PID {d}", .{pe.th32ProcessID});
+                    const h = w32.OpenProcess(w32.PROCESS_TERMINATE, .FALSE, pe.th32ProcessID) orelse {
+                        std.log.warn("[svc] killAllUtmm: OpenProcess(PID {d}) failed", .{pe.th32ProcessID});
+                        if (@intFromEnum(w32.Process32NextW(snap, &pe)) == 0) break;
+                        continue;
+                    };
+                    _ = w32.TerminateProcess(h, 1);
+                    _ = w32.CloseHandle(h);
+                    killed += 1;
                 }
-                std.log.info("[svc] killAllUtmm: killing PID {d}", .{pid});
-                _ = runCmdQuiet(alloc, io, &[_][]const u8{ "taskkill", "/f", "/pid", pid_str });
-                killed += 1;
+                if (@intFromEnum(w32.Process32NextW(snap, &pe)) == 0) break;
             }
             if (killed > 0) {
                 std.log.info("[svc] killAllUtmm: killed {d} process(es)", .{killed});
@@ -910,21 +1050,21 @@ fn countOtherUtmmProcesses(alloc: std.mem.Allocator, io: std.Io, my_pid: u32) !u
             return count;
         },
         .windows => {
-            const out = runCmdStdout(alloc, io, &[_][]const u8{
-                "tasklist", "/fi", "imagename eq utmm.exe", "/fo", "csv", "/nh",
-            }) orelse return 0;
-            defer alloc.free(out);
+            const snap = w32.CreateToolhelp32Snapshot(w32.TH32CS_SNAPPROCESS, 0);
+            if (snap == std.os.windows.INVALID_HANDLE_VALUE) return 0;
+            defer _ = w32.CloseHandle(snap);
+
+            var pe = std.mem.zeroInit(w32.PROCESSENTRY32W, .{});
+            pe.dwSize = @intCast(@sizeOf(w32.PROCESSENTRY32W));
+
+            if (@intFromEnum(w32.Process32FirstW(snap, &pe)) == 0) return 0;
+
             var count: usize = 0;
-            var iter = std.mem.tokenizeScalar(u8, out, '\n');
-            while (iter.next()) |line| {
-                const trimmed = std.mem.trim(u8, line, " \r");
-                if (trimmed.len < 2) continue;
-                var csv_iter = std.mem.splitScalar(u8, trimmed, ',');
-                _ = csv_iter.next(); // skip image name
-                const pid_field = csv_iter.next() orelse continue;
-                const pid_str = std.mem.trim(u8, pid_field, " \"\r");
-                const pid = std.fmt.parseInt(u32, pid_str, 10) catch continue;
-                if (pid != my_pid) count += 1;
+            while (true) {
+                if (w32.isUtmmExe(&pe.szExeFile) and pe.th32ProcessID != my_pid) {
+                    count += 1;
+                }
+                if (@intFromEnum(w32.Process32NextW(snap, &pe)) == 0) break;
             }
             return count;
         },
@@ -1083,18 +1223,19 @@ pub fn selfCopy(io: std.Io, alloc: std.mem.Allocator) !void {
             copyFile(io, alloc, tmp_path, dest, builtin.os.tag != .windows) catch |err2| {
                 fail.err("selfCopy/copy-fallback", err2);
             };
-            // macOS: copyFile destroys the ad-hoc code signature.
-            // Re-sign so launchd doesn't kill the process on next bootstrap.
-            if (builtin.os.tag == .macos) {
-                if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dest })) {
-                    std.log.warn("[svc] selfCopy: codesign re-sign failed — ad-hoc signature may be missing", .{});
-                }
-            }
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         } else {
             fail.err("selfCopy/rename", err);
         }
     };
+
+    // macOS: copyFile + rename strips the ad-hoc code signature applied by
+    // the Zig compiler.  Re-sign so the kernel doesn't SIGKILL the process.
+    if (builtin.os.tag == .macos) {
+        if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dest })) {
+            std.log.warn("[svc] selfCopy: codesign re-sign failed — ad-hoc signature may be missing", .{});
+        }
+    }
 
     std.log.info("[svc] self-copied to canonical path {s}", .{dest});
 }
@@ -1272,7 +1413,7 @@ fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole,
     // or manual intervention) can bring the service back. Deleting everything
     // leaves the VM unreachable with no recovery path — especially critical
     // for auto-upgrade where the old Guest process was already killed.
-    start(io, alloc, role) catch |err| {
+    start(io, alloc, role, extra_args) catch |err| {
         std.log.err("[svc] start failed for {s}: {} — binary and config preserved, not rolling back", .{ name, err });
         fail.err("forceInstall/start", err);
     };
@@ -1300,110 +1441,6 @@ pub fn ensure(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_arg
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-// utmmd 安装优化：hash 比对 + config 持久化
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Config file path — stored alongside the canonical binary.
-fn configFilePath() []const u8 {
-    if (builtin.os.tag == .windows) return "C:\\opt\\utmm\\utmm.conf";
-    return "/opt/utmm/utmm.conf";
-}
-
-/// Read a single key=value from the config file. Returns null if not found.
-fn readConfigValue(io: std.Io, alloc: std.mem.Allocator, key: []const u8) ?[]const u8 {
-    const path = configFilePath();
-    const cwd = std.Io.Dir.cwd();
-    const file = cwd.openFile(io, path, .{ .mode = .read_only }) catch return null;
-    defer file.close(io);
-
-    var rbuf: [4096]u8 = undefined;
-    var read_buf: [4096]u8 = undefined;
-    var reader = file.reader(io, &read_buf);
-    const n = reader.interface.readSliceShort(&rbuf) catch return null;
-    const content = rbuf[0..n];
-
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed[0] == '#') continue;
-        if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
-            const k = trimmed[0..eq_pos];
-            const v = trimmed[eq_pos + 1 ..];
-            if (std.mem.eql(u8, k, key)) {
-                return alloc.dupe(u8, v) catch null;
-            }
-        }
-    }
-    return null;
-}
-
-/// Write/update a key=value pair in the config file. Creates the file if missing.
-/// Preserves existing entries; replaces the key if already present.
-fn writeConfigValue(io: std.Io, alloc: std.mem.Allocator, key: []const u8, value: []const u8) !void {
-    const path = configFilePath();
-    const cwd = std.Io.Dir.cwd();
-
-    // Ensure directory exists
-    const dirname = canonicalDir();
-    cwd.createDirPath(io, dirname) catch {};
-
-    // Read existing content
-    const existing = readFullFile(io, alloc, path) orelse &.{};
-    defer if (existing.len > 0) alloc.free(existing);
-
-    // Write back with updated key
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}/utmm.conf.tmp", .{dirname});
-    defer alloc.free(tmp_path);
-
-    const dst = try cwd.createFile(io, tmp_path, .{ .truncate = true, .permissions = @enumFromInt(0o644) });
-    defer dst.close(io);
-    var wb: [4096]u8 = undefined;
-    var writer = dst.writer(io, &wb);
-
-    var found = false;
-    var lines = std.mem.splitScalar(u8, existing, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or trimmed[0] == '#') {
-            try writer.interface.print("{s}\n", .{line});
-            continue;
-        }
-        if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
-            const k = trimmed[0..eq_pos];
-            if (std.mem.eql(u8, k, key)) {
-                try writer.interface.print("{s}={s}\n", .{ key, value });
-                found = true;
-                continue;
-            }
-        }
-        try writer.interface.print("{s}\n", .{line});
-    }
-    if (!found) {
-        try writer.interface.print("{s}={s}\n", .{ key, value });
-    }
-    writer.interface.flush() catch {};
-    dst.sync(io) catch {};
-
-    // Atomic rename
-    cwd.rename(tmp_path, cwd, path, io) catch |err| {
-        cwd.deleteFile(io, tmp_path) catch {};
-        return err;
-    };
-}
-
-/// Read entire file content, or null if not found.
-fn readFullFile(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    const cwd = std.Io.Dir.cwd();
-    const file = cwd.openFile(io, path, .{ .mode = .read_only }) catch return null;
-    defer file.close(io);
-
-    var rbuf: [4096]u8 = undefined;
-    var read_buf: [4096]u8 = undefined;
-    var reader = file.reader(io, &read_buf);
-    const n = reader.interface.readSliceShort(&rbuf) catch return null;
-    return alloc.dupe(u8, rbuf[0..n]) catch null;
-}
-
 /// Compute SHA256 of a file at the given path. Returns hex string or null on error.
 fn fileSha256Hex(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ?[]const u8 {
     const cwd = std.Io.Dir.cwd();
@@ -1431,66 +1468,37 @@ fn fileSha256Hex(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ?[]cons
     return alloc.dupe(u8, &hex) catch null;
 }
 
-/// Build the args string that was used to install utmmd.
-/// This is the canonical form stored in config for comparison.
-fn buildArgsString(alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) ![]const u8 {
-    var buf: std.ArrayListAligned(u8, null) = .empty;
-    try buf.appendSlice(alloc, if (role == .host) "--role host" else "--role guest");
-    for (extra_args) |arg| {
-        try buf.append(alloc, ' ');
-        try buf.appendSlice(alloc, arg);
-    }
-    return buf.toOwnedSlice(alloc);
-}
-
 /// Check whether the installed utmmd needs updating.
-/// Returns true if utmmd should be reinstalled (binary missing, hash differs, or args changed).
-pub fn shouldUpdateUtmmd(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8, comptime embedded_sha256_hex: []const u8) bool {
+/// Returns true if utmmd binary is missing or its SHA256 differs from the
+/// comptime-embedded value.  No config file needed — just compare against
+/// the hash baked into the current binary at compile time.
+pub fn shouldUpdateUtmmd(io: std.Io, alloc: std.mem.Allocator, comptime embedded_sha256_hex: []const u8) bool {
     const svc_path = canonicalSvcPath();
 
-    // Check 1: binary must exist
     const installed_hash = fileSha256Hex(io, alloc, svc_path) orelse {
         std.log.debug("[svc] utmmd binary missing at {s}, needs install", .{svc_path});
         return true;
     };
     defer alloc.free(installed_hash);
 
-    // Check 2: hash must match embedded
     if (!std.mem.eql(u8, installed_hash, embedded_sha256_hex)) {
         std.log.debug("[svc] utmmd hash differs (installed={s}, embedded={s}), needs update", .{ installed_hash[0..@min(installed_hash.len, 16)], embedded_sha256_hex[0..@min(embedded_sha256_hex.len, 16)] });
         return true;
     }
 
-    // Check 3: args must match stored config
-    const current_args = buildArgsString(alloc, role, extra_args) catch return true;
-    defer alloc.free(current_args);
-
-    if (readConfigValue(io, alloc, "utmmd_args")) |stored_args| {
-        defer alloc.free(stored_args);
-        if (!std.mem.eql(u8, stored_args, current_args)) {
-            std.log.debug("[svc] utmmd args changed (stored=''{s}'' current=''{s}''), needs reinstall", .{ stored_args, current_args });
-            return true;
-        }
-    }
-    // If no stored args entry but utmmd exists and hash matches, assume OK
-
     return false;
 }
 
-/// Save utmmd metadata to config file after successful install.
-pub fn saveUtmmdMeta(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8, comptime embedded_sha256_hex: []const u8) void {
-    writeConfigValue(io, alloc, "utmmd_sha256", embedded_sha256_hex) catch |err| {
-        std.log.warn("[svc] failed to save utmmd_sha256: {}", .{err});
-    };
-    const args_str = buildArgsString(alloc, role, extra_args) catch return;
-    defer alloc.free(args_str);
-    writeConfigValue(io, alloc, "utmmd_args", args_str) catch |err| {
-        std.log.warn("[svc] failed to save utmmd_args: {}", .{err});
-    };
-}
+/// No-op stub — previously persisted metadata to /opt/utmm/utmm.conf.
+/// Kept so callers in main.zig don't need to change.
+pub fn saveUtmmdMeta(
+    _: std.Io,
+    _: std.mem.Allocator,
+    _: ServiceRole,
+    _: []const []const u8,
+    comptime _: []const u8,
+) void {}
 
-
-// ═══════════════════════════════════════════════════════════════════════════
 // Platform detection + init script generation (moved from host.zig, Task 9)
 // ═══════════════════════════════════════════════════════════════════════════
 

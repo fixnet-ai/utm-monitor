@@ -19,11 +19,10 @@ setlocal enabledelayedexpansion
 ::      C:\opt\utmm\utmm.exe --install --hostname mybox        (Guest)
 ::   Note: --install extracts utmmd.exe from utmm.exe and registers utmmd
 ::   as the system service. utmmd manages utmm's lifecycle (spawn, monitor,
-::   crash recovery, auto-upgrade).
+::   crash recovery, upgrade).
 ::
 :: Deploy to existing Host network (v0.12.0+):
 ::   utmm --deploy                (Build + SCP + SSH deploy to all guests)
-::   utmm --verify                (Health check: status + ping + exec per guest)
 :: =============================================================================
 
 set "CANONICAL_DIR=C:\opt\utmm"
@@ -300,8 +299,8 @@ if /i "%MODE%"=="guest" (
     )
     echo   Kept: %ZIP_BINARY% (as utmm.exe)
 ) else (
-    :: Host: keep all platform binaries for Guest auto-upgrade via KCP tunnel
-    echo   Host mode - keeping all platform binaries for Guest auto-upgrade:
+    :: Host: keep all platform binaries for Host-initiated --upgrade (push model)
+    echo   Host mode - keeping all platform binaries for Guest upgrade:
     for %%f in (utmm-* utmm*.exe) do (
         if exist "%%f" echo     %%f
     )
@@ -329,7 +328,6 @@ echo Done.
 if /i "%MODE%"=="host" (
     echo   utmmd supervisor is managing the Host service on UDP :2121
     echo   Status:  %CANONICAL_DIR%\%BINARY_NAME% --status
-    echo   Verify:  %CANONICAL_DIR%\%BINARY_NAME% --verify
     echo   Deploy:  %CANONICAL_DIR%\%BINARY_NAME% --deploy [^<vm^>]
 ) else (
     echo   utmmd supervisor installed — Guest auto-starts on boot.

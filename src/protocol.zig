@@ -12,7 +12,7 @@ pub const DISCOVERY_QUERY = "ARE YOU OK?\r\n";
 pub const DISCOVERY_RESPONSE_PREFIX = "ANNOUNCE\r\n";
 
 // ──────────────────────────────────────────────────────────────────────────
-// Mesh networking protocol (v0.10.0)
+// Mesh networking protocol
 // ──────────────────────────────────────────────────────────────────────────
 
 /// Unified mesh protocol message types (first-byte dispatch on UDP :2121).
@@ -71,14 +71,21 @@ pub fn parseDiscoveryVersion(data: []const u8) ?[]const u8 {
 /// /etc/hosts marker block
 pub const HOSTS_MARKER_BEGIN = "# UTM-MONITOR-BEGIN";
 pub const HOSTS_MARKER_END = "# UTM-MONITOR-END";
+// 旧版标记（v0.14.5 及之前），updateHosts 会自动清理
+pub const HOSTS_MARKER_BEGIN_OLD = "# BEGIN UTM-MONITOR";
+pub const HOSTS_MARKER_END_OLD = "# END UTM-MONITOR";
 
-/// Program version number — bump to trigger auto-upgrade.
+/// Program version number — embedded at compile time, displayed in --status.
 /// Sourced from ver.txt at compile time via @embedFile.
 const embedded_ver = @embedFile("ver.txt");
 pub const VERSION: []const u8 = if (embedded_ver.len > 0 and embedded_ver[embedded_ver.len - 1] == '\n')
     embedded_ver[0 .. embedded_ver.len - 1]
 else
     embedded_ver[0..embedded_ver.len :0];
+
+/// When true, Host daemon auto-pushes upgrade binary to any Guest whose
+/// LSA-advertised version differs from VERSION.  Disable by setting to false.
+pub const AUTO_UPGRADE = true;
 
 /// Parse "IP:port" string to net.IpAddress for local testing peer mesh.
 /// Returns null on any parse failure.
@@ -93,7 +100,7 @@ pub fn parsePeerMeshAddr(s: []const u8) ?std.Io.net.IpAddress {
 /// Map Guest target triple → versioned deployment binary filename in serve-dir.
 /// Filenames include the version suffix (e.g. utmm-aarch64-linux-0.11.19).
 /// The version suffix ensures a Host never serves stale binaries to Guests.
-/// Returns null for unknown targets (Host skips auto-upgrade in that case).
+/// Returns null for unknown targets (Host reports error on --upgrade in that case).
 pub fn deploymentFilename(target: []const u8) ?[]const u8 {
     const mappings = [_]struct { target: []const u8, filename: []const u8 }{
         .{ .target = "aarch64-linux-musl", .filename = "utmm-aarch64-linux-" ++ VERSION },
@@ -125,7 +132,7 @@ test "deploymentFilename - known targets" {
     try std.testing.expectEqualStrings("utmm-aarch64-windows-" ++ VERSION ++ ".exe", deploymentFilename("aarch64-windows").?);
 }
 
-test "deploymentFilename - legacy glibc targets" {
+test "deploymentFilename - glibc targets" {
     try std.testing.expectEqualStrings("utmm-aarch64-linux-" ++ VERSION, deploymentFilename("aarch64-linux").?);
     try std.testing.expectEqualStrings("utmm-x86_64-linux-" ++ VERSION, deploymentFilename("x86_64-linux").?);
     try std.testing.expectEqualStrings("utmm-x86-linux-" ++ VERSION, deploymentFilename("x86-linux").?);
@@ -136,17 +143,17 @@ test "deploymentFilename - unknown target" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Tunnel protocol — binary message framing (merged from tunproto.zig)
+// Tunnel protocol — binary message framing
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Messages are framed: 1-byte type + type-specific payload.
 // String fields: null-terminated. Binary fields: 4-byte BE length prefix + data.
 // Integer fields: 4-byte BE.
 //
-// Previously carried over KCP tunnel (v0.11.0–v0.13.0). Now carried over TCP/SOCKS4
-// via tcp frame protocol (v0.14.0+).
+// Wire protocol message types — carried over TCP/SOCKS4a via tcp frame protocol.
+// Formerly over KCP tunnels (v0.11.0–v0.13.0), now over TCP per-command connections.
 
-/// Tunnel protocol message types (inner payload inside tcp frames).
+/// Wire protocol message types (inner payload inside tcp frames).
 /// These flow over TCP/SOCKS4 connections — not directly on UDP :2121.
 pub const MsgType = enum(u8) {
     // Host → Guest commands
@@ -162,9 +169,9 @@ pub const MsgType = enum(u8) {
     upload_result = 0x17,
     _unused_0x18 = 0x18,
 
-    // Guest → Host: upgrade request
-    upgrade_req = 0x19,
-    _unused_0x1a = 0x1a,
+    // Host → Guest: upgrade push
+    upgrade_cmd = 0x1a,
+    _unused_0x19 = 0x19,
 
     // File transfer
     upload_cmd = 0x1b,
@@ -280,12 +287,14 @@ pub fn buildUploadCmd(allocator: std.mem.Allocator, cmd_id: []const u8, path: []
     return buf.toOwnedSlice(allocator);
 }
 
-pub fn buildUpgradeReq(allocator: std.mem.Allocator, cmd_id: []const u8, target: []const u8) ![]const u8 {
+pub fn buildUpgradeCmd(allocator: std.mem.Allocator, cmd_id: []const u8, target: []const u8, file_size: u32, sha256_hex: []const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
-    try buf.append(allocator, @intFromEnum(MsgType.upgrade_req));
+    try buf.append(allocator, @intFromEnum(MsgType.upgrade_cmd));
     try writeString(&buf, allocator, cmd_id);
     try writeString(&buf, allocator, target);
+    try writeU32(&buf, allocator, file_size);
+    try writeString(&buf, allocator, sha256_hex);
     return buf.toOwnedSlice(allocator);
 }
 
@@ -294,7 +303,7 @@ pub fn buildPtyExecOutput(allocator: std.mem.Allocator, cmd_id: []const u8, data
     errdefer buf.deinit(allocator);
     try buf.append(allocator, @intFromEnum(MsgType.pty_exec_output));
     try writeString(&buf, allocator, cmd_id);
-    try buf.appendSlice(allocator, data);
+    try writeBlob(&buf, allocator, data);
     return buf.toOwnedSlice(allocator);
 }
 
@@ -350,9 +359,11 @@ pub const UploadCmdData = struct {
     file_hash: []const u8,
 };
 
-pub const UpgradeReqData = struct {
+pub const UpgradeCmdData = struct {
     cmd_id: []const u8,
     target: []const u8,
+    file_size: u32,
+    sha256_hex: []const u8,
 };
 
 // ── Parse functions ──
@@ -370,7 +381,7 @@ pub fn parsePtyExecInput(data: []const u8) ?PtyExecInputData {
 pub fn parsePtyExecOutput(data: []const u8) ?PtyExecOutputData {
     var pos: usize = 0;
     const cmd_id = readString(data, &pos) orelse return null;
-    const payload = data[pos..];
+    const payload = readBlob(data, &pos) orelse return null;
     return .{ .cmd_id = cmd_id, .data = payload };
 }
 
@@ -404,11 +415,13 @@ pub fn parseUploadCmd(data: []const u8) ?UploadCmdData {
     return .{ .cmd_id = cmd_id, .path = path, .file_size = file_size, .file_hash = file_hash };
 }
 
-pub fn parseUpgradeReq(data: []const u8) ?UpgradeReqData {
+pub fn parseUpgradeCmd(data: []const u8) ?UpgradeCmdData {
     var pos: usize = 0;
     const cmd_id = readString(data, &pos) orelse return null;
     const target = readString(data, &pos) orelse return null;
-    return .{ .cmd_id = cmd_id, .target = target };
+    const file_size = readU32(data, &pos) orelse return null;
+    const sha256_hex = readString(data, &pos) orelse return null;
+    return .{ .cmd_id = cmd_id, .target = target, .file_size = file_size, .sha256_hex = sha256_hex };
 }
 
 /// Parsed Guest info
@@ -478,7 +491,7 @@ pub const GuestInfo = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// JSON helpers (migrated from state.zig)
+// JSON helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Get a string field from a JSON object. Returns null if missing or wrong type.
@@ -572,7 +585,7 @@ pub fn jsonBuildError(allocator: std.mem.Allocator, id: std.json.Value, code: i6
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Shell command helpers (migrated from state.zig)
+// Shell command helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Build command with appropriate MDELIM marker for the guest's shell.
@@ -737,7 +750,7 @@ test "VERSION follows semver" {
     try std.testing.expect(parts.next() == null);
 }
 
-// ── Tunnel protocol tests (from tunproto.zig) ──
+// ── Tunnel protocol tests ──
 
 test "pty_spawn build" {
     const allocator = std.testing.allocator;
@@ -860,14 +873,17 @@ test "pty_exec_output with binary data" {
     try std.testing.expectEqualSlices(u8, binary, parsed.data);
 }
 
-test "upgrade_req round-trip" {
+test "upgrade_cmd round-trip" {
     const allocator = std.testing.allocator;
-    const msg = try buildUpgradeReq(allocator, "up1", "aarch64-linux-musl");
+    const hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const msg = try buildUpgradeCmd(allocator, "up1", "aarch64-linux-musl", 1048576, hash);
     defer allocator.free(msg);
-    try std.testing.expectEqual(@intFromEnum(MsgType.upgrade_req), msg[0]);
-    const parsed = parseUpgradeReq(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqual(@intFromEnum(MsgType.upgrade_cmd), msg[0]);
+    const parsed = parseUpgradeCmd(msg[1..]) orelse return error.ParseFailed;
     try std.testing.expectEqualStrings("up1", parsed.cmd_id);
     try std.testing.expectEqualStrings("aarch64-linux-musl", parsed.target);
+    try std.testing.expectEqual(@as(u32, 1048576), parsed.file_size);
+    try std.testing.expectEqualStrings(hash, parsed.sha256_hex);
 }
 
 test "upload_cmd round-trip" {

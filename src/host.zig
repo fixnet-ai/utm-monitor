@@ -1,6 +1,6 @@
 //! Host mode — mesh networking daemon on UDP :2121.
 //!
-//! LSA broadcast + TCP/SOCKS4 replace the old HTTP server (v0.11.0) and KCP transport (v0.14.0).
+//! TCP per-command model with LSA broadcast + IPC socket.
 //! Management commands (--status/--exec/--upload/--download) communicate via IPC socket.
 
 const std = @import("std");
@@ -11,6 +11,8 @@ const guest = @import("guest.zig");
 const lsa = @import("lsa.zig");
 const tcp = @import("tcp.zig");
 const svc = @import("svc.zig");
+const arp = @import("arp.zig");
+const sshpass = @import("sshpass.zig");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     return runWithIo(init.io, init.gpa, cli, null);
@@ -19,12 +21,12 @@ pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
 pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
     // Management commands: stateless, no Host daemon needed
     if (cli.cmd_status) return cmdStatus(block_io, gpa, cli.port);
-    if (cli.cmd_verify) return cmdVerify(block_io, gpa, cli.port);
     if (cli.cmd_deploy) return cmdDeploy(block_io, gpa, cli.deploy_target);
     if (cli.cmd_ping) return cmdPing(block_io, gpa, cli.port, cli.ping_target.?);
     if (cli.cmd_exec) return cmdExec(block_io, gpa, cli.port, cli.exec_target.?, cli.exec_cmd.?);
     if (cli.cmd_upload) return cmdUpload(block_io, gpa, cli.port, cli.upload_target.?, cli.upload_file.?);
     if (cli.cmd_download) return cmdDownload(block_io, gpa, cli.port, cli.download_target.?, cli.download_remote.?, cli.download_local.?);
+    if (cli.cmd_upgrade) return cmdUpgrade(block_io, gpa, cli.port, cli.upgrade_target.?);
     // --gen-init
     if (cli.cmd_gen_init) {
         const platform_str = cli.gen_init_platform orelse "linux";
@@ -38,23 +40,11 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
         std.debug.print("{s}", .{script});
         return;
     }
-    // --save-config
-    if (cli.save_config) {
-        const config_mod = @import("config.zig");
-        const cfg = config_mod.Config{
-            .port = cli.port,
-            .name = cli.hostname orelse "",
-            .hosts_file = cli.hosts_file,
-            .marker = cli.marker,
-        };
-        return config_mod.saveConfig(block_io, gpa, cfg, cli.config_path orelse "utmm.conf");
-    }
-
     // Default serve_dir to exe directory if not specified
     const serve_dir = if (cli.serve_dir) |sd| sd else blk: {
         const exe_path = try std.process.executablePathAlloc(block_io, gpa);
         defer gpa.free(exe_path);
-        const dir = std.fs.path.dirname(exe_path) orelse "/opt/utmm";
+        const dir = std.fs.path.dirname(exe_path) orelse svc.canonicalDir();
         break :blk try gpa.dupe(u8, dir);
     };
     defer if (cli.serve_dir == null) gpa.free(serve_dir);
@@ -71,7 +61,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 
     // --host (via --svc): start Host daemon
     if (cli.is_host) {
-        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, cli.auto_upgrade, shutdown);
+        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown, cli.hostname);
         return;
     }
 }
@@ -81,14 +71,14 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
-    // IPC-only — HTTP handlers preserved for future WebUI
+    // IPC handler
     const json_str = try ipc_mod.ipcStatus(block_io, gpa);
     defer gpa.free(json_str);
 
-    // Parse JSON and print table (same as HTTP path)
+    // Parse JSON and print table
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_str, .{ .allocate = .alloc_always }) catch |err| {
         std.debug.print("[status] JSON parse error: {}\n", .{err});
         return err;
@@ -122,7 +112,7 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         }
     }.fmt;
 
-    std.debug.print("\n{s: <6} {s: <16} {s: <18} {s: <16} {s: <18} {s: <10} {s: <10} {s: <8} {s}\n", .{ "Role", "Hostname", "Target", "IP", "MAC", "Version", "Status", "Shell", "Last" });
+    std.debug.print("\n{s: <6} {s: <16} {s: <18} {s: <16} {s: <18} {s: <10} {s: <10} {s: <8} {s: <7} {s}\n", .{ "Role", "Hostname", "Target", "IP", "MAC", "Version", "Status", "Shell", "ConPTY", "Last" });
     std.debug.print("{s:-<120}\n", .{""});
     for (guests.items) |guest_val| {
         const g = switch (guest_val) {
@@ -137,6 +127,7 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         const version = protocol.jsonGetString(g, "version") orelse "?";
         const status = protocol.jsonGetString(g, "status") orelse "?";
         const shell = protocol.jsonGetString(g, "shell") orelse "?";
+        const conpty = protocol.jsonGetString(g, "conpty") orelse "?";
         // Parse last_seen from JSON integer
         var last_seen: i64 = 0;
         if (g.get("last_seen")) |v| {
@@ -153,7 +144,7 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
             @as(i64, @intCast(@divTrunc(now_ms - last_seen, 86400_000)))
         else
             @as(i64, 0);
-        std.debug.print("{s: <6} {s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s: <10} {s: <8}", .{ role, hostname, target, ip, mac, version, status, shell });
+        std.debug.print("{s: <6} {s: <16} {s: <18} {s: <16} {s: <18} v{s: <9} {s: <10} {s: <8} {s: <7}", .{ role, hostname, target, ip, mac, version, status, shell, conpty });
         if (rel_val > 0) {
             std.debug.print(" {d}{s}\n", .{ rel_val, rel });
         } else {
@@ -161,205 +152,6 @@ fn cmdStatus(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
         }
     }
     std.debug.print("\n", .{});
-}
-
-/// Health check: for each guest, run status + ping + exec echo and print a
-/// pass/fail matrix. Each check has a 5-second timeout — if any check hangs
-/// (e.g. tunnel stalled), it's marked as a failure rather than blocking forever.
-fn cmdVerify(block_io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
-    _ = gpa;
-    _ = port;
-    const ipc_mod = @import("ipc.zig");
-
-    // ── helpers ──
-    const GREEN = "\x1b[32m";
-    const RED = "\x1b[31m";
-    const YELLOW = "\x1b[33m";
-    const RESET = "\x1b[0m";
-
-    const CheckResult = enum { pass, fail, skip };
-    const checkIcon = struct {
-        fn icon(result: CheckResult) []const u8 {
-            return switch (result) {
-                .pass => GREEN ++ "✓" ++ RESET,
-                .fail => RED ++ "✗" ++ RESET,
-                .skip => YELLOW ++ "−" ++ RESET,
-            };
-        }
-    }.icon;
-
-    // 1. Get guest list via IPC status
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-
-    const json_str = ipc_mod.ipcStatus(block_io, aa) catch |err| {
-        std.debug.print("[verify] Failed to query guest list: {}\n", .{err});
-        std.process.exit(1);
-    };
-    defer aa.free(json_str);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, aa, json_str, .{ .allocate = .alloc_always }) catch |err| {
-        std.debug.print("[verify] JSON parse error: {}\n", .{err});
-        std.process.exit(1);
-    };
-
-    const guests = switch (parsed.value) {
-        .array => |arr| arr,
-        else => {
-            std.debug.print("No UTM guests found.\n", .{});
-            return;
-        },
-    };
-
-    if (guests.items.len == 0) {
-        std.debug.print("No UTM guests found.\n", .{});
-        return;
-    }
-
-    // Collect hostnames (skip Host itself — no tunnel for ping/exec)
-    var hostnames: std.ArrayListAligned([]const u8, null) = .empty;
-    for (guests.items) |guest_val| {
-        const g = switch (guest_val) {
-            .object => |o| o,
-            else => continue,
-        };
-        // Skip Host — no connection to itself, ping/exec would fail
-        if (protocol.jsonGetString(g, "role")) |r| {
-            if (std.mem.eql(u8, r, "host")) continue;
-        }
-        if (protocol.jsonGetString(g, "hostname")) |h| {
-            try hostnames.append(aa, try aa.dupe(u8, h));
-        }
-    }
-
-    // 2. Run checks for each guest
-    const GuestResult = struct {
-        status: CheckResult = .skip,
-        ping: CheckResult = .skip,
-        exec: CheckResult = .skip,
-        ping_rtt: ?u32 = null,
-        exec_error: ?[]const u8 = null,
-    };
-
-    var results = std.StringHashMap(GuestResult).init(aa);
-    for (hostnames.items) |h| {
-        try results.put(h, GuestResult{});
-    }
-
-    // 2a. Status check — guests are already in the list (from LSA)
-    for (hostnames.items) |h| {
-        var r = results.getPtr(h).?;
-        r.status = .pass;
-    }
-
-    // 2b. Ping check (mesh reachability)
-    for (hostnames.items) |h| {
-        var r = results.getPtr(h).?;
-        const ping_json = ipc_mod.ipcPing(block_io, aa, h) catch {
-            r.ping = .fail;
-            continue;
-        };
-        defer aa.free(ping_json);
-
-        // Parse RTT from ping response JSON
-        const ping_parsed = std.json.parseFromSlice(std.json.Value, aa, ping_json, .{ .allocate = .alloc_always }) catch {
-            r.ping = .fail;
-            continue;
-        };
-        if (ping_parsed.value == .object) {
-            if (ping_parsed.value.object.get("rtt_ms")) |rtt_val| {
-                if (rtt_val == .integer) {
-                    r.ping_rtt = @intCast(rtt_val.integer);
-                }
-            }
-            if (ping_parsed.value.object.get("error")) |_| {
-                r.ping = .fail;
-            } else {
-                r.ping = .pass;
-            }
-        } else {
-            r.ping = .fail;
-        }
-    }
-
-    // 2c. Exec echo check (tunnel + shell working)
-    for (hostnames.items) |h| {
-        var r = results.getPtr(h).?;
-
-        // Run "echo utmm-verify" — we only care about exit code.
-        // Write output to /dev/null (NUL on Windows).
-        const null_path = if (builtin.os.tag == .windows) "NUL" else "/dev/null";
-        var null_file = std.Io.Dir.cwd().openFile(block_io, null_path, .{ .mode = .write_only }) catch {
-            r.exec = .fail;
-            r.exec_error = try aa.dupe(u8, "cannot open null device");
-            continue;
-        };
-        defer null_file.close(block_io);
-        var null_wb: [256]u8 = undefined;
-        var null_writer = null_file.writer(block_io, &null_wb);
-        const null_iface = &null_writer.interface;
-
-        const exit_code = ipc_mod.ipcExec(block_io, aa, h, "echo utmm-verify", null_iface) catch {
-            r.exec = .fail;
-            r.exec_error = try aa.dupe(u8, "IPC error (tunnel down?)");
-            continue;
-        };
-
-        if (exit_code == 0) {
-            r.exec = .pass;
-        } else {
-            r.exec = .fail;
-            r.exec_error = try std.fmt.allocPrint(aa, "exit_code={d}", .{exit_code});
-        }
-    }
-
-    // 3. Print pass/fail matrix
-    std.debug.print("\n{s: <16} {s}  {s}  {s}  {s}\n", .{ "Guest", "Status", "Ping", "Exec", "Details" });
-    std.debug.print("{s:-<60}\n", .{""});
-
-    var all_pass = true;
-    for (hostnames.items) |h| {
-        const r = results.get(h).?;
-        var details: std.ArrayListAligned(u8, null) = .empty;
-        defer details.deinit(aa);
-
-        if (r.ping == .pass) {
-            if (r.ping_rtt) |rtt| {
-                const rtt_str = try std.fmt.allocPrint(aa, "{d}ms", .{rtt});
-                try details.appendSlice(aa, rtt_str);
-            }
-        } else if (r.ping == .fail) {
-            try details.appendSlice(aa, "unreachable");
-        }
-
-        if (r.exec == .fail) {
-            if (details.items.len > 0) try details.appendSlice(aa, ", ");
-            try details.appendSlice(aa, r.exec_error orelse "exec failed");
-        }
-
-        const detail_str = if (details.items.len > 0) details.items else "-";
-
-        std.debug.print("{s: <16} {s}     {s}     {s}     {s}\n", .{
-            h,
-            checkIcon(r.status),
-            checkIcon(r.ping),
-            checkIcon(r.exec),
-            detail_str,
-        });
-
-        if (r.status != .pass or r.ping != .pass or r.exec != .pass) {
-            all_pass = false;
-        }
-    }
-
-    std.debug.print("\n", .{});
-    if (all_pass) {
-        std.debug.print("All checks passed. {d} guest(s) healthy.\n", .{hostnames.items.len});
-    } else {
-        std.debug.print("Some checks failed. Review the matrix above.\n", .{});
-        std.process.exit(1);
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -384,6 +176,15 @@ const VM_DEPLOY_TABLE: []const VmDeployConfig = &[_]VmDeployConfig{
     .{ .hostname = "windowsvm", .target = "aarch64-windows", .ip = "192.168.65.2", .user = "Administrator", .password = "111", .remote_dir = "C:\\opt\\utmm" },
     .{ .hostname = "winx64", .target = "x86_64-windows", .ip = "192.168.3.108", .user = "Administrator", .password = "111", .remote_dir = "C:\\opt\\utmm" },
 };
+
+/// Look up a VM's remote canonical directory by hostname.
+/// Returns null if hostname not found in VM_DEPLOY_TABLE.
+fn vmRemoteDir(hostname: []const u8) ?[]const u8 {
+    for (VM_DEPLOY_TABLE) |vm| {
+        if (std.mem.eql(u8, vm.hostname, hostname)) return vm.remote_dir;
+    }
+    return null;
+}
 
 /// One-shot deploy: cross-compile → SCP → SSH install → verify.
 /// Uses sshpass for non-interactive password auth.
@@ -484,6 +285,14 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         try compiled.put(vm.target, bin_path);
 
         std.debug.print("[deploy]   -> {s}\n", .{bin_path});
+
+        // Copy to serve-dir for future --upgrade use
+        const serve_copy_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ svc.canonicalDir(), bin_name });
+        defer gpa.free(serve_copy_path);
+        std.Io.Dir.cwd().copyFile(bin_path, std.Io.Dir.cwd(), serve_copy_path, io, .{}) catch |err| {
+            std.log.warn("[deploy] copy to serve-dir failed: {}", .{err});
+        };
+        std.debug.print("[deploy]   -> serve-dir: {s}\n", .{serve_copy_path});
     }
 
     // ── 3. SCP + install for each VM ──
@@ -567,20 +376,20 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
 }
 
 fn cmdPing(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8) !void {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
-    // IPC-only — HTTP handlers preserved for future WebUI
+    // IPC handler
     const json = try ipc_mod.ipcPing(block_io, gpa, target);
     defer gpa.free(json);
     std.debug.print("{s}\n", .{json});
 }
 
 fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, cmd: []const u8) !void {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
-    // IPC-only — HTTP handlers preserved for future WebUI
+    // IPC handler
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(block_io, &stdout_buf);
     const stdout_iface = &stdout_writer.interface;
@@ -594,27 +403,40 @@ fn cmdExec(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const 
 }
 
 fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, local_file: []const u8) !void {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
     const basename = std.fs.path.basename(local_file);
-    const dest = try std.fmt.allocPrint(gpa, "/opt/utmm/{s}", .{basename});
+    const remote_dir = vmRemoteDir(target) orelse "/opt/utmm";
+    // Always use forward slash — Windows accepts both / and \ in file paths,
+    // and the Host may not be running on Windows even when the Guest is.
+    const dest = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ remote_dir, basename });
     defer gpa.free(dest);
 
     std.debug.print("[upload] Uploading {s} -> {s} ({s})...\n", .{ local_file, target, dest });
 
-    // IPC-only — HTTP handlers preserved for future WebUI
+    // IPC handler
     try ipc_mod.ipcUpload(block_io, gpa, target, local_file, dest);
     std.debug.print("[upload] OK\n", .{});
 }
 
+fn cmdUpgrade(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8) !void {
+    _ = port;
+    const ipc_mod = @import("ipc.zig");
+
+    std.debug.print("[upgrade] Pushing upgrade binary to {s}...\n", .{target});
+
+    try ipc_mod.ipcUpgrade(block_io, gpa, target);
+    std.debug.print("[upgrade] OK\n", .{});
+}
+
 fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []const u8, remote_file: []const u8, local_path: []const u8) !void {
-    _ = port; // HTTP handlers preserved for future WebUI
+    _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
     std.debug.print("[download] Downloading {s} from {s} -> {s}...\n", .{ remote_file, target, local_path });
 
-    // IPC-only — HTTP handlers preserved for future WebUI
+    // IPC handler
     // Write to temp file first, then rename atomically
     var rand_bytes: [8]u8 = undefined;
     block_io.random(&rand_bytes);
@@ -647,280 +469,36 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
 // ═══════════════════════════════════════════════════════════════════════════
 // Host daemon (--host): Mesh LSA + TCP/SOCKS4 connections + IPC server
 // ═══════════════════════════════════════════════════════════════════════════
-
-/// Check that a version string looks like "X.Y.Z" (digits only).
-/// Rejects anything that doesn't match — human-verification pages, HTML, etc.
-pub fn isValidVersion(ver: []const u8) bool {
-    if (ver.len < 5) return false; // minimum: "0.0.0"
-    var parts = std.mem.splitSequence(u8, ver, ".");
-    var count: u8 = 0;
-    while (parts.next()) |part| : (count += 1) {
-        if (part.len == 0) return false;
-        for (part) |c| {
-            if (c < '0' or c > '9') return false;
-        }
-        if (count > 3) return false;
-    }
-    return count == 3;
-}
-
-/// Fire-and-forget OS thread: check GitHub for the latest release version.
-/// On mismatch, logs "New version X.Y.Z available on github" and returns.
-/// Never triggers any upgrade — purely informational.
-fn checkGitHubVersion() void {
-    // Own Io instance for HTTP request in this detached thread.
-    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var gpa = std.heap.DebugAllocator(.{}).init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer client.deinit();
-
-    const uri = std.Uri.parse("https://api.github.com/repos/fixnet-ai/utm-monitor/releases/latest") catch return;
-    // Allow up to 5 redirects — GitHub may issue 302.
-    var req = client.request(.GET, uri, .{ .redirect_behavior = .init(5) }) catch return;
-    defer req.deinit();
-
-    req.sendBodiless() catch return;
-
-    var redirect_buf: [4096]u8 = undefined;
-    _ = req.receiveHead(&redirect_buf) catch return;
-
-    // Read response body — use req.reader.bodyReader() directly since
-    // Response.reader() skips GET (checks requestHasBody, not responseHasBody).
-    var body_buf: [4096]u8 = undefined;
-    const body_reader = req.reader.bodyReader(&body_buf, req.response_transfer_encoding, req.response_content_length);
-
-    var body_data: [8192]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&body_data);
-    _ = body_reader.stream(&w, .limited(8192)) catch {};
-    const body = w.buffered();
-
-    // Parse "tag_name" from JSON response.
-    const tag_key = "\"tag_name\":\"";
-    if (std.mem.indexOf(u8, body, tag_key)) |start| {
-        const value_start = start + tag_key.len;
-        if (std.mem.indexOfScalar(u8, body[value_start..], '"')) |end| {
-            const tag = body[value_start .. value_start + end];
-            // Strip leading "v" (e.g. "v0.11.19" → "0.11.19")
-            const new_ver = if (tag.len > 0 and tag[0] == 'v') tag[1..] else tag;
-            // Validate version format — rejects human-verification pages, HTML, etc.
-            if (!isValidVersion(new_ver)) return;
-            if (!std.mem.eql(u8, new_ver, protocol.VERSION)) {
-                std.log.warn("[host] New version {s} available on github", .{new_ver});
-            }
-        }
-    }
-}
-
-/// Verify that platform binaries in serve_dir match the running Host version.
-/// Checks each known deployment target's versioned filename exists.
-/// Returns true if at least one platform binary is found (partial deployment OK).
-/// Returns false only if NO platform binaries exist at all.
-fn verifyServeDirBinaries(io: std.Io, serve_dir: []const u8) bool {
-    const targets = [_][]const u8{
-        "aarch64-linux-musl", "x86_64-linux-musl", "x86-linux-musl",
-        "aarch64-macos", "x86_64-macos",
-        "x86-windows", "x86_64-windows", "aarch64-windows",
-        "aarch64-linux", "x86_64-linux", "x86-linux",
-    };
-
-    var found: usize = 0;
-    var missing: usize = 0;
-
-    for (targets) |target| {
-        const filename = protocol.deploymentFilename(target) orelse continue;
-        var path_buf: [1024]u8 = undefined;
-        const file_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ serve_dir, filename }) catch continue;
-
-        if (std.Io.Dir.cwd().statFile(io, file_path, .{})) |_| {
-            found += 1;
-        } else |_| {
-            missing += 1;
-        }
-    }
-
-    if (found == 0) {
-        std.log.err("[host] No platform binaries found in serve-dir '{s}'", .{serve_dir});
-        std.log.err("[host] Host version is {s} but no matching binaries exist.", .{protocol.VERSION});
-        std.log.err("[host] Please download the full release package and re-install.", .{});
-        return false;
-    }
-
-    if (missing > 0) {
-        std.log.warn("[host] {d} platform binaries missing from serve-dir (some Guests may not auto-upgrade)", .{missing});
-    }
-
-    std.log.info("[host] {d} platform binaries verified in serve-dir", .{found});
-    return true;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// 升级 TCP 监听器 — Guest 连接 Host 下载新二进制
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// 处理单个升级连接：接收 upgrade_req → 流式返回二进制。
-fn handleUpgradeConnection(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    fd: std.posix.socket_t,
-    serve_dir: []const u8,
-) void {
-    defer {
-        _ = std.posix.system.shutdown(fd, 2);
-        _ = std.posix.system.close(fd);
-    }
-
-    // 接收 upgrade_req 帧（sendFrame 写入 4B BE length + payload）
-    const frame = tcp.recvFrame(allocator, fd) catch |err| {
-        std.log.warn("[host] upgrade: recv upgrade_req: {}", .{err});
-        return;
-    };
-    defer allocator.free(frame);
-
-    // frame[0] = type byte, frame[1..] = cmd_id + target
-    if (frame.len < 1 or frame[0] != @intFromEnum(protocol.MsgType.upgrade_req)) {
-        std.log.warn("[host] upgrade: unexpected frame type 0x{x}", .{frame[0]});
-        return;
-    }
-
-    const req = protocol.parseUpgradeReq(frame[1..]) orelse {
-        std.log.warn("[host] upgrade: parse upgrade_req failed", .{});
-        return;
-    };
-
-    std.log.info("[host] upgrade: serving binary for target={s}", .{req.target});
-
-    // 构造二进制文件名并打开
-    const filename = protocol.deploymentFilename(req.target) orelse {
-        std.log.err("[host] upgrade: unknown target '{s}'", .{req.target});
-        return;
-    };
-    var path_buf: [512]u8 = undefined;
-    const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ serve_dir, filename }) catch {
-        std.log.err("[host] upgrade: path too long: {s}/{s}", .{ serve_dir, filename });
-        return;
-    };
-
-    const file = std.Io.Dir.cwd().openFile(io, full_path, .{}) catch |err| {
-        std.log.err("[host] upgrade: open {s}: {}", .{ full_path, err });
-        return;
-    };
-    defer file.close(io);
-
-    // 流式发送文件内容（原始字节，无帧协议，sendFrame 不适合大文件）
-    var rbuf: [65536]u8 = undefined;
-    while (true) {
-        const nr = file.readStreaming(io, &.{rbuf[0..]}) catch |err| {
-            std.log.err("[host] upgrade: read {s}: {}", .{ full_path, err });
-            return;
-        };
-        if (nr == 0) break; // EOF
-
-        const nw = std.posix.system.write(fd, &rbuf, nr);
-        if (nw != @as(isize, @intCast(nr))) {
-            std.log.err("[host] upgrade: send binary failed", .{});
-            return;
-        }
-    }
-
-    std.log.info("[host] upgrade: served {s} successfully", .{filename});
-}
-
-/// TCP 升级监听器线程入口。
-fn upgradeTcpListener(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    port: u16,
-    serve_dir: []const u8,
-    shutdown: *std.atomic.Value(bool),
-) void {
-    const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", port) catch |err| {
-        std.log.err("[host] upgrade listener: bind addr parse: {}", .{err});
-        return;
-    };
-    const sock = bind_addr.bind(io, .{ .mode = .stream }) catch |err| {
-        std.log.err("[host] upgrade listener: TCP bind :{d}: {}", .{ port, err });
-        return;
-    };
-    defer sock.close(io);
-
-    _ = std.posix.system.listen(sock.handle, 8);
-    std.log.info("[host] upgrade TCP listener on :{d}", .{port});
-
-    while (!shutdown.load(.acquire)) {
-        var addr: std.Io.net.IpAddress = undefined;
-        var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
-        const client_fd = std.posix.system.accept(sock.handle, @ptrCast(&addr), &addr_len);
-        if (client_fd < 0) {
-            const e = std.posix.errno(client_fd);
-            if (e == .AGAIN or e == .INTR) {
-                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
-                continue;
-            }
-            std.log.err("[host] upgrade listener: accept failed", .{});
-            continue;
-        }
-
-        // 处理升级连接（阻塞，但连接是独立的且通常很快）
-        handleUpgradeConnection(io, allocator, client_fd, serve_dir);
-    }
-
-    std.log.info("[host] upgrade TCP listener stopped", .{});
-}
-
 fn startHost(
     block_io: std.Io,
     gpa: std.mem.Allocator,
     mesh_port: u16,
     serve_dir: ?[]const u8,
     peer_mesh: ?[]const u8,
-    auto_upgrade: bool,
     shutdown: ?*std.atomic.Value(bool),
+    hostname: ?[]const u8,
 ) !void {
-    const sd = serve_dir orelse "/opt/utmm";
+    const sd = serve_dir orelse svc.canonicalDir();
     std.debug.print("[host] Host daemon starting (mesh UDP :{d})\n", .{mesh_port});
     std.debug.print("[host] Serve dir: {s}\n", .{sd});
-
-    if (auto_upgrade) {
-        // Verify serve-dir platform binaries match running Host version.
-        // Missing binaries are logged as warnings; the Host continues running
-        // so Guests can still be managed (exec/upload/download). Guest
-        // auto-upgrade is degraded until matching binaries are provided.
-        // Auto-uninstall was removed: self-destructing on version mismatch
-        // leaves the machine unreachable with zero recovery path — far worse
-        // than an upgrade loop (which is self-limiting anyway).
-        _ = verifyServeDirBinaries(block_io, sd);
-
-        // Spawn fire-and-forget GitHub version check thread.
-        // OS thread, detach immediately, runs once — no join needed.
-        if (std.Thread.spawn(.{}, checkGitHubVersion, .{})) |t| {
-            t.detach();
-        } else |_| {
-            // spawn failed — silently ignored
-        }
-    }
 
     // Initialize guest table
     var state = GuestTable.init(gpa, block_io);
     defer state.deinit();
 
-    // Upgrade signal for version mismatch detection via LSA (only when auto_upgrade enabled).
-    var upgrade_signal = guest.UpgradeSignal{};
-
     // Spawn mesh networking thread — replaces periodic UDP guest.
-    // Mesh broadcasts LSA every 2s (carries version for auto-upgrade),
+    // Mesh broadcasts LSA every 2s (version is informational — displayed in --status),
     // maintains guest topology via LSA database.
     var mesh_opt: ?lsa.Mesh = null;
     var mesh_thread: ?std.Thread = null;
 
+    // Allocated copies for tunnelManager (set inside start_mesh block)
+    var host_ip_copy: []const u8 = &.{};
+    var host_hostname_copy: []const u8 = &.{};
+
     start_mesh: {
         // Get Host's own system info for node identification
-        const host_info = guest.getSystemInfo(block_io, gpa) catch |err| {
+        var host_info = guest.getSystemInfo(block_io, gpa) catch |err| {
             std.log.err("[host] getSystemInfo failed: {}", .{err});
             break :start_mesh;
         };
@@ -931,6 +509,14 @@ fn startHost(
             // host_info.target is a compile-time constant from zigTarget()
             gpa.free(host_info.iface_name);
             gpa.free(host_info.shell);
+        }
+
+        // Override hostname if --hostname was specified (applies to host mode too)
+        if (hostname) |n| {
+            // getSystemInfo allocated hostname, but defer will free the original;
+            // free old first, then allocate the override so defer frees the new one.
+            gpa.free(host_info.hostname);
+            host_info.hostname = try gpa.dupe(u8, n);
         }
 
         // Collect broadcast addresses
@@ -976,8 +562,8 @@ fn startHost(
 
         // Build node_info for LSA (Mesh.init() appends epoch internally)
         const node_info = std.fmt.allocPrint(gpa,
-            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nrole:host\nstatus:serving",
-            .{ host_info.hostname, host_info.ip, host_info.target, protocol.VERSION, host_info.shell },
+            "hostname:{s}\nip:{s}\ntarget:{s}\nversion:{s}\nshell:{s}\nconpty:{s}\nrole:host\nstatus:serving",
+            .{ host_info.hostname, host_info.ip, host_info.target, protocol.VERSION, host_info.shell, if (sshpass.conptyAvailable()) "yes" else "no" },
         ) catch |err| {
             std.log.err("[host] Mesh node_info alloc: {}", .{err});
             mesh_socket.close(mesh_io);
@@ -986,7 +572,7 @@ fn startHost(
         };
 
         // Create mesh instance (epoch is auto-appended to node_info by init())
-        mesh_opt = lsa.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, if (auto_upgrade) &upgrade_signal.needed else null, bc_addrs, guest.getSubnetBroadcasts) catch |err| {
+        mesh_opt = lsa.Mesh.init(gpa, node_id, node_info, mesh_socket, mesh_io, bc_addrs, guest.getSubnetBroadcasts) catch |err| {
             std.log.err("[host] Mesh init failed: {}", .{err});
             gpa.free(node_info);
             mesh_socket.close(mesh_io);
@@ -1010,27 +596,21 @@ fn startHost(
         _ = state.upsert(
             host_info.hostname, host_info.ip, host_info.target,
             host_info.mac, protocol.VERSION, host_info.shell,
+            if (sshpass.conptyAvailable()) "yes" else "no",
             "serving", "host", now_ms,
         );
 
+        // Allocate copies of host IP/hostname for tunnelManager (which outlives start_mesh block)
+        host_ip_copy = try gpa.dupe(u8, host_info.ip);
+        errdefer gpa.free(host_ip_copy);
+        host_hostname_copy = try gpa.dupe(u8, host_info.hostname);
+        errdefer gpa.free(host_hostname_copy);
+
     }
 
-    // Spawn tunnel manager thread — syncs LSA→guest table, connects tunnels.
+    // Spawn LSA manager thread — syncs LSA→guest table, triggers auto-upgrade.
     // Must spawn before the defer below so join() runs in correct order.
-    var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ block_io, gpa, &state, &mesh_opt });
-
-    // Spawn upgrade TCP listener thread — serves binary to upgrading Guests.
-    // Only spawned when auto_upgrade is enabled.
-    var upgrade_shutdown = std.atomic.Value(bool).init(false);
-    var upgrade_thread: ?std.Thread = null;
-    if (auto_upgrade) {
-        upgrade_thread = std.Thread.spawn(.{}, upgradeTcpListener, .{
-            block_io, gpa, mesh_port, sd, &upgrade_shutdown,
-        }) catch |err| {
-            std.log.err("[host] upgrade listener thread spawn failed: {}", .{err});
-            upgrade_thread = null;
-        };
-    }
+    var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy });
 
     // Spawn IPC server thread — Unix domain socket (POSIX) / named pipe (Windows).
     // Shares HostState and Mesh with the mesh networking layer.
@@ -1043,13 +623,11 @@ fn startHost(
     defer {
         // 1. Signal all background threads to stop
         ipc_shutdown.store(true, .release);
-        upgrade_shutdown.store(true, .release);
         // 2. Signal mesh shutdown — tunnelManager checks this each loop iteration
         if (mesh_opt) |*m| m.signalShutdown();
 
-        // 3. Join threads (order: IPC → upgrade → tunnel mgr → mesh)
+        // 3. Join threads (order: IPC → tunnel mgr → mesh)
         ipc_thread.join();
-        if (upgrade_thread) |t| t.join();
         tun_mgr_thread.join();
 
         // 4. Join mesh thread after all consumers have exited
@@ -1090,17 +668,167 @@ fn parseNodeInfoLine(line: []const u8, key: []const u8) ?[]const u8 {
 /// Background thread: periodically scans mesh LSAs for guest nodes
 /// and syncs them to the guest table. No persistent TCP connections —
 /// each exec/upload/download opens a fresh per-command TCP connection.
+// ═══════════════════════════════════════════════════════════════════════════
+// Auto-upgrade: push binary to Guest
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Cooldown between auto-upgrade attempts per Guest (ms).
+const AUTO_UPGRADE_COOLDOWN_MS: i64 = 120_000; // 2 minutes
+
+/// Tracks last auto-upgrade attempt timestamp per Guest hostname.
+const LastUpgradeMap = std.StringHashMap(i64);
+
+/// Connect to a Guest via TCP with ARP-based IP rediscovery on failure.
+/// On primary connect failure, queries the system ARP table by MAC to find
+/// the Guest's new IP (handles UTM VM IP address changes).
+/// Returns a TCP connection or an error message string (caller does NOT own).
+pub fn connectGuest(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    state: *GuestTable,
+    hostname: []const u8,
+) !tcp.Connection {
+    const guest_entry = state.findByHostname(hostname) orelse return error.GuestNotFound;
+
+    return tcp.hostConnect(io, guest_entry.ip, hostname, protocol.DEFAULT_PORT) catch |primary_err| {
+        std.log.warn("[arp] primary connect to {s} ({s}) failed: {}", .{ hostname, guest_entry.ip, primary_err });
+
+        // ARP recovery: try to find new IP by MAC
+        if (guest_entry.mac.len > 0) {
+            const new_ip = arp.rediscoverIp(gpa, guest_entry.mac, guest_entry.ip) catch null;
+            if (new_ip) |nip| {
+                defer gpa.free(nip);
+                std.log.info("[arp] rediscovered {s}: {s} -> {s}", .{ hostname, guest_entry.ip, nip });
+                _ = state.updateIp(hostname, nip);
+
+                return tcp.hostConnect(io, nip, hostname, protocol.DEFAULT_PORT) catch |retry_err| {
+                    std.log.err("[arp] retry connect to {s} ({s}) also failed: {}", .{ hostname, nip, retry_err });
+                    return retry_err;
+                };
+            }
+        }
+
+        return primary_err;
+    };
+}
+
+/// Push an upgrade binary to a Guest.  Used by both manual --upgrade (IPC)
+/// and automatic version-mismatch detection (LSA manager).
+/// Returns an error string on failure (caller does NOT own), or null on success.
+pub fn pushUpgrade(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    state: *GuestTable,
+    hostname: []const u8,
+) ?[]const u8 {
+    // 1. Look up Guest entry
+    const guest_entry = state.findByHostname(hostname) orelse return "GuestNotFound";
+
+    // 2. Determine deployment filename from target triple
+    const filename = protocol.deploymentFilename(guest_entry.target) orelse {
+        std.log.err("[auto-upgrade] unknown guest target: {s}", .{guest_entry.target});
+        return "UnknownTarget";
+    };
+
+    // 3. Open binary from serve-dir
+    var path_buf: [512]u8 = undefined;
+    const serve_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ svc.canonicalDir(), filename }) catch return "PathTooLong";
+
+    const bin_file = std.Io.Dir.cwd().openFile(io, serve_path, .{ .mode = .read_only }) catch |err| {
+        std.log.err("[auto-upgrade] open {s}: {}", .{ serve_path, err });
+        return "BinaryNotFound";
+    };
+    defer bin_file.close(io);
+
+    // 4. Read and validate file size
+    const file_size_b: u64 = (bin_file.stat(io) catch return "StatFailed").size;
+    if (file_size_b == 0 or file_size_b > 50 * 1024 * 1024) {
+        std.log.err("[auto-upgrade] invalid file size: {d}", .{file_size_b});
+        return "InvalidBinary";
+    }
+    const file_size: u32 = @intCast(file_size_b);
+
+    // 5. Read entire binary into memory
+    const file_data = gpa.alloc(u8, file_size) catch return "AllocFailed";
+    defer gpa.free(file_data);
+    _ = bin_file.readPositionalAll(io, file_data, 0) catch |err| {
+        std.log.err("[auto-upgrade] read {s}: {}", .{ serve_path, err });
+        return "ReadFailed";
+    };
+
+    // 6. Compute SHA256
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(file_data);
+    var hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&hash);
+    var sha256_hex: [64]u8 = undefined;
+    for (hash, 0..) |byte, i| {
+        const h = "0123456789abcdef";
+        sha256_hex[i * 2] = h[byte >> 4];
+        sha256_hex[i * 2 + 1] = h[byte & 0x0f];
+    }
+
+    std.log.info("[auto-upgrade] {s} ({s}): {d} bytes, sha256={s}", .{ hostname, guest_entry.target, file_size, &sha256_hex });
+
+    // 7. Connect to Guest via SOCKS4a (with ARP recovery)
+    var tcp_conn = connectGuest(io, gpa, state, hostname) catch |err| {
+        std.log.err("[auto-upgrade] TCP connect to {s} failed: {}", .{ hostname, err });
+        return "GuestConnectFailed";
+    };
+    defer tcp_conn.deinit();
+
+    // 8. Build and send upgrade_cmd frame
+    const cmd_id = std.fmt.allocPrint(gpa, "up-{d}", .{@as(u64, @intCast(std.Io.Timestamp.now(io, .real).nanoseconds))}) catch return "AllocFailed";
+    defer gpa.free(cmd_id);
+
+    const up_frame = protocol.buildUpgradeCmd(gpa, cmd_id, guest_entry.target, file_size, &sha256_hex) catch return "AllocFailed";
+    defer gpa.free(up_frame);
+
+    // Fire-and-forget: push upgrade_cmd + raw binary
+    tcp_conn.sendAndFlush(up_frame, 0) catch {};
+    _ = tcp.sockWrite(tcp_conn.fd, file_data.ptr, file_size);
+
+    std.log.info("[auto-upgrade] {s} pushed (fire-and-forget, {d} bytes)", .{ hostname, file_size });
+    return null; // success
+}
+
+/// Thread entry point for auto-upgrade push: calls pushUpgrade then frees hostname.
+fn pushUpgradeThread(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    state: *GuestTable,
+    hostname: []const u8,
+) void {
+    defer gpa.free(hostname);
+    const err_msg = pushUpgrade(io, gpa, state, hostname);
+    if (err_msg) |msg| {
+        std.log.err("[auto-upgrade] pushUpgrade({s}) failed: {s}", .{ hostname, msg });
+    }
+}
+
 fn tunnelManager(
     io: std.Io,
     allocator: std.mem.Allocator,
     state: *GuestTable,
     mesh_opt: *?lsa.Mesh,
+    host_ip: []const u8,
+    host_hostname: []const u8,
 ) void {
+    defer allocator.free(host_ip);
+    defer allocator.free(host_hostname);
     // Pre-allocated list for LSA snapshots (reused across iterations).
     var snapshots: std.ArrayList(struct { node_id: lsa.NodeId, info_copy: []const u8 }) = .empty;
     defer {
         for (snapshots.items) |s| allocator.free(s.info_copy);
         snapshots.deinit(allocator);
+    }
+
+    // Auto-upgrade cooldown map: hostname → last push timestamp (ms)
+    var last_upgrade = LastUpgradeMap.init(allocator);
+    defer {
+        var it = last_upgrade.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        last_upgrade.deinit();
     }
 
     while (true) {
@@ -1124,7 +852,7 @@ fn tunnelManager(
                 if (std.mem.eql(u8, entry.key_ptr, &m.node_id)) continue;
 
                 const info_copy = allocator.dupe(u8, entry.value_ptr.node_info) catch continue;
-                snapshots.append(.{
+                snapshots.append(allocator, .{
                     .node_id = entry.key_ptr.*,
                     .info_copy = info_copy,
                 }) catch {
@@ -1145,6 +873,7 @@ fn tunnelManager(
             var mac_str: []const u8 = "";
             var status: []const u8 = "";
             var role: []const u8 = "";
+            var conpty: []const u8 = "";
 
             var line_it = std.mem.splitScalar(u8, s.info_copy, '\n');
             while (line_it.next()) |line| {
@@ -1155,6 +884,7 @@ fn tunnelManager(
                 if (parseNodeInfoLine(line, "shell")) |v| shell = v;
                 if (parseNodeInfoLine(line, "status")) |v| status = v;
                 if (parseNodeInfoLine(line, "role")) |v| role = v;
+                if (parseNodeInfoLine(line, "conpty")) |v| conpty = v;
             }
 
             if (hostname.len == 0 or ip.len == 0) continue;
@@ -1168,10 +898,41 @@ fn tunnelManager(
 
             // Upsert to guest table and set mesh MAC
             const now_ms = @as(i64, @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms)));
-            const changed = state.upsert(hostname, ip, target, mac_str, version, shell, status, role, @intCast(now_ms));
+            const changed = state.upsert(hostname, ip, target, mac_str, version, shell, conpty, status, role, @intCast(now_ms));
             if (changed and hostname.len > 0) {
                 state.setMeshMac(hostname, s.node_id);
-                syncHostsFromTable(io, allocator, state);
+                syncHosts(io, allocator, state, host_ip, host_hostname);
+            }
+
+            // ── Auto-upgrade: version mismatch → push ──
+            if (protocol.AUTO_UPGRADE) {
+                if (version.len > 0 and role.len > 0 and
+                    !std.mem.eql(u8, version, protocol.VERSION) and
+                    std.mem.eql(u8, role, "guest") and
+                    !std.mem.eql(u8, status, "upgrading"))
+                {
+                    const in_cooldown = if (last_upgrade.get(hostname)) |last_ts|
+                        (now_ms - last_ts) < AUTO_UPGRADE_COOLDOWN_MS
+                    else
+                        false;
+
+                    if (!in_cooldown) {
+                        std.log.info("[auto-upgrade] version mismatch: {s} v{s} != Host v{s}, pushing upgrade...", .{ hostname, version, protocol.VERSION });
+
+                        const key_dupe = allocator.dupe(u8, hostname) catch continue;
+                        last_upgrade.put(key_dupe, now_ms) catch {
+                            allocator.free(key_dupe);
+                            continue;
+                        };
+
+                        const push_hostname = allocator.dupe(u8, hostname) catch continue;
+                        const thread = std.Thread.spawn(.{}, pushUpgradeThread, .{ io, allocator, state, push_hostname }) catch {
+                            allocator.free(push_hostname);
+                            continue;
+                        };
+                        thread.detach();
+                    }
+                }
             }
         }
 
@@ -1181,15 +942,8 @@ fn tunnelManager(
 }
 
 
-test "isValidVersion - valid semver" {
-    try std.testing.expect(isValidVersion("0.11.18"));
-    try std.testing.expect(isValidVersion("1.0.0"));
-    try std.testing.expect(isValidVersion("10.20.30"));
-    try std.testing.expect(isValidVersion("0.0.0"));
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
-// GuestTable — minimal guest registry (was state.zig, now inlined)
+// GuestTable — minimal guest registry
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const GuestEntry = struct {
@@ -1200,6 +954,7 @@ pub const GuestEntry = struct {
     mac: []const u8,
     version: []const u8,
     shell: []const u8,
+    conpty: []const u8,
     status: []const u8,
     last_seen: i64,
     mesh_mac: ?[6]u8 = null,
@@ -1228,6 +983,7 @@ pub const GuestTable = struct {
             self.allocator.free(entry.mac);
             self.allocator.free(entry.version);
             if (entry.shell.len > 0) self.allocator.free(entry.shell);
+            if (entry.conpty.len > 0) self.allocator.free(entry.conpty);
             if (entry.status.len > 0) self.allocator.free(entry.status);
             if (entry.role.len > 0) self.allocator.free(entry.role);
         }
@@ -1256,6 +1012,7 @@ pub const GuestTable = struct {
         mac: []const u8,
         version: []const u8,
         shell: []const u8,
+        conpty: []const u8,
         status: []const u8,
         role: []const u8,
         last_seen: i64,
@@ -1270,8 +1027,10 @@ pub const GuestTable = struct {
             if (!std.mem.eql(u8, existing.target, target)) changed = true;
             if (!std.mem.eql(u8, existing.version, version)) changed = true;
             if (!std.mem.eql(u8, existing.shell, shell)) changed = true;
+            if (!std.mem.eql(u8, existing.conpty, conpty)) changed = true;
             if (!std.mem.eql(u8, existing.status, status)) changed = true;
             if (!std.mem.eql(u8, existing.role, role)) changed = true;
+            if (!std.mem.eql(u8, existing.mac, mac)) changed = true;
 
             if (!std.mem.eql(u8, existing.ip, ip)) {
                 self.allocator.free(existing.ip);
@@ -1289,6 +1048,10 @@ pub const GuestTable = struct {
                 if (existing.shell.len > 0) self.allocator.free(existing.shell);
                 existing.shell = self.allocator.dupe(u8, shell) catch existing.shell;
             }
+            if (!std.mem.eql(u8, existing.conpty, conpty)) {
+                if (existing.conpty.len > 0) self.allocator.free(existing.conpty);
+                existing.conpty = self.allocator.dupe(u8, conpty) catch existing.conpty;
+            }
             if (!std.mem.eql(u8, existing.status, status)) {
                 if (existing.status.len > 0) self.allocator.free(existing.status);
                 existing.status = self.allocator.dupe(u8, status) catch existing.status;
@@ -1296,6 +1059,10 @@ pub const GuestTable = struct {
             if (!std.mem.eql(u8, existing.role, role)) {
                 if (existing.role.len > 0) self.allocator.free(existing.role);
                 existing.role = self.allocator.dupe(u8, role) catch existing.role;
+            }
+            if (!std.mem.eql(u8, existing.mac, mac)) {
+                self.allocator.free(existing.mac);
+                existing.mac = self.allocator.dupe(u8, mac) catch existing.mac;
             }
             existing.last_seen = last_seen;
             return changed;
@@ -1308,6 +1075,7 @@ pub const GuestTable = struct {
             .mac = self.allocator.dupe(u8, mac) catch mac,
             .version = self.allocator.dupe(u8, version) catch version,
             .shell = if (shell.len > 0) self.allocator.dupe(u8, shell) catch shell else "",
+            .conpty = if (conpty.len > 0) self.allocator.dupe(u8, conpty) catch conpty else "",
             .status = if (status.len > 0) self.allocator.dupe(u8, status) catch status else "",
             .role = if (role.len > 0) self.allocator.dupe(u8, role) catch role else "guest",
             .last_seen = last_seen,
@@ -1326,6 +1094,7 @@ pub const GuestTable = struct {
         self.allocator.free(entry.mac);
         self.allocator.free(entry.version);
         if (entry.shell.len > 0) self.allocator.free(entry.shell);
+        if (entry.conpty.len > 0) self.allocator.free(entry.conpty);
         if (entry.status.len > 0) self.allocator.free(entry.status);
         if (entry.role.len > 0) self.allocator.free(entry.role);
     }
@@ -1336,92 +1105,56 @@ pub const GuestTable = struct {
         const idx = self.indexOf(hostname) orelse return;
         self.guests.items[idx].mesh_mac = mac_bytes;
     }
+
+    /// 更新 Guest IP（用于 ARP 重发现后更新）。
+    /// 返回 true 表示 IP 已变更，false 表示未变更或未找到。
+    pub fn updateIp(self: *GuestTable, hostname: []const u8, new_ip: []const u8) bool {
+        self.mutex.lock(self.io) catch return false;
+        defer self.mutex.unlock(self.io);
+        const idx = self.indexOf(hostname) orelse return false;
+        const existing = &self.guests.items[idx];
+        if (std.mem.eql(u8, existing.ip, new_ip)) return false;
+        self.allocator.free(existing.ip);
+        existing.ip = self.allocator.dupe(u8, new_ip) catch return false;
+        return true;
+    }
 };
 
-// /etc/hosts sync constants
-const MARKER_BEGIN = "# BEGIN UTM-MONITOR\n";
-const MARKER_END = "# END UTM-MONITOR\n";
+/// Sync /etc/hosts with all known guests + gateway entry. Uses lsa.updateHosts
+/// which does temp-file + atomic rename for safe concurrent writes.
+fn syncHosts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    state: *GuestTable,
+    gateway_ip: []const u8,
+    gateway_name: []const u8,
+) void {
+    var entries: std.ArrayList(lsa.HostEntry) = .empty;
+    defer entries.deinit(allocator);
 
-pub fn syncHostsFromTable(io: std.Io, allocator: std.mem.Allocator, table: *GuestTable) void {
-    const cwd = std.Io.Dir.cwd();
-    const root_dir = cwd.openDir(io, "/", .{}) catch {
-        std.log.err("[state] Cannot open root directory for /etc/hosts sync", .{});
-        return;
+    // Gateway entry first (Host's own IP for Host mode)
+    if (gateway_ip.len > 0 and gateway_name.len > 0) {
+        entries.append(allocator, .{ .ip = gateway_ip, .name = gateway_name }) catch return;
+    }
+
+    // Lock and collect all guest entries (skip Host itself — already added as gateway above)
+    state.mutex.lock(io) catch return;
+    defer state.mutex.unlock(io);
+    for (state.guests.items) |g| {
+        if (g.ip.len > 0 and g.hostname.len > 0) {
+            // Skip Host's own entry added at line 594 to avoid duplicate with gateway entry
+            if (gateway_ip.len > 0 and std.mem.eql(u8, g.ip, gateway_ip)) continue;
+            entries.append(allocator, .{ .ip = g.ip, .name = g.hostname }) catch continue;
+        }
+    }
+
+    lsa.updateHosts(io, allocator, "/etc/hosts", entries.items) catch |err| {
+        std.log.err("[host] updateHosts /etc/hosts: {}", .{err});
     };
-
-    var original: std.ArrayList(u8) = .empty;
-    defer original.deinit(allocator);
-
-    const file = root_dir.openFile(io, "etc/hosts", .{}) catch null;
-    if (file) |f| {
-        defer f.close(io);
-        const file_size = f.length(io) catch 0;
-        original.resize(allocator, @intCast(file_size)) catch return;
-        var rbuf: [4096]u8 = undefined;
-        var reader = f.reader(io, &rbuf);
-        reader.interface.readSliceAll(original.items) catch {};
-    }
-
-    var new_block: std.ArrayList(u8) = .empty;
-    defer new_block.deinit(allocator);
-    new_block.appendSlice(allocator, MARKER_BEGIN) catch return;
-    for (table.guests.items) |g| {
-        new_block.print(allocator, "{s} {s}.{s}.utm\n", .{ g.ip, g.hostname, g.target }) catch return;
-    }
-    new_block.appendSlice(allocator, MARKER_END) catch return;
-
-    const begin_pos = std.mem.indexOf(u8, original.items, MARKER_BEGIN);
-    const end_pos = if (begin_pos != null)
-        std.mem.indexOf(u8, original.items[begin_pos.?..], MARKER_END)
-    else
-        null;
-
-    const needs_newline = original.items.len > 0 and original.items[original.items.len - 1] != '\n';
-
-    var output: std.ArrayList(u8) = .empty;
-    defer output.deinit(allocator);
-
-    if (begin_pos != null and end_pos != null) {
-        const before = original.items[0..begin_pos.?];
-        const after = original.items[begin_pos.? + end_pos.? + MARKER_END.len ..];
-        output.appendSlice(allocator, before) catch return;
-        output.appendSlice(allocator, new_block.items) catch return;
-        output.appendSlice(allocator, after) catch return;
-    } else {
-        output.appendSlice(allocator, original.items) catch return;
-        if (needs_newline) output.appendSlice(allocator, "\n") catch return;
-        output.appendSlice(allocator, new_block.items) catch return;
-    }
-
-    const out_file = root_dir.createFile(io, "etc/hosts", .{ .truncate = true }) catch {
-        std.log.err("[state] Cannot write /etc/hosts (permission denied?)", .{});
-        return;
-    };
-    defer out_file.close(io);
-    var wbuf: [4096]u8 = undefined;
-    var writer = out_file.writer(io, &wbuf);
-    writer.interface.writeAll(output.items) catch {};
-    writer.interface.flush() catch {};
-}
-
-test "isValidVersion - invalid" {
-    try std.testing.expect(!isValidVersion(""));
-    try std.testing.expect(!isValidVersion("0"));
-    try std.testing.expect(!isValidVersion("0.11"));
-    try std.testing.expect(!isValidVersion("0.11.18.1"));
-    try std.testing.expect(!isValidVersion("v0.11.18"));
-    try std.testing.expect(!isValidVersion("a.b.c"));
-    try std.testing.expect(!isValidVersion("0.11.alpha"));
-}
-
-test "isValidVersion - garbage (human verification page)" {
-    try std.testing.expect(!isValidVersion("<!DOCTYPE html>"));
-    try std.testing.expect(!isValidVersion("<html>captcha</html>"));
-    try std.testing.expect(!isValidVersion("Please verify you are human"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GuestTable tests (from state.zig)
+// GuestTable tests
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Helper: create a single-threaded Io for tests (needed by GuestTable mutex).
@@ -1444,7 +1177,7 @@ test "GuestTable upsert and findByHostname" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "serving", "guest", 1000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "serving", "guest", 1000);
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
 
     const found = table.findByHostname("linuxvm");
@@ -1463,8 +1196,8 @@ test "GuestTable upsert updates existing guest" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
-    const changed = table.upsert("linuxvm", "192.168.64.3", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.14.0", "/bin/zsh", "serving", "guest", 2000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "", "guest", 1000);
+    const changed = table.upsert("linuxvm", "192.168.64.3", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.14.0", "/bin/zsh", "yes", "serving", "guest", 2000);
 
     try std.testing.expect(changed);
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
@@ -1477,13 +1210,29 @@ test "GuestTable upsert updates existing guest" {
     try std.testing.expectEqual(@as(i64, 2000), found.last_seen);
 }
 
+test "GuestTable upsert detects MAC change" {
+    const allocator = std.testing.allocator;
+    var table = GuestTable.init(allocator, testIo());
+    defer table.deinit();
+
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "", "guest", 1000);
+    // Change only the MAC address — should be detected
+    const changed = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "11:22:33:44:55:66", "0.13.0", "/bin/bash", "yes", "", "guest", 2000);
+
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
+
+    const found = table.findByHostname("linuxvm").?;
+    try std.testing.expectEqualStrings("11:22:33:44:55:66", found.mac);
+}
+
 test "GuestTable upsert no-change returns false" {
     const allocator = std.testing.allocator;
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "serving", "guest", 1000);
-    const changed = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "serving", "guest", 1000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "serving", "guest", 1000);
+    const changed = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "serving", "guest", 1000);
 
     try std.testing.expect(!changed);
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
@@ -1494,8 +1243,8 @@ test "GuestTable remove" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
-    _ = table.upsert("macvm", "192.168.64.4", "aarch64-macos", "11:22:33:44:55:66", "0.13.0", "/bin/zsh", "", "guest", 2000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "", "guest", 1000);
+    _ = table.upsert("macvm", "192.168.64.4", "aarch64-macos", "11:22:33:44:55:66", "0.13.0", "/bin/zsh", "yes", "", "guest", 2000);
     try std.testing.expectEqual(@as(usize, 2), table.guests.items.len);
 
     table.remove("linuxvm");
@@ -1511,7 +1260,7 @@ test "GuestTable setMeshMac" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "", "guest", 1000);
     try std.testing.expect(table.guests.items[0].mesh_mac == null);
 
     const mac: [6]u8 = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
@@ -1527,11 +1276,30 @@ test "GuestTable findByHostname after update" {
     var table = GuestTable.init(allocator, testIo());
     defer table.deinit();
 
-    _ = table.upsert("winx64", "192.168.3.1", "x86_64-windows", "ff:ee:dd:cc:bb:aa", "0.13.0", "cmd.exe", "upgrading", "guest", 3000);
+    _ = table.upsert("winx64", "192.168.3.1", "x86_64-windows", "ff:ee:dd:cc:bb:aa", "0.13.0", "cmd.exe", "yes", "upgrading", "guest", 3000);
 
     const found = table.findByHostname("winx64").?;
     try std.testing.expectEqualStrings("cmd.exe", found.shell);
     try std.testing.expectEqualStrings("upgrading", found.status);
     try std.testing.expectEqualStrings("x86_64-windows", found.target);
     try std.testing.expectEqual(@as(i64, 3000), found.last_seen);
+}
+
+test "GuestTable updateIp" {
+    const allocator = std.testing.allocator;
+    var table = GuestTable.init(allocator, testIo());
+    defer table.deinit();
+
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "yes", "", "guest", 1000);
+
+    // updateIp: change IP
+    try std.testing.expect(table.updateIp("linuxvm", "192.168.64.99"));
+    const found = table.findByHostname("linuxvm").?;
+    try std.testing.expectEqualStrings("192.168.64.99", found.ip);
+
+    // updateIp: no change
+    try std.testing.expect(!table.updateIp("linuxvm", "192.168.64.99"));
+
+    // updateIp: nonexistent hostname
+    try std.testing.expect(!table.updateIp("noexist", "10.0.0.1"));
 }

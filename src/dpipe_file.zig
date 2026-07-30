@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const dpipe = @import("dpipe.zig");
+const svc = @import("svc.zig");
 
 // ── 只读文件管道 ──────────────────────────────────────────────
 
@@ -91,8 +92,8 @@ pub fn writeFile(
     dest_path: []const u8,
     expected_hash: []const u8,
 ) !dpipe.DuplexPipe {
-    // 在目标目录中创建临时文件
-    const dirname = std.fs.path.dirname(dest_path) orelse ".";
+    // 在系统临时目录中创建随机临时文件
+    const dirname = svc.tempDir();
     var rand_bytes: [8]u8 = undefined;
     io.random(&rand_bytes);
     var temp_hex: [16]u8 = undefined;
@@ -109,6 +110,7 @@ pub fn writeFile(
     const file = try std.Io.Dir.cwd().createFile(io, temp_path, .{});
     errdefer {
         file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, temp_path) catch {};
         allocator.free(temp_path);
     }
 
@@ -183,8 +185,40 @@ fn writeFileCloseFn(ctx: *anyopaque) void {
     std.Io.Dir.cwd().deleteFile(self.io, self.dest_path) catch {};
     const cwd = std.Io.Dir.cwd();
     cwd.rename(self.temp_path, cwd, self.dest_path, self.io) catch |e| {
-        std.log.err("[dpipe-file] rename failed: {} temp={s} dest={s}", .{ e, self.temp_path, self.dest_path });
+        if (e == error.CrossDevice) {
+            // 跨文件系统：先 copy 再删除 temp
+            if (copyAndDelete(self.io, self.temp_path, self.dest_path)) {
+                // copy+delete 成功，temp 已删除；目标已创建
+            } else |ce| {
+                std.log.err("[dpipe-file] cross-device copy failed: {} temp={s} dest={s}", .{ ce, self.temp_path, self.dest_path });
+                std.Io.Dir.cwd().deleteFile(self.io, self.temp_path) catch {};
+            }
+        } else {
+            std.log.err("[dpipe-file] rename failed: {} temp={s} dest={s}", .{ e, self.temp_path, self.dest_path });
+            std.Io.Dir.cwd().deleteFile(self.io, self.temp_path) catch {};
+        }
     };
+}
+
+/// 跨文件系统复制 + 删除源文件。
+fn copyAndDelete(io: std.Io, src: []const u8, dst: []const u8) !void {
+    const sf = try std.Io.Dir.cwd().openFile(io, src, .{ .mode = .read_only });
+    defer sf.close(io);
+    const df = try std.Io.Dir.cwd().createFile(io, dst, .{ .truncate = true });
+    defer df.close(io);
+
+    var rdbuf: [65536]u8 = undefined;
+    var wrbuf: [65536]u8 = undefined;
+    var r = sf.reader(io, &rdbuf);
+    var w = df.writer(io, &wrbuf);
+    while (true) {
+        const n = r.interface.readSliceShort(&rdbuf) catch return error.ReadFailed;
+        if (n == 0) break;
+        w.interface.writeAll(rdbuf[0..n]) catch return error.WriteFailed;
+    }
+    w.interface.flush() catch {};
+    df.sync(io) catch {};
+    std.Io.Dir.cwd().deleteFile(io, src) catch {};
 }
 
 const write_file_vtable = dpipe.VTable{
