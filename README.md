@@ -10,7 +10,7 @@ required at runtime. AI agents get the same capabilities through MCP stdio.
 
 ## MCP Integration
 
-`utmm --mcp` provides five tools over stdio JSON-RPC 2.0 for AI coding agents.
+`utmm --mcp` provides six tools over stdio JSON-RPC 2.0 for AI coding agents.
 
 | Tool | Description |
 |------|-------------|
@@ -19,11 +19,7 @@ required at runtime. AI agents get the same capabilities through MCP stdio.
 | `ping` | Ping a Guest over the mesh network and measure RTT |
 | `upload` | Upload file from Host to Guest (TCP/SOCKS4, SHA256 verified) |
 | `download` | Download file from Guest to Host (TCP/SOCKS4, SHA256 verified) |
-| `sshpass` | Non-interactive SSH password auth — direct shell access to any machine. Works on **Linux, macOS, and Windows** (ConPTY dynamic loading + pipe fallback). Bootstrap, recovery, and pre-install scenarios that MCP alone cannot cover. |
-
-The first five are MCP JSON-RPC tools (`utmm --mcp`). `sshpass` is a CLI command
-that runs alongside MCP (`utmm sshpass`), filling the gap when the Guest daemon is
-down or not yet installed.
+| `sshpass` | Non-interactive SSH password auth — direct shell access to any machine. Works on **Linux, macOS, and Windows** (ConPTY dynamic loading + pipe fallback). Bootstrap, recovery, and pre-install scenarios when the Guest daemon is down or not yet installed. |
 
 Example prompts your AI agent can handle:
 - "Check the status of all my machines"
@@ -42,8 +38,8 @@ See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
 - **sshpass built-in** — non-interactive SSH password auth, 100% CLI-compatible
   with the standalone `sshpass` tool. POSIX PTY + Windows ConPTY (dynamic load
   with pipe fallback on older Windows).
-- **MCP stdio** — AI agents control machines via `utmm --mcp`. Five tools:
-  `status`, `exec`, `ping`, `upload`, `download`. Auto-ensures Host on first use.
+- **MCP stdio** — AI agents control machines via `utmm --mcp`. Six tools:
+  `status`, `exec`, `ping`, `upload`, `download`, `sshpass`. Auto-ensures Host on first use.
 - **LSA mesh zero-config** — Guests auto-discover Host over the local network.
   No fixed IPs, no DNS. `/etc/hosts` kept in sync automatically.
 - **Self-copy install** — single `--install` handles stop→kill→copy→start.

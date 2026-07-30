@@ -139,42 +139,25 @@ newline-delimited. Log traffic goes to stderr, JSON-RPC to stdout.
 
 ### tools/list Response
 
-Returns 5 tools: `status`, `exec`, `ping`, `upload`, `download`. Each tool
-has `name`, `description`, and `inputSchema` (JSON Schema).
+Returns 6 tools: `status`, `exec`, `ping`, `upload`, `download`, `sshpass`.
+Each tool has `name`, `description`, and `inputSchema` (JSON Schema).
 
 ### sshpass: Direct SSH from AI Agents
 
-The 5 MCP tools handle Host↔Guest communication through the utmm mesh. For
-scenarios requiring direct SSH (initial VM setup, OpenSSH configuration, or
-running commands before utmm is installed), the **`utmm sshpass`** CLI command
-is the essential companion. It runs on the Host alongside the MCP server and is
-invoked directly from the shell — not through the MCP JSON-RPC channel.
+`sshpass` is a first-class MCP tool that spawns `utmm sshpass` as a child process
+— AI agents call it through the standard MCP JSON-RPC channel, just like any other
+tool. It is also available as a CLI command for shell-based automation.
 
-**Why sshpass matters for AI agents:**
+**Why sshpass matters:**
 
-- **Cross-platform SSH automation** — `utmm sshpass` works identically on Linux,
-  macOS, and Windows. On Windows, it dynamically loads ConPTY (Windows 10 1809+)
-  or falls back to pipe mode, giving Windows users the same password-based SSH
-  scripting capability that Unix users take for granted. No external sshpass
-  binary needed.
-- **VM lifecycle management** — MCP tools require utmm running on the Guest.
-  `utmm sshpass` can SSH into a VM before utmm is installed, during upgrades,
-  or when the Guest daemon is down — enabling bootstrap, recovery, and debugging
-  scenarios that MCP alone cannot cover.
-- **Compound operations** — AI agents can combine MCP tools (for normal
-  operations) with `utmm sshpass` (for edge cases) in the same session.
-
-**Typical AI agent usage (alongside MCP):**
-```bash
-# Bootstrap a VM before utmm is installed:
-utmm sshpass -p '111' ssh root@linuxvm 'apt-get update && apt-get install -y curl'
-
-# Debug when utmm Guest daemon is down:
-utmm sshpass -p '111' ssh Administrator@windowsvm 'sc.exe query UTM-MonitorD'
-
-# File operations outside /opt/utmm (download from a different path):
-utmm sshpass -p '111' ssh root@macvm 'cat /var/log/system.log' > /tmp/macvm_system.log
-```
+- **Cross-platform SSH automation** — works identically on Linux, macOS, and
+  Windows. On Windows, dynamically loads ConPTY (Windows 10 1809+) or falls back
+  to pipe mode. No external sshpass binary needed.
+- **Bootstrap and recovery** — SSH into a VM before utmm is installed, during
+  upgrades, or when the Guest daemon is down.
+- **Unified AI agent interface** — calling sshpass through MCP means AI agents
+  get structured request/response handling, error codes, and output capture —
+  no shell escape needed.
 
 See [sshpass Subcommand](#sshpass-subcommand) for the full CLI reference.
 
@@ -208,6 +191,12 @@ See [sshpass Subcommand](#sshpass-subcommand) for the full CLI reference.
 ```
 → {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"download","arguments":{"vm":"linuxvm","remote_path":"/var/log/app.log","local_path":"./app.log"}}}
 ← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"Download OK: ./app.log (4096 bytes)"}]}}
+```
+
+**sshpass** — direct SSH to any machine:
+```
+→ {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"sshpass","arguments":{"host":"linuxvm","user":"root","password":"111","command":"uname -a"}}}
+← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"**ssh root@linuxvm** `uname -a`\\nexit: 0\\n```\\nLinux linuxvm 6.1.0-... aarch64 GNU/Linux\\n```"}]}}
 ```
 
 ### Error Response Format

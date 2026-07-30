@@ -1,9 +1,10 @@
 //! MCP stdio server — AI agent interface via stdin/stdout JSON-RPC 2.0.
 //!
 //! The utmm --mcp command starts a stdio MCP server. Tool calls (status,
-//! exec, ping, upload, download) are translated to IPC commands
+//! exec, ping, upload, download, sshpass) are translated to IPC commands
 //! against the local Host service via /var/run/utmm.sock, benefiting from
-//! auto-ensure (Phase 52).
+//! auto-ensure (Phase 52). sshpass spawns utmm as a child process for
+//! direct SSH access to machines without utmm installed.
 //!
 //! Protocol: newline-delimited JSON, one JSON-RPC object per line.
 //! Logging goes to stderr; JSON-RPC traffic goes to stdout.
@@ -25,7 +26,7 @@ const MAX_REQUEST_SIZE = 65536;
 const SERVER_INFO = "{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"utmm\",\"version\":\"__VERSION__\"},\"capabilities\":{\"tools\":{}}}";
 
 /// MCP tool definitions (JSON). Single-line for MCP stdio transport.
-const TOOLS_JSON = "[{\"name\":\"status\",\"description\":\"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},{\"name\":\"exec\",\"description\":\"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check status first to see each VM's shell type, then write compatible commands.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)\"}},\"required\":[\"vm\",\"command\"]}},{\"name\":\"ping\",\"description\":\"Ping a Guest over the mesh network to test connectivity and measure RTT. Returns JSON with hostname, MAC address, and rtt_ms.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"}},\"required\":[\"vm\"]}},{\"name\":\"upload\",\"description\":\"Upload a file from the Host to a Guest VM. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"local_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Host filesystem\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Destination path on the Guest (e.g. /opt/utmm/file.txt). Defaults to /opt/utmm/<basename> (POSIX) or C:\\\\opt\\\\utmm\\\\<basename> (Windows) if omitted.\"}},\"required\":[\"vm\",\"local_path\"]}},{\"name\":\"download\",\"description\":\"Download a file from a Guest VM to the Host. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Guest (e.g. /opt/utmm/core.dump)\"},\"local_path\":{\"type\":\"string\",\"description\":\"Local path on the Host to save the file. Defaults to ./<basename> if omitted.\"}},\"required\":[\"vm\",\"remote_path\"]}}]";
+const TOOLS_JSON = "[{\"name\":\"status\",\"description\":\"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},{\"name\":\"exec\",\"description\":\"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check status first to see each VM's shell type, then write compatible commands.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)\"}},\"required\":[\"vm\",\"command\"]}},{\"name\":\"ping\",\"description\":\"Ping a Guest over the mesh network to test connectivity and measure RTT. Returns JSON with hostname, MAC address, and rtt_ms.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"}},\"required\":[\"vm\"]}},{\"name\":\"upload\",\"description\":\"Upload a file from the Host to a Guest VM. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"local_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Host filesystem\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Destination path on the Guest (e.g. /opt/utmm/file.txt). Defaults to /opt/utmm/<basename> (POSIX) or C:\\\\opt\\\\utmm\\\\<basename> (Windows) if omitted.\"}},\"required\":[\"vm\",\"local_path\"]}},{\"name\":\"download\",\"description\":\"Download a file from a Guest VM to the Host. The file is transferred through a TCP/SOCKS4 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Guest (e.g. /opt/utmm/core.dump)\"},\"local_path\":{\"type\":\"string\",\"description\":\"Local path on the Host to save the file. Defaults to ./<basename> if omitted.\"}},\"required\":[\"vm\",\"remote_path\"]}},{\"name\":\"sshpass\",\"description\":\"Execute a shell command on any machine via non-interactive SSH password authentication. Works on Linux, macOS, and Windows (ConPTY dynamic loading). Use this for direct SSH access to machines that may not have utmm installed — bootstrap, recovery, and pre-install scenarios. For machines already running utmm Guest daemon, prefer the exec tool for mesh-based command execution.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\",\"description\":\"Target hostname or IP address (e.g. 'linuxvm', '192.168.64.6')\"},\"user\":{\"type\":\"string\",\"description\":\"SSH username (e.g. 'root', 'Administrator')\"},\"password\":{\"type\":\"string\",\"description\":\"SSH password\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command to execute on the remote machine\"}},\"required\":[\"host\",\"user\",\"password\",\"command\"]}}]";
 
 /// MCP server entry point. Reads JSON-RPC from stdin, writes responses to stdout.
 pub fn run(io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
@@ -288,6 +289,35 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
             return jsonBuildResponse(gpa, id_val, result);
         }
 
+        if (std.mem.eql(u8, tool_name, "sshpass")) {
+            if (args == null) {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing arguments: host, user, password, command");
+            }
+            const host_raw = jsonGetString(args.?, "host") orelse {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing argument: host");
+            };
+            const user = jsonGetString(args.?, "user") orelse {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing argument: user");
+            };
+            const password = jsonGetString(args.?, "password") orelse {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing argument: password");
+            };
+            const command = jsonGetString(args.?, "command") orelse {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32602, "Missing argument: command");
+            };
+            const result = handleVmSshpass(gpa, io, host_raw, user, password, command) catch |err| {
+                if (is_notification) return gpa.dupe(u8, "");
+                return jsonBuildError(gpa, id_val, -32603, @errorName(err));
+            };
+            defer gpa.free(result);
+            return jsonBuildResponse(gpa, id_val, result);
+        }
+
         if (is_notification) return gpa.dupe(u8, "");
         return jsonBuildError(gpa, id_val, -32601, "Unknown tool");
     }
@@ -466,6 +496,70 @@ fn handleVmDownload(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u
     return std.fmt.allocPrint(gpa,
         "{{\"content\":[{{\"type\":\"text\",\"text\":\"Downloaded **{s}**:`{s}` → `{s}` ({d} bytes)\"}}]}}",
         .{ esc_vm, esc_remote, esc_local, total_bytes },
+    );
+}
+
+/// Handle sshpass via child process — spawns `utmm sshpass -p <pass> ssh <user>@<host> <command>`.
+fn handleVmSshpass(gpa: std.mem.Allocator, io: std.Io, host: []const u8, user: []const u8, password: []const u8, command: []const u8) ![]const u8 {
+    // Build destination string: user@host
+    const dest = try std.fmt.allocPrint(gpa, "{s}@{s}", .{ user, host });
+    defer gpa.free(dest);
+
+    // Get path to current executable
+    const exe_path = try std.process.executablePathAlloc(io, gpa);
+    defer gpa.free(exe_path);
+
+    // Build argv: utmm sshpass -p <password> ssh <dest> <command>
+    var argv = try std.ArrayList([]const u8).initCapacity(gpa, 0);
+    defer argv.deinit(gpa);
+    try argv.append(gpa, exe_path);
+    try argv.append(gpa, "sshpass");
+    try argv.append(gpa, "-p");
+    try argv.append(gpa, password);
+    try argv.append(gpa, "ssh");
+    try argv.append(gpa, dest);
+    // Split command into args on spaces (shell handles quoting on remote)
+    var cmd_iter = std.mem.splitScalar(u8, command, ' ');
+    while (cmd_iter.next()) |arg| {
+        if (arg.len > 0) try argv.append(gpa, arg);
+    }
+
+    // Spawn child process, collect output, wait
+    const result = try std.process.run(gpa, io, .{
+        .argv = argv.items,
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+
+    const exit_code: i32 = switch (result.term) {
+        .exited => |code| @as(i32, code),
+        .signal => |sig| @intCast(@intFromEnum(sig)),
+        .stopped => |sig| @intCast(@intFromEnum(sig)),
+        .unknown => -1,
+    };
+
+    // Build result
+    const esc_host = try jsonEscape(gpa, host);
+    defer gpa.free(esc_host);
+    const esc_user = try jsonEscape(gpa, user);
+    defer gpa.free(esc_user);
+    const esc_command = try jsonEscape(gpa, command);
+    defer gpa.free(esc_command);
+    const esc_stdout = try jsonEscape(gpa, result.stdout);
+    defer gpa.free(esc_stdout);
+
+    if (exit_code == 0) {
+        return std.fmt.allocPrint(gpa,
+            "{{\"content\":[{{\"type\":\"text\",\"text\":\"**ssh {s}@{s}** `{s}`\\nexit: {d}\\n```\\n{s}\\n```\"}}]}}",
+            .{ esc_user, esc_host, esc_command, exit_code, esc_stdout },
+        );
+    }
+
+    const esc_stderr = try jsonEscape(gpa, result.stderr);
+    defer gpa.free(esc_stderr);
+    return std.fmt.allocPrint(gpa,
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"**ssh {s}@{s}** `{s}`\\nexit: {d}\\n```\\n{s}\\n```\\nstderr:\\n```\\n{s}\\n```\"}}]}}",
+        .{ esc_user, esc_host, esc_command, exit_code, esc_stdout, esc_stderr },
     );
 }
 
@@ -765,7 +859,7 @@ test "processRequest: tools/list" {
     );
     defer alloc.free(result);
 
-    // Should contain all 5 tools
+    // Should contain all 6 tools
     try std.testing.expect(std.mem.indexOf(u8, result, "\"result\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"status\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"name\":\"exec\"") != null);
@@ -1082,12 +1176,13 @@ test "SERVER_INFO contains required fields" {
     try std.testing.expect(std.mem.indexOf(u8, SERVER_INFO, "capabilities") != null);
 }
 
-test "TOOLS_JSON lists all 5 tools" {
+test "TOOLS_JSON lists all 6 tools" {
     try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"status\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"exec\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"ping\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"upload\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"download\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TOOLS_JSON, "\"name\":\"sshpass\"") != null);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1254,10 +1349,10 @@ test "tools/list response: each tool has required MCP fields" {
     const result_val = root.get("result").?;
     const tools_arr = result_val.object.get("tools").?.array;
 
-    // Must have exactly 5 tools
-    try std.testing.expectEqual(@as(usize, 5), tools_arr.items.len);
+    // Must have exactly 6 tools
+    try std.testing.expectEqual(@as(usize, 6), tools_arr.items.len);
 
-    const expected_tools = [_][]const u8{ "status", "exec", "ping", "upload", "download" };
+    const expected_tools = [_][]const u8{ "status", "exec", "ping", "upload", "download", "sshpass" };
     for (expected_tools) |expected_name| {
         var found = false;
         for (tools_arr.items) |tool_val| {
