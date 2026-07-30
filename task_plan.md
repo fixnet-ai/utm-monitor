@@ -7,7 +7,7 @@
 - **分支**: `refac/layered-arch`
 - **源文件**: 17 src + 10 test（9 集成测试 flat file + 1 common）
 - **测试**: 146 唯一单元测试 + 41 集成测试场景，全部通过
-- **真机验证**: linuxvm + windowsvm + macvm + winx64 — 4 台全 v0.14.2 ✅
+- **真机验证**: linuxvm + windowsvm + macvm + winx64 — 4 台全 v0.14.3 ✅
 - **自动升级**: AUTO_UPGRADE=true ✅
 - **设计文档**: `refac.md`
 
@@ -297,6 +297,26 @@ src/
 | 97 | 版本号 bump: ver.txt 0.14.2 → 0.14.3 | ✅ |
 | 98 | 8 交叉编译目标构建 + 集成测试 41/41 通过 | ✅ |
 
+### Phase 14: v0.14.3 — linuxvm 重建 + 文档更新 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 99 | linuxvm 重建：UTM phantom VM 清理 + Ubuntu Desktop 24.04 重装 | ✅ |
+| 100 | linuxvm SSH 配置：PermitRootLogin + PasswordAuthentication | ✅ |
+| 101 | linuxvm 部署 v0.14.3 + exec/upload/download/ping 验证 | ✅ |
+| 102 | 临时 Lima VM `utmm-test` 创建 + socket_vmnet 桥接网络探索 | ✅ |
+| 103 | 发现 `detectUnixIp()` 多 NIC bug（eth0 先于 lima0）+ Lima VM 上修复验证 | ✅ |
+| 104 | 发现 `upsert()` 不检查 MAC 变化（cosmetic bug，host.zig:969-974）| ✅ |
+| 105 | CLAUDE.md + SKILL.md linuxvm IP 更新（192.168.64.2 → 192.168.64.6）| ✅ |
+| 106 | progress.md + task_plan.md 更新 | ✅ |
+
+**踩坑记录**:
+1. UTM bundle 可能因 QEMU 崩溃/磁盘空间不足从文件系统消失，UTM Registry 与磁盘不同步
+2. Lima `socket_vmnet` symlink 被拒绝 → 必须 cp 实际二进制
+3. `/etc/sudoers.d/lima` 权限 wheel → admin（dasimo 在 admin 组非 wheel）
+4. `detectUnixIp()` 返回第一个物理 NIC，多 NIC VM 可能返回不可达 IP
+5. Lima `lima:shared` 网络模式 = socket_vmnet + vmnet-shared，提供主机到 VM 直接 connectivity
+
 ## 关键决策记录（续 3）
 
 | # | 决策 | 理由 |
@@ -304,3 +324,5 @@ src/
 | 33 | 自动升级 Host 端 LSA 版本检测 + 推送 | Host 已每 5s 解析所有 Guest 版本，零额外开销。编译时常量 false 时死代码消除 |
 | 34 | Windows 进程杀死换用 Toolhelp + TerminateProcess API | `taskkill /F` 无法终止 SYSTEM 权限进程；原生 API 层面终止 |
 | 35 | `sc.exe stop` 不可靠 → 不杀 utmmd.exe | utmmd 应通过服务管理器停止；killAllUtmm 只杀 utmm.exe 是正确的设计 |
+| 36 | `detectUnixIp()` 多 NIC bug 已知暂不修复 | 返回第一个物理 NIC，多 NIC VM 可能返回不可达 IP（如 eth0 NAT 而非 lima0 vmnet）。当前所有生产 VM 均为单 NIC，不影响实际使用 |
+| 37 | `upsert()` 不检查 MAC 变化暂不修复 | host.zig:969-974 只检查 ip/target/version/shell/status/role，不检查 MAC。MAC 仅用于显示，路由使用 LSA node_id（含 MAC 后缀），功能正确 |

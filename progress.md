@@ -46,6 +46,41 @@ Windows upload 路径分隔符修复；SKILL 版本号批量更新；清理旧�
 - `zig build test-integration` 41/41 通过 ✅
 - 8 交叉编译目标全部通过 ✅
 
+### 2026-07-30 — linuxvm 重建与文档更新
+
+**背景**: linuxvm 的 `Linux.utm` bundle 从磁盘消失，UTM 显示 phantom "started" 状态但无实际进程。
+用户重装 Ubuntu Desktop 为新 VM，IP 从 192.168.64.2 变为 192.168.64.6。
+
+**linuxvm 重建**:
+- Phantom UTM Linux VM 从 UTM Registry 删除（Python plistlib 操作 `com.utmapp.UTM.plist`）
+- 用户通过 UTM GUI 安装 Ubuntu Desktop 24.04 (aarch64)，UUID `13BE0E67-8CA3-44A7-AE50-D0A65842FD2F`
+- SSH 配置：`PermitRootLogin yes` + `PasswordAuthentication yes`（`/etc/ssh/sshd_config.d/50-utmm.conf`）
+- root 密码 111，dasimo 用户 sudo 权限
+- 部署 utmm v0.14.3 并验证 exec/upload/download/ping 全部通过
+
+**临时 Lima VM 测试**:
+- 在等待用户重装期间，创建 Lima VM `utmm-test`（Ubuntu 26.04, aarch64, vz 驱动）
+- 探索 socket_vmnet 桥接网络配置，发现两个踩坑：
+  1. Lima 拒绝 symlink → 必须 `sudo cp` 实际二进制到 `/opt/socket_vmnet/bin/`
+  2. `/etc/sudoers.d/lima` 权限问题 → `chgrp admin`（dasimo 在 admin 组非 wheel）
+- 发现 `detectUnixIp()` 多 NIC bug：eth0 (NAT) 先于 lima0 (vmnet) 被发现，返回错误 IP
+  - 修复：`ip link set eth0 down` + netplan `dhcp4: false` for eth0
+  - utmmd 重启后 Guest 正确检测 lima0 IP (192.168.105.2) 和 MAC
+- 临时 VM 未删除（`limactl` 不在 PATH），待后续清理
+
+**观察到的代码问题**:
+- `upsert()` in host.zig (lines 969-974)：不检查 MAC 字段变化 — 仅 cosmetic，路由使用正确的 LSA node_id
+- LSA 注册延迟：Host 重启后需 10-20s Guest 才出现在 status 中（正常行为）
+
+**文档更新**:
+- CLAUDE.md：linuxvm IP 192.168.64.2 → 192.168.64.6
+- SKILL.md (clean-deploy)：5 处 linuxvm IP 更新
+
+**关键发现**:
+- UTM VM bundle 可能因 QEMU 崩溃或磁盘空间不足而从文件系统消失
+- UTM Registry 与文件系统不同步时会显示 phantom 状态
+- Lima `lima:shared` 网络模式（socket_vmnet + vmnet-shared）提供主机到 VM 直接 connectivity
+
 ### 2026-07-30 — v0.14.2 裸机部署验证
 
 **成果**: 完整的"清空—构建—部署—测试"裸机部署测试循环。5 台机器从零部署 v0.14.2，
