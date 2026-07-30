@@ -418,7 +418,7 @@ Update one file:
 
 `build.zig.zon` version is permanently `0.0.0` (never changes). Runtime version
 comes from `src/ver.txt` via `@embedFile` at compile time — single source of truth.
-Install scripts (`install.sh`/`install.bat`) also read `ver.txt` at runtime.
+`--install` is a single self-contained operation — no external scripts needed.
 
 ### Step 3: Commit & tag
 ```bash

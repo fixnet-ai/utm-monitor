@@ -124,10 +124,6 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&target_install.step);
     }
 
-    // Install scripts — copied to zig-out/bin for Host HTTP serving and distribution
-    b.installBinFile("install.sh", "install.sh");
-    b.installBinFile("install.bat", "install.bat");
-
     // Run command
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

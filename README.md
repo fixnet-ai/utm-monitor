@@ -105,13 +105,21 @@ utmm --ping linuxvm
 
 ## Install
 
+Download the latest `utmm.zip` from [GitHub Releases](https://github.com/fixnet-ai/utm-monitor/releases),
+unzip, and run `--install`:
+
 ```bash
-# One-shot install (downloads binary + installs as system service)
-curl -fsSL https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.sh | sudo bash
-# Windows (PowerShell as Administrator):
-# Invoke-WebRequest -Uri https://raw.githubusercontent.com/fixnet-ai/utm-monitor/main/install.bat -OutFile install.bat
-# .\install.bat
+# POSIX (Linux/macOS)
+unzip utmm.zip
+sudo ./utmm-<target>-<version> --install --hostname <name>
+
+# Windows (PowerShell as Administrator)
+Expand-Archive utmm.zip
+C:\opt\utmm\utmm-<target>-<version>.exe --install --hostname <name>
 ```
+
+Install is a single atomic operation: stop → kill → copy to canonical path →
+install system service → start. No shell scripts, no package managers.
 
 ## Build
 
