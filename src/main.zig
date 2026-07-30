@@ -17,6 +17,7 @@ const svc = @import("svc.zig");
 const fail = @import("fail.zig");
 const mcp = @import("mcp.zig");
 const shm = @import("shm.zig");
+const sshpass = @import("sshpass.zig");
 
 /// Embedded utmmd binary — compiled at build time, extracted at install time.
 /// Target-specific: embed/{arch}-{os}/utmmd.bin, selected at comptime via builtin.
@@ -71,6 +72,7 @@ comptime {
     _ = @import("tcp.zig");
     _ = @import("mcp.zig");
     _ = @import("host.zig");
+    _ = @import("sshpass.zig");
     _ = svc;
     _ = fail;
 }
@@ -135,12 +137,21 @@ pub const CliArgs = struct {
     download_target: ?[]const u8 = null,
     download_remote: ?[]const u8 = null,
     download_local: ?[]const u8 = null,
+
+    // sshpass subcommand
+    cmd_sshpass: bool = false,
 };
 
 /// Parse command-line arguments
 pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !CliArgs {
     var cli = CliArgs{};
     var i: usize = 1;
+
+    // sshpass 子命令检测（必须在其他选项之前，因为 sshpass 有自己的参数解析）
+    if (args.len > 1 and std.mem.eql(u8, args[1], "sshpass")) {
+        cli.cmd_sshpass = true;
+        return cli;
+    }
 
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -308,7 +319,10 @@ pub fn printHelp() void {
         \\  --gen-init PLATFORM Generate auto-start script (linux/macos/windows)
         \\  --version           Show version info
         \\
+        \\  sshpass [OPTS] CMD   Non-interactive SSH password authentication
+        \\
         \\NOTE: All operations require root/Administrator privileges.
+        \\  sshpass does not require root privileges.
         \\  POSIX: sudo utmm ...
         \\  Windows: Run as Administrator
         \\
@@ -337,7 +351,12 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // ── 3. Admin privilege check — required for everything below ──
+    // ── 3. sshpass: non-interactive SSH authentication (no admin needed) ──
+    if (cli.cmd_sshpass) {
+        sshpass.main(allocator, args);
+    }
+
+    // ── 4. Admin privilege check — required for everything below ──
     if (!isAdmin()) {
         if (builtin.os.tag == .windows) {
             std.debug.print(
@@ -355,7 +374,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    // ── 4. --svc: spawned by utmmd supervisor ──
+    // ── 5. --svc: spawned by utmmd supervisor ──
     // utmmd creates shared memory before spawning us. Open it and register
     // our PID so utmmd can monitor our heartbeat.
     if (cli.is_svc) {
@@ -392,7 +411,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // ── 5. --install: force install service ──
+    // ── 6. --install: force install service ──
     // Extract utmmd (the supervisor daemon) to canonical path, then
     // force-install it as the system service. utmmd manages utmm's lifecycle.
     if (cli.cmd_install) {
@@ -408,13 +427,13 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // ── 6. --uninstall: remove service ──
+    // ── 7. --uninstall: remove service ──
     if (cli.cmd_uninstall) {
         try svc.uninstall(init.io, init.gpa);
         return;
     }
 
-    // ── 7. Ensure Host service for --host and management commands ──
+    // ── 8. Ensure Host service for --host and management commands ──
     // --status, --exec, --upload, --download all need the Host daemon (IPC socket).
     // Auto-start it if not running so users and AI agents can go directly
     // from "utmm --exec vm cmd" without a separate "utmm --host" step.
@@ -459,20 +478,20 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // ── 8. Management commands ──
+    // ── 9. Management commands ──
     if (cli.cmd_status or cli.cmd_exec or cli.cmd_ping or cli.cmd_upload or cli.cmd_download or cli.cmd_gen_init or cli.cmd_deploy or cli.cmd_upgrade) {
         cli.is_host = false; // reset: Host ensured above, run() just dispatches commands
         try host_mod.run(init, cli);
         return;
     }
 
-    // ── 9. --mcp: stdio MCP server (Host service already ensured above) ──
+    // ── 10. --mcp: stdio MCP server (Host service already ensured above) ──
     if (cli.is_mcp) {
         try mcp.run(init.io, init.gpa, cli.port);
         return;
     }
 
-    // ── 10. Default: ensure Guest service is running ──
+    // ── 11. Default: ensure Guest service is running ──
     {
         const was_running = svc.isRunning(init.io, init.gpa, .guest);
         var extra_args_guest = try buildServiceArgs(init.gpa, cli, .guest);

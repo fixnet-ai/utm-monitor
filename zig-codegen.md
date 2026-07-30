@@ -819,6 +819,67 @@ fn hexHash(hash: [32]u8, hex_buf: *[64]u8) []const u8 {
 - 适用于 GB 级文件 — 内存占用与文件大小无关
 - 此 API 来自 `std.crypto.hash.sha2.Sha256`（Zig 0.16）
 
+## Zig 0.16.0 API 适配记录（v0.14.7 sshpass 集成）
+
+### extern "c" fn open() 必须传 3 个参数
+
+Zig 中的 `extern "c" fn open()` 声明要求所有 3 个参数（path, flags, mode），
+即使 `O_CREAT` 未设置也必须传 mode=0：
+
+```zig
+// ❌ 错误：缺少 mode 参数
+const fd = open("/dev/tty", O_RDWR);
+
+// ✅ 正确：显式传 mode=0
+const fd = open("/dev/tty", O_RDWR, 0);
+```
+
+### allocSentinel 需要 3 个参数
+
+Zig 0.16.0 的 `allocSentinel(T, n, sentinel)` 相比旧版增加了 sentinel 参数：
+
+```zig
+// ❌ 旧 API（2 参数）
+const arr = allocator.allocSentinel(?[*:0]const u8, cmd_args.len);
+
+// ✅ 新 API（3 参数）
+const arr = allocator.allocSentinel(?[*:0]const u8, cmd_args.len, null);
+```
+
+### @enumFromInt 对 exhaustive enum 不可用 → 加 _ 变 non-exhaustive
+
+当枚举需要容纳任意底层类型值（如子进程退出码）时，exhaustive enum 的
+`@enumFromInt` 在编译期拒绝未定义的 tag 值。添加 `_` 变为 non-exhaustive：
+
+```zig
+// ❌ 编译错误：value 255 not in enum
+pub const ExitCode = enum(u8) { no_error = 0, ... };
+return @enumFromInt(@as(u8, 255));
+
+// ✅ non-exhaustive enum 可容纳任意 u8 值
+pub const ExitCode = enum(u8) { no_error = 0, ..., _ };
+return @enumFromInt(@as(u8, 255)); // OK
+```
+
+### zig build test 的 --listen=- 协议可能卡住
+
+`zig build test` 通过 `b.addRunArtifact()` 运行测试时，测试进程使用
+`--listen=-` stdio 协议与构建系统通信。某些情况下此协议会卡住
+（构建系统等待测试进程关闭 pipe，但测试进程已结束）。
+
+**解决方案**：分步运行测试
+1. 直接运行缓存的测试二进制：`.zig-cache/o/<hash>/test`
+2. 或使用 `zig test <file>.zig` 逐个模块运行
+3. 用 shell 手动超时检测（macOS 无 `timeout` 命令，可用 `&` + `sleep` + `kill -0`）
+
+### open() 调用处的 allocLowerString 崩溃
+
+`--install` 后若二进制未正确替换（MD5 不匹配），可能是：
+- `forceInstall` 的 copy 步骤失败但未报错
+- 新进程在旧进程完全退出前就替换了二进制
+
+**解决**：手动 `cp zig-out/bin/utmm /opt/utmm/utmm` 确保二进制一致性。
+
 ### KCP 协议实现：序列号回绕比较
 
 C 参考实现使用 `ITimediff(sn, una)` 宏进行 u32 序列号带绕回比较。
@@ -895,3 +956,92 @@ const ts = self.acklist.items[i][1];
 - 二维索引 `items[i][0]` 直接访问，无需中间结构体
 - ArrayList 仍可做 append/clearRetainingCapacity 等操作
 - 此模式比创建 struct 更轻量（无需定义新类型）
+
+## Windows 交叉编译修复 (v0.14.7)
+
+### std.os.windows API 移除
+
+Zig 0.16.0 移除了 `std.os.windows` 中的多个 API 声明，需要手动 `@extern` 导入：
+
+| 已移除 | 替代方案 |
+|--------|---------|
+| `std.os.windows.WriteFile` | `@extern` 声明 `kernel32.WriteFile` |
+| `std.os.windows.GetStdHandle` | `@extern` 声明 `kernel32.GetStdHandle` |
+| `std.os.windows.HRESULT` | 直接定义 `const HRESULT = i32` |
+
+```zig
+// ✅ Zig 0.16.0 正确做法
+const WriteFile = @extern(
+    *const fn (hFile: HANDLE, lpBuffer: [*]const u8, nNumberOfBytesToWrite: DWORD,
+               lpNumberOfBytesWritten: *DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) BOOL,
+    .{ .name = "WriteFile", .library_name = "kernel32" },
+);
+const GetStdHandle = @extern(
+    *const fn (nStdHandle: DWORD) callconv(.winapi) ?HANDLE,
+    .{ .name = "GetStdHandle", .library_name = "kernel32" },
+);
+```
+
+### Windows fd_t 类型差异
+
+`std.posix.fd_t` 在 POSIX 是 `i32`，在 Windows 是 `*anyopaque`（HANDLE）。
+跨平台代码不能直接对 `fd_t` 使用 `parseInt`，需要平台分派：
+
+```zig
+// ❌ WRONG — 在 Windows 上 parseIparseInt(*anyopaque) 编译失败
+const fd_num = std.fmt.parseInt(std.posix.fd_t, argv[i], 10) catch ...;
+
+// ✅ 正确 — 平台分派
+const fd_num = if (builtin.os.tag == .windows)
+    @as(std.posix.fd_t, @ptrFromInt(std.fmt.parseInt(std.os.windows.DWORD, argv[i], 10) catch ...))
+else std.fmt.parseInt(std.posix.fd_t, argv[i], 10) catch ...;
+```
+
+### struct 默认值不能使用零指针
+
+Windows 上 `std.posix.fd_t` 是 `*anyopaque`，`@ptrFromInt(0)` 编译报错
+"pointer type '*anyopaque' does not allow address zero"。
+默认值使用 `undefined` 并在使用前确保已被赋值：
+
+```zig
+// ❌ Windows 编译错
+pwsrc: PwSource = .{ .fd = 0 },
+
+// ✅ 跨平台
+pwsrc: PwSource = .{ .fd = undefined },
+```
+
+### DeleteProcThreadAttribute 不存在于 kernel32
+
+`DeleteProcThreadAttribute` 是 Windows SDK 的 inline 函数，不被 kernel32.dll 导出。
+应使用 `DeleteProcThreadAttributeList`：
+
+```zig
+// ❌ 链接错误: undefined symbol: DeleteProcThreadAttribute
+const DeleteProcThreadAttribute = @extern(..., .{ .name = "DeleteProcThreadAttribute", ... });
+
+// ✅ 正确
+const DeleteProcThreadAttributeList = @extern(
+    ..., .{ .name = "DeleteProcThreadAttributeList", .library_name = "kernel32" },
+);
+```
+
+### ArrayList 初始化与 append
+
+Zig 0.16.0 中 `ArrayList.append()` 和 `appendSlice()` 需要 Allocator 参数，
+初始化使用 `.empty`（不是 `.init(allocator)`）：
+
+```zig
+// ✅ Zig 0.16.0 正确用法
+var buf: std.ArrayList(u8) = .empty;
+defer buf.deinit(allocator);
+try buf.append(allocator, 'x');
+try buf.appendSlice(allocator, "hello");
+```
+
+### 跨编译目标编译注意事项
+
+- 原生编译（如 macOS）不会检查 Windows 代码路径的类型错误
+- develepment build 成功了不代表所有目标都能编译
+- 在 CI 中应包含 `zig build -Dtarget=aarch64-windows` 等交叉编译检查
+- `comptime if (builtin.os.tag == ...)` 虽会消除死代码分支，但函数签名和类型定义仍会被检查

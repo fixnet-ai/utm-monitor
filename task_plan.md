@@ -2,16 +2,17 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.14.6 — /etc/hosts 同步统一 + hostname 规范化
+**最新版本**: v0.14.7 — sshpass 集成 + MCP 工具名去前缀
 
 - **分支**: `refac/layered-arch`
-- **源文件**: 17 src + 11 test（10 集成测试 flat file + 1 common）
-- **测试**: 161 唯一单元测试 + 59 集成测试场景，全部通过
+- **源文件**: 18 src + 11 test（含新增 sshpass.zig）
+- **测试**: 208 单元测试全部通过 + 59 集成测试场景（待验证）
 
-## 当前阶段: Phase 19 — /etc/hosts 同步统一 + hostname 规范化 ✅
+## 当前阶段: Phase 21 — sshpass 集成 + MCP 工具名去前缀 + 真机部署 ✅
 
-**目标**: 合并两套 hosts 同步实现到 `lsa.zig`，统一 hostname 为全小写（无 FQDN 后缀），Host/Guest 均增加 gateway 条目。
-- **ARP 恢复**: connectGuest 自动 ARP 重发现 + 10 集成测试覆盖 ✅
+**目标**: 消除外部 sshpass 依赖，集成到 utmm 作为子命令；移除 MCP 工具 vm_ 前缀。
+- **单元测试**: 208 测试全部通过 ✅
+- **集成测试**: 待验证
 
 ## 架构概述
 
@@ -514,7 +515,99 @@ Guest 端（linuxvm，IP 192.168.64.6，Host IP 192.168.64.1）:
 - Windows `COMPUTERNAME` 全大写（如 `DESKTOP-ABC123`）→ 小写后 LSA 广播新 hostname，Host 端 `GuestTable.upsert()` 检测大小写不匹配 → 创建新条目而非更新旧条目，旧条目需手动 `GuestTable.remove()` 或等过期清理
 - `deriveNodeId()` hash 变更（peer-mesh 模式，非生产路径）
 
-### Phase 20: v0.14.6 真机部署验证 🚧
+### Phase 21: v0.14.7 — sshpass 集成 + MCP 工具名去前缀 + 真机部署 ✅
+
+**背景**: 消除外部 `sshpass` 依赖，集成到 utmm 作为 `sshpass` 子命令。100% CLI 兼容，POSIX (PTY) + Windows (ConPTY) 双平台。原 C 源码 505 行逐行移植。同时移除 MCP 工具名 `vm_` 前缀。
+
+**涉及模块**:
+
+```
+src/sshpass.zig (NEW, ~1200 行)
+├── ExitCode 枚举（7 个退出码，与 C 版完全一致）
+├── PwType/PwSource 类型（4 种密码源）
+├── patternMatch() — 逐字符状态机（同 C 版算法）
+├── parseArgs() — 模拟 getopt("+f:d:p:heV")，100% CLI 兼容
+├── writePassFd()/writePassPosix()/writePassWindows()
+├── handleoutputPosix()/handleoutputWindows() — 提示匹配 + 密码注入
+├── runPosix() — posix_openpt→fork→setsid→execvp→pselect→prompt matching
+├── runWindows() — CreatePseudoConsole (ConPTY)→CreateProcessW→ReadFile/WriteFile loop
+├── 内联测试：7 个 patternMatch + 8 个 parseArgs + 32 个 protocol（共 47 测试）
+└── pub fn main(gpa, args) noreturn — 模块入口
+
+src/mcp.zig
+├── 移除所有 MCP 工具名的 vm_ 前缀：vm_status→status, vm_exec→exec, etc.
+└── 54 测试适配（TOOLS_JSON 校验、方法名比较、期望数组）
+
+src/main.zig
+├── 新增 sshpass import + cmd_sshpass 字段 + comptime 注册 + help text
+├── parseArgs 早期检测 "sshpass" 子命令
+└── main() sshpass 分发（在管理员权限检查之前，sshpass 无需 root）
+
+CLAUDE.md / README.md / task_plan.md
+└── MCP 工具名更新 + sshpass 架构说明
+```
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 155 | 新建 `src/sshpass.zig` 核心模块 | `src/sshpass.zig` | ✅ ~1200 行，POSIX + Windows 完整实现 |
+| 156 | zig test 编译验证 + 修复 Zig 0.16.0 API 适配 | `src/sshpass.zig` | ✅ 47/47 测试通过，0 泄漏，0 错误 |
+| 157 | 集成 sshpass 到 main.zig | `src/main.zig` | ✅ CliArgs + parseArgs + main dispatch + comptime + help |
+| 158 | MCP 工具名移除 vm_ 前缀 | `src/mcp.zig` | ✅ 5 个工具名 + 所有比较路径 + 54 测试 |
+| 159 | 更新文档 | CLAUDE.md / README.md / task_plan.md | ✅ MCP 工具名表 + sshpass 架构说明 |
+| 160 | zig build test 全部通过 | - | ✅ 208 测试全部通过（分步运行） |
+| 161 | zig build test-integration 全部通过 | - | ✅ 59/59 通过，0 泄漏 |
+| 162 | 8 交叉编译目标构建 | - | ✅ 8/8 通过 |
+| 163 | 真机部署验证（Host + 4 VM）| - | ✅ 全部通过 |
+| 164 | 版本号 bump 0.14.6 → 0.14.7 | `src/ver.txt` | ✅ 已完成 |
+
+**Zig 0.16.0 API 适配记录**:
+| 问题 | 旧 API | 新 API |
+|------|--------|--------|
+| stdout/stderr | `std.io.getStdErr().writeAll()` | `std.c.write(fd, ...)` (POSIX) / `WriteFile` (Windows) |
+| getenv | `std.posix.getenv()` | `std.c.getenv()` |
+| sleep (Windows) | `std.Io.sleep(std.Io.default_io, ...)` | `kernel32.Sleep(ms)` |
+| c_int/c_ulong | 重定义为 fd_t/usize（阴影原语）| 使用 Zig 内置 c_int/c_ulong |
+| @bitCast/@intCast | 无已知结果类型 | 添加显式 @as |
+| std.c.getenv 返回值 | `?[*:0]u8` | 需 `std.mem.sliceTo` 转换为 slice |
+
+**设计决策**:
+| # | 决策 | 理由 |
+|---|------|------|
+| 42 | sshpass 密码不 dupe（引用 argv），隐藏密码移到 main() | 避免 `parseArgs` 错误路径内存泄漏；`main()` 中 argv 在进程生命周期内有效 |
+| 43 | sshpass 无需 root 权限 | 原版 sshpass 不需要；AI agent 无法 sudo 交互式提权 |
+| 44 | POSIX + Windows 一起做 | 用户要求；ConPTY API 在 Windows 10 1809+ 可用 |
+| 45 | sshpass.main() 需 args[2..] 而非 args[1..] | Zig `init.minimal.args.toSlice()` 返回完整 args（含 argv[0]）；"sshpass" 是 args[1]，参数和命令从 args[2] 开始 |
+
+### Phase 21-b: v0.14.7 args[2..] Bug 修复 + Windows 交叉编译 ✅
+
+**Bug**: sshpass.main() 使用 `args[1..]` 只跳过了二进制路径（args[0]），未跳过 "sshpass"
+子命令名（args[1]）。导致 `parseArgs` 将 "sshpass" 当作命令，`runPosix()` 执行 `execvp("sshpass", ...)`
+时找到系统外部 sshpass 二进制（Host 上 `/opt/homebrew/bin/sshpass`），嵌入实现从未被调用。
+
+**修复**: `const actual_args = args[1..]` → `const actual_args = args[2..]`
+
+**Windows 交叉编译修复**（6 个预存 Zig 0.16.0 API 问题）:
+1. `std.os.windows.WriteFile` → `@extern("kernel32", "WriteFile")`
+2. `std.os.windows.GetStdHandle` → `@extern("kernel32", "GetStdHandle")`
+3. `std.os.windows.HRESULT` → `const HRESULT = i32`
+4. `std.fmt.parseInt(std.posix.fd_t, ...)` Windows 失败 → 平台分派
+5. `ArrayList.append(x)` → `ArrayList.append(allocator, x)`
+6. `DeleteProcThreadAttribute` → `DeleteProcThreadAttributeList`
+
+**验证**:
+- 8/8 交叉编译目标通过 ✅（含 aarch64/x86_64-windows 首次成功）
+- Host/linuxvm/macvm sshpass 功能验证 ✅
+- windowsvm 升级成功，runtime 待进一步测试
+
+| # | 任务 | 文件 | 状态 |
+|---|------|------|------|
+| 165 | 修复 sshpass.main() args[2..] | `src/sshpass.zig` | ✅ |
+| 166 | 修复 Windows 交叉编译 | `src/sshpass.zig` | ✅ 6 处修正 |
+| 167 | 更新 zig-codegen.md | `zig-codegen.md` | ✅ 新增 6 条经验记录 |
+| 168 | 更新 progress.md | `progress.md` | ✅ |
+| 169 | 更新 task_plan.md | `task_plan.md` | ✅ |
+
+### Phase 20: v0.14.6 真机部署验证 ✅
 
 | # | 任务 | 说明 |
 |---|------|------|

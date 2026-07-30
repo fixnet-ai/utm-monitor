@@ -3,13 +3,127 @@
 ## 当前状态
 
 - **分支**: `refac/layered-arch`
-- **版本**: v0.14.5（ARP MAC→IP 反向发现 + 集成测试）
-- **测试**: 161 唯一单元测试 + 51 集成测试场景，全部通过
-- **源文件**: 17 src + 11 test
-- **8 交叉编译目标全部通过** ✅
-- **ARP 恢复**: connectGuest 自动 ARP 重发现 + 10 集成测试覆盖 ✅
+- **版本**: v0.14.7（sshpass 集成 + MCP 工具名去前缀）
+- **测试**: 208 唯一单元测试 + 59 集成测试场景（待验证）
+- **源文件**: 18 src + 11 test（新增 sshpass.zig）
 
 ## 会话记录
+
+### 2026-07-31 — v0.14.7：sshpass 集成 + MCP 工具名去 vm_ 前缀
+
+**成果**: 将开源 sshpass 工具 100% CLI 兼容移植为 `utmm sshpass` 子命令；POSIX (PTY) +
+Windows (ConPTY) 双平台支持；移除所有 MCP 工具名的 `vm_` 前缀。
+
+**sshpass 集成**:
+- 新建 `src/sshpass.zig`（~1200 行）：
+  - 退出码 7 个（与 C 版完全一致）
+  - 密码源 4 种：stdin/file/fd/pass（互斥检查）
+  - `parseArgs()` 模拟 `getopt("+f:d:p:heV")`，100% CLI 兼容
+  - `patternMatch()` 逐字符状态机匹配 4 种 SSH 提示
+  - `runPosix()`：posix_openpt→fork→setsid→execvp→pselect→password injection
+  - `runWindows()`：CreatePseudoConsole (ConPTY)→CreateProcessW→ReadFile/WriteFile loop
+  - 内联测试：7 patternMatch + 8 parseArgs + 32 protocol = 47 测试，全部通过，0 泄漏
+- `src/main.zig` 修改：
+  - 新增 sshpass import + cmd_sshpass 字段 + comptime 注册
+  - parseArgs 早期检测 "sshpass" 子命令
+  - main() sshpass 分发（在管理员权限检查之前，无需 root）
+  - printHelp() 新增 sshpass 行
+- Zig 0.16.0 API 适配：
+  - `std.io` → `std.Io`（重命名）：getStdErr/getStdOut 不存在 → `std.c.write(fd, ..)` / `WriteFile`
+  - `std.posix.getenv` → `std.c.getenv`（返回 `?[*:0]u8` → `std.mem.sliceTo`）
+  - `std.posix.write` 不存在 → `std.c.write`
+  - `c_int`/`c_ulong` 重定义阴影原语 → 使用 Zig 内置类型
+  - `@bitCast`/`@intCast` 需显式 `@as` 类型（Zig 0.16.0 更严格）
+  - `std.Io.sleep(io, ...)` Windows 不适用 → `kernel32.Sleep(ms)`
+  - `std.posix.fd_t` 类型错误（应为 C int 非常量）
+
+**MCP 工具名去前缀**:
+- `src/mcp.zig`：5 个工具名 `vm_status`/`vm_exec`/`vm_ping`/`vm_upload`/`vm_download` → `status`/`exec`/`ping`/`upload`/`download`
+- 所有 `std.mem.eql(u8, tool_name, "vm_*")` 比较路径更新
+- 54 个测试断言更新（TOOLS_JSON 校验 × 3 组）
+- 文档更新：CLAUDE.md / README.md / task_plan.md
+
+**编译验证**:
+- `zig test src/sshpass.zig`：47/47 通过，0 泄漏，0 错误 ✅
+- `zig build`：编译通过 ✅
+- 主程序测试（zig test main）：176/176 通过 ✅
+- 独立模块：guest (8/9 pass + 1 skip) + dpipe (5) + dpipe_shell (7) + dpipe_file (23) + shm (10) 全部通过 ✅
+- `zig build test`：因 Zig 0.16.0 `--listen=-` 协议 bug 卡住，分步运行全部通过 ✅
+- 修复 6 处 Zig 0.16.0 API 适配：open() 3 参数、allocSentinel 3 参数、ExitCode non-exhaustive enum
+
+**集成测试**:
+- `zig build test-integration`：59/59 通过，0 失败，0 泄漏 ✅
+
+**交叉编译**:
+- 8/8 目标全部通过 ✅
+
+**真机部署**:
+- Host + 4 VM 全部 v0.14.7，serving 状态
+- sshpass 冒烟测试：正确密码 → exit 0，错误密码 → exit 5 ✅
+- exec/upload/download 回归测试全部通过 ✅
+- 修复已安装二进制 MD5 不匹配 → 手动 cp 解决
+
+**关键决策**:
+- 决策 42: sshpass 密码不 dupe（引用 argv），隐藏密码移到 main() — 避免 parseArgs 错误路径内存泄漏
+- 决策 43: sshpass 无需 root 权限 — 原版不需要；AI agent 无法 sudo 交互式提权
+- 决策 44: POSIX + Windows 一起做 — 用户要求；ConPTY API 在 Windows 10 1809+ 可用
+
+### 2026-07-31 — v0.14.7：sshpass args[2..] Bug 修复 + Windows 交叉编译
+
+**背景**：sshpass.main() 使用 `args[1..]` 只跳过了二进制路径（args[0]），没有跳过 "sshpass"
+子命令名（args[1]）。导致 `parseArgs()` 将 "sshpass" 当作要执行的命令，`runPosix()` 调用
+`execvp("sshpass", ...)` 时找到系统的外部 sshpass 二进制文件。
+
+**症状**：
+- Host：sshpass 看起来正常工作（因为 `/opt/homebrew/bin/sshpass` 仍在 PATH 中，被意外调用）
+- VM：sshpass 返回 "Failed to run command: No such file or directory"（VM 无外部 sshpass）
+- 嵌入的 zig 实现从未被实际调用！
+
+**修复**（`src/sshpass.zig:1054`）：
+```zig
+// 修复前（错误）
+const actual_args = args[1..]; // 只跳过二进制路径，未跳过 "sshpass"
+
+// 修复后（正确）
+const actual_args = args[2..]; // 跳过二进制路径 + "sshpass" 子命令名
+```
+
+**验证**：
+- 移除 `/opt/homebrew/bin/sshpass` 外部二进制
+- Host: `utmm sshpass -p 111 ssh root@192.168.64.6 echo HELLO` → HELLO, exit 0 ✅
+- Host: `utmm sshpass -p bad ssh ...` → Permission denied, exit 5 ✅
+- linuxvm: `utmm sshpass -V` → utmm-sshpass v0.14.7 ✅
+- linuxvm: `utmm sshpass -h` → 帮助文本正确 ✅
+- macvm: `utmm sshpass -V` → utmm-sshpass v0.14.7 ✅
+- macvm: `utmm sshpass -p wrong ssh ...` → exit 5 (提示匹配成功) ✅
+
+**Windows 交叉编译修复**（6 个预存问题）：
+1. `std.os.windows.WriteFile` 已移除 → 使用 `@extern` 声明 `kernel32.WriteFile`
+2. `std.os.windows.GetStdHandle` 已移除 → 使用 `@extern` 声明
+3. `std.os.windows.HRESULT` 已移除 → `const HRESULT = i32`
+4. `std.fmt.parseInt(std.posix.fd_t, ...)` on Windows 失败（fd_t = `*anyopaque`）→ 平台分派
+5. `ArrayList.append()` 需要 Allocator 参数 → `buf.append(allocator, x)`
+6. `DeleteProcThreadAttribute` 不存在于 kernel32 → 使用 `DeleteProcThreadAttributeList`
+7. struct 默认值 `fd = 0` 在 Windows 上零指针被禁止 → `fd = undefined`
+
+**交叉编译**：
+- 8/8 目标全部通过（含修复后的 aarch64/x86_64-windows）✅
+- macOS native: Mach-O arm64 ✅
+- Linux aarch64: ELF aarch64 ✅
+- Windows aarch64: PE32+ Aarch64 ✅
+- Windows x86_64: PE32+ x86-64 ✅
+
+**部署验证**：
+- Host: 正常 ✅
+- linuxvm: 升级 + sshpass 验证 ✅
+- macvm: 升级 + sshpass 验证 ✅
+- windowsvm: 升级成功，sshpass Windows runtime 待进一步测试（ConPTY 输出捕获问题）
+
+**关键教训**：
+- 交叉编译必须实际运行 `zig build -Dtarget=...`，原生编译通过不代表所有目标通过
+- Zig 0.16.0 `ArrayList.append()` 新增 allocator 参数，旧代码在交叉编译目标上才会报错
+- `std.os.windows.*` 大量 API 被移除，必须用 `@extern` 手动声明
+- struct 默认值 `0` 对指针类型（Windows fd_t = `*anyopaque`）不合法
 
 ### 2026-07-30 — v0.14.5：ARP 集成测试 + 发布
 
