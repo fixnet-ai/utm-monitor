@@ -7,16 +7,6 @@
 - **测试**: 208 唯一单元测试 + 59 集成测试场景（待验证）
 - **源文件**: 18 src + 11 test（新增 sshpass.zig）
 
-## 2026-07-31: zig skill + zig-codegen.md 软链接统一 ✅
-
-### 变更
-- `.claude/skills/zig/`：独立目录（含 SKILL.md + references/）→ 软链接 → zigfoundation 权威源
-- `zig-codegen.md`：独立文件（1047 行）→ 软链接 → zigfoundation/zig-codegen.md
-- zigfoundation zig skill SKILL.md 末尾新增「编码前必读：zig-codegen.md」章节
-
-### 原因
-统一 fixnet 生态的 Zig 编码知识源，避免各项目独立维护导致内容分叉。
-
 ## 会话记录
 
 ### 2026-07-31 — v0.14.7：sshpass 集成 + MCP 工具名去 vm_ 前缀
