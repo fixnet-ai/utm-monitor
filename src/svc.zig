@@ -215,6 +215,18 @@ const w32 = struct {
         }
         return i == target.len and name[i] == 0;
     }
+
+    /// Case-insensitive match against "utmmd.exe" in UTF-16LE.
+    fn isUtmmdExe(name: [*]const u16) bool {
+        const target = [_]u16{ 'u', 't', 'm', 'm', 'd', '.', 'e', 'x', 'e' };
+        var i: usize = 0;
+        while (name[i] != 0 and i < target.len) : (i += 1) {
+            const c = name[i];
+            const lower: u16 = if (c >= 'A' and c <= 'Z') c + ('a' - 'A') else c;
+            if (lower != target[i]) return false;
+        }
+        return i == target.len and name[i] == 0;
+    }
 };
 
 const protocol = @import("protocol.zig");
@@ -897,9 +909,50 @@ pub fn stop(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) !void {
         .windows => {
             if (!runCmd(alloc, io, &[_][]const u8{ "sc", "stop", name })) {
                 std.log.warn("[svc] stop {s}: sc stop returned non-zero (may not be running)", .{name});
+                // sc.exe stop can fail if the service was already deleted.
+                // Fall back to terminating utmmd.exe directly via Toolhelp API.
+                killUtmmd();
             }
         },
         else => {},
+    }
+}
+
+/// Kill utmmd.exe on Windows using Toolhelp + TerminateProcess.
+/// Public so that extractUtmmd in main.zig can call it when rename
+/// fails with AccessDenied (old utmmd.exe locks the file).
+pub fn killUtmmd() void {
+    if (builtin.os.tag != .windows) return;
+
+    const snap = w32.CreateToolhelp32Snapshot(w32.TH32CS_SNAPPROCESS, 0);
+    if (snap == std.os.windows.INVALID_HANDLE_VALUE) {
+        std.log.err("[svc] killUtmmd: CreateToolhelp32Snapshot failed", .{});
+        return;
+    }
+    defer _ = w32.CloseHandle(snap);
+
+    var pe = std.mem.zeroInit(w32.PROCESSENTRY32W, .{});
+    pe.dwSize = @intCast(@sizeOf(w32.PROCESSENTRY32W));
+
+    if (@intFromEnum(w32.Process32FirstW(snap, &pe)) == 0) return;
+
+    var killed: usize = 0;
+    while (true) {
+        if (w32.isUtmmdExe(&pe.szExeFile)) {
+            std.log.info("[svc] killUtmmd: killing PID {d}", .{pe.th32ProcessID});
+            const h = w32.OpenProcess(w32.PROCESS_TERMINATE, .FALSE, pe.th32ProcessID) orelse {
+                std.log.warn("[svc] killUtmmd: OpenProcess(PID {d}) failed", .{pe.th32ProcessID});
+                if (@intFromEnum(w32.Process32NextW(snap, &pe)) == 0) break;
+                continue;
+            };
+            _ = w32.TerminateProcess(h, 1);
+            _ = w32.CloseHandle(h);
+            killed += 1;
+        }
+        if (@intFromEnum(w32.Process32NextW(snap, &pe)) == 0) break;
+    }
+    if (killed > 0) {
+        std.log.info("[svc] killUtmmd: killed {d} utmmd process(es)", .{killed});
     }
 }
 

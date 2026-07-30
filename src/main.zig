@@ -542,6 +542,14 @@ fn extractUtmmd(io: std.Io, alloc: std.mem.Allocator) !void {
         };
     }
 
+    // On Windows, if utmmd.exe is running (e.g. old service not cleanly stopped),
+    // the rename below fails with AccessDenied. Kill utmmd first via Toolhelp API.
+    if (builtin.os.tag == .windows) {
+        svc.killUtmmd();
+        // Brief sleep so the OS releases the file lock.
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+    }
+
     // Atomic rename tmp → dest
     std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), dest, io) catch |err| {
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
@@ -564,6 +572,15 @@ fn extractUtmmd(io: std.Io, alloc: std.mem.Allocator) !void {
                 }
             }
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        } else if (builtin.os.tag == .windows and err == error.AccessDenied) {
+            // Retry once after killing utmmd — file may still be locked briefly
+            std.log.warn("[main] extractUtmmd rename AccessDenied after killUtmmd, retrying...", .{});
+            svc.killUtmmd();
+            std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {};
+            std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), dest, io) catch |err2| {
+                std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+                fail.err("extractUtmmd/rename-retry", err2);
+            };
         } else {
             fail.err("extractUtmmd/rename", err);
         }
