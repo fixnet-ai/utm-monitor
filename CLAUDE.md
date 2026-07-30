@@ -34,6 +34,10 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
   socket — no TCP or HTTP on any port. MCP uses stdio — see `mcp.json.example`.
 - **8 cross-compilation targets**: aarch64/x86_64/x86 × linux-musl/macos/windows.
 - **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
+- **Connectivity Fabric**: `/etc/hosts` sync (LSA-driven, all system tools auto-resolve
+  Guest hostnames) + SOCKS4a proxy (`--socks-proxy PORT`, Host as universal gateway
+  for VM mesh + LAN + internet). These turn utmm from a CLI tool into a general
+  connectivity infrastructure.
 
 Current configuration — four VM targets tracked:
 | VM | Hostname | OS | IP | Credentials | App Path |
@@ -54,6 +58,10 @@ Current configuration — four VM targets tracked:
 │  host.zig            Host daemon: LSA + IPC + command dispatch    │
 │  ipc.zig             IPC socket server (CLI/MCP entry)            │
 │  mcp.zig             MCP stdio JSON-RPC                           │
+├──────────────────────────────────────────────────────────────────┤
+│  Connectivity Fabric Layer                                        │
+│  socks_proxy.zig     SOCKS4a proxy listener (Host→any target)     │
+│  /etc/hosts sync     LSA-driven hostname→IP (all system tools)    │
 ├──────────────────────────────────────────────────────────────────┤
 │  Topology Layer                                                   │
 │  lsa.zig             LSA broadcast + node table + /etc/hosts      │
@@ -325,6 +333,12 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
 - **LSA version broadcast**: Host broadcasts version in LSA every 2s for informational
   purposes. Guest no longer takes autonomous action on version mismatch.
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
+- **Connectivity Fabric** (v0.15.0) — `/etc/hosts` sync (LSA-driven hostname→IP mapping,
+  all system tools auto-resolve Guest hostnames) + SOCKS4a proxy (`--socks-proxy PORT`,
+  `socks_proxy.zig` new module, Host as universal gateway for VM mesh + LAN + internet).
+  Resolution priority: GuestTable → `/etc/hosts` → DNS. Proxy binds 127.0.0.1 only.
+  Thread model: +1 proxy listener thread spawned by `startHost()`, per-connection
+  detached handler threads. Clean shutdown via atomic flag + join.
 
 ## Build & Run
 
@@ -462,7 +476,7 @@ After release, use `utmm --deploy` to compile and copy new binaries to the
 serve-dir (`/opt/utmm/`). Then use `utmm --upgrade <vm>` to push upgrades
 to individual Guest VMs via the Host-initiated push model.
 
-## Project File Structure (17 src files + 10 test files)
+## Project File Structure (18 src files + 10 test files)
 
 ```
 src/
@@ -472,6 +486,7 @@ src/
 ├── config.zig         Config persistence + file logger
 ├── lsa.zig            LSA broadcast + node table + /etc/hosts sync (self-contained)
 ├── tcp.zig            Frame protocol + SOCKS4 + connection management
+├── socks_proxy.zig    SOCKS4a proxy listener (Host→any target)
 ├── dpipe.zig          DuplexPipe interface + relay engine
 ├── dpipe_shell.zig    pty ↔ DuplexPipe (posix_openpt/CreatePipe)
 ├── dpipe_file.zig     file ↔ DuplexPipe + SHA256 verification

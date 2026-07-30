@@ -48,6 +48,77 @@ See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
   memory: heartbeat, crash recovery (exponential backoff), binary upgrade coordination.
 - **8 cross-compilation targets** — aarch64/x86_64/x86 × linux-musl/macos/windows.
   Zero runtime dependencies.
+- **Connectivity Fabric** — `/etc/hosts` sync + SOCKS4a proxy turn the Host into a
+  universal gateway. All system tools (ssh, scp, curl, browser, IDE) automatically
+  resolve Guest hostnames and reach any target — VM mesh, LAN, internet — through
+  the Host proxy.
+
+## Connectivity Fabric
+
+utmm 在底层创建了一个通用互联层，让**你所有的工具**都能无缝访问整个网络：
+
+```
+你的工具（ssh, curl, scp, 浏览器, IDE...）
+│
+├─ 名字解析：/etc/hosts（LSA 自动同步）
+│   linuxvm → 192.168.64.6
+│   macvm   → 192.168.65.4
+│
+└─ 连通：SOCKS4a 代理（localhost:1080）
+    ├─ VM 网格（linuxvm, macvm, windowsvm）
+    ├─ 局域网（internal-server.local）
+    └─ 互联网（example.com）
+```
+
+### /etc/hosts 同步
+
+Host 守护进程在 LSA 状态变化时自动将 Guest hostname→IP 映射写入 `/etc/hosts`。
+Guest 端也有 30 秒周期同步。标记块（`# UTM-MONITOR-BEGIN` / `# UTM-MONITOR-END`）
+原子替换，不影响文件中其他内容。
+
+**效果**：所有系统工具（ssh、scp、curl、ping、浏览器、IDE）都能直接用 hostname
+访问 VM，无需手动配置 DNS 或记住 IP。
+
+```bash
+# /etc/hosts 中的条目（Host 自动维护）：
+# === UTM-MONITOR-BEGIN (auto-managed by utmm) ===
+192.168.64.6	linuxvm.target.utm linuxvm
+192.168.65.4	macvm.target.utm macvm
+192.168.64.3	windowsvm.target.utm windowsvm
+# === UTM-MONITOR-END ===
+
+# 然后你可以：
+ssh root@linuxvm           # 直接用 hostname
+curl http://macvm:8080     # 无需知道 IP
+```
+
+### SOCKS4a 代理
+
+`utmm --host --socks-proxy 1080` 启动 SOCKS4a 代理，将 Host 变成通用网络网关。
+外部工具配置代理后，可通过 Host 到达任何目标。
+
+**主机名解析优先级**：GuestTable（mesh VM 实时 IP）→ `/etc/hosts` → 系统 DNS
+
+```bash
+# 启动 Host 并开启 SOCKS4a 代理
+sudo utmm --host --socks-proxy 1080
+
+# 通过代理访问 VM（hostname 自动解析为 Guest IP）
+curl --socks4a localhost:1080 http://linuxvm:8080/metrics
+
+# 通过代理访问局域网机器
+curl --socks4a localhost:1080 http://db-server.local:5432
+
+# 通过代理访问互联网
+curl --socks4a localhost:1080 https://example.com
+
+# SSH 通过代理（~/.ssh/config）：
+# Host *.target.utm
+#     ProxyCommand nc -X 4 -x localhost:1080 %h %p
+ssh root@linuxvm.target.utm
+```
+
+**安全性**：代理仅绑定 127.0.0.1，不可从网络访问。
 
 ## Architecture
 
