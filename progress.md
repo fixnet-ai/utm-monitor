@@ -46,6 +46,28 @@ Windows upload 路径分隔符修复；SKILL 版本号批量更新；清理旧�
 - `zig build test-integration` 41/41 通过 ✅
 - 8 交叉编译目标全部通过 ✅
 
+### 2026-07-30 — v0.14.3 Bug 修复：detectUnixIp + upsert MAC
+
+**成果**: 修复两个已知 bug：多 NIC VM IP 检测偏好 + GuestTable MAC 变更检测。
+
+**detectUnixIp() 多 NIC 偏好修复**:
+- 根因：`detectUnixIp()` 返回 getifaddrs 枚举的第一个物理 NIC。多 NIC VM（如 Lima `utmm-test`）上 eth0 (NAT, 192.168.5.15) 先于 lima0 (vmnet bridged, 192.168.105.2) 被发现，导致 LSA 广播不可达 IP
+- 修复：新增 `isLikelyVmNat()` 辅助函数，检查已知 VM NAT 范围（10.0.2.0/24 = QEMU/VirtualBox，192.168.122.0/24 = libvirt）。`detectUnixIp()` 改为优先返回非 NAT 地址，无可用时回退到第一个物理 NIC
+- 影响：多 NIC VM 现在自动选择更可能可达的 IP。当前 4 台生产 VM 均为单 NIC，行为无变化
+
+**upsert() MAC 变更检测修复**:
+- 根因：`host.zig:969-974` 检查 ip/target/version/shell/status/role 共 6 个字段变更，遗漏 MAC。VM 重装后 MAC 可能变化，但 status 显示旧 MAC（仅 cosmetic，路由使用正确的 LSA node_id）
+- 修复：新增 `existing.mac` 比对和更新，与其余 6 个字段保持一致模式
+- 影响：VM 重装后 `--status` 正确显示新 MAC
+
+**新增测试**:
+- `isLikelyVmNat - QEMU/VirtualBox default`：验证 10.0.2.x 匹配
+- `isLikelyVmNat - libvirt default`：验证 192.168.122.x 匹配
+- `isLikelyVmNat - non-NAT addresses`：验证正常 IP 不匹配
+- `GuestTable upsert detects MAC change`：验证 MAC 变更可检测并更新
+
+**验证**: `zig build test` + `zig build test-integration` 全部通过（41/41，0 泄漏）
+
 ### 2026-07-30 — v0.14.3 Clean Deploy 全量验证
 
 **成果**: 完整的"清空—构建—部署—测试"裸机部署循环，4 台 VM 全 v0.14.3，

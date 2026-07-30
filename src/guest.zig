@@ -302,14 +302,27 @@ fn getMacAddress(io: std.Io, allocator: std.mem.Allocator, iface_name: []const u
     return allocator.dupe(u8, "00:00:00:00:00:00");
 }
 
-/// One-stop system info collection: hostname + IP + MAC + target
-/// Enumerate physical NICs via getifaddrs(), return the first valid IPv4 address.
-/// Returns null if no suitable interface found (getifaddrs failure, no IPv4 on
-/// any physical NIC, or all addresses are 0.0.0.0 / loopback).
+/// Check if an IPv4 address is in a known VM NAT range (QEMU/VirtualBox default).
+/// These addresses are typically unreachable from the Host on multi-NIC VMs.
+fn isLikelyVmNat(bytes: [4]u8) bool {
+    // 10.0.2.0/24 — QEMU user-mode networking / VirtualBox NAT default
+    if (bytes[0] == 10 and bytes[1] == 0 and bytes[2] == 2) return true;
+    // 192.168.122.0/24 — libvirt default NAT
+    if (bytes[0] == 192 and bytes[1] == 168 and bytes[2] == 122) return true;
+    return false;
+}
+
+/// One-stop system info collection: hostname + IP + MAC + target.
+/// Enumerate physical NICs via getifaddrs(), prefer non-NAT addresses
+/// (skip known VM NAT ranges like 10.0.2.x, 192.168.122.x).
+/// Returns the first non-NAT physical IPv4, or the first physical IPv4 if all
+/// are in NAT ranges. Returns null if no suitable interface found.
 fn detectUnixIp(allocator: std.mem.Allocator) !?struct { ip: []const u8, iface_name: []const u8 } {
     var ifap: ?*ifaddrs = undefined;
     if (getifaddrs(&ifap) != 0) return null;
     defer freeifaddrs(ifap);
+
+    var fallback: ?struct { ip: []const u8, iface_name: []const u8 } = null;
 
     var current: ?*ifaddrs = ifap;
     while (current) |ifa| : (current = ifa.ifa_next) {
@@ -330,8 +343,18 @@ fn detectUnixIp(allocator: std.mem.Allocator) !?struct { ip: []const u8, iface_n
         const ip = try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
         const iface_name = try allocator.dupe(u8, name);
         std.debug.print("[guest] Physical NIC {s}: {s}\n", .{ name, ip });
-        return .{ .ip = ip, .iface_name = iface_name };
+
+        // Return immediately if this is a non-NAT address (preferred)
+        if (!isLikelyVmNat(bytes)) {
+            return .{ .ip = ip, .iface_name = iface_name };
+        }
+        // Otherwise save as fallback and keep scanning for a better interface
+        if (fallback == null) {
+            fallback = .{ .ip = ip, .iface_name = iface_name };
+        }
     }
+    // All physical NICs are in VM NAT ranges — return the first one as fallback
+    if (fallback) |fb| return fb;
     return null;
 }
 
@@ -614,6 +637,26 @@ test "isPhysicalInterface - virtual interfaces excluded" {
 test "isPhysicalInterface - loopback excluded" {
     try std.testing.expect(!isPhysicalInterface("lo0"));
     try std.testing.expect(!isPhysicalInterface("lo"));
+}
+
+test "isLikelyVmNat - QEMU/VirtualBox default" {
+    try std.testing.expect(isLikelyVmNat(.{ 10, 0, 2, 15 }));
+    // IPs on 10.0.2.0/24 should match
+    try std.testing.expect(isLikelyVmNat(.{ 10, 0, 2, 1 }));
+    try std.testing.expect(isLikelyVmNat(.{ 10, 0, 2, 254 }));
+}
+
+test "isLikelyVmNat - libvirt default" {
+    try std.testing.expect(isLikelyVmNat(.{ 192, 168, 122, 1 }));
+    try std.testing.expect(isLikelyVmNat(.{ 192, 168, 122, 100 }));
+}
+
+test "isLikelyVmNat - non-NAT addresses" {
+    try std.testing.expect(!isLikelyVmNat(.{ 192, 168, 64, 6 }));
+    try std.testing.expect(!isLikelyVmNat(.{ 192, 168, 105, 2 }));
+    try std.testing.expect(!isLikelyVmNat(.{ 192, 168, 5, 15 }));
+    try std.testing.expect(!isLikelyVmNat(.{ 172, 16, 0, 1 }));
+    try std.testing.expect(!isLikelyVmNat(.{ 10, 1, 0, 1 }));
 }
 
 test "zigTarget - valid format" {

@@ -972,6 +972,7 @@ pub const GuestTable = struct {
             if (!std.mem.eql(u8, existing.shell, shell)) changed = true;
             if (!std.mem.eql(u8, existing.status, status)) changed = true;
             if (!std.mem.eql(u8, existing.role, role)) changed = true;
+            if (!std.mem.eql(u8, existing.mac, mac)) changed = true;
 
             if (!std.mem.eql(u8, existing.ip, ip)) {
                 self.allocator.free(existing.ip);
@@ -996,6 +997,10 @@ pub const GuestTable = struct {
             if (!std.mem.eql(u8, existing.role, role)) {
                 if (existing.role.len > 0) self.allocator.free(existing.role);
                 existing.role = self.allocator.dupe(u8, role) catch existing.role;
+            }
+            if (!std.mem.eql(u8, existing.mac, mac)) {
+                self.allocator.free(existing.mac);
+                existing.mac = self.allocator.dupe(u8, mac) catch existing.mac;
             }
             existing.last_seen = last_seen;
             return changed;
@@ -1159,6 +1164,22 @@ test "GuestTable upsert updates existing guest" {
     try std.testing.expectEqualStrings("/bin/zsh", found.shell);
     try std.testing.expectEqualStrings("serving", found.status);
     try std.testing.expectEqual(@as(i64, 2000), found.last_seen);
+}
+
+test "GuestTable upsert detects MAC change" {
+    const allocator = std.testing.allocator;
+    var table = GuestTable.init(allocator, testIo());
+    defer table.deinit();
+
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
+    // Change only the MAC address — should be detected
+    const changed = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "11:22:33:44:55:66", "0.13.0", "/bin/bash", "", "guest", 2000);
+
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
+
+    const found = table.findByHostname("linuxvm").?;
+    try std.testing.expectEqualStrings("11:22:33:44:55:66", found.mac);
 }
 
 test "GuestTable upsert no-change returns false" {

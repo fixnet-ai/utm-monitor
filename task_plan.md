@@ -310,6 +310,21 @@ src/
 | 105 | CLAUDE.md + SKILL.md linuxvm IP 更新（192.168.64.2 → 192.168.64.6）| ✅ |
 | 106 | progress.md + task_plan.md 更新 | ✅ |
 
+### Phase 15: v0.14.3 — Bug 修复 ✅
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 107 | 修复 `detectUnixIp()` 多 NIC 偏好：新增 `isLikelyVmNat()` 跳过 VM NAT 范围 | ✅ |
+| 108 | 修复 `upsert()` MAC 检测：新增 MAC 字段比对和更新 | ✅ |
+| 109 | 新增 `isLikelyVmNat` 单元测试（3 组：QEMU/libvirt/Normal）| ✅ |
+| 110 | 新增 `GuestTable upsert detects MAC change` 单元测试 | ✅ |
+| 111 | 推送 5 个本地 commit 到 remote | ✅ |
+| 112 | 临时 Lima VM `utmm-test` 清理确认（无残留）| ✅ |
+
+**修复详情**:
+1. `detectUnixIp()` (guest.zig:305-350)：从"返回第一个物理 NIC"改为"收集候选 → 优先返回非 NAT → 回退到第一个"。新增 `isLikelyVmNat()` 检查 10.0.2.0/24（QEMU/VirtualBox 默认 NAT）和 192.168.122.0/24（libvirt 默认 NAT）
+2. `upsert()` (host.zig:951-1012)：新增 `existing.mac` 比对（第 975 行）和更新逻辑（第 1002-1005 行），与 ip/target/version/shell/status/role 保持一致模式
+
 **踩坑记录**:
 1. UTM bundle 可能因 QEMU 崩溃/磁盘空间不足从文件系统消失，UTM Registry 与磁盘不同步
 2. Lima `socket_vmnet` symlink 被拒绝 → 必须 cp 实际二进制
@@ -324,5 +339,5 @@ src/
 | 33 | 自动升级 Host 端 LSA 版本检测 + 推送 | Host 已每 5s 解析所有 Guest 版本，零额外开销。编译时常量 false 时死代码消除 |
 | 34 | Windows 进程杀死换用 Toolhelp + TerminateProcess API | `taskkill /F` 无法终止 SYSTEM 权限进程；原生 API 层面终止 |
 | 35 | `sc.exe stop` 不可靠 → 不杀 utmmd.exe | utmmd 应通过服务管理器停止；killAllUtmm 只杀 utmm.exe 是正确的设计 |
-| 36 | `detectUnixIp()` 多 NIC bug 已知暂不修复 | 返回第一个物理 NIC，多 NIC VM 可能返回不可达 IP（如 eth0 NAT 而非 lima0 vmnet）。当前所有生产 VM 均为单 NIC，不影响实际使用 |
-| 37 | `upsert()` 不检查 MAC 变化暂不修复 | host.zig:969-974 只检查 ip/target/version/shell/status/role，不检查 MAC。MAC 仅用于显示，路由使用 LSA node_id（含 MAC 后缀），功能正确 |
+| 36 | `detectUnixIp()` 跳过 VM NAT 地址 | 新增 `isLikelyVmNat()` 检查 10.0.2.x (QEMU/VirtualBox) 和 192.168.122.x (libvirt)。多 NIC VM 优先选择非 NAT 接口，回退到第一个物理 NIC |
+| 37 | `upsert()` 检测 MAC 地址变化 | 新增 MAC 字段比对和更新逻辑。VM 重装后 MAC 变更可在 status 中正确显示 |
