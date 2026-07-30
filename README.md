@@ -8,6 +8,33 @@ Single Zig binary, dual mode (Guest agent + Host controller). Check processes,
 read logs, transfer files on any machine — Linux, macOS, Windows. No SSH daemon
 required at runtime. AI agents get the same capabilities through MCP stdio.
 
+## MCP Integration
+
+`utmm --mcp` provides five tools over stdio JSON-RPC 2.0 for AI coding agents.
+
+| Tool | Description |
+|------|-------------|
+| `status` | List all nodes: hostname, role, IP, OS/arch, MAC, version, status, shell, ConPTY |
+| `exec` | Execute a shell command on any Guest via per-command pty |
+| `ping` | Ping a Guest over the mesh network and measure RTT |
+| `upload` | Upload file from Host to Guest (TCP/SOCKS4, SHA256 verified) |
+| `download` | Download file from Guest to Host (TCP/SOCKS4, SHA256 verified) |
+
+**Beyond MCP**: When the Guest daemon is down or not yet installed (bootstrap,
+recovery, pre-install setup), the built-in `utmm sshpass` fills the gap. It works
+on **Linux, macOS, and Windows** — ConPTY dynamic loading gives Windows the same
+SSH scripting power as Unix. AI agents use it directly from the shell alongside
+MCP tools, not through the JSON-RPC channel.
+
+Example prompts your AI agent can handle:
+- "Check the status of all my machines"
+- "linuxvm is slow — check CPU, memory, and disk IO"
+- "Upload the new build to all Guests and restart the service"
+- "Download the core dump from linuxvm and analyze the crash"
+
+See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
+(message format, request/response examples).
+
 ## Core Capabilities
 
 - **Streaming exec** — per-command pty shell on any Guest. Real-time output,
@@ -75,32 +102,6 @@ utmm --ping linuxvm
 > Windows < 10.0.17763 lacks the ConPTY API — sshpass falls back to pipe mode.
 > POSIX always reports `conpty:yes`. This is critical for MCP SSH operations.
 
-## MCP Integration
-
-`utmm --mcp` provides five tools over stdio JSON-RPC 2.0 for AI coding agents.
-
-| Tool | Description |
-|------|-------------|
-| `status` | List all nodes: hostname, role, IP, OS/arch, MAC, version, status, shell, ConPTY |
-| `exec` | Execute a shell command on any Guest via per-command pty |
-| `ping` | Ping a Guest over the mesh network and measure RTT |
-| `upload` | Upload file from Host to Guest (TCP/SOCKS4, SHA256 verified) |
-| `download` | Download file from Guest to Host (TCP/SOCKS4, SHA256 verified) |
-
-**Beyond MCP**: When the Guest daemon is down or not yet installed (bootstrap,
-recovery, pre-install setup), the built-in `utmm sshpass` fills the gap. It works
-on **Linux, macOS, and Windows** — ConPTY dynamic loading gives Windows the same
-SSH scripting power as Unix. AI agents use it directly from the shell alongside
-MCP tools, not through the JSON-RPC channel.
-
-Example prompts your AI agent can handle:
-- "Check the status of all my machines"
-- "linuxvm is slow — check CPU, memory, and disk IO"
-- "Upload the new build to all Guests and restart the service"
-- "Download the core dump from linuxvm and analyze the crash"
-
-See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
-(message format, request/response examples).
 
 ## Install
 
