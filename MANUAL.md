@@ -107,7 +107,7 @@ Password sources are mutually exclusive — conflicting sources return exit code
 
 **Examples**:
 ```bash
-utmm sshpass -p '123456' ssh root@192.168.1.1 'ls -la'
+utmm sshpass -p '111' ssh root@linuxvm 'ls -la'
 utmm sshpass -f ~/.ssh/pass ssh user@server 'uptime'
 utmm sshpass -e ssh admin@host 'cat /proc/cpuinfo'
 ```
@@ -141,12 +141,48 @@ newline-delimited. Log traffic goes to stderr, JSON-RPC to stdout.
 Returns 5 tools: `status`, `exec`, `ping`, `upload`, `download`. Each tool
 has `name`, `description`, and `inputSchema` (JSON Schema).
 
+### sshpass: Direct SSH from AI Agents
+
+The 5 MCP tools handle Host↔Guest communication through the utmm mesh. For
+scenarios requiring direct SSH (initial VM setup, OpenSSH configuration, or
+running commands before utmm is installed), the **`utmm sshpass`** CLI command
+is the essential companion. It runs on the Host alongside the MCP server and is
+invoked directly from the shell — not through the MCP JSON-RPC channel.
+
+**Why sshpass matters for AI agents:**
+
+- **Cross-platform SSH automation** — `utmm sshpass` works identically on Linux,
+  macOS, and Windows. On Windows, it dynamically loads ConPTY (Windows 10 1809+)
+  or falls back to pipe mode, giving Windows users the same password-based SSH
+  scripting capability that Unix users take for granted. No external sshpass
+  binary needed.
+- **VM lifecycle management** — MCP tools require utmm running on the Guest.
+  `utmm sshpass` can SSH into a VM before utmm is installed, during upgrades,
+  or when the Guest daemon is down — enabling bootstrap, recovery, and debugging
+  scenarios that MCP alone cannot cover.
+- **Compound operations** — AI agents can combine MCP tools (for normal
+  operations) with `utmm sshpass` (for edge cases) in the same session.
+
+**Typical AI agent usage (alongside MCP):**
+```bash
+# Bootstrap a VM before utmm is installed:
+utmm sshpass -p '111' ssh root@linuxvm 'apt-get update && apt-get install -y curl'
+
+# Debug when utmm Guest daemon is down:
+utmm sshpass -p '111' ssh Administrator@windowsvm 'sc.exe query UTM-MonitorD'
+
+# File operations outside /opt/utmm (download from a different path):
+utmm sshpass -p '111' ssh root@macvm 'cat /var/log/system.log' > /tmp/macvm_system.log
+```
+
+See [sshpass Subcommand](#sshpass-subcommand) for the full CLI reference.
+
 ### tools/call Examples
 
 **status** — list all nodes:
 ```
 → {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}
-← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"**UTM Virtual Machines:**\n- **linuxvm** (guest) — aarch64-linux-musl | IP: 192.168.64.2 | MAC: 16:a0:6c:... | v0.14.7 | shell: /bin/bash | status: serving\n..."}]}}
+← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"**UTM Virtual Machines:**\n- **linuxvm** (guest) — aarch64-linux-musl | IP: 192.168.64.6 | MAC: 16:a0:6c:... | v0.14.7 | shell: /bin/bash | status: serving\n..."}]}}
 ```
 
 **exec** — execute a command:
@@ -333,8 +369,8 @@ sudo utmm --status    # verify
 
 ```bash
 V=$(cat src/ver.txt)
-scp zig-out/bin/utmm-aarch64-linux-$V root@192.168.64.2:/opt/utmm/utmm-new
-ssh root@192.168.64.2 '/opt/utmm/utmm-new --install --hostname linuxvm'
+scp zig-out/bin/utmm-aarch64-linux-$V root@linuxvm:/opt/utmm/utmm-new
+ssh root@linuxvm '/opt/utmm/utmm-new --install --hostname linuxvm'
 ```
 
 ### macOS Guest
@@ -342,9 +378,9 @@ ssh root@192.168.64.2 '/opt/utmm/utmm-new --install --hostname linuxvm'
 ```bash
 V=$(cat src/ver.txt)
 # If launchctl throttles: kill processes first, then cp + --install
-ssh root@192.168.65.4 'killall -9 utmm utmmd 2>/dev/null; sleep 1'
-scp zig-out/bin/utmm-aarch64-macos-$V root@192.168.65.4:/opt/utmm/utmm-new
-ssh root@192.168.65.4 'cp /opt/utmm/utmm-new /opt/utmm/utmm && /opt/utmm/utmm --install --hostname macvm'
+ssh root@macvm 'killall -9 utmm utmmd 2>/dev/null; sleep 1'
+scp zig-out/bin/utmm-aarch64-macos-$V root@macvm:/opt/utmm/utmm-new
+ssh root@macvm 'cp /opt/utmm/utmm-new /opt/utmm/utmm && /opt/utmm/utmm --install --hostname macvm'
 ```
 
 ### Windows Guest
@@ -352,9 +388,9 @@ ssh root@192.168.65.4 'cp /opt/utmm/utmm-new /opt/utmm/utmm && /opt/utmm/utmm --
 ```bash
 V=$(cat src/ver.txt)
 # Must kill utmmd before install (AccessDenied if utmmd locks the exe)
-ssh Administrator@192.168.64.3 'taskkill /F /IM utmmd.exe 2>nul'
-scp zig-out/bin/utmm-aarch64-windows-$V.exe Administrator@192.168.64.3:C:/opt/utmm/utmm-new.exe
-ssh Administrator@192.168.64.3 'C:\opt\utmm\utmm-new.exe --install --hostname windowsvm'
+ssh Administrator@windowsvm 'taskkill /F /IM utmmd.exe 2>nul'
+scp zig-out/bin/utmm-aarch64-windows-$V.exe Administrator@windowsvm:C:/opt/utmm/utmm-new.exe
+ssh Administrator@windowsvm 'C:\opt\utmm\utmm-new.exe --install --hostname windowsvm'
 ```
 
 ### Upgrade via Host Push Model

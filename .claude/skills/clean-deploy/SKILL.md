@@ -49,7 +49,7 @@ sudo rm -f /var/run/utmm.sock /var/run/utmm-install.lock
 ### macvm (macOS Guest)
 
 ```bash
-./zig-out/bin/utmm sshpass -p 111 ssh root@192.168.65.4 '
+./zig-out/bin/utmm sshpass -p 111 ssh root@macvm '
 launchctl enable system/com.utmmd 2>/dev/null
 launchctl bootout system/com.utmmd 2>/dev/null || true
 launchctl bootout system/com.utmm.guest 2>/dev/null || true
@@ -67,7 +67,7 @@ echo "macvm cleaned"
 ### linuxvm (Linux Guest)
 
 ```bash
-./zig-out/bin/utmm sshpass -p 111 ssh root@192.168.64.6 '
+./zig-out/bin/utmm sshpass -p 111 ssh root@linuxvm '
 systemctl stop utmmd 2>/dev/null || true
 systemctl stop utmm-guest 2>/dev/null || true
 systemctl disable utmmd 2>/dev/null || true
@@ -88,7 +88,7 @@ echo "linuxvm cleaned"
 
 ```bash
 # windowsvm
-./zig-out/bin/utmm sshpass -p 111 ssh Administrator@192.168.64.3 'powershell -Command "
+./zig-out/bin/utmm sshpass -p 111 ssh Administrator@windowsvm 'powershell -Command "
 sc.exe stop UTM-MonitorD 2>$null; sc.exe delete UTM-MonitorD 2>$null;
 Get-Process -Name utmm -ErrorAction SilentlyContinue | Stop-Process -Force;
 Get-Process -Name utmmd -ErrorAction SilentlyContinue | Stop-Process -Force;
@@ -98,7 +98,7 @@ Remove-Item -Recurse -Force C:\opt\utmm -ErrorAction SilentlyContinue
 echo "windowsvm cleaned"
 
 # winx64
-./zig-out/bin/utmm sshpass -p 111 ssh Administrator@192.168.3.108 'powershell -Command "
+./zig-out/bin/utmm sshpass -p 111 ssh Administrator@winx64 'powershell -Command "
 sc.exe stop UTM-MonitorD 2>$null; sc.exe delete UTM-MonitorD 2>$null;
 Get-Process -Name utmm -ErrorAction SilentlyContinue | Stop-Process -Force;
 Get-Process -Name utmmd -ErrorAction SilentlyContinue | Stop-Process -Force;
@@ -112,10 +112,10 @@ echo "winx64 cleaned"
 
 ```bash
 ps aux | grep -i utmm | grep -v grep || echo "Host clean"
-./zig-out/bin/utmm sshpass -p 111 ssh root@192.168.65.4 'ps aux | grep -i utmm | grep -v grep || echo "macvm clean"'
-./zig-out/bin/utmm sshpass -p 111 ssh root@192.168.64.6 'ps aux | grep -i utmm | grep -v grep || echo "linuxvm clean"'
-./zig-out/bin/utmm sshpass -p 111 ssh Administrator@192.168.64.3 'tasklist /fi "imagename eq utmm.exe" 2>nul'
-./zig-out/bin/utmm sshpass -p 111 ssh Administrator@192.168.3.108 'tasklist /fi "imagename eq utmm.exe" 2>nul'
+./zig-out/bin/utmm sshpass -p 111 ssh root@macvm 'ps aux | grep -i utmm | grep -v grep || echo "macvm clean"'
+./zig-out/bin/utmm sshpass -p 111 ssh root@linuxvm 'ps aux | grep -i utmm | grep -v grep || echo "linuxvm clean"'
+./zig-out/bin/utmm sshpass -p 111 ssh Administrator@windowsvm 'tasklist /fi "imagename eq utmm.exe" 2>nul'
+./zig-out/bin/utmm sshpass -p 111 ssh Administrator@winx64 'tasklist /fi "imagename eq utmm.exe" 2>nul'
 ```
 
 ---
@@ -138,7 +138,7 @@ zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows
 Follow `.claude/skills/deploy/SKILL.md` flow. Key extra steps for clean deploy:
 
 - **mkdir first**: wipe deletes `/opt/utmm` — run `mkdir -p /opt/utmm` on each Guest before scp.
-  On Windows use: `./zig-out/bin/utmm sshpass -p 111 ssh Administrator@<ip> 'powershell -Command "New-Item -ItemType Directory -Force -Path C:\opt\utmm"'`
+  On Windows use: `./zig-out/bin/utmm sshpass -p 111 ssh Administrator@windowsvm 'powershell -Command "New-Item -ItemType Directory -Force -Path C:\opt\utmm"'`
 - **Wait 15s**: after all deployments, wait for LSA sync before testing
 
 ---
@@ -196,6 +196,9 @@ Record results in `progress.md`:
 ## Caveats
 
 - **Phase 0 required**: v0.14.7 removed external sshpass — build native utmm first for `utmm sshpass`
+- **Hostname resolution**: all commands use hostnames (linuxvm/macvm/windowsvm/winx64) — the Host's
+  LSA `/etc/hosts` sync provides DNS-free name resolution. If a hostname doesn't resolve during
+  wipe (e.g. first-time setup), use the IP from the VM table in `SKILL.md`.
 - **Irreversible** — wipes all configs, logs, history. Dev/test only.
 - **Windows OpenSSH** must be pre-enabled on Guests
 - **mkdir after wipe** — `/opt/utmm` is deleted during wipe; use `New-Item` on Windows

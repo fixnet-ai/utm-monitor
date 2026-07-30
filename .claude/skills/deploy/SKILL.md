@@ -43,23 +43,23 @@ sudo zig-out/bin/utmm --status
 V=$(cat src/ver.txt)
 
 # linuxvm
-scp zig-out/bin/utmm-aarch64-linux-$V root@192.168.64.6:/opt/utmm/utmm-new
-ssh root@192.168.64.6 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname linuxvm'
+scp zig-out/bin/utmm-aarch64-linux-$V root@linuxvm:/opt/utmm/utmm-new
+ssh root@linuxvm 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname linuxvm'
 
 # macvm — kill first to avoid launchctl throttle
-ssh root@192.168.65.4 'killall -9 utmm utmmd 2>/dev/null; sleep 1'
-scp zig-out/bin/utmm-aarch64-macos-$V root@192.168.65.4:/opt/utmm/utmm-new
-ssh root@192.168.65.4 'cp /opt/utmm/utmm-new /opt/utmm/utmm && /opt/utmm/utmm --install --hostname macvm'
+ssh root@macvm 'killall -9 utmm utmmd 2>/dev/null; sleep 1'
+scp zig-out/bin/utmm-aarch64-macos-$V root@macvm:/opt/utmm/utmm-new
+ssh root@macvm 'cp /opt/utmm/utmm-new /opt/utmm/utmm && /opt/utmm/utmm --install --hostname macvm'
 
 # windowsvm — kill utmmd first (locks exe)
-ssh Administrator@192.168.64.3 'taskkill /F /IM utmmd.exe 2>nul'
-scp zig-out/bin/utmm-aarch64-windows-$V.exe Administrator@192.168.64.3:C:/opt/utmm/utmm-new.exe
-ssh Administrator@192.168.64.3 'C:\opt\utmm\utmm-new.exe --install --hostname windowsvm'
+ssh Administrator@windowsvm 'taskkill /F /IM utmmd.exe 2>nul'
+scp zig-out/bin/utmm-aarch64-windows-$V.exe Administrator@windowsvm:C:/opt/utmm/utmm-new.exe
+ssh Administrator@windowsvm 'C:\opt\utmm\utmm-new.exe --install --hostname windowsvm'
 
 # winx64
-ssh Administrator@192.168.3.108 'taskkill /F /IM utmmd.exe 2>nul'
-scp zig-out/bin/utmm-x86_64-windows-$V.exe Administrator@192.168.3.108:C:/opt/utmm/utmm-new.exe
-ssh Administrator@192.168.3.108 'C:\opt\utmm\utmm-new.exe --install --hostname winx64'
+ssh Administrator@winx64 'taskkill /F /IM utmmd.exe 2>nul'
+scp zig-out/bin/utmm-x86_64-windows-$V.exe Administrator@winx64:C:/opt/utmm/utmm-new.exe
+ssh Administrator@winx64 'C:\opt\utmm\utmm-new.exe --install --hostname winx64'
 ```
 
 ### 5. Verify

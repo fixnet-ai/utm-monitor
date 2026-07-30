@@ -44,8 +44,14 @@ sudo utmm --download <vm> <remote-path> [<local-path>]
 ```
 
 ### SSH with Password (built-in sshpass)
+
+Built-in non-interactive SSH password auth — identical to standalone `sshpass(1)`.
+Works on **Linux, macOS, and Windows** (ConPTY dynamic loading + pipe fallback).
+No external sshpass binary needed. This is the primary tool for direct VM access
+when MCP tools are not applicable (bootstrap, recovery, pre-install debugging).
+
 ```bash
-utmm sshpass -p '<pass>' ssh <user>@<ip> '<command>'
+utmm sshpass -p '<pass>' ssh <user>@<hostname> '<command>'
 utmm sshpass -f <file> ssh ...      # read password from file
 utmm sshpass -e ssh ...             # read password from $SSHPASS
 ```
@@ -59,14 +65,17 @@ zig build test && zig build test-integration   # must pass before deployment
 ```
 
 ### Deploy to Guest
+
+Host LSA syncs `/etc/hosts` — use hostname, not IP:
+
 ```bash
 # POSIX (Linux/macOS):
-scp zig-out/bin/utmm-<target>-<ver> <user>@<ip>:/opt/utmm/utmm-new
-ssh <user>@<ip> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
+scp zig-out/bin/utmm-<target>-<ver> <user>@<hostname>:/opt/utmm/utmm-new
+ssh <user>@<hostname> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
 
 # Windows:
-scp zig-out/bin/utmm-<target>-<ver>.exe Administrator@<ip>:C:/opt/utmm/utmm-new.exe
-ssh Administrator@<ip> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
+scp zig-out/bin/utmm-<target>-<ver>.exe Administrator@<hostname>:C:/opt/utmm/utmm-new.exe
+ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
 ```
 
 ## Key Notes
@@ -78,6 +87,7 @@ ssh Administrator@<ip> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>
 - **Windows SSH** does NOT handle `;` command chaining — use separate SSH calls
 - **Windows OpenSSH** must be enabled (`Add-WindowsCapability -Online -Name OpenSSH.Server`)
 - **LSA sync** takes ~10-15s after guest restart before it appears in `--status`
+- **Hostname resolution**: Host LSA syncs `/etc/hosts` — use `linuxvm`/`macvm`/`windowsvm`/`winx64` instead of IPs in all commands
 - **Build output naming**: cross-compiled binaries include version suffix (e.g. `utmm-aarch64-linux-0.14.7`)
 
 ## Skills for Specific Workflows

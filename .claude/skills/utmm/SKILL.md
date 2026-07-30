@@ -50,14 +50,14 @@ sudo utmm --status
 
 ```bash
 # POSIX:
-scp zig-out/bin/utmm-<target>-<ver> <user>@<ip>:/opt/utmm/utmm-new
-ssh <user>@<ip> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
+scp zig-out/bin/utmm-<target>-<ver> <user>@<hostname>:/opt/utmm/utmm-new
+ssh <user>@<hostname> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
 
 # Windows:
 # Kill utmmd first (locks exe → AccessDenied):
-ssh Administrator@<ip> 'taskkill /F /IM utmmd.exe 2>nul'
-scp zig-out/bin/utmm-<target>-<ver>.exe Administrator@<ip>:C:/opt/utmm/utmm-new.exe
-ssh Administrator@<ip> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
+ssh Administrator@<hostname> 'taskkill /F /IM utmmd.exe 2>nul'
+scp zig-out/bin/utmm-<target>-<ver>.exe Administrator@<hostname>:C:/opt/utmm/utmm-new.exe
+ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
 ```
 
 ### Quick Deploy (all VMs)
@@ -76,7 +76,7 @@ sudo utmm --upload <file> <vm>[:<remote-path>]        # upload
 sudo utmm --download <vm> <remote-path> [<local-path>] # download
 sudo utmm --ping <vm>                                 # mesh ping
 sudo utmm --upgrade <vm>                              # push upgrade
-utmm sshpass -p '<pass>' ssh <user>@<ip> '<cmd>'       # non-interactive SSH
+utmm sshpass -p '<pass>' ssh <user>@<hostname> '<cmd>'       # non-interactive SSH
 ```
 
 ## Verify
