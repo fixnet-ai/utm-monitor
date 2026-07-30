@@ -19,12 +19,11 @@ required at runtime. AI agents get the same capabilities through MCP stdio.
 | `ping` | Ping a Guest over the mesh network and measure RTT |
 | `upload` | Upload file from Host to Guest (TCP/SOCKS4, SHA256 verified) |
 | `download` | Download file from Guest to Host (TCP/SOCKS4, SHA256 verified) |
+| `sshpass` | Non-interactive SSH password auth — direct shell access to any machine. Works on **Linux, macOS, and Windows** (ConPTY dynamic loading + pipe fallback). Bootstrap, recovery, and pre-install scenarios that MCP alone cannot cover. |
 
-**Beyond MCP**: When the Guest daemon is down or not yet installed (bootstrap,
-recovery, pre-install setup), the built-in `utmm sshpass` fills the gap. It works
-on **Linux, macOS, and Windows** — ConPTY dynamic loading gives Windows the same
-SSH scripting power as Unix. AI agents use it directly from the shell alongside
-MCP tools, not through the JSON-RPC channel.
+The first five are MCP JSON-RPC tools (`utmm --mcp`). `sshpass` is a CLI command
+that runs alongside MCP (`utmm sshpass`), filling the gap when the Guest daemon is
+down or not yet installed.
 
 Example prompts your AI agent can handle:
 - "Check the status of all my machines"
