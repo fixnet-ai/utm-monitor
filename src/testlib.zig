@@ -17,4 +17,3 @@ pub const config = @import("config.zig");
 pub const ipc = @import("ipc.zig");
 pub const arp = @import("arp.zig");
 pub const guest = @import("guest.zig");
-pub const socks_proxy = @import("socks_proxy.zig");

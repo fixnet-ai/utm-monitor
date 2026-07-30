@@ -102,8 +102,6 @@ pub const CliArgs = struct {
     log_file: ?[]const u8 = null,
     /// Binary serve directory for Host upgrade push (--serve-dir), default: exe directory
     serve_dir: ?[]const u8 = null,
-    /// SOCKS4a proxy port (--socks-proxy), 0 = disabled (default), e.g. 1080
-    socks_proxy_port: u16 = 0,
     /// Run as daemon via service manager (--svc, set by service configs)
     is_svc: bool = false,
 
@@ -265,11 +263,6 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !CliA
                 i += 1;
                 cli.serve_dir = args[i];
             } else fail.msg("arg", "--serve-dir requires a value", .{});
-        } else if (std.mem.eql(u8, arg, "--socks-proxy")) {
-            if (i + 1 < args.len) {
-                i += 1;
-                cli.socks_proxy_port = try std.fmt.parseInt(u16, args[i], 10);
-            } else fail.msg("arg", "--socks-proxy requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--marker")) {
             if (i + 1 < args.len) {
                 i += 1;
@@ -312,7 +305,6 @@ pub fn printHelp() void {
         \\  --port PORT         Service port (default 2121)
         \\  --hosts-file PATH   hosts file path (default /etc/hosts)
         \\  --serve-dir PATH    Binary serve directory for upgrade push (default: exe directory)
-        \\  --socks-proxy PORT  SOCKS4a proxy port (0=disabled, e.g. 1080)
         \\  --marker TAG        Marker comment text (default "UTM-MONITOR")
         \\  --log-file PATH     Log file path
         \\
@@ -747,14 +739,6 @@ fn buildServiceArgs(alloc: std.mem.Allocator, cli: CliArgs, role: svc.ServiceRol
         const val = try alloc.dupe(u8, p);
         errdefer alloc.free(val);
         try args.append(alloc, val);
-    }
-    if (cli.socks_proxy_port > 0 and role == .host) {
-        const arg = try alloc.dupe(u8, "--socks-proxy");
-        errdefer alloc.free(arg);
-        try args.append(alloc, arg);
-        const port_str = try std.fmt.allocPrint(alloc, "{d}", .{cli.socks_proxy_port});
-        errdefer alloc.free(port_str);
-        try args.append(alloc, port_str);
     }
 
     return args;

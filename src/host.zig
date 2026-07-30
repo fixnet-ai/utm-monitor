@@ -13,7 +13,6 @@ const tcp = @import("tcp.zig");
 const svc = @import("svc.zig");
 const arp = @import("arp.zig");
 const sshpass = @import("sshpass.zig");
-const socks_proxy = @import("socks_proxy.zig");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     return runWithIo(init.io, init.gpa, cli, null);
@@ -62,7 +61,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 
     // --host (via --svc): start Host daemon
     if (cli.is_host) {
-        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown, cli.hostname, cli.socks_proxy_port);
+        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown, cli.hostname);
         return;
     }
 }
@@ -478,7 +477,6 @@ fn startHost(
     peer_mesh: ?[]const u8,
     shutdown: ?*std.atomic.Value(bool),
     hostname: ?[]const u8,
-    socks_proxy_port: u16,
 ) !void {
     const sd = serve_dir orelse svc.canonicalDir();
     std.debug.print("[host] Host daemon starting (mesh UDP :{d})\n", .{mesh_port});
@@ -622,53 +620,29 @@ fn startHost(
         block_io, gpa, @as(*anyopaque, @ptrCast(&state)), @as(*anyopaque, @ptrCast(&mesh_opt)), &ipc_shutdown,
     });
 
-    // Spawn SOCKS4a proxy listener thread (if --socks-proxy specified).
-    // External tools (curl, ssh, browser, IDE) connect to localhost:socks_proxy_port
-    // and reach any Guest via hostname, plus LAN/internet via direct TCP.
-    var proxy_shutdown = std.atomic.Value(bool).init(false);
-    var proxy_thread: ?std.Thread = null;
-    if (socks_proxy_port > 0) {
-        if (std.Thread.spawn(.{}, socks_proxy.socksProxyRun, .{
-            block_io,
-            socks_proxy_port,
-            resolveForProxy,
-            @as(*anyopaque, @ptrCast(&state)),
-            &proxy_shutdown,
-        })) |t| {
-            proxy_thread = t;
-        } else |err| {
-            std.log.err("[host] SOCKS proxy thread spawn failed: {}", .{err});
-        }
-    }
-
     defer {
-        // 1. Signal SOCKS proxy shutdown first (stops accepting new connections)
-        if (socks_proxy_port > 0) {
-            proxy_shutdown.store(true, .release);
-            if (proxy_thread) |t| t.join();
-        }
-        // 2. Signal IPC server to stop
+        // 1. Signal all background threads to stop
         ipc_shutdown.store(true, .release);
-        // 3. Signal mesh shutdown — tunnelManager checks this each loop iteration
+        // 2. Signal mesh shutdown — tunnelManager checks this each loop iteration
         if (mesh_opt) |*m| m.signalShutdown();
 
-        // 4. Join threads (order: IPC → tunnel mgr → mesh)
+        // 3. Join threads (order: IPC → tunnel mgr → mesh)
         ipc_thread.join();
         tun_mgr_thread.join();
 
-        // 5. Join mesh thread after all consumers have exited
+        // 4. Join mesh thread after all consumers have exited
         if (mesh_thread) |t| {
             t.join();
         }
 
-        // 6. Deinit mesh (safe: all threads using it have exited)
+        // 5. Deinit mesh (safe: all threads using it have exited)
         if (mesh_opt) |*m| {
             const m_io = m.io;
             m.deinit();
             _ = m_io;
         }
 
-        // 7. state.deinit() runs via its own defer (declared earlier, runs later)
+        // 6. state.deinit() runs via its own defer (declared earlier, runs later)
     }
 
     // Block until shutdown — Host runs via Mesh + IPC threads
@@ -703,16 +677,6 @@ const AUTO_UPGRADE_COOLDOWN_MS: i64 = 120_000; // 2 minutes
 
 /// Tracks last auto-upgrade attempt timestamp per Guest hostname.
 const LastUpgradeMap = std.StringHashMap(i64);
-
-/// SOCKS4a proxy hostname→IP resolver callback for socks_proxy.zig.
-/// Resolution priority: GuestTable (mesh VM live IP) → returns null
-/// (socks_proxy resolves via /etc/hosts + DNS as fallback).
-/// The returned IP pointer is valid until the next GuestTable mutation.
-pub fn resolveForProxy(ctx: *anyopaque, hostname: []const u8) ?[]const u8 {
-    const state: *GuestTable = @ptrCast(@alignCast(ctx));
-    const entry = state.findByHostname(hostname) orelse return null;
-    return entry.ip;
-}
 
 /// Connect to a Guest via TCP with ARP-based IP rediscovery on failure.
 /// On primary connect failure, queries the system ARP table by MAC to find

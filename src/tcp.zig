@@ -3,14 +3,9 @@
 //! Guest 和 Host 共享同一套网络层：
 //!   - Guest:  TCP listen → SOCKS4a accept → Connection
 //!   - Host:   TCP connect → SOCKS4a connect → Connection
-//!   - Host:   SOCKS4a proxy listener → resolve → connect → relay
-//!             (向外暴露通用 SOCKS4a 代理，见 socks_proxy.zig)
 //!
 //! 帧格式: [4-byte BE length][payload]
 //! SOCKS4a: VER(1) CMD(1) DSTPORT(2 BE) DSTIP(4 BE) USERID\0 [HOSTNAME\0]
-//!
-//! SOCKS4a 的核心优势：目标地址可以是 hostname（不限于 IP），
-//! 使 Host 代理能覆盖 VM 网格 + 局域网 + 互联网全部互通。
 //!
 //! 每条 TCP 连接 = 一个请求-响应周期。连接关闭表示会话结束。
 
@@ -28,7 +23,7 @@ const dpipe = @import("dpipe.zig");
 // sockets — Winsock2 requires send/recv/closesocket. These inline wrappers
 // branch at comptime so there is zero runtime overhead.
 
-pub const socket_t = std.posix.socket_t;
+const socket_t = std.posix.socket_t;
 
 /// Write data to a socket. POSIX: write(), Windows: send().
 /// Returns number of bytes written, or -1 on fatal error.
@@ -548,33 +543,24 @@ fn socks4SendRequest(fd: std.posix.socket_t, hostname: []const u8, port: u16) !v
 }
 
 /// 双向中继：A ↔ B。两个线程各负责一个方向。
-/// 任一侧关闭时，通过 sockShutdown(SHUT_WR) 通知对端，确保双向及时退出。
-/// 不返回错误 — 所有错误路径内部处理，确保 fd 最终由调用者关闭。
-pub fn socks4Relay(a_fd: std.posix.socket_t, b_fd: std.posix.socket_t) void {
-    var done = std.atomic.Value(bool).init(false);
+pub fn socks4Relay(a_fd: std.posix.socket_t, b_fd: std.posix.socket_t) !void {
+    var a_to_b_done = std.atomic.Value(bool).init(false);
 
-    const relay_thread = std.Thread.spawn(.{}, relayDir, .{ b_fd, a_fd, &done }) catch {
-        return;
-    };
+    const relay_thread = try std.Thread.spawn(.{}, relayDir, .{ b_fd, a_fd, &a_to_b_done });
     defer relay_thread.join();
 
-    relayDir(a_fd, b_fd, &done);
+    relayDir(a_fd, b_fd, &a_to_b_done);
 }
 
 fn relayDir(src: std.posix.socket_t, dst: std.posix.socket_t, done: *std.atomic.Value(bool)) void {
     var buf: [65536]u8 = undefined;
-    while (!done.load(.acquire)) {
+    while (true) {
         const n = sockRead(src, &buf, buf.len);
-        if (n <= 0) {
+        if (n == 0) {
             done.store(true, .release);
-            sockShutdown(dst, 1); // SHUT_WR — 通知对端 sockWrite 退出
             return;
         }
-        if (sockWrite(dst, &buf, @intCast(n)) < 0) {
-            done.store(true, .release);
-            sockShutdown(dst, 1);
-            return;
-        }
+        _ = sockWrite(dst, &buf, @intCast(n));
     }
 }
 

@@ -52,7 +52,6 @@ differences, and deployment.
 | `--port PORT` | Service port (default 2121) |
 | `--hosts-file PATH` | hosts file path (default /etc/hosts) |
 | `--serve-dir PATH` | Binary serve directory for upgrade push |
-| `--socks-proxy PORT` | SOCKS4a proxy port (0=disabled, e.g. 1080) |
 | `--marker TAG` | Marker comment text (default "UTM-MONITOR") |
 | `--config PATH` | Config file path |
 | `--log-file PATH` | Log file path |
@@ -208,96 +207,6 @@ See [sshpass Subcommand](#sshpass-subcommand) for the full CLI reference.
 
 Standard JSON-RPC error codes: `-32600` (Invalid Request), `-32602` (Invalid
 Params), `-32603` (Internal Error — tool-specific failure).
-
----
-
-## Connectivity Fabric
-
-utmm 在底层创建了一个通用互联层，将所有系统工具接入 utmm 通信体系：
-
-```
-你的工具（ssh, curl, scp, 浏览器, IDE...）
-│
-├─ 名字解析：/etc/hosts（LSA 自动同步）
-│   linuxvm → 192.168.64.6
-│   macvm   → 192.168.65.4
-│
-└─ 连通：SOCKS4a 代理（localhost:1080）
-    ├─ VM 网格（linuxvm, macvm, windowsvm）
-    ├─ 局域网（internal-server.local）
-    └─ 互联网（example.com）
-```
-
-### /etc/hosts 同步
-
-**工作机制**：
-- **Host 端**：LSA 状态变化时触发 `/etc/hosts` 同步。通过标记块（marker block）范围
-  替换实现原子更新，不影响文件中其他内容。写入流程：tmp file → rename（POSIX 原子操作）。
-- **Guest 端**：30 秒周期同步（自身 + gateway），同时接收 LSA 状态变化事件触发即时更新。
-- **标记格式**：`# UTM-MONITOR-BEGIN` / `# UTM-MONITOR-END`
-- **条目格式**：`<IP> <fqdn> <hostname>`，其中 FQDN 为 `<hostname>.target.utm`
-
-**设计目的**：让所有系统工具（ssh、scp、curl、ping、浏览器、IDE）都能直接用 hostname
-访问 VM，无需手动配置 DNS 或记住 IP 地址。这是将 utmm 从单一 CLI 工具扩展为通用
-通信基础设施的关键设计。
-
-```bash
-# /etc/hosts 中的实际条目（Host 自动维护）：
-# === UTM-MONITOR-BEGIN (auto-managed by utmm) ===
-192.168.64.6	linuxvm.target.utm linuxvm
-192.168.65.4	macvm.target.utm macvm
-192.168.64.3	windowsvm.target.utm windowsvm
-# === UTM-MONITOR-END ===
-```
-
-### SOCKS4a 代理
-
-`--socks-proxy PORT` 启动 SOCKS4a 代理监听器，将 Host 变成通用网络网关。
-SOCKS4a 协议的核心优势：目标地址是 **hostname**（不是 IP），让 Host 代理能覆盖
-VM 网格 + 局域网 + 互联网的全部目标。
-
-**命令行**：
-```bash
-sudo utmm --host --socks-proxy 1080     # 启动 Host + SOCKS4a 代理
-```
-
-**主机名解析优先级**：GuestTable（mesh VM 实时 IP）→ `/etc/hosts` → 系统 DNS
-
-**连接策略**：
-- GuestTable 命中 → Host 直接 TCP 连接 Guest IP:port
-- 非 Guest 目标 → Host 直接 TCP 连接目标（/etc/hosts 或 DNS 解析后）
-
-**安全性**：代理仅绑定 127.0.0.1，不可从网络访问。外部机器无法连接到代理端口。
-
-**工具配置**：
-
-```bash
-# curl：通过代理访问任何目标
-curl --socks4a localhost:1080 http://linuxvm:8080/metrics
-curl --socks4a localhost:1080 https://example.com
-
-# SSH：通过 ProxyCommand（~/.ssh/config）
-# Host *.target.utm
-#     ProxyCommand nc -X 4 -x localhost:1080 %h %p
-ssh root@linuxvm.target.utm
-
-# 浏览器：配置 SOCKS4 代理为 localhost:1080
-# Firefox: Settings → Network Settings → SOCKS Host: localhost, Port: 1080, SOCKS v4
-# 然后直接在地址栏输入 http://linuxvm:8080/
-
-# git：通过代理 clone
-git -c http.proxy=socks4a://localhost:1080 clone http://git-server.local/repo.git
-```
-
-### 跨子网支持
-
-对于不在同一子网的机器（如 winx64），`/etc/hosts` 条目仍然会被写入（LSA 通过
-`--peer-mesh` 转发），curl/浏览器等工具通过 SOCKS4a 代理访问：
-
-```bash
-# 在 Host 代理可达的情况下，跨子网访问透明：
-curl --socks4a localhost:1080 http://winx64:8080/
-```
 
 ---
 
