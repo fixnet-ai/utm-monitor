@@ -223,7 +223,8 @@ Params), `-32603` (Internal Error — tool-specific failure).
 │  lsa.zig (LSA broadcast + node table)    │
 ├─────────────────────────────────────────┤
 │  Transport Layer                         │
-│  tcp.zig (Frame protocol + SOCKS4)       │
+│  tcp.zig (Frame protocol + SOCKS4a +     │
+│           forwarding + relay)            │
 ├─────────────────────────────────────────┤
 │  Data Pipe Layer                         │
 │  dpipe.zig (DuplexPipe + relay engine)   │
@@ -244,12 +245,14 @@ Params), `-32603` (Internal Error — tool-specific failure).
 ### Run Modes
 
 **Guest mode** (default): utmmd spawns utmm as Guest — UDP LSA broadcast,
-TCP listener on port 2121, per-command pty shell. No CLI entry point for guest
-commands — all interaction goes through Host.
+TCP listener on port 2121 (SOCKS4a accept + utmm frame protocol + chained
+forwarding), per-command pty shell. No CLI entry point for guest commands
+— all interaction goes through Host.
 
 **Host mode** (`--host`): utmmd spawns utmm as Host — UDP LSA mesh, IPC socket
-(`/var/run/utmm.sock` on POSIX, `\\.\pipe\utmm` on Windows), TCP SOCKS4a
-connections to Guests. CLI/MCP commands talk to Host daemon via IPC.
+(`/var/run/utmm.sock` on POSIX, `\\.\pipe\utmm` on Windows), TCP listener on
+port 2121 (SOCKS4a accept + forwarding, same dispatch logic as Guest),
+TCP SOCKS4a connections to Guests. CLI/MCP commands talk to Host daemon via IPC.
 
 **MCP mode** (`--mcp`): stdio JSON-RPC server for AI agents. Auto-ensures Host
 on first use — no daemon awareness needed.
@@ -265,6 +268,49 @@ on first use — no daemon awareness needed.
 6. Guest → Host: pty_exec_output frames (streaming) + pty_exec_done (exit code)
 7. Host → CLI: binary frames via IPC socket → stdout
 ```
+
+### SOCKS4a Mesh Forwarding
+
+Every utmm node (Host and Guest) is a peer SOCKS4a proxy endpoint on TCP :2121.
+Third-party tools connect through **any** node to reach **any other** node in the
+mesh — no SSH tunnels, no port mapping, no manual routing.
+
+**Chained forwarding model:**
+
+```
+SOCKS4a request arrives on TCP :2121:
+  target_hostname == self ?
+    ├─ target_port == 2121 → OK, utmm internal frame protocol (exec/upload/download)
+    └─ target_port != 2121 → OK, connect 127.0.0.1:target_port, relay
+  target_hostname != self ?
+    └─ lookup hostname→IP in node table
+        ├─ found → OK, chain-forward SOCKS4a to target_ip:2121, relay
+        └─ not found → REJECT
+```
+
+**Examples:**
+
+```bash
+# Host → linuxvm:8080 web server (chained: Host → linuxvm:2121 → localhost:8080)
+curl --socks4a localhost:2121 http://linuxvm:8080
+
+# linuxvm → macvm:22 SSH (chained: linuxvm → Host → macvm:2121 → localhost:22)
+# (from linuxvm) curl --socks4a localhost:2121 http://macvm:22
+
+# Direct local service access on the same node
+curl --socks4a localhost:2121 http://localhost:3000   # local dev server
+
+# Git clone through mesh to a VM-hosted repo
+git clone --config http.proxy=socks4a://localhost:2121 \
+    http://linuxvm:8080/repo.git
+```
+
+**Key properties:**
+- Only port 2121 needs to be reachable between mesh nodes
+- Each forwarded connection runs in its own thread, exits when either side closes
+- Works with any SOCKS4a-compatible client: `curl`, `wget`, browsers, `git`
+- Zero configuration — hostname→IP lookup uses the existing LSA node table
+- No new CLI flags, no new ports, no new files
 
 ### TCP Wire Protocol (protocol.zig)
 

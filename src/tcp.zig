@@ -1,8 +1,10 @@
-//! TCP transport: frame protocol + SOCKS4a proxy + connection management
+//! TCP transport: frame protocol + SOCKS4a proxy + connection management + forwarding
 //!
 //! Guest 和 Host 共享同一套网络层：
-//!   - Guest:  TCP listen → SOCKS4a accept → Connection
-//!   - Host:   TCP connect → SOCKS4a connect → Connection
+//!   - 监听:    TCP listen → SOCKS4a accept → dispatch (self/forward/local)
+//!   - 连接:    TCP connect → SOCKS4a connect → Connection
+//!   - 转发:    SOCKS4a chain-forward → 目标节点 :2121 → 本地 relay
+//!   - 本地:    127.0.0.1:port → relay
 //!
 //! 帧格式: [4-byte BE length][payload]
 //! SOCKS4a: VER(1) CMD(1) DSTPORT(2 BE) DSTIP(4 BE) USERID\0 [HOSTNAME\0]
@@ -339,12 +341,48 @@ const SOCKS_REP_OK: u8 = 0x5a;
 const SOCKS_REP_REJECTED: u8 = 0x5b;
 
 /// 单个连接的最大 hostname 长度。
-const MAX_HOSTNAME: usize = 256;
+pub const MAX_HOSTNAME: usize = 256;
 
 pub const Socks4Request = struct {
     hostname: []const u8,
     port: u16,
 };
+
+/// 栈分配的 SOCKS4a 请求读取结果。hostname 指向调用者缓冲区。
+pub const Socks4RequestBuf = struct {
+    hostname: []const u8,
+    port: u16,
+};
+
+/// 读取 SOCKS4a 请求到调用者提供的缓冲区，不发回复。
+/// 将 hostname 写入 buf，返回 Socks4RequestBuf（hostname 切片指向 buf）。
+pub fn socks4ReadRequestBuf(fd: std.posix.socket_t, buf: []u8) !Socks4RequestBuf {
+    // 读取固定头: VER(1) CMD(1) DSTPORT(2) DSTIP(4) = 8 bytes
+    var hdr: [8]u8 = undefined;
+    var off: usize = 0;
+    while (off < 8) {
+        const n = sockRead(fd, hdr[off..].ptr, hdr.len - off);
+        if (sockIsError(n) or n == 0) return error.Socks4HeaderTooShort;
+        off += @intCast(n);
+    }
+    if (hdr[0] != SOCKS_VER) return error.Socks4BadVersion;
+    if (hdr[1] != SOCKS_CMD_CONNECT) return error.Socks4BadCommand;
+
+    const dst_port = std.mem.readInt(u16, hdr[2..4], .big);
+    const dst_ip3 = hdr[7]; // SOCKS4a: DSTIP[3] != 0
+
+    // 跳过 USERID（读入临时缓冲后丢弃）
+    var userid_buf: [256]u8 = undefined;
+    _ = try readUntilNullBuf(fd, userid_buf[0..]);
+
+    // SOCKS4a: 如果 DSTIP[3] != 0，读取目标 hostname 到调用者 buf
+    if (dst_ip3 != 0) {
+        const hn = try readUntilNullBuf(fd, buf);
+        if (hn.len == 0 or hn.len > MAX_HOSTNAME) return error.Socks4BadHostname;
+        return Socks4RequestBuf{ .hostname = hn, .port = dst_port };
+    }
+    return error.Socks4aRequired;
+}
 
 /// 发送 SOCKS4a 连接请求到目标地址。
 /// 返回连接成功后的 TCP socket fd（调用者负责关闭）。
@@ -412,43 +450,17 @@ pub fn socks4Connect(
     return stream;
 }
 
-/// 从已 accept 的 TCP socket 读取 SOCKS4a 请求。
-/// 读取 SOCKS4a 请求并检查 hostname 是否匹配。匹配则发送 OK 响应并返回 true，
-/// 否则发送拒绝响应并返回 false。
-/// 使用调用者提供的缓冲区避免栈悬垂指针 — readUntilNullBuf 将数据写入
-/// socks4CheckAndReply 的栈帧，保证整个比较过程内存有效。
+/// 从已 accept 的 TCP socket 读取 SOCKS4a 请求，检查 hostname 是否匹配。
+/// 匹配则发送 OK 响应并返回 true，否则发送拒绝响应并返回 false。
 pub fn socks4CheckAndReply(fd: std.posix.socket_t, self_hostname: []const u8) !bool {
-    // 读取固定头: VER(1) CMD(1) DSTPORT(2) DSTIP(4) = 8 bytes
-    var hdr: [8]u8 = undefined;
-    var off: usize = 0;
-    while (off < 8) {
-        const n = sockRead(fd, hdr[off..].ptr, hdr.len - off);
-        if (sockIsError(n) or n == 0) return error.Socks4HeaderTooShort;
-        off += @intCast(n);
+    var buf: [MAX_HOSTNAME + 1]u8 = undefined;
+    const req = try socks4ReadRequestBuf(fd, buf[0..]);
+    if (std.mem.eql(u8, req.hostname, self_hostname)) {
+        socks4ReplyOk(fd);
+        return true;
     }
-    if (hdr[0] != SOCKS_VER) return error.Socks4BadVersion;
-    if (hdr[1] != SOCKS_CMD_CONNECT) return error.Socks4BadCommand;
-
-    const dst_ip3 = hdr[7]; // SOCKS4a: DSTIP[3] != 0
-
-    // 跳过 USERID（读入临时缓冲后丢弃）
-    var userid_buf: [256]u8 = undefined;
-    _ = try readUntilNullBuf(fd, userid_buf[0..]);
-
-    // SOCKS4a: 如果 DSTIP[3] != 0，读取目标 hostname
-    if (dst_ip3 != 0) {
-        var hn_buf: [MAX_HOSTNAME + 1]u8 = undefined;
-        const hn = try readUntilNullBuf(fd, hn_buf[0..]);
-        if (hn.len == 0 or hn.len > MAX_HOSTNAME) return error.Socks4BadHostname;
-        // hn 指向 hn_buf（在我们的栈帧中），调用后仍然有效
-        if (std.mem.eql(u8, hn, self_hostname)) {
-            socks4ReplyOk(fd);
-            return true;
-        }
-        socks4ReplyRejected(fd);
-        return false;
-    }
-    return error.Socks4aRequired;
+    socks4ReplyRejected(fd);
+    return false;
 }
 
 /// 读取 SOCKS4a 请求（仅用于测试）。
@@ -493,6 +505,49 @@ pub fn socks4ReplyOk(fd: std.posix.socket_t) void {
 pub fn socks4ReplyRejected(fd: std.posix.socket_t) void {
     const resp = [_]u8{ 0x00, SOCKS_REP_REJECTED, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
     _ = sockWrite(fd, &resp, resp.len);
+}
+
+/// SOCKS4a 链式转发：连接下一跳节点，发送原始 SOCKS4a 请求，成功后 relay。
+/// 失败时发送拒绝响应给原始客户端。此函数不返回（void），适合在线程中调用。
+pub fn socks4Forward(
+    io: std.Io,
+    client_fd: std.posix.socket_t,
+    next_hop_ip: std.Io.net.IpAddress,
+    target_hostname: []const u8,
+    target_port: u16,
+) void {
+    const stream = socks4Connect(io, next_hop_ip, target_hostname, target_port) catch {
+        socks4ReplyRejected(client_fd);
+        sockClose(client_fd);
+        return;
+    };
+    const next_fd = stream.socket.handle;
+    // 不 close stream — fd 所有权转移给 socks4Relay
+
+    socks4ReplyOk(client_fd);
+    socks4Relay(client_fd, next_fd);
+    sockClose(client_fd);
+    sockClose(next_fd);
+}
+
+/// 本地 relay：连接 127.0.0.1:target_port，成功后 relay。
+/// 失败时发送拒绝响应给客户端。此函数不返回（void），适合在线程中调用。
+pub fn socks4LocalRelay(io: std.Io, client_fd: std.posix.socket_t, target_port: u16) void {
+    const local_addr = std.Io.net.IpAddress.parse("127.0.0.1", target_port) catch {
+        socks4ReplyRejected(client_fd);
+        sockClose(client_fd);
+        return;
+    };
+    const stream = local_addr.connect(io, .{ .mode = .stream }) catch {
+        socks4ReplyRejected(client_fd);
+        sockClose(client_fd);
+        return;
+    };
+
+    socks4ReplyOk(client_fd);
+    socks4Relay(client_fd, stream.socket.handle);
+    sockClose(client_fd);
+    sockClose(stream.socket.handle);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -543,10 +598,11 @@ fn socks4SendRequest(fd: std.posix.socket_t, hostname: []const u8, port: u16) !v
 }
 
 /// 双向中继：A ↔ B。两个线程各负责一个方向。
-pub fn socks4Relay(a_fd: std.posix.socket_t, b_fd: std.posix.socket_t) !void {
+/// 一侧关闭时 shutdown 对端写端，避免半开连接。
+pub fn socks4Relay(a_fd: std.posix.socket_t, b_fd: std.posix.socket_t) void {
     var a_to_b_done = std.atomic.Value(bool).init(false);
 
-    const relay_thread = try std.Thread.spawn(.{}, relayDir, .{ b_fd, a_fd, &a_to_b_done });
+    const relay_thread = std.Thread.spawn(.{}, relayDir, .{ b_fd, a_fd, &a_to_b_done }) catch return;
     defer relay_thread.join();
 
     relayDir(a_fd, b_fd, &a_to_b_done);
@@ -557,10 +613,19 @@ fn relayDir(src: std.posix.socket_t, dst: std.posix.socket_t, done: *std.atomic.
     while (true) {
         const n = sockRead(src, &buf, buf.len);
         if (n == 0) {
+            sockShutdown(dst, 1); // SHUT_WR — 通知对端不再发送
             done.store(true, .release);
             return;
         }
-        _ = sockWrite(dst, &buf, @intCast(n));
+        if (sockIsError(n)) {
+            done.store(true, .release);
+            return;
+        }
+        const w = sockWrite(dst, &buf, @intCast(n));
+        if (sockIsError(w)) {
+            done.store(true, .release);
+            return;
+        }
     }
 }
 
@@ -763,22 +828,29 @@ pub const TcpListener = struct {
         }
     }
 
+    /// 接受一个 TCP 连接，返回 raw socket fd。
+    /// SOCKS4a 握手和 dispatch 由调用方处理（guest.zig / host.zig）。
+    pub fn acceptRaw(self: *TcpListener) !std.posix.socket_t {
+        while (true) {
+            if (self.use_raw_accept) {
+                return try sockAccept(self.listener_fd);
+            }
+            const stream = self.server.?.accept(self.io) catch |err| {
+                if (err == error.WouldBlock) {
+                    std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+                    continue;
+                }
+                return error.AcceptFailed;
+            };
+            return stream.socket.handle;
+        }
+    }
+
     /// 接受一个 TCP 连接，完成 SOCKS4a 握手，返回 Connection。
     /// 只有目标是 self_hostname 才接受，否则拒绝并返回错误。
     pub fn accept(self: *TcpListener, self_hostname: []const u8) !Connection {
         while (true) {
-            const fd = if (self.use_raw_accept) fd: {
-                break :fd try sockAccept(self.listener_fd);
-            } else fd: {
-                const stream = self.server.?.accept(self.io) catch |err| {
-                    if (err == error.WouldBlock) {
-                        std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
-                        continue;
-                    }
-                    return error.AcceptFailed;
-                };
-                break :fd stream.socket.handle;
-            };
+            const fd = try self.acceptRaw();
 
             // SOCKS4a 握手
             const accepted = socks4CheckAndReply(fd, self_hostname) catch |err| {

@@ -1187,6 +1187,38 @@ pub const Mesh = struct {
 
         return list;
     }
+
+    /// 根据 hostname 查找对应的 IP 地址。
+    /// 遍历 LSA 数据库，解析 node_info 中的 hostname: 和 ip: 字段。
+    /// 返回 allocator 分配的 IP 字符串，调用者负责释放；未找到返回 null。
+    pub fn lookupHostnameIp(self: *Mesh, allocator: std.mem.Allocator, hostname: []const u8) ?[]const u8 {
+        self.lsas_mutex.lock(self.io) catch return null;
+        defer self.lsas_mutex.unlock(self.io);
+
+        var l_iter = self.lsas.iterator();
+        while (l_iter.next()) |entry| {
+            const info = entry.value_ptr.node_info;
+            var found_hostname: bool = false;
+            var found_ip: ?[]const u8 = null;
+
+            var lines = std.mem.splitScalar(u8, info, '\n');
+            while (lines.next()) |line| {
+                if (std.mem.startsWith(u8, line, "hostname:") and line.len > 9) {
+                    if (std.mem.eql(u8, line[9..], hostname)) {
+                        found_hostname = true;
+                    }
+                }
+                if (std.mem.startsWith(u8, line, "ip:") and line.len > 3) {
+                    found_ip = line[3..];
+                }
+            }
+
+            if (found_hostname and found_ip != null) {
+                return allocator.dupe(u8, found_ip.?) catch null;
+            }
+        }
+        return null;
+    }
 };
 
 /// Public node information (for status queries).

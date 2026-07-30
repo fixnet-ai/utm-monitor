@@ -1,7 +1,8 @@
-//! Host mode — mesh networking daemon on UDP :2121.
+//! Host mode — mesh networking daemon on UDP :2121 + TCP :2121.
 //!
-//! TCP per-command model with LSA broadcast + IPC socket.
+//! TCP per-command model with LSA broadcast + IPC socket + SOCKS4a forwarding.
 //! Management commands (--status/--exec/--upload/--download) communicate via IPC socket.
+//! TCP :2121 accepts SOCKS4a and dispatches: self→localhost relay, other→chained forward.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -620,14 +621,21 @@ fn startHost(
         block_io, gpa, @as(*anyopaque, @ptrCast(&state)), @as(*anyopaque, @ptrCast(&mesh_opt)), &ipc_shutdown,
     });
 
+    // Spawn TCP listener thread — SOCKS4a accept + three-way dispatch.
+    // Uses GuestTable.findByHostname for hostname→IP lookup.
+    var tcp_thread = try std.Thread.spawn(.{}, hostTcpListen, .{
+        block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown,
+    });
+
     defer {
         // 1. Signal all background threads to stop
         ipc_shutdown.store(true, .release);
         // 2. Signal mesh shutdown — tunnelManager checks this each loop iteration
         if (mesh_opt) |*m| m.signalShutdown();
 
-        // 3. Join threads (order: IPC → tunnel mgr → mesh)
+        // 3. Join threads (order: IPC → TCP → tunnel mgr → mesh)
         ipc_thread.join();
+        tcp_thread.join();
         tun_mgr_thread.join();
 
         // 4. Join mesh thread after all consumers have exited
@@ -653,6 +661,110 @@ fn startHost(
     } else {
         while (true) {
             std.Io.sleep(block_io, std.Io.Duration.fromSeconds(60), .awake) catch {};
+        }
+    }
+}
+
+/// Host TCP listener — SOCKS4a accept + three-way dispatch.
+/// Uses GuestTable.findByHostname for hostname→IP lookup (vs guest's lsa.Mesh).
+fn hostTcpListen(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    state: *GuestTable,
+    hostname: []const u8,
+    mesh_port: u16,
+    shutdown: ?*std.atomic.Value(bool),
+) !void {
+    var listener = tcp.TcpListener.init(io, mesh_port) catch |err| {
+        std.log.err("[host] TCP listen :{d} failed: {}", .{ mesh_port, err });
+        return error.TcpBindFailed;
+    };
+    defer listener.deinit();
+
+    std.log.info("[host] TCP SOCKS4a listener on :{d}", .{mesh_port});
+
+    while (true) {
+        if (shutdown) |s| {
+            if (s.load(.acquire)) break;
+        }
+
+        const fd = listener.acceptRaw() catch |err| {
+            if (err == error.WouldBlock) continue;
+            std.log.err("[host] accept failed: {}", .{err});
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
+            continue;
+        };
+
+        // 读取 SOCKS4a 请求
+        var req_buf: [tcp.MAX_HOSTNAME + 1]u8 = undefined;
+        const req = tcp.socks4ReadRequestBuf(fd, req_buf[0..]) catch |err| {
+            std.log.err("[host] SOCKS4a read failed: {}", .{err});
+            tcp.sockClose(fd);
+            continue;
+        };
+
+        // 三路 dispatch
+        if (std.mem.eql(u8, req.hostname, hostname)) {
+            // 目标是本机
+            if (req.port == mesh_port) {
+                // self:2121 — no utmm handler on Host side, just close
+                tcp.socks4ReplyOk(fd);
+                tcp.sockClose(fd);
+                std.log.info("[host] self:2121 (no handler)", .{});
+            } else {
+                // 本机 localhost relay
+                const t = std.Thread.spawn(.{}, tcp.socks4LocalRelay, .{ io, fd, req.port }) catch {
+                    tcp.socks4ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                };
+                t.detach();
+                std.log.info("[host] local relay :{d}", .{req.port});
+            }
+        } else {
+            // 目标不是本机 — 链式 SOCKS4a 转发
+            if (state.findByHostname(req.hostname)) |guest_entry| {
+                const next_hop = std.Io.net.IpAddress.parse(guest_entry.ip, mesh_port) catch {
+                    tcp.socks4ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                };
+
+                const hn_copy = allocator.dupe(u8, req.hostname) catch {
+                    tcp.socks4ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                };
+
+                const ctx = allocator.create(guest.ForwardCtx) catch {
+                    allocator.free(hn_copy);
+                    tcp.socks4ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                };
+                ctx.* = .{
+                    .io = io,
+                    .client_fd = fd,
+                    .next_hop_ip = next_hop,
+                    .hostname = hn_copy,
+                    .target_port = req.port,
+                    .allocator = allocator,
+                };
+
+                const t = std.Thread.spawn(.{}, guest.forwardThreadFn, .{ctx}) catch {
+                    allocator.destroy(ctx);
+                    allocator.free(hn_copy);
+                    tcp.socks4ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                };
+                t.detach();
+                std.log.info("[host] forward {s}:{d} → {s}", .{ req.hostname, req.port, guest_entry.ip });
+            } else {
+                std.log.info("[host] no route to {s}", .{req.hostname});
+                tcp.socks4ReplyRejected(fd);
+                tcp.sockClose(fd);
+            }
         }
     }
 }

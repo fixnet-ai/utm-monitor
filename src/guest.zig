@@ -743,6 +743,23 @@ fn guestHostsSync(
     }
 }
 
+/// SOCKS4a 转发线程上下文（堆分配，detach 线程负责释放）。
+pub const ForwardCtx = struct {
+    io: std.Io,
+    client_fd: std.posix.socket_t,
+    next_hop_ip: std.Io.net.IpAddress,
+    hostname: []const u8,
+    target_port: u16,
+    allocator: std.mem.Allocator,
+};
+
+/// 转发 detach 线程入口：释放 ctx 并调用 socks4Forward。
+pub fn forwardThreadFn(ctx: *ForwardCtx) void {
+    defer ctx.allocator.destroy(ctx);
+    defer ctx.allocator.free(ctx.hostname);
+    tcp.socks4Forward(ctx.io, ctx.client_fd, ctx.next_hop_ip, ctx.hostname, ctx.target_port);
+}
+
 pub fn guestTcpLoop(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -878,19 +895,96 @@ pub fn guestTcpLoop(
             }
         }
 
-        // Accept SOCKS4 连接
-        var conn = listener.accept(info.hostname) catch |err| {
+        // Accept TCP 连接（不含 SOCKS4a 握手）
+        const fd = listener.acceptRaw() catch |err| {
             if (err == error.WouldBlock) continue;
             std.log.err("[guest] accept failed: {}", .{err});
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
             continue;
         };
 
-        // 处理单条命令
-        handleOneCommand(io, allocator, info, &conn, shutdown) catch |err| {
-            std.log.err("[guest] handleOneCommand: {}", .{err});
+        // 读取 SOCKS4a 请求
+        var req_buf: [tcp.MAX_HOSTNAME + 1]u8 = undefined;
+        const req = tcp.socks4ReadRequestBuf(fd, req_buf[0..]) catch |err| {
+            std.log.err("[guest] SOCKS4a read failed: {}", .{err});
+            tcp.sockClose(fd);
+            continue;
         };
-        conn.deinit();
+
+        // 三路 dispatch
+        if (std.mem.eql(u8, req.hostname, info.hostname)) {
+            // 目标是本机
+            if (req.port == mesh_port) {
+                // utmm 内部帧协议
+                tcp.socks4ReplyOk(fd);
+                var conn = tcp.Connection{ .fd = fd, .alive = true };
+                handleOneCommand(io, allocator, info, &conn, shutdown) catch |err| {
+                    std.log.err("[guest] handleOneCommand: {}", .{err});
+                };
+                conn.deinit();
+            } else {
+                // 本机 localhost relay
+                const t = std.Thread.spawn(.{}, tcp.socks4LocalRelay, .{ io, fd, req.port }) catch {
+                    tcp.socks4ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                };
+                t.detach();
+                std.log.info("[guest] local relay :{d}", .{req.port});
+            }
+        } else {
+            // 目标不是本机 — 链式 SOCKS4a 转发
+            if (mesh_opt) |*mesh| {
+                if (mesh.lookupHostnameIp(allocator, req.hostname)) |target_ip| {
+                    const next_hop = std.Io.net.IpAddress.parse(target_ip, mesh_port) catch {
+                        allocator.free(target_ip);
+                        tcp.socks4ReplyRejected(fd);
+                        tcp.sockClose(fd);
+                        continue;
+                    };
+                    allocator.free(target_ip);
+
+                    const hn_copy = allocator.dupe(u8, req.hostname) catch {
+                        tcp.socks4ReplyRejected(fd);
+                        tcp.sockClose(fd);
+                        continue;
+                    };
+
+                    const ctx = allocator.create(ForwardCtx) catch {
+                        allocator.free(hn_copy);
+                        tcp.socks4ReplyRejected(fd);
+                        tcp.sockClose(fd);
+                        continue;
+                    };
+                    ctx.* = .{
+                        .io = io,
+                        .client_fd = fd,
+                        .next_hop_ip = next_hop,
+                        .hostname = hn_copy,
+                        .target_port = req.port,
+                        .allocator = allocator,
+                    };
+
+                    const t = std.Thread.spawn(.{}, forwardThreadFn, .{ctx}) catch {
+                        allocator.destroy(ctx);
+                        allocator.free(hn_copy);
+                        tcp.socks4ReplyRejected(fd);
+                        tcp.sockClose(fd);
+                        continue;
+                    };
+                    t.detach();
+                    std.log.info("[guest] forward {s}:{d}", .{ req.hostname, req.port });
+                } else {
+                    std.log.info("[guest] no route to {s}", .{req.hostname});
+                    tcp.socks4ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                }
+            } else {
+                std.log.info("[guest] no mesh for forward to {s}", .{req.hostname});
+                tcp.socks4ReplyRejected(fd);
+                tcp.sockClose(fd);
+            }
+        }
     }
 }
 
