@@ -565,7 +565,28 @@ fn monitorUtmm(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
         // 命令处理
         const cmd: shm.Cmd = @enumFromInt(shm_ptr.cmd);
         switch (cmd) {
-            .restart, .upgrade => {
+            .upgrade => {
+                shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.accepted);
+                // 在 kill 之前读取升级路径（shm 数据仍有效）
+                const up = getCmdDataStr(alloc, shm_ptr) catch |err| {
+                    std.log.err("[utmmd] bad upgrade path: {}", .{err});
+                    shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.failed);
+                    shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
+                    return .crashed;
+                };
+                defer alloc.free(up);
+                upgradeUtmm(io, alloc, up) catch |err| {
+                    std.log.err("[utmmd] upgrade failed: {}", .{err});
+                    shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.failed);
+                    shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
+                    return .crashed;
+                };
+                shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.done);
+                shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
+                killProcess(proc);
+                return .restart;
+            },
+            .restart => {
                 shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.accepted);
                 killProcess(proc);
                 return .restart;

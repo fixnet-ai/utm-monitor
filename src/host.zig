@@ -11,6 +11,7 @@ const guest = @import("guest.zig");
 const lsa = @import("lsa.zig");
 const tcp = @import("tcp.zig");
 const svc = @import("svc.zig");
+const arp = @import("arp.zig");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     return runWithIo(init.io, init.gpa, cli, null);
@@ -664,6 +665,40 @@ const AUTO_UPGRADE_COOLDOWN_MS: i64 = 120_000; // 2 minutes
 /// Tracks last auto-upgrade attempt timestamp per Guest hostname.
 const LastUpgradeMap = std.StringHashMap(i64);
 
+/// Connect to a Guest via TCP with ARP-based IP rediscovery on failure.
+/// On primary connect failure, queries the system ARP table by MAC to find
+/// the Guest's new IP (handles UTM VM IP address changes).
+/// Returns a TCP connection or an error message string (caller does NOT own).
+pub fn connectGuest(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    state: *GuestTable,
+    hostname: []const u8,
+) !tcp.Connection {
+    const guest_entry = state.findByHostname(hostname) orelse return error.GuestNotFound;
+
+    return tcp.hostConnect(io, guest_entry.ip, hostname, protocol.DEFAULT_PORT) catch |primary_err| {
+        std.log.warn("[arp] primary connect to {s} ({s}) failed: {}", .{ hostname, guest_entry.ip, primary_err });
+
+        // ARP recovery: try to find new IP by MAC
+        if (guest_entry.mac.len > 0) {
+            const new_ip = arp.rediscoverIp(gpa, guest_entry.mac, guest_entry.ip) catch null;
+            if (new_ip) |nip| {
+                defer gpa.free(nip);
+                std.log.info("[arp] rediscovered {s}: {s} -> {s}", .{ hostname, guest_entry.ip, nip });
+                _ = state.updateIp(hostname, nip);
+
+                return tcp.hostConnect(io, nip, hostname, protocol.DEFAULT_PORT) catch |retry_err| {
+                    std.log.err("[arp] retry connect to {s} ({s}) also failed: {}", .{ hostname, nip, retry_err });
+                    return retry_err;
+                };
+            }
+        }
+
+        return primary_err;
+    };
+}
+
 /// Push an upgrade binary to a Guest.  Used by both manual --upgrade (IPC)
 /// and automatic version-mismatch detection (LSA manager).
 /// Returns an error string on failure (caller does NOT own), or null on success.
@@ -722,8 +757,8 @@ pub fn pushUpgrade(
 
     std.log.info("[auto-upgrade] {s} ({s}): {d} bytes, sha256={s}", .{ hostname, guest_entry.target, file_size, &sha256_hex });
 
-    // 7. Connect to Guest via SOCKS4a
-    var tcp_conn = tcp.hostConnect(io, guest_entry.ip, hostname, protocol.DEFAULT_PORT) catch |err| {
+    // 7. Connect to Guest via SOCKS4a (with ARP recovery)
+    var tcp_conn = connectGuest(io, gpa, state, hostname) catch |err| {
         std.log.err("[auto-upgrade] TCP connect to {s} failed: {}", .{ hostname, err });
         return "GuestConnectFailed";
     };
@@ -1041,6 +1076,19 @@ pub const GuestTable = struct {
         const idx = self.indexOf(hostname) orelse return;
         self.guests.items[idx].mesh_mac = mac_bytes;
     }
+
+    /// 更新 Guest IP（用于 ARP 重发现后更新）。
+    /// 返回 true 表示 IP 已变更，false 表示未变更或未找到。
+    pub fn updateIp(self: *GuestTable, hostname: []const u8, new_ip: []const u8) bool {
+        self.mutex.lock(self.io) catch return false;
+        defer self.mutex.unlock(self.io);
+        const idx = self.indexOf(hostname) orelse return false;
+        const existing = &self.guests.items[idx];
+        if (std.mem.eql(u8, existing.ip, new_ip)) return false;
+        self.allocator.free(existing.ip);
+        existing.ip = self.allocator.dupe(u8, new_ip) catch return false;
+        return true;
+    }
 };
 
 // /etc/hosts sync constants
@@ -1239,4 +1287,23 @@ test "GuestTable findByHostname after update" {
     try std.testing.expectEqualStrings("upgrading", found.status);
     try std.testing.expectEqualStrings("x86_64-windows", found.target);
     try std.testing.expectEqual(@as(i64, 3000), found.last_seen);
+}
+
+test "GuestTable updateIp" {
+    const allocator = std.testing.allocator;
+    var table = GuestTable.init(allocator, testIo());
+    defer table.deinit();
+
+    _ = table.upsert("linuxvm", "192.168.64.2", "aarch64-linux-musl", "aa:bb:cc:dd:ee:ff", "0.13.0", "/bin/bash", "", "guest", 1000);
+
+    // updateIp: change IP
+    try std.testing.expect(table.updateIp("linuxvm", "192.168.64.99"));
+    const found = table.findByHostname("linuxvm").?;
+    try std.testing.expectEqualStrings("192.168.64.99", found.ip);
+
+    // updateIp: no change
+    try std.testing.expect(!table.updateIp("linuxvm", "192.168.64.99"));
+
+    // updateIp: nonexistent hostname
+    try std.testing.expect(!table.updateIp("noexist", "10.0.0.1"));
 }

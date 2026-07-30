@@ -15,4 +15,5 @@ pub const svc = @import("svc.zig");
 pub const fail = @import("fail.zig");
 pub const config = @import("config.zig");
 pub const ipc = @import("ipc.zig");
+pub const arp = @import("arp.zig");
 pub const guest = @import("guest.zig");

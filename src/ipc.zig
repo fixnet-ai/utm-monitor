@@ -618,23 +618,23 @@ fn handleExec(
         return;
     };
 
-    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
-    const tcp_mod = @import("tcp.zig");
+    const host_mod = @import("host.zig");
+    const state = @as(*host_mod.GuestTable, @ptrCast(@alignCast(state_ptr)));
     const ptcl = @import("protocol.zig");
 
-    // Look up guest IP
+    // Per-command TCP connection (with ARP recovery)
+    var tcp_conn = host_mod.connectGuest(io, gpa, state, vm) catch |err| {
+        std.log.err("[ipc-exec] TCP connect to {s} failed: {}", .{ vm, err });
+        sendError(conn, if (err == error.GuestNotFound) "GuestNotFound" else "GuestNotConnected");
+        return;
+    };
+    defer tcp_conn.deinit();
+
+    // Look up guest for shell (needed for buildCmdWithMarker)
     const guest = state.findByHostname(vm) orelse {
         sendError(conn, "GuestNotFound");
         return;
     };
-
-    // Per-command TCP connection
-    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
-        std.log.err("[ipc-exec] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(conn, "GuestNotConnected");
-        return;
-    };
-    defer tcp_conn.deinit();
 
     // Generate cmd_id
     const cmd_id = std.fmt.allocPrint(gpa, "exec_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds}) catch {
@@ -754,20 +754,15 @@ fn handleUpload(
         return;
     };
 
-    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
+    const host_mod = @import("host.zig");
+    const state = @as(*host_mod.GuestTable, @ptrCast(@alignCast(state_ptr)));
     const tcp_mod = @import("tcp.zig");
     const ptcl = @import("protocol.zig");
 
-    // Look up guest IP
-    const guest = state.findByHostname(vm) orelse {
-        sendError(ipc_conn, "GuestNotFound");
-        return;
-    };
-
-    // Per-command TCP connection
-    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
+    // Per-command TCP connection (with ARP recovery)
+    var tcp_conn = host_mod.connectGuest(io, gpa, state, vm) catch |err| {
         std.log.err("[ipc-upload] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(ipc_conn, "GuestNotConnected");
+        sendError(ipc_conn, if (err == error.GuestNotFound) "GuestNotFound" else "GuestNotConnected");
         return;
     };
     defer tcp_conn.deinit();
@@ -878,20 +873,15 @@ fn handleDownload(
         return;
     };
 
-    const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
+    const host_mod = @import("host.zig");
+    const state = @as(*host_mod.GuestTable, @ptrCast(@alignCast(state_ptr)));
     const tcp_mod = @import("tcp.zig");
     const ptcl = @import("protocol.zig");
 
-    // Look up guest IP
-    const guest = state.findByHostname(vm) orelse {
-        sendError(conn, "GuestNotFound");
-        return;
-    };
-
-    // Per-command TCP connection
-    var tcp_conn = tcp_mod.hostConnect(io, guest.ip, vm, ptcl.DEFAULT_PORT) catch |err| {
+    // Per-command TCP connection (with ARP recovery)
+    var tcp_conn = host_mod.connectGuest(io, gpa, state, vm) catch |err| {
         std.log.err("[ipc-download] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(conn, "GuestNotConnected");
+        sendError(conn, if (err == error.GuestNotFound) "GuestNotFound" else "GuestNotConnected");
         return;
     };
     defer tcp_conn.deinit();
