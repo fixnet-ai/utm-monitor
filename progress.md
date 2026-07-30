@@ -742,6 +742,36 @@ tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig
 
 ---
 
+### 2026-07-31 — v0.14.7：裸机部署测试（clean deploy）+ skill 问题修复
+
+**测试流程**：全清空 → 构建(176 unit + 59 integration) → 部署(Host + 4 Guest) → 全功能验证
+
+**测试结果（全部通过）**：
+
+| Test | linuxvm | macvm | windowsvm | winx64 |
+|------|---------|-------|-----------|--------|
+| --exec | ✅ | ✅ | ✅ | ✅ |
+| --upload | ✅ | ✅ | ✅ | ✅ |
+| --download | ✅ | ✅ | ✅ | ✅ |
+| --ping | ✅* | ✅ | ✅ | ✅ |
+
+*linuxvm 首次 ping RTT 异常（1636224693 ms），重试正常（0 ms）
+
+**发现的 skill 问题（5 个）**：
+
+| # | 问题 | 影响 | 修复 |
+|---|------|------|------|
+| 1 | **sshpass 不存在** — v0.14.7 移除了外部 sshpass，clean-deploy skill 仍直接调用 `sshpass` | 清空 Host 后无法执行 Guest SSH 操作（鸡和蛋问题：需要 utmm 内置 sshpass，但 utmm 先被删了） | 先构建 → 用 `./zig-out/bin/utmm sshpass` 替代 `sshpass`；skill 需更新流程顺序 |
+| 2 | **linuxvm IP 错误** — skill 中写 `192.168.64.2` | SSH 连接超时 | 更新为 `192.168.64.6` |
+| 3 | **`pkill -9 -f utmm` 自杀** — Linux 上 `-f` 匹配命令全行，pkill 杀死执行该命令的 shell 自身 | SSH 会话异常退出（255） | 改用 `pkill -9 utmm`（仅匹配进程名，不用 `-f`） |
+| 4 | **Windows `mkdir C:\opt\utmm` 不可靠** — `2>nul` 隐藏错误但目录未创建 | SCP 失败 "No such file or directory" | 用 PowerShell `New-Item -ItemType Directory -Force -Path` |
+| 5 | **linuxvm ping RTT 偶尔异常** — 首次 ping 返回时间戳值而非 RTT | `--ping` 结果不可靠 | 待排查（可能 LSA 未完全同步时的竞争条件） |
+
+**skill 文件已同步修复**：
+- `clean-deploy/SKILL.md`：移除 `-f` 标志、更新 IP、添加 PowerShell mkdir
+- `deploy/SKILL.md`：更新 linuxvm IP
+- `SKILL.md`（根）：更新 linuxvm IP
+
 ### 2026-07-31 — v0.14.7：动态 ConPTY 加载 + 管道降级 + conpty 状态标记 + 文档审查
 
 **Task 190 — 动态 ConPTY 加载 + 管道降级**:

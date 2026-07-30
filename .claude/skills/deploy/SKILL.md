@@ -43,8 +43,8 @@ sudo zig-out/bin/utmm --status
 V=$(cat src/ver.txt)
 
 # linuxvm
-scp zig-out/bin/utmm-aarch64-linux-$V root@192.168.64.2:/opt/utmm/utmm-new
-ssh root@192.168.64.2 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname linuxvm'
+scp zig-out/bin/utmm-aarch64-linux-$V root@192.168.64.6:/opt/utmm/utmm-new
+ssh root@192.168.64.6 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname linuxvm'
 
 # macvm — kill first to avoid launchctl throttle
 ssh root@192.168.65.4 'killall -9 utmm utmmd 2>/dev/null; sleep 1'

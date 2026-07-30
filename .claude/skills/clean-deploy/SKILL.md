@@ -1,6 +1,6 @@
 # Clean Deploy Skill — UTM Monitor 裸机部署测试
 
-Complete "wipe → build → deploy → test" cycle. Simulates bare-metal deployment from
+Complete "build → wipe → deploy → test" cycle. Simulates bare-metal deployment from
 scratch. For VM table and prerequisites, see `SKILL.md` (project root). For deploy
 flow, see `.claude/skills/deploy/SKILL.md`.
 
@@ -10,10 +10,25 @@ flow, see `.claude/skills/deploy/SKILL.md`.
 
 ---
 
+## Phase 0: Build Native utmm (required for sshpass)
+
+External `sshpass` was removed in v0.14.7 — all remote SSH commands in Phase 1
+use `./zig-out/bin/utmm sshpass`. Must build native binary first:
+
+```bash
+zig build test              # must pass, 0 failures
+zig build test-integration   # must pass, 0 failures
+zig build -Doptimize=ReleaseSafe   # native → zig-out/bin/utmm
+```
+
+---
+
 ## Phase 1: Full Wipe
 
 Stop all services, kill processes, delete binaries, configs, logs. Return all machines
 to pre-installation state.
+
+**`UTMM=./zig-out/bin/utmm` — all sshpass calls use utmm's built-in sshpass.**
 
 ### Host (local macOS)
 
@@ -23,8 +38,8 @@ sudo launchctl bootout system/com.utmmd 2>/dev/null || true
 sudo launchctl bootout system/com.utmm.host 2>/dev/null || true
 sudo launchctl bootout system/com.utmm.guest 2>/dev/null || true
 sleep 2
-sudo pkill -9 -f utmm 2>/dev/null || true
-sudo pkill -9 -f utmmd 2>/dev/null || true
+sudo pkill -9 utmm 2>/dev/null || true
+sudo pkill -9 utmmd 2>/dev/null || true
 sudo rm -f /Library/LaunchDaemons/com.utmm*.plist
 sudo rm -rf /opt/utmm
 sudo rm -f /var/log/utmm*.log /var/log/utm*.log /var/log/utmmd*.log /var/log/utmm*.bak /var/log/utmm*.old
@@ -34,13 +49,13 @@ sudo rm -f /var/run/utmm.sock /var/run/utmm-install.lock
 ### macvm (macOS Guest)
 
 ```bash
-sshpass -p 111 ssh root@192.168.65.4 '
+./zig-out/bin/utmm sshpass -p 111 ssh root@192.168.65.4 '
 launchctl enable system/com.utmmd 2>/dev/null
 launchctl bootout system/com.utmmd 2>/dev/null || true
 launchctl bootout system/com.utmm.guest 2>/dev/null || true
 sleep 2
-pkill -9 -f utmm 2>/dev/null || true
-pkill -9 -f utmmd 2>/dev/null || true
+pkill -9 utmm 2>/dev/null || true
+pkill -9 utmmd 2>/dev/null || true
 rm -f /Library/LaunchDaemons/com.utmm*.plist
 rm -rf /opt/utmm
 rm -f /var/log/utmm*.log /var/log/utm*.log /var/log/utmmd*.log
@@ -52,14 +67,14 @@ echo "macvm cleaned"
 ### linuxvm (Linux Guest)
 
 ```bash
-sshpass -p 111 ssh root@192.168.64.2 '
+./zig-out/bin/utmm sshpass -p 111 ssh root@192.168.64.6 '
 systemctl stop utmmd 2>/dev/null || true
 systemctl stop utmm-guest 2>/dev/null || true
 systemctl disable utmmd 2>/dev/null || true
 systemctl disable utmm-guest 2>/dev/null || true
 sleep 2
-pkill -9 -f utmm 2>/dev/null || true
-pkill -9 -f utmmd 2>/dev/null || true
+pkill -9 utmm 2>/dev/null || true
+pkill -9 utmmd 2>/dev/null || true
 rm -f /etc/systemd/system/utmm*.service
 systemctl daemon-reload 2>/dev/null || true
 rm -rf /opt/utmm
@@ -73,7 +88,7 @@ echo "linuxvm cleaned"
 
 ```bash
 # windowsvm
-sshpass -p 111 ssh Administrator@192.168.64.3 'powershell -Command "
+./zig-out/bin/utmm sshpass -p 111 ssh Administrator@192.168.64.3 'powershell -Command "
 sc.exe stop UTM-MonitorD 2>$null; sc.exe delete UTM-MonitorD 2>$null;
 Get-Process -Name utmm -ErrorAction SilentlyContinue | Stop-Process -Force;
 Get-Process -Name utmmd -ErrorAction SilentlyContinue | Stop-Process -Force;
@@ -83,7 +98,7 @@ Remove-Item -Recurse -Force C:\opt\utmm -ErrorAction SilentlyContinue
 echo "windowsvm cleaned"
 
 # winx64
-sshpass -p 111 ssh Administrator@192.168.3.108 'powershell -Command "
+./zig-out/bin/utmm sshpass -p 111 ssh Administrator@192.168.3.108 'powershell -Command "
 sc.exe stop UTM-MonitorD 2>$null; sc.exe delete UTM-MonitorD 2>$null;
 Get-Process -Name utmm -ErrorAction SilentlyContinue | Stop-Process -Force;
 Get-Process -Name utmmd -ErrorAction SilentlyContinue | Stop-Process -Force;
@@ -97,20 +112,19 @@ echo "winx64 cleaned"
 
 ```bash
 ps aux | grep -i utmm | grep -v grep || echo "Host clean"
-sshpass -p 111 ssh root@192.168.65.4 'ps aux | grep -i utmm | grep -v grep || echo "macvm clean"'
-sshpass -p 111 ssh root@192.168.64.2 'ps aux | grep -i utmm | grep -v grep || echo "linuxvm clean"'
-sshpass -p 111 ssh Administrator@192.168.64.3 'tasklist /fi "imagename eq utmm.exe" 2>nul'
-sshpass -p 111 ssh Administrator@192.168.3.108 'tasklist /fi "imagename eq utmm.exe" 2>nul'
+./zig-out/bin/utmm sshpass -p 111 ssh root@192.168.65.4 'ps aux | grep -i utmm | grep -v grep || echo "macvm clean"'
+./zig-out/bin/utmm sshpass -p 111 ssh root@192.168.64.6 'ps aux | grep -i utmm | grep -v grep || echo "linuxvm clean"'
+./zig-out/bin/utmm sshpass -p 111 ssh Administrator@192.168.64.3 'tasklist /fi "imagename eq utmm.exe" 2>nul'
+./zig-out/bin/utmm sshpass -p 111 ssh Administrator@192.168.3.108 'tasklist /fi "imagename eq utmm.exe" 2>nul'
 ```
 
 ---
 
-## Phase 2: Build
+## Phase 2: Cross-Compile
+
+Build for all Guest targets:
 
 ```bash
-zig build test            # must pass, 0 failures
-zig build test-integration # must pass, 0 failures
-zig build -Doptimize=ReleaseSafe                     # native
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
@@ -123,7 +137,8 @@ zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows
 
 Follow `.claude/skills/deploy/SKILL.md` flow. Key extra steps for clean deploy:
 
-- **mkdir first**: wipe deletes `/opt/utmm` — run `mkdir -p /opt/utmm` on each Guest before scp
+- **mkdir first**: wipe deletes `/opt/utmm` — run `mkdir -p /opt/utmm` on each Guest before scp.
+  On Windows use: `./zig-out/bin/utmm sshpass -p 111 ssh Administrator@<ip> 'powershell -Command "New-Item -ItemType Directory -Force -Path C:\opt\utmm"'`
 - **Wait 15s**: after all deployments, wait for LSA sync before testing
 
 ---
@@ -180,9 +195,11 @@ Record results in `progress.md`:
 
 ## Caveats
 
+- **Phase 0 required**: v0.14.7 removed external sshpass — build native utmm first for `utmm sshpass`
 - **Irreversible** — wipes all configs, logs, history. Dev/test only.
 - **Windows OpenSSH** must be pre-enabled on Guests
-- **mkdir after wipe** — `/opt/utmm` is deleted during wipe
+- **mkdir after wipe** — `/opt/utmm` is deleted during wipe; use `New-Item` on Windows
 - **Windows download paths**: single-quote in bash (`'C:\opt\utmm\file.txt'`)
 - **Cross-compile output has version suffix** — `utmm-aarch64-macos-0.14.7`
 - SSH compound commands: avoid very long ones with `&&` + pipes — split into separate calls
+- **`pkill -9 utmm`** (no `-f`): `-f` matches full command line and kills the ssh/bash parent process on Linux

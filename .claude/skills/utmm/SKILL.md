@@ -15,9 +15,9 @@ See `SKILL.md` at project root for the current VM table. Quick reference:
 
 | VM | Hostname | Target | IP | User |
 |----|----------|--------|----|------|
-| Linux | linuxvm | aarch64-linux-musl | 192.168.64.2 | root |
-| macOS | macvm | aarch64-macos | 192.168.64.4 | root |
-| Windows ARM | windowsvm | aarch64-windows | 192.168.65.2 | Administrator |
+| Linux | linuxvm | aarch64-linux-musl | 192.168.64.6 | root |
+| macOS | macvm | aarch64-macos | 192.168.65.4 | root |
+| Windows ARM | windowsvm | aarch64-windows | 192.168.64.3 | Administrator |
 | Windows x64 | winx64 | x86_64-windows | 192.168.3.108 | Administrator |
 
 Password for all VMs: `111`.

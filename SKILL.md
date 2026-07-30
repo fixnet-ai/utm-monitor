@@ -7,9 +7,9 @@ Single Zig binary: `utmm` (embeds `utmmd` supervisor).
 
 | VM | Hostname | Target | IP | User | Password | Shell |
 |----|----------|--------|----|------|----------|-------|
-| Linux | linuxvm | aarch64-linux-musl | 192.168.64.2 | root | 111 | /bin/bash |
-| macOS | macvm | aarch64-macos | 192.168.64.4 | root | 111 | /bin/zsh |
-| Windows ARM | windowsvm | aarch64-windows | 192.168.65.2 | Administrator | 111 | cmd.exe |
+| Linux | linuxvm | aarch64-linux-musl | 192.168.64.6 | root | 111 | /bin/bash |
+| macOS | macvm | aarch64-macos | 192.168.65.4 | root | 111 | /bin/zsh |
+| Windows ARM | windowsvm | aarch64-windows | 192.168.64.3 | Administrator | 111 | cmd.exe |
 | Windows x64 | winx64 | x86_64-windows | 192.168.3.108 | Administrator | 111 | cmd.exe |
 
 ## Trigger Conditions
