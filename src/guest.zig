@@ -1243,27 +1243,57 @@ fn handleUpgradeCmd(
 
     std.log.info("[guest] upgrade: SHA256 verified, {d} bytes → {s}", .{ cmd.file_size, upgrade_path });
 
-    // 发送成功响应
+    // 发送成功响应（在写 marker 之前——即使 marker 写入失败，Host 已确认收到）
     const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
     defer allocator.free(resp);
     _ = conn.sendAndFlush(resp, 0) catch {};
 
-    // 写入 .sha256 标记文件，utmmd 轮询发现后执行原子替换
+    // 写入 .sha256 标记文件（原子写入：先写临时文件，再 rename 到最终路径，
+    // 避免 utmmd 读到半写文件）
     const sha_path = if (builtin.os.tag == .windows)
         try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.sha256", .{svc.canonicalDir()})
     else
         try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256", .{svc.canonicalDir()});
     defer allocator.free(sha_path);
 
-    const sha_file = std.Io.Dir.cwd().createFile(io, sha_path, .{ .truncate = true }) catch |err| {
-        std.log.err("[guest] upgrade: create sha256 file: {}", .{err});
+    // 临时文件：写完整内容后原子 rename，避免 utmmd 读到空/半写文件
+    const sha_tmp = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.sha256.tmp", .{svc.canonicalDir()})
+    else
+        try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256.tmp", .{svc.canonicalDir()});
+    defer allocator.free(sha_tmp);
+
+    const sha_file = std.Io.Dir.cwd().createFile(io, sha_tmp, .{ .truncate = true }) catch |err| {
+        std.log.err("[guest] upgrade: create sha256 tmp file: {}", .{err});
+        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
         return;
     };
+
     var sha_wb: [128]u8 = undefined;
     var sw = sha_file.writer(io, &sha_wb);
-    _ = sw.interface.writeAll(&hex_buf) catch {};
-    sw.interface.flush() catch {};
+    sw.interface.writeAll(&hex_buf) catch |err| {
+        std.log.err("[guest] upgrade: write sha256: {}", .{err});
+        sha_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, sha_tmp) catch {};
+        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        return;
+    };
+    sw.interface.flush() catch |err| {
+        std.log.err("[guest] upgrade: flush sha256: {}", .{err});
+        sha_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, sha_tmp) catch {};
+        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        return;
+    };
     sha_file.close(io);
+
+    // 原子 rename：tmp → 最终路径，utmmd 看到 marker 时内容已完整
+    std.Io.Dir.cwd().rename(sha_tmp, std.Io.Dir.cwd(), sha_path, io) catch |err| {
+        std.log.err("[guest] upgrade: rename sha256: {}", .{err});
+        std.Io.Dir.cwd().deleteFile(io, sha_tmp) catch {};
+        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        return;
+    };
     std.log.info("[guest] upgrade: marker written, utmmd will pick up", .{});
 }
 
