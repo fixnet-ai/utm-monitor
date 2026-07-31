@@ -475,9 +475,9 @@ fn handleVmUpload(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8,
 fn handleVmDownload(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, remote_path: []const u8, local_path: []const u8) ![]const u8 {
     _ = port;
 
-    // Open local file for writing
-    const file = std.Io.Dir.cwd().openFile(io, local_path, .{ .mode = .write_only }) catch |err| {
-        std.log.err("[mcp] Cannot open {s} for write: {}", .{ local_path, err });
+    // Create local file for writing (createFile = open or create, truncate)
+    const file = std.Io.Dir.cwd().createFile(io, local_path, .{}) catch |err| {
+        std.log.err("[mcp] Cannot create {s} for write: {}", .{ local_path, err });
         return error.DownloadFailed;
     };
     defer file.close(io);
