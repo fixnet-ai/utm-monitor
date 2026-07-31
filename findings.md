@@ -645,3 +645,24 @@ defer 的第二次 close 对已释放的 ctx 操作：`self.file` 字段为垃�
 - `/etc/hosts` 条目本应是简单的 hostname→IP 映射，不需要伪造 FQDN
 - `{target}` 是编译目标标识（如 `aarch64-linux-musl`），与 hostname 无关
 - 去除后缀后可以简化 DNS/SSH 等工具的使用
+
+---
+
+## 2026-08-01 — Hub-Spoke 架构全面修正（v0.16.1 后续）
+
+### Finding 199: Guest 链式转发代码与 Hub-Spoke 架构矛盾
+
+**问题**: `src/guest.zig` SOCKS5 分发中 `target!=self` 分支仍保留了直接 Guest→Guest 链式转发代码
+（~58 行），通过 `mesh.lookupHostnameIp()` 查目标 Guest IP 然后 `socks5.forward()` 直连。
+这与 Hub-Spoke 架构矛盾：只有 Host 应该做链式转发，Guest 间通信必须经 Host (gateway) 中转。
+
+**修复** (commit `2b69c8e`): 删除直接链式转发，改为直接 REJECT。
+```
+// 旧：查 node table → connect target_ip:2121 → socks5 forward
+// 新：reject non-self target — 统一经 Host (gateway) 中转
+```
+
+**保留**: `ForwardCtx` 和 `forwardThreadFn` 未删除 — `host.zig` 仍使用它们做正确的 Host 侧链式转发。
+
+**影响范围**: 仅 Guest 端 SOCKS5 接受逻辑。Host 端不受影响。所有 Guest 间通信本就走 Host，
+此修复消除了 Guest 被直接连接时绕开 Host 的错误路径。

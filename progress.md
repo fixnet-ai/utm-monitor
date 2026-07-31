@@ -1073,3 +1073,34 @@ tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig
 **修复后二进制确认**:
 - `/opt/utmm/utmm` 已包含 `createFile` 代码 + 重新 ad-hoc 签名
 - MCP 进程需重启会话才能加载新二进制（管道测试已验证功能正确）
+
+---
+
+## v0.16.1 后续 — Hub-Spoke 架构全面修正
+
+**时间**: 2026-08-01
+
+### SOCKS5 文档全面修正
+
+用户指出对 SOCKS5 转发架构理解有根本性错误 — 是 Hub-Spoke（Host 唯一中转），
+不是 peer-mesh（每节点中转）。Host IP 同步到每个 Guest 的 `/etc/hosts` 文件
+作为 `gateway` hostname。
+
+**文档修正** (commit `dc782b9`):
+- `README.md`: CLI Quick Start SOCKS5 示例加 gateway 注释
+- `MANUAL.md`: SOCKS5 Forwarding 整节重写，Run Modes 更新，加 Windows Firewall BIND 限制
+- `CLAUDE.md`: 5+ 处修正 — 端口描述、运行模式、转发流程、设计决策、TCP 帧协议模式
+
+### Guest 链式转发代码修正
+
+**Explore agent 发现**: `src/guest.zig:989-1051` 仍保留直接 Guest→Guest 链式转发代码，
+与 Hub-Spoke 模型矛盾。
+
+**修复** (commit `2b69c8e`):
+- 删除 ~58 行直接链式转发代码（node table lookup → connect → socks5 forward）
+- 替换为直接 REJECT：目标非本机时拒绝，统一走 Host (gateway) 中转
+- `ForwardCtx`/`forwardThreadFn` 保留 — host.zig 仍使用它们做正确的 Host 侧转发
+
+**测试验证**:
+- 186 单元测试全通过 ✅
+- 59 集成测试全通过，无内存泄漏 ✅
