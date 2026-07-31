@@ -5,6 +5,7 @@ const lib = @import("testlib");
 const common = @import("common");
 const tcp = lib.tcp;
 const protocol = lib.protocol;
+const socks5 = lib.socks5;
 
 pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestRunner) !void {
     // ── 场景 1: SOCKS5 完整握手 ──
@@ -29,7 +30,7 @@ pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.Test
                     done.store(true, .release);
                     return;
                 };
-                const stream = tcp.socks5Connect(io2, ip, h, port) catch {
+                const stream = socks5.connect(io2, ip, h, port) catch {
                     done.store(true, .release);
                     return;
                 };
@@ -46,7 +47,7 @@ pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.Test
         };
         defer common.sockClose(cli_fd);
 
-        const req = tcp.socks5Accept(cli_fd, alloc) catch |err| {
+        const req = socks5.accept(cli_fd, alloc) catch |err| {
             tc.expect(false, "socks5Accept 失败: {}", .{err});
             tc.deinit();
             return;
@@ -54,7 +55,7 @@ pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.Test
         defer alloc.free(req.hostname);
         tc.expectStr(hostname, req.hostname, "hostname 匹配");
         tc.expectEqual(@as(u16, listener.port), req.port, "端口匹配");
-        tcp.socks5ReplyOk(cli_fd);
+        socks5.replyOk(cli_fd);
 
         while (!client_done.load(.acquire)) {
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
@@ -80,8 +81,8 @@ pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.Test
         }
 
         const test_data = "hello tcp frame protocol";
-        try tcp.sendFrame(pair.a, test_data);
-        const received = try tcp.recvFrame(alloc, pair.b);
+        try protocol.sendFrame(pair.a, test_data);
+        const received = try protocol.recvFrame(alloc, pair.b);
         defer alloc.free(received);
         tc.expectStr(test_data, received, "小载荷往返一致");
 
@@ -111,12 +112,12 @@ pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.Test
         const ctx = SendCtx{ .fd = pair.a, .data = &big_data };
         const sender = try std.Thread.spawn(.{}, struct {
             fn run(c: SendCtx) void {
-                tcp.sendFrame(c.fd, c.data) catch @panic("sendFrame failed");
+                protocol.sendFrame(c.fd, c.data) catch @panic("sendFrame failed");
             }
         }.run, .{ctx});
         defer sender.join();
 
-        const received = try tcp.recvFrame(alloc, pair.b);
+        const received = try protocol.recvFrame(alloc, pair.b);
         defer alloc.free(received);
         tc.expectEqual(big_data.len, received.len, "大帧长度一致");
         tc.expectTrue(std.mem.eql(u8, &big_data, received), "大帧内容一致");
@@ -143,9 +144,9 @@ pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.Test
         const send_frame = try protocol.buildPtyExecInput(alloc, cmd_id, command);
         defer alloc.free(send_frame);
 
-        try tcp.sendFrame(pair.a, send_frame);
+        try protocol.sendFrame(pair.a, send_frame);
 
-        const received = try tcp.recvFrame(alloc, pair.b);
+        const received = try protocol.recvFrame(alloc, pair.b);
         defer alloc.free(received);
         tc.expectTrue(received.len >= 5, "recvFrame 返回了数据");
 
@@ -174,7 +175,7 @@ pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.Test
             common.sockClose(pair.b);
         }
 
-        var conn = tcp.Connection{ .fd = pair.a, .alive = true };
+        var conn = protocol.Connection{ .fd = pair.a, .alive = true };
         defer conn.deinit();
 
         tc.expectTrue(conn.isAlive(), "初始状态 alive=true");

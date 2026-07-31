@@ -1,6 +1,7 @@
 //! Communication protocol definitions: message formats, constants, parse/build utilities
 
 const std = @import("std");
+const tcp = @import("tcp.zig");
 
 /// Default UDP broadcast/listen + TCP message port (unified on 2121)
 pub const DEFAULT_PORT: u16 = 2121;
@@ -649,6 +650,118 @@ pub fn scanForMarker(output: *std.ArrayList(u8)) MarkerResult {
     return .{ .exit_code = ec, .found = true };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Frame Protocol
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Max frame size 16 MB (for file transfers).
+pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
+
+/// Send a frame: write 4-byte BE length + payload.
+pub fn sendFrame(fd: tcp.socket_t, data: []const u8) !void {
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, @intCast(data.len), .big);
+    const n1 = tcp.sockWrite(fd, &len_buf, len_buf.len);
+    if (n1 != 4) return error.SendFailed;
+    const n2 = tcp.sockWrite(fd, data.ptr, data.len);
+    if (n2 != data.len) return error.SendFailed;
+}
+
+/// Receive a frame: read 4-byte BE length → allocate buffer → read payload.
+/// Returns caller-owned memory (must free with allocator).
+pub fn recvFrame(allocator: std.mem.Allocator, fd: tcp.socket_t) ![]const u8 {
+    var len_buf: [4]u8 = undefined;
+    const n = try recvExact(fd, &len_buf);
+    if (n == 0) return error.ConnectionClosed;
+    const len = std.mem.readInt(u32, &len_buf, .big);
+    if (len > MAX_FRAME) return error.FrameTooLarge;
+
+    const payload = try allocator.alloc(u8, len);
+    errdefer allocator.free(payload);
+    const m = try recvExact(fd, payload);
+    if (m < len) return error.TruncatedFrame;
+    return payload;
+}
+
+/// Read exactly len bytes. Returns actual read count (0 = EOF).
+pub fn recvExact(fd: tcp.socket_t, buf: []u8) !usize {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = tcp.sockRead(fd, buf.ptr + total, buf.len - total);
+        if (n < 0) return error.ConnectionClosed; // read error on dead socket
+        if (n == 0) return total; // EOF
+        total += @intCast(n);
+    }
+    return total;
+}
+
+/// Send thread args (for large-payload tests to avoid socketpair deadlock).
+const SendArgs = struct { fd: tcp.socket_t, data: []const u8 };
+
+/// Thread entry: send a frame.
+fn sendInThread(args: SendArgs) void {
+    sendFrame(args.fd, args.data) catch @panic("sendFrame failed in thread");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Connection — TCP + SOCKS5 framed connection abstraction
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub const Connection = struct {
+    fd: tcp.socket_t,
+    alive: bool,
+
+    /// Send a frame (4B BE length + payload).
+    pub fn send(self: *Connection, data: []const u8) !void {
+        return sendFrame(self.fd, data);
+    }
+
+    /// Send and flush (same as send — TCP has no flush concept).
+    pub fn sendAndFlush(self: *Connection, data: []const u8, _: u32) !void {
+        return sendFrame(self.fd, data);
+    }
+
+    /// Receive a frame: read 4B length → read payload into buf.
+    /// Returns payload byte count. buf must be large enough for the full frame.
+    /// Returns 0 if connection closed.
+    pub fn recv(self: *Connection, buf: []u8) !usize {
+        var len_buf: [4]u8 = undefined;
+        const nr = recvExact(self.fd, &len_buf) catch |err| {
+            if (err == error.ConnectionClosed) {
+                self.alive = false;
+                return 0;
+            }
+            return err;
+        };
+        if (nr == 0) {
+            self.alive = false;
+            return 0;
+        }
+        const len = std.mem.readInt(u32, &len_buf, .big);
+        if (len > buf.len) return error.BufferTooSmall;
+
+        return recvExact(self.fd, buf[0..len]) catch |err| {
+            if (err == error.ConnectionClosed) {
+                self.alive = false;
+                return 0;
+            }
+            return err;
+        };
+    }
+
+    /// Whether connection is alive.
+    pub fn isAlive(self: *Connection) bool {
+        return self.alive;
+    }
+
+    /// Close connection and release resources.
+    pub fn deinit(self: *Connection) void {
+        self.alive = false;
+        tcp.sockShutdown(self.fd, 2); // SHUT_RDWR
+        tcp.sockClose(self.fd);
+    }
+};
+
 // ========== Tests ==========
 
 test "GuestInfo.parse" {
@@ -961,3 +1074,175 @@ test "readString - default max is MAX_STRING_LEN" {
     try std.testing.expectEqualStrings("hello", result);
 }
 
+// ── Frame protocol tests ──
+
+test "sendFrame/recvFrame round-trip" {
+    const allocator = std.testing.allocator;
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const msg = "hello tcp frame";
+    try sendFrame(pair.a, msg);
+
+    const received = try recvFrame(allocator, pair.b);
+    defer allocator.free(received);
+    try std.testing.expectEqualStrings(msg, received);
+}
+
+test "recvFrame empty" {
+    const allocator = std.testing.allocator;
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    tcp.sockShutdown(pair.a, 1); // SHUT_WR=1
+    const result = recvFrame(allocator, pair.b);
+    try std.testing.expectError(error.ConnectionClosed, result);
+}
+
+test "recvFrame large payload" {
+    const allocator = std.testing.allocator;
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const large = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(large);
+    @memset(large, 0xAB);
+
+    const sender = try std.Thread.spawn(.{}, sendInThread, .{SendArgs{ .fd = pair.a, .data = large }});
+    defer sender.join();
+
+    const received = try recvFrame(allocator, pair.b);
+    defer allocator.free(received);
+    try std.testing.expectEqual(large.len, received.len);
+    try std.testing.expectEqualSlices(u8, large, received);
+}
+
+test "recvFrame multiple frames" {
+    const allocator = std.testing.allocator;
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    try sendFrame(pair.a, "first");
+    try sendFrame(pair.a, "second");
+
+    const r1 = try recvFrame(allocator, pair.b);
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings("first", r1);
+
+    const r2 = try recvFrame(allocator, pair.b);
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings("second", r2);
+}
+
+// ── Connection tests ──
+
+test "Connection send/recv round-trip" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    var conn = Connection{ .fd = pair.a, .alive = true };
+    try conn.send("hello world");
+
+    var rbuf: [256]u8 = undefined;
+    // Peer reads 4B header + payload to verify correct frame format
+    const nr = try recvExact(pair.b, rbuf[0..15]);
+    try std.testing.expect(nr == 15);
+}
+
+test "Connection recv detects close" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.b);
+    }
+
+    var conn = Connection{ .fd = pair.a, .alive = true };
+    tcp.sockShutdown(pair.a, 2);
+    tcp.sockClose(pair.a);
+
+    var rbuf: [256]u8 = undefined;
+    if (conn.recv(&rbuf)) |_| {} else |_| {}
+    try std.testing.expect(!conn.isAlive());
+}
+
+// ── EAGAIN regression tests — non-blocking socket I/O retry ──
+
+test "sockRead retries on EAGAIN (non-blocking socket, delayed write)" {
+    const pair = try tcp.makeNonBlockingPair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    // Writer thread delays 50ms then writes, simulating split packet arrival.
+    // sockRead must retry on EAGAIN until data is available.
+    const writer_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            var t: std.Io.Threaded = .init_single_threaded;
+            std.Io.sleep(t.io(), std.Io.Duration.fromMilliseconds(50), .real) catch {};
+            _ = tcp.sockWrite(fd, "EAGAIN_OK", 9);
+        }
+    }.run, .{pair.b});
+    defer writer_thread.join();
+
+    var buf: [9]u8 = undefined;
+    var off: usize = 0;
+    while (off < buf.len) {
+        const n = tcp.sockRead(pair.a, buf[off..].ptr, buf.len - off);
+        if (n < 0) {
+            @panic("sockRead returned error on non-blocking test socket");
+        }
+        if (n == 0) {
+            continue;
+        }
+        off += @intCast(n);
+    }
+    try std.testing.expectEqualStrings("EAGAIN_OK", buf[0..]);
+}
+
+test "sendFrame/recvFrame on non-blocking socket" {
+    const allocator = std.testing.allocator;
+    const pair = try tcp.makeNonBlockingPair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const msg = "non-blocking frame test";
+    const sender = try std.Thread.spawn(.{}, sendInThread, .{SendArgs{ .fd = pair.a, .data = msg }});
+    defer sender.join();
+
+    const received = try recvFrame(allocator, pair.b);
+    defer allocator.free(received);
+    try std.testing.expectEqualStrings(msg, received);
+}
+
+test "recvExact handles partial reads on non-blocking socket" {
+    const pair = try tcp.makeNonBlockingPair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const data = "0123456789ABCDEF";
+    _ = tcp.sockWrite(pair.b, data, data.len);
+
+    var buf: [16]u8 = undefined;
+    const n = try recvExact(pair.a, buf[0..]);
+    try std.testing.expectEqual(data.len, n);
+    try std.testing.expectEqualStrings(data, buf[0..n]);
+}

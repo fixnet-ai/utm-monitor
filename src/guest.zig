@@ -11,6 +11,7 @@ const net = std.Io.net;
 const protocol = @import("protocol.zig");
 const lsa = @import("lsa.zig");
 const tcp = @import("tcp.zig");
+const socks5 = @import("socks5.zig");
 const svc = @import("svc.zig");
 const dpipe = @import("dpipe.zig");
 const dpipe_shell = @import("dpipe_shell.zig");
@@ -768,7 +769,7 @@ pub fn forwardThreadFn(ctx: *ForwardCtx) void {
     defer ctx.allocator.destroy(ctx);
     defer ctx.allocator.free(ctx.hostname);
     defer ctx.maybeReleaseLimit();
-    tcp.socks5Forward(ctx.io, ctx.client_fd, ctx.next_hop_ip, ctx.hostname, ctx.target_port);
+    socks5.forward(ctx.io, ctx.client_fd, ctx.next_hop_ip, ctx.hostname, ctx.target_port);
 }
 
 pub fn guestTcpLoop(
@@ -917,7 +918,7 @@ pub fn guestTcpLoop(
 
         // 读取 SOCKS5 请求
         var req_buf: [tcp.MAX_HOSTNAME + 1]u8 = undefined;
-        const req = tcp.socks5ReadRequestBuf(fd, req_buf[0..]) catch |err| {
+        const req = socks5.readRequestBuf(fd, req_buf[0..]) catch |err| {
             std.log.err("[guest] SOCKS5 read failed: {}", .{err});
             tcp.sockClose(fd);
             continue;
@@ -929,13 +930,13 @@ pub fn guestTcpLoop(
             if (req.port == mesh_port) {
                 // utmm 内部帧协议 — 连接限制计数（单连接 inline 处理）
                 if (!conn_limit.tryAcquire()) {
-                    tcp.socks5ReplyRejected(fd);
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 }
                 defer conn_limit.release();
-                tcp.socks5ReplyOk(fd);
-                var conn = tcp.Connection{ .fd = fd, .alive = true };
+                socks5.replyOk(fd);
+                var conn = protocol.Connection{ .fd = fd, .alive = true };
                 handleOneCommand(io, allocator, info, &conn, shutdown) catch |err| {
                     std.log.err("[guest] handleOneCommand: {}", .{err});
                 };
@@ -943,13 +944,13 @@ pub fn guestTcpLoop(
             } else {
                 // 本机 localhost relay — 连接限制计数
                 if (!conn_limit.tryAcquire()) {
-                    tcp.socks5ReplyRejected(fd);
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 }
                 errdefer conn_limit.release();
-                const t = std.Thread.spawn(.{}, tcp.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
-                    tcp.socks5ReplyRejected(fd);
+                const t = std.Thread.spawn(.{}, socks5.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
@@ -963,7 +964,7 @@ pub fn guestTcpLoop(
                     // 连接限制计数
                     if (!conn_limit.tryAcquire()) {
                         allocator.free(target_ip);
-                        tcp.socks5ReplyRejected(fd);
+                        socks5.replyRejected(fd);
                         tcp.sockClose(fd);
                         continue;
                     }
@@ -971,21 +972,21 @@ pub fn guestTcpLoop(
 
                     const next_hop = std.Io.net.IpAddress.parse(target_ip, mesh_port) catch {
                         allocator.free(target_ip);
-                        tcp.socks5ReplyRejected(fd);
+                        socks5.replyRejected(fd);
                         tcp.sockClose(fd);
                         continue;
                     };
                     allocator.free(target_ip);
 
                     const hn_copy = allocator.dupe(u8, req.hostname) catch {
-                        tcp.socks5ReplyRejected(fd);
+                        socks5.replyRejected(fd);
                         tcp.sockClose(fd);
                         continue;
                     };
 
                     const ctx = allocator.create(ForwardCtx) catch {
                         allocator.free(hn_copy);
-                        tcp.socks5ReplyRejected(fd);
+                        socks5.replyRejected(fd);
                         tcp.sockClose(fd);
                         continue;
                     };
@@ -1002,7 +1003,7 @@ pub fn guestTcpLoop(
                     const t = std.Thread.spawn(.{}, forwardThreadFn, .{ctx}) catch {
                         allocator.destroy(ctx);
                         allocator.free(hn_copy);
-                        tcp.socks5ReplyRejected(fd);
+                        socks5.replyRejected(fd);
                         tcp.sockClose(fd);
                         continue;
                     };
@@ -1010,12 +1011,12 @@ pub fn guestTcpLoop(
                     std.log.info("[guest] forward {s}:{d}", .{ req.hostname, req.port });
                 } else {
                     std.log.info("[guest] no route to {s}", .{req.hostname});
-                    tcp.socks5ReplyRejected(fd);
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                 }
             } else {
                 std.log.info("[guest] no mesh for forward to {s}", .{req.hostname});
-                tcp.socks5ReplyRejected(fd);
+                socks5.replyRejected(fd);
                 tcp.sockClose(fd);
             }
         }
@@ -1028,7 +1029,7 @@ fn handleOneCommand(
     io: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
-    conn: *tcp.Connection,
+    conn: *protocol.Connection,
     shutdown: ?*std.atomic.Value(bool),
 ) !void {
     var rbuf: [262144]u8 = undefined;
@@ -1071,7 +1072,7 @@ fn handleExecCmd(
     io: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
-    conn: *tcp.Connection,
+    conn: *protocol.Connection,
     payload: []const u8,
 ) !void {
     _ = io;
@@ -1143,7 +1144,7 @@ fn handleExecCmd(
 fn handleUpload(
     io: std.Io,
     allocator: std.mem.Allocator,
-    conn: *tcp.Connection,
+    conn: *protocol.Connection,
     payload: []const u8,
 ) !void {
     const cmd = protocol.parseUploadCmd(payload) orelse {
@@ -1197,7 +1198,7 @@ fn handleUpload(
 fn handleUpgradeCmd(
     io: std.Io,
     allocator: std.mem.Allocator,
-    conn: *tcp.Connection,
+    conn: *protocol.Connection,
     payload: []const u8,
 ) !void {
     const cmd = protocol.parseUpgradeCmd(payload) orelse {
@@ -1363,7 +1364,7 @@ fn handleUpgradeCmd(
 fn handleDownload(
     io: std.Io,
     allocator: std.mem.Allocator,
-    conn: *tcp.Connection,
+    conn: *protocol.Connection,
     payload: []const u8,
 ) !void {
     const cmd = protocol.parseDownloadCmd(payload) orelse {

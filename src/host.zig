@@ -11,6 +11,7 @@ const protocol = @import("protocol.zig");
 const guest = @import("guest.zig");
 const lsa = @import("lsa.zig");
 const tcp = @import("tcp.zig");
+const socks5 = @import("socks5.zig");
 const svc = @import("svc.zig");
 const arp = @import("arp.zig");
 const sshpass = @import("sshpass.zig");
@@ -730,7 +731,7 @@ fn hostTcpListen(
 
         // 读取 SOCKS5 请求
         var req_buf: [tcp.MAX_HOSTNAME + 1]u8 = undefined;
-        const req = tcp.socks5ReadRequestBuf(fd, req_buf[0..]) catch |err| {
+        const req = socks5.readRequestBuf(fd, req_buf[0..]) catch |err| {
             std.log.err("[host] SOCKS5 read failed: {}", .{err});
             tcp.sockClose(fd);
             continue;
@@ -741,19 +742,19 @@ fn hostTcpListen(
             // 目标是本机
             if (req.port == mesh_port) {
                 // self:2121 — no utmm handler on Host side, just close
-                tcp.socks5ReplyOk(fd);
+                socks5.replyOk(fd);
                 tcp.sockClose(fd);
                 std.log.debug("[host] self:2121 (no handler)", .{});
             } else {
                 // 本机 localhost relay — 连接限制计数
                 if (!conn_limit.tryAcquire()) {
-                    tcp.socks5ReplyRejected(fd);
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 }
                 errdefer conn_limit.release();
-                const t = std.Thread.spawn(.{}, tcp.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
-                    tcp.socks5ReplyRejected(fd);
+                const t = std.Thread.spawn(.{}, socks5.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
@@ -767,27 +768,27 @@ fn hostTcpListen(
 
                 // 连接限制计数
                 if (!conn_limit.tryAcquire()) {
-                    tcp.socks5ReplyRejected(fd);
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 }
                 errdefer conn_limit.release();
 
                 const next_hop = std.Io.net.IpAddress.parse(guest_entry.ip, mesh_port) catch {
-                    tcp.socks5ReplyRejected(fd);
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
 
                 const hn_copy = allocator.dupe(u8, req.hostname) catch {
-                    tcp.socks5ReplyRejected(fd);
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
 
                 const ctx = allocator.create(guest.ForwardCtx) catch {
                     allocator.free(hn_copy);
-                    tcp.socks5ReplyRejected(fd);
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
@@ -804,7 +805,7 @@ fn hostTcpListen(
                 const t = std.Thread.spawn(.{}, guest.forwardThreadFn, .{ctx}) catch {
                     allocator.destroy(ctx);
                     allocator.free(hn_copy);
-                    tcp.socks5ReplyRejected(fd);
+                    socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
@@ -812,7 +813,7 @@ fn hostTcpListen(
                 std.log.info("[host] forward {s}:{d} → {s}", .{ req.hostname, req.port, guest_entry.ip });
             } else {
                 std.log.info("[host] no route to {s}", .{req.hostname});
-                tcp.socks5ReplyRejected(fd);
+                socks5.replyRejected(fd);
                 tcp.sockClose(fd);
             }
         }
@@ -849,11 +850,11 @@ pub fn connectGuest(
     gpa: std.mem.Allocator,
     state: *GuestTable,
     hostname: []const u8,
-) !tcp.Connection {
+) !protocol.Connection {
     const guest_entry = state.findByHostname(hostname) orelse return error.GuestNotFound;
     defer state.freeEntry(guest_entry);
 
-    return tcp.hostConnect(io, guest_entry.ip, hostname, protocol.DEFAULT_PORT) catch |primary_err| {
+    return socks5.hostConnect(io, guest_entry.ip, hostname, protocol.DEFAULT_PORT) catch |primary_err| {
         std.log.warn("[arp] primary connect to {s} ({s}) failed: {}", .{ hostname, guest_entry.ip, primary_err });
 
         // ARP recovery: try to find new IP by MAC
@@ -864,7 +865,7 @@ pub fn connectGuest(
                 std.log.info("[arp] rediscovered {s}: {s} -> {s}", .{ hostname, guest_entry.ip, nip });
                 _ = state.updateIp(hostname, nip);
 
-                return tcp.hostConnect(io, nip, hostname, protocol.DEFAULT_PORT) catch |retry_err| {
+                return socks5.hostConnect(io, nip, hostname, protocol.DEFAULT_PORT) catch |retry_err| {
                     std.log.err("[arp] retry connect to {s} ({s}) also failed: {}", .{ hostname, nip, retry_err });
                     return retry_err;
                 };

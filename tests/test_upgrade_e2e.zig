@@ -23,7 +23,7 @@ fn guestUpgradeSimulator(
         common.sockClose(cli_fd);
     }
 
-    const cmd_frame = tcp.recvFrame(allocator, cli_fd) catch return;
+    const cmd_frame = protocol.recvFrame(allocator, cli_fd) catch return;
     defer allocator.free(cmd_frame);
 
     if (cmd_frame.len < 1 or cmd_frame[0] != @intFromEnum(protocol.MsgType.upgrade_cmd)) return;
@@ -56,7 +56,7 @@ fn guestUpgradeSimulator(
 
     const resp_frame = protocol.buildUploadResult(allocator, cmd.cmd_id, exit_code) catch return;
     defer allocator.free(resp_frame);
-    tcp.sendFrame(cli_fd, resp_frame) catch return;
+    protocol.sendFrame(cli_fd, resp_frame) catch return;
 
     if (hash_ok) result_ok.store(true, .release);
 }
@@ -116,11 +116,11 @@ pub fn test_upgrade_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
 
         const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-1", "aarch64-linux", @intCast(fake_binary.len), sha256_hex, protocol.VERSION);
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
 
         _ = common.sockWrite(fd, fake_binary.ptr, fake_binary.len);
 
-        const resp_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const resp_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
             tc.deinit();
             return;
@@ -178,11 +178,11 @@ pub fn test_upgrade_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
 
         const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-2", "x86_64-windows", @intCast(binary.len), sha256_hex, protocol.VERSION);
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
 
         _ = common.sockWrite(fd, binary.ptr, binary.len);
 
-        const resp_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const resp_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
             tc.deinit();
             return;
@@ -241,7 +241,7 @@ pub fn test_upgrade_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
 
         const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-3", "aarch64-macos", @intCast(big_binary.len), sha256_hex, protocol.VERSION);
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
 
         var sent: usize = 0;
         var wbuf: [65536]u8 = undefined;
@@ -253,7 +253,7 @@ pub fn test_upgrade_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
         }
         tc.expectEqual(big_binary.len, sent, "发送完整的 256KB 二进制");
 
-        const resp_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const resp_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
             tc.deinit();
             return;

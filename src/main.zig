@@ -70,6 +70,8 @@ comptime {
     _ = @import("lsa.zig");
     _ = @import("config.zig");
     _ = @import("tcp.zig");
+    _ = @import("protocol.zig");
+    _ = @import("socks5.zig");
     _ = @import("mcp.zig");
     _ = @import("host.zig");
     _ = @import("sshpass.zig");

@@ -25,7 +25,7 @@ fn guestDownloadSimulator(
         common.sockClose(cli_fd);
     }
 
-    const cmd_frame = tcp.recvFrame(allocator, cli_fd) catch return;
+    const cmd_frame = protocol.recvFrame(allocator, cli_fd) catch return;
     defer allocator.free(cmd_frame);
 
     if (cmd_frame.len < 1 or cmd_frame[0] != @intFromEnum(protocol.MsgType.download_cmd)) return;
@@ -36,7 +36,7 @@ fn guestDownloadSimulator(
 
     const done_frame = protocol.buildPtyExecDone(allocator, cmd.cmd_id, exit_code) catch return;
     defer allocator.free(done_frame);
-    tcp.sendFrame(cli_fd, done_frame) catch return;
+    protocol.sendFrame(cli_fd, done_frame) catch return;
 
     result_ok.store(true, .release);
 }
@@ -77,7 +77,7 @@ pub fn test_download_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.T
 
         const cmd_frame = try protocol.buildDownloadCmd(alloc, "dl-1", "/tmp/download.txt");
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
 
         var received: std.ArrayList(u8) = .empty;
         defer received.deinit(alloc);
@@ -88,7 +88,7 @@ pub fn test_download_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.T
         try received.appendSlice(alloc, rbuf[0..@intCast(file_n)]);
         tc.expectStr(test_data, received.items, "文件内容一致");
 
-        const done_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const done_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv pty_exec_done: {}", .{err});
             tc.deinit();
             return;
@@ -146,7 +146,7 @@ pub fn test_download_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.T
 
         const cmd_frame = try protocol.buildDownloadCmd(alloc, "dl-2", "/tmp/big.dat");
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
 
         var received: std.ArrayList(u8) = .empty;
         defer received.deinit(alloc);
@@ -165,7 +165,7 @@ pub fn test_download_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.T
         tc.expectEqual(big_data.len, received.items.len, "收到完整的 128KB 数据");
         tc.expectTrue(std.mem.eql(u8, &big_data, received.items), "128KB 数据内容一致");
 
-        const done_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const done_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv pty_exec_done: {}", .{err});
             tc.deinit();
             return;
@@ -219,9 +219,9 @@ pub fn test_download_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.T
 
         const cmd_frame = try protocol.buildDownloadCmd(alloc, "dl-3", "/tmp/empty.dat");
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
 
-        const done_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const done_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv pty_exec_done: {}", .{err});
             tc.deinit();
             return;
@@ -276,12 +276,12 @@ pub fn test_download_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.T
 
         const cmd_frame = try protocol.buildDownloadCmd(alloc, "dl-4", "/nonexistent/file");
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
 
         var rbuf: [4096]u8 = undefined;
         _ = common.sockRead(fd, &rbuf, test_data.len);
 
-        const done_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const done_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv pty_exec_done: {}", .{err});
             tc.deinit();
             return;

@@ -25,7 +25,7 @@ fn guestSimulator(
         common.sockClose(cli_fd);
     }
 
-    const frame = tcp.recvFrame(allocator, cli_fd) catch return;
+    const frame = protocol.recvFrame(allocator, cli_fd) catch return;
     defer allocator.free(frame);
 
     if (frame.len < 1 or frame[0] != @intFromEnum(protocol.MsgType.pty_exec_input)) return;
@@ -43,11 +43,11 @@ fn guestSimulator(
 
     const out_frame = protocol.buildPtyExecOutput(allocator, parsed.cmd_id, sim_output.items) catch return;
     defer allocator.free(out_frame);
-    tcp.sendFrame(cli_fd, out_frame) catch return;
+    protocol.sendFrame(cli_fd, out_frame) catch return;
 
     const done_frame = protocol.buildPtyExecDone(allocator, parsed.cmd_id, exit_code) catch return;
     defer allocator.free(done_frame);
-    tcp.sendFrame(cli_fd, done_frame) catch return;
+    protocol.sendFrame(cli_fd, done_frame) catch return;
 
     result_ok.store(true, .release);
 }
@@ -90,9 +90,9 @@ pub fn test_exec_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestR
 
         const input_frame = try protocol.buildPtyExecInput(alloc, "cmd-1", cmd_with_marker);
         defer alloc.free(input_frame);
-        try tcp.sendFrame(fd, input_frame);
+        try protocol.sendFrame(fd, input_frame);
 
-        const out_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const out_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv pty_exec_output: {}", .{err});
             tc.deinit();
             return;
@@ -107,7 +107,7 @@ pub fn test_exec_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestR
         tc.expectTrue(mr.found, "找到 MDELIM 标记");
         tc.expectEqual(@as(i32, 0), mr.exit_code, "exit code = 0");
 
-        const done_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const done_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv pty_exec_done: {}", .{err});
             tc.deinit();
             return;
@@ -162,9 +162,9 @@ pub fn test_exec_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestR
         defer alloc.free(cmd_with_marker);
         const input_frame = try protocol.buildPtyExecInput(alloc, "cmd-2", cmd_with_marker);
         defer alloc.free(input_frame);
-        try tcp.sendFrame(fd, input_frame);
+        try protocol.sendFrame(fd, input_frame);
 
-        const out_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const out_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv pty_exec_output: {}", .{err});
             tc.deinit();
             return;
@@ -178,7 +178,7 @@ pub fn test_exec_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestR
         tc.expectTrue(mr.found, "找到 MDELIM 标记");
         tc.expectEqual(@as(i32, 42), mr.exit_code, "exit code = 42");
 
-        const done_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const done_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv pty_exec_done: {}", .{err});
             tc.deinit();
             return;
@@ -231,9 +231,9 @@ pub fn test_exec_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestR
         defer alloc.free(cmd_with_marker);
         const input_frame = try protocol.buildPtyExecInput(alloc, "cmd-3", cmd_with_marker);
         defer alloc.free(input_frame);
-        try tcp.sendFrame(fd, input_frame);
+        try protocol.sendFrame(fd, input_frame);
 
-        const out_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const out_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv pty_exec_output: {}", .{err});
             tc.deinit();
             return;
@@ -288,9 +288,9 @@ pub fn test_exec_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestR
 
         const input_frame = try protocol.buildPtyExecInput(alloc, "cmd-4", cmd_with_marker);
         defer alloc.free(input_frame);
-        try tcp.sendFrame(fd, input_frame);
+        try protocol.sendFrame(fd, input_frame);
 
-        const out_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const out_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv pty_exec_output: {}", .{err});
             tc.deinit();
             return;

@@ -8,6 +8,7 @@
 
 pub const protocol = @import("protocol.zig");
 pub const tcp = @import("tcp.zig");
+pub const socks5 = @import("socks5.zig");
 pub const dpipe = @import("dpipe.zig");
 pub const lsa = @import("lsa.zig");
 pub const host = @import("host.zig");

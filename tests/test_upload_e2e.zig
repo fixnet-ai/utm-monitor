@@ -25,7 +25,7 @@ fn guestUploadSimulator(
         common.sockClose(cli_fd);
     }
 
-    const cmd_frame = tcp.recvFrame(allocator, cli_fd) catch return;
+    const cmd_frame = protocol.recvFrame(allocator, cli_fd) catch return;
     defer allocator.free(cmd_frame);
 
     if (cmd_frame.len < 1 or cmd_frame[0] != @intFromEnum(protocol.MsgType.upload_cmd)) return;
@@ -56,7 +56,7 @@ fn guestUploadSimulator(
 
     const result_frame = protocol.buildUploadResult(allocator, cmd.cmd_id, exit_code) catch return;
     defer allocator.free(result_frame);
-    tcp.sendFrame(cli_fd, result_frame) catch return;
+    protocol.sendFrame(cli_fd, result_frame) catch return;
 
     result_ok.store(true, .release);
 }
@@ -104,11 +104,11 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
 
         const cmd_frame = try protocol.buildUploadCmd(alloc, "up-1", "/tmp/test.txt", @intCast(test_data.len), &file_hash);
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
 
         _ = common.sockWrite(fd, test_data.ptr, test_data.len);
 
-        const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const result_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
             tc.deinit();
             return;
@@ -165,10 +165,10 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
 
         const cmd_frame = try protocol.buildUploadCmd(alloc, "up-2", "/tmp/err.txt", @intCast(test_data.len), &file_hash);
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
         _ = common.sockWrite(fd, test_data.ptr, test_data.len);
 
-        const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const result_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
             tc.deinit();
             return;
@@ -223,9 +223,9 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
 
         const cmd_frame = try protocol.buildUploadCmd(alloc, "up-3", "/tmp/empty.txt", 0, &file_hash);
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
 
-        const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const result_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
             tc.deinit();
             return;
@@ -284,10 +284,10 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
 
         const cmd_frame = try protocol.buildUploadCmd(alloc, "up-4", "/tmp/binary.bin", 256, &file_hash);
         defer alloc.free(cmd_frame);
-        try tcp.sendFrame(fd, cmd_frame);
+        try protocol.sendFrame(fd, cmd_frame);
         _ = common.sockWrite(fd, &binary_data, binary_data.len);
 
-        const result_frame = tcp.recvFrame(alloc, fd) catch |err| {
+        const result_frame = protocol.recvFrame(alloc, fd) catch |err| {
             tc.expect(false, "recv upload_result: {}", .{err});
             tc.deinit();
             return;
