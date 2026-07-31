@@ -379,29 +379,44 @@ fn applyUpgrade(io: std.Io, alloc: std.mem.Allocator, proc: ProcessRef) !Restart
         _ = std.posix.system.chmod(@ptrCast(upgrade.ptr), 0o755);
     }
 
-    // 6. 替换二进制（同目录 rename，不存在跨文件系统问题）
-    if (builtin.os.tag == .windows) {
-        std.Io.Dir.cwd().deleteFile(io, dest) catch {};
-    }
+    // 6. 替换二进制。
+    // POSIX: rename 原子替换目标文件。
+    // Windows: rename 不覆盖已有文件，需先删后重命名。为避免删后重命名失败导致
+    // 系统无 utmm 二进制，仅在首次 rename 失败后才删目标文件再重试。
     var retry: u32 = 0;
     while (true) {
         std.Io.Dir.cwd().rename(upgrade, std.Io.Dir.cwd(), dest, io) catch |err| {
             if (err == error.CrossDevice) {
                 // 跨文件系统回退：copy + delete
-                try copyFileUpgradeFallback(io, alloc, upgrade, dest);
+                try copyFileUpgradeFallback(io, upgrade, dest);
                 if (builtin.os.tag == .macos) {
-                    _ = runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest });
+                    if (!runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest })) {
+                        std.log.warn("[utmmd] codesign failed — checking if binary is executable...", .{});
+                        // 验证新二进制是否可执行（--version 输出版本号则说明可用）
+                        if (!runCmd(alloc, io, &.{ dest, "--version" })) {
+                            std.log.err("[utmmd] codesign failed AND binary not executable — manual recovery needed (upgrade at {s})", .{upgrade});
+                            // 不删除 upgrade 源文件，供管理员手动恢复
+                            return error.UpgradeNotExecutable;
+                        }
+                        std.log.info("[utmmd] codesign failed but binary runs — continuing", .{});
+                    }
                 }
                 std.Io.Dir.cwd().deleteFile(io, upgrade) catch {};
                 break;
             }
             if (builtin.os.tag == .windows and retry < 10) {
+                // Windows: 首次失败先删目标再试（rename 不覆盖已有文件）
+                if (retry == 0) {
+                    std.Io.Dir.cwd().deleteFile(io, dest) catch {};
+                }
                 retry += 1;
                 std.log.warn("[utmmd] upgrade rename retry {d}/10: {}", .{ retry, err });
                 sleepMs(io, 500);
                 continue;
             }
+            // 永久失败：清理 marker 避免死循环（upgrade 二进制保留可手动恢复）
             std.log.err("[utmmd] upgrade rename failed: {}", .{err});
+            std.Io.Dir.cwd().deleteFile(io, marker) catch {};
             return err;
         };
         break;
@@ -414,8 +429,7 @@ fn applyUpgrade(io: std.Io, alloc: std.mem.Allocator, proc: ProcessRef) !Restart
 }
 
 /// 跨文件系统回退：逐块 copy src → dst。
-fn copyFileUpgradeFallback(io: std.Io, alloc: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
-    _ = alloc;
+fn copyFileUpgradeFallback(io: std.Io, src: []const u8, dst: []const u8) !void {
     const sf = try std.Io.Dir.cwd().openFile(io, src, .{ .mode = .read_only });
     defer sf.close(io);
     const df = try std.Io.Dir.cwd().createFile(io, dst, .{ .truncate = true });

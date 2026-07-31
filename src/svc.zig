@@ -281,6 +281,36 @@ pub fn tempDir() [:0]const u8 {
     return "/tmp";
 }
 
+/// Clean up stale upgrade temporary files left by a crashed Guest.
+/// Guest writes .sha256 atomically (tmp → rename); if it crashes mid-write
+/// the .sha256.tmp file persists. If Guest crashes after writing the upgrade
+/// binary but before writing .sha256, the binary has no marker and utmmd will
+/// never process it — clean it up as well.
+/// Call at utmm startup (both Host and Guest modes).
+pub fn cleanupStaleUpgradeTmp(io: std.Io) void {
+    const tmp_path = if (builtin.os.tag == .windows)
+        "C:\\opt\\utmm\\utmm-upgrade.sha256.tmp"
+    else
+        "/opt/utmm/utmm-upgrade.sha256.tmp";
+    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+
+    // 孤儿升级二进制：Guest crash 在写二进制之后、写 .sha256 标记之前。
+    // 此时 marker 不存在，utmmd 永远不会处理，残留二进制需清理。
+    const marker_path = if (builtin.os.tag == .windows)
+        "C:\\opt\\utmm\\utmm-upgrade.sha256"
+    else
+        "/opt/utmm/utmm-upgrade.sha256";
+    if (std.Io.Dir.cwd().statFile(io, marker_path, .{})) |_| {
+        // 标记存在，utmmd 会处理，不动二进制
+        return;
+    } else |_| {}
+    const bin_path = if (builtin.os.tag == .windows)
+        "C:\\opt\\utmm\\utmm-upgrade.exe"
+    else
+        "/opt/utmm/utmm-upgrade";
+    std.Io.Dir.cwd().deleteFile(io, bin_path) catch {};
+}
+
 /// Return the canonical install path for utmmd (the supervisor daemon).
 pub fn canonicalSvcPath() []const u8 {
     if (builtin.os.tag == .windows) return CANONICAL_SVC_PATH_WIN;

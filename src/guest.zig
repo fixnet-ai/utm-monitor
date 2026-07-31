@@ -1170,7 +1170,34 @@ fn handleUpgradeCmd(
         return;
     };
 
-    std.log.info("[guest] upgrade: cmd_id={s} target={s} size={d}", .{ cmd.cmd_id, cmd.target, cmd.file_size });
+    std.log.info("[guest] upgrade: cmd_id={s} target={s} size={d} version={s}", .{ cmd.cmd_id, cmd.target, cmd.file_size, cmd.version });
+
+    // 同版本检测：如果推送的版本与当前运行版本相同，跳过升级
+    if (std.mem.eql(u8, cmd.version, protocol.VERSION)) {
+        std.log.info("[guest] upgrade: same version ({s}), skipping", .{cmd.version});
+        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
+        defer allocator.free(resp);
+        _ = conn.sendAndFlush(resp, 0) catch {};
+        return;
+    }
+
+    // 并发保护：如果已有待处理升级（.sha256 标记存在，utmmd 还未消费），
+    // 拒绝本次推送，防止两次升级并发导致二进制文件损坏。
+    {
+        const pending_marker = if (builtin.os.tag == .windows)
+            try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.sha256", .{svc.canonicalDir()})
+        else
+            try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256", .{svc.canonicalDir()});
+        defer allocator.free(pending_marker);
+
+        if (std.Io.Dir.cwd().statFile(io, pending_marker, .{})) |_| {
+            std.log.info("[guest] upgrade: pending upgrade exists, rejecting", .{});
+            const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+            defer allocator.free(resp);
+            _ = conn.sendAndFlush(resp, 0) catch {};
+            return;
+        } else |_| {}
+    }
 
     // 固定路径：与 utmm.exe 同目录，utmmd 轮询发现后执行升级
     const upgrade_path = if (builtin.os.tag == .windows)
@@ -1243,27 +1270,57 @@ fn handleUpgradeCmd(
 
     std.log.info("[guest] upgrade: SHA256 verified, {d} bytes → {s}", .{ cmd.file_size, upgrade_path });
 
-    // 发送成功响应
+    // 发送成功响应（在写 marker 之前——即使 marker 写入失败，Host 已确认收到）
     const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
     defer allocator.free(resp);
     _ = conn.sendAndFlush(resp, 0) catch {};
 
-    // 写入 .sha256 标记文件，utmmd 轮询发现后执行原子替换
+    // 写入 .sha256 标记文件（原子写入：先写临时文件，再 rename 到最终路径，
+    // 避免 utmmd 读到半写文件）
     const sha_path = if (builtin.os.tag == .windows)
         try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.sha256", .{svc.canonicalDir()})
     else
         try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256", .{svc.canonicalDir()});
     defer allocator.free(sha_path);
 
-    const sha_file = std.Io.Dir.cwd().createFile(io, sha_path, .{ .truncate = true }) catch |err| {
-        std.log.err("[guest] upgrade: create sha256 file: {}", .{err});
+    // 临时文件：写完整内容后原子 rename，避免 utmmd 读到空/半写文件
+    const sha_tmp = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.sha256.tmp", .{svc.canonicalDir()})
+    else
+        try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256.tmp", .{svc.canonicalDir()});
+    defer allocator.free(sha_tmp);
+
+    const sha_file = std.Io.Dir.cwd().createFile(io, sha_tmp, .{ .truncate = true }) catch |err| {
+        std.log.err("[guest] upgrade: create sha256 tmp file: {}", .{err});
+        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
         return;
     };
+
     var sha_wb: [128]u8 = undefined;
     var sw = sha_file.writer(io, &sha_wb);
-    _ = sw.interface.writeAll(&hex_buf) catch {};
-    sw.interface.flush() catch {};
+    sw.interface.writeAll(&hex_buf) catch |err| {
+        std.log.err("[guest] upgrade: write sha256: {}", .{err});
+        sha_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, sha_tmp) catch {};
+        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        return;
+    };
+    sw.interface.flush() catch |err| {
+        std.log.err("[guest] upgrade: flush sha256: {}", .{err});
+        sha_file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, sha_tmp) catch {};
+        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        return;
+    };
     sha_file.close(io);
+
+    // 原子 rename：tmp → 最终路径，utmmd 看到 marker 时内容已完整
+    std.Io.Dir.cwd().rename(sha_tmp, std.Io.Dir.cwd(), sha_path, io) catch |err| {
+        std.log.err("[guest] upgrade: rename sha256: {}", .{err});
+        std.Io.Dir.cwd().deleteFile(io, sha_tmp) catch {};
+        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        return;
+    };
     std.log.info("[guest] upgrade: marker written, utmmd will pick up", .{});
 }
 
@@ -1321,6 +1378,9 @@ pub fn guestRun(init: std.process.Init, cli: @import("main.zig").CliArgs) !void 
 /// 启动时清理残留的临时文件（升级/上传失败遗留）。
 /// 扫描 canonicalDir 和 tempDir，删除 `.utmm-*` 和 `.utmm-upgrade-*` 前缀的文件。
 fn cleanupStaleTempFiles(io: std.Io, alloc: std.mem.Allocator) void {
+    // 原子 .sha256 写入残留（Guest crash 在 tmp→rename 之前）
+    svc.cleanupStaleUpgradeTmp(io);
+
     const dirs = [_][]const u8{ svc.canonicalDir(), svc.tempDir() };
     const prefixes = [_][]const u8{ ".utmm-upgrade-", ".utmm-" };
 
