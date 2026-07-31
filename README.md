@@ -22,10 +22,12 @@ required at runtime. AI agents get the same capabilities through MCP stdio.
 | `sshpass` | Non-interactive SSH password auth — direct shell access to any machine. Works on **Linux, macOS, and Windows** (ConPTY dynamic loading + pipe fallback). Bootstrap, recovery, and pre-install scenarios when the Guest daemon is down or not yet installed. |
 
 Example prompts your AI agent can handle:
-- "Check the status of all my machines"
-- "linuxvm is slow — check CPU, memory, and disk IO"
-- "Upload the new build to all Guests and restart the service"
-- "Download the core dump from linuxvm and analyze the crash"
+- "Push the new build to linuxvm and run the test suite — show me the failures"
+- "linuxvm just crashed. Grab the system logs and core dump, find the root cause"
+- "This binary works on Linux but panics on Windows — run it on both and compare"
+- "Can windowsvm reach linuxvm on port 3000? Diagnose what's blocking it"
+- "Attach lldb to myapp on macvm, set a breakpoint, and show the backtrace"
+- "Install zig 0.16.0 on all Linux VMs and verify the version"
 
 See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
 (message format, request/response examples).
