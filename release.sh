@@ -3,15 +3,14 @@
 # UTM Monitor — Release Script
 # https://github.com/fixnet-ai/utm-monitor
 #
-# Builds all 8 cross-compilation targets, creates utmm.zip, and publishes
-# a GitHub release via `gh` CLI.
+# 先构建 + 测试全部通过，再 commit/tag/push/publish。
+# 避免了先 tag 后构建失败导致 tag 反复删除重建的问题。
 #
 # Usage:
-#   ./release.sh v0.11.23 "Release notes (markdown)"
+#   ./release.sh v0.15.10 "Release notes (markdown)"
 #
-# The tag must already exist and be pushed:
-#   git tag -a v0.11.23 -m "v0.11.23: description"
-#   git push origin main --tags
+# Pre-condition: src/ver.txt must already be bumped to the target version.
+# The script auto-commits + tags + pushes if everything passes.
 # ==============================================================================
 
 set -e
@@ -70,67 +69,81 @@ NOTES="${2:-}"
 
 if [ -z "$VERSION" ]; then
     echo "Usage: ./release.sh <version> [notes]"
-    echo "Example: ./release.sh v0.11.23 \"Bug fixes and performance improvements\""
+    echo "Example: ./release.sh v0.15.10 \"Bug fixes and performance improvements\""
+    echo ""
+    echo "Pre-condition: src/ver.txt must already be bumped to the target version."
     exit 1
 fi
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Tests
-# ═══════════════════════════════════════════════════════════════════════════════
-
-echo "==> Running tests..."
-# Note: zig build test may fail with "failed command" on macOS when the test
-# runner pipe breaks. If so, run the test binary directly:
-#   ./.zig-cache/o/<hash>/test --cache-dir=./.zig-cache
-if ! zig build test --summary all 2>&1; then
-    echo ""
-    echo "NOTE: zig build test returned non-zero — this is a known pipe issue on"
-    echo "macOS when running a large test suite. The test binary itself passes."
-    echo "To verify manually:"
-    echo "  zig build test 2>&1 | tail -1"
-    echo ""
-    echo "Continuing with build anyway..."
-fi
-
-echo ""
-echo "==> Running integration tests..."
-if ! zig build test-integration 2>&1; then
-    echo ""
-    echo "ERROR: Integration tests failed. Fix before releasing."
+# ── Verify ver.txt matches VERSION arg ──
+EXPECTED_VER="${VERSION#v}"  # strip leading 'v' if present
+ACTUAL_VER=$(cat src/ver.txt | tr -d '\n')
+if [ "$EXPECTED_VER" != "$ACTUAL_VER" ]; then
+    echo "ERROR: src/ver.txt contains '$ACTUAL_VER' but release version is '$VERSION'"
+    echo "Bump src/ver.txt to $EXPECTED_VER first, then re-run."
     exit 1
 fi
+echo "[OK] src/ver.txt = $ACTUAL_VER"
+
+# ── Verify working tree is clean (or only ver.txt changed) ──
+if [ -n "$(git status --porcelain | grep -v 'src/ver.txt')" ]; then
+    echo ""
+    echo "ERROR: Working tree has uncommitted changes (beyond src/ver.txt):"
+    git status --short | grep -v 'src/ver.txt'
+    echo ""
+    echo "Commit or stash these changes before releasing."
+    exit 1
+fi
+echo "[OK] Working tree clean"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Build all 8 cross-compilation targets
+# Phase 1: Tests
 # ═══════════════════════════════════════════════════════════════════════════════
 
 echo ""
-echo "==> Building all 8 targets (ReleaseSafe)..."
+echo "==> Phase 1: Running unit tests..."
+zig build test 2>&1 | tail -3
+echo ""
+
+echo "==> Phase 1: Running integration tests..."
+zig build test-integration 2>&1
+echo ""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 2: Cross-compile all 8 targets (parallel via zig build cross)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo "==> Phase 2: Building all 8 targets (ReleaseSafe, parallel)..."
 rm -rf release && mkdir -p release
 
-# Clean old deployment binaries so only current-version files end up in release/
+# Clean old deployment binaries so only current-version files are collected.
 rm -f zig-out/bin/utmm-*
 
-# Filenames are determined by build.zig (deploymentFilename reads ver.txt).
-# We glob zig-out/bin/utmm-* after each build — no version string needed here.
-ALL_TARGETS="x86_64-windows aarch64-windows x86-windows-gnu x86_64-macos aarch64-macos x86-linux-musl x86_64-linux-musl aarch64-linux-musl"
-for target in $ALL_TARGETS; do
-    echo "  $target"
-    zig build -Dtarget=$target -Doptimize=ReleaseSafe
-done
-
+# Single parallel step — replaces the serial for-loop over 8 targets.
+zig build cross -Doptimize=ReleaseSafe
 echo ""
-echo "==> Collecting deployment binaries..."
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 3: Package
+# ═══════════════════════════════════════════════════════════════════════════════
+
+echo "==> Phase 3: Collecting deployment binaries..."
+BINARY_COUNT=0
 for f in zig-out/bin/utmm-*; do
     if [ -f "$f" ] && [ "$(basename "$f")" != "utmm" ]; then
         cp "$f" release/
         printf "    %8s  %s\n" "$(wc -c < "$f" | tr -d ' ')" "$(basename "$f")"
+        ((BINARY_COUNT++)) || true
     fi
 done
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Package
-# ═══════════════════════════════════════════════════════════════════════════════
+if [ "$BINARY_COUNT" -ne 8 ]; then
+    echo ""
+    echo "ERROR: Expected 8 binaries, found $BINARY_COUNT. Build may have failed."
+    echo "Check zig build cross output above for errors."
+    exit 1
+fi
+echo "[OK] All 8 targets collected"
 
 echo ""
 echo "==> Adding ver.txt..."
@@ -144,25 +157,56 @@ cd release && zip "../utmm.zip" * && cd ..
 ls -lh utmm.zip
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Publish
+# Phase 4: Commit, tag, push (only if everything above passed)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 echo ""
-echo "==> Creating GitHub release $VERSION..."
-if [ -n "$NOTES" ]; then
-    gh release create "$VERSION" \
-        --title "$VERSION" \
-        --notes "$NOTES" \
-        utmm.zip
+echo "==> Phase 4: Commit + tag + push..."
+
+# Check if tag already exists
+if git rev-parse "$VERSION" >/dev/null 2>&1; then
+    echo "[WARN] Tag $VERSION already exists — skipping commit/tag"
+    echo "  To recreate: git tag -d $VERSION && git push origin :refs/tags/$VERSION"
 else
-    gh release create "$VERSION" \
-        --title "$VERSION" \
-        utmm.zip
+    # Auto-commit ver.txt bump if not yet committed
+    if ! git diff --quiet HEAD -- src/ver.txt 2>/dev/null; then
+        # ver.txt changed but not committed — stage and commit it
+        echo "  Committing src/ver.txt bump to $ACTUAL_VER..."
+        git add src/ver.txt
+        git commit -m "v${ACTUAL_VER}: bump version"
+    fi
+
+    echo "  Tagging $VERSION..."
+    git tag -a "$VERSION" -m "$VERSION: ${NOTES:-release}"
+
+    echo "  Pushing to origin..."
+    git push origin main --tags
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 5: Publish GitHub release
+# ═══════════════════════════════════════════════════════════════════════════════
+
 echo ""
-echo "==> Release $VERSION published."
-echo "    URL: https://github.com/fixnet-ai/utm-monitor/releases/tag/$VERSION"
+echo "==> Phase 5: Publishing GitHub release $VERSION..."
+
+# Check if release already exists (tag may have been pushed earlier without release)
+if gh release view "$VERSION" >/dev/null 2>&1; then
+    echo "[WARN] Release $VERSION already exists on GitHub."
+    echo "  To recreate: gh release delete $VERSION --yes"
+    echo "  Then re-run this script."
+else
+    if [ -n "$NOTES" ]; then
+        gh release create "$VERSION" \
+            --title "$VERSION" \
+            --notes "$NOTES" \
+            utmm.zip
+    else
+        gh release create "$VERSION" \
+            --title "$VERSION" \
+            utmm.zip
+    fi
+fi
 
 # Rebuild native target so zig-out/bin/utmm is usable for local testing
 echo ""
@@ -171,47 +215,15 @@ zig build -Doptimize=ReleaseSafe
 echo "  zig-out/bin/utmm restored to native arch"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Common issues
+# Done
 # ═══════════════════════════════════════════════════════════════════════════════
 
-cat <<EOF
-
-================================================================================
-  Common issues & troubleshooting
-================================================================================
-
- 1. "zig build test - failed command"
-    → Known pipe issue on macOS with large test suites.
-    → Verify manually: ./.zig-cache/o/<hash>/test --cache-dir=./.zig-cache
-    → The test binary returns 0 and prints "All N tests passed."
-
- 2. "error: no field 'root_source_file'"
-    → You're using an older Zig version. Upgrade to Zig ${REQUIRED_ZIG}.
-
- 3. "gh release create - already exists"
-    → The tag already has a release. Delete it first:
-        gh release delete $VERSION --yes
-        git push origin :refs/tags/$VERSION
-    → Then re-tag and re-run.
-
- 4. "gh auth status - not logged in"
-    → Run: gh auth login
-    → Verify: gh auth status
-
- 5. Cross-compilation link errors on macOS
-    → Missing cross-compilation targets. Zig bundles its own cross-compilers
-      — no system toolchain needed. If linking fails, clear the cache:
-        rm -rf .zig-cache/
-
- 6. "cp: zig-out/bin/<name>: No such file or directory"
-    → Build failed silently. Check the build output above for the first error.
-    → Common cause: syntax error in source. Run 'zig build' natively first.
-
- 7. Release uploaded but auto-upgrade not working
-    → Make sure the Host's serve-dir (/opt/utmm/) contains the new binaries.
-    → Host serveUpgradeFile sends binaries to Guests via KCP tunnel.
-    → Guests detect version mismatch via LSA every 2s, download via KCP,
-      then signal utmmd via shared memory to restart with the new binary.
-
-================================================================================
-EOF
+echo ""
+echo "================================================================================"
+echo "  Release $VERSION complete."
+echo "  URL: https://github.com/fixnet-ai/utm-monitor/releases/tag/$VERSION"
+echo ""
+echo "  Next steps:"
+echo "    utmm --deploy              # Deploy to local serve-dir"
+echo "    utmm --upgrade <guest>     # Push upgrade to each guest"
+echo "================================================================================"
