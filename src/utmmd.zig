@@ -137,6 +137,7 @@ fn killUtmmByPid(pid: u32) void {
         // Windows: 通过 PID 获取句柄再杀
         const h = OpenProcess(1, 0, pid) orelse return;
         _ = TerminateProcess(h, 1);
+        _ = WaitForSingleObject(h, 5000); // 等待异步终止完成
         _ = std.os.windows.CloseHandle(h);
         std.log.info("[utmmd] utmm killed by pid, pid={d}", .{pid});
     } else {
@@ -145,10 +146,14 @@ fn killUtmmByPid(pid: u32) void {
     }
 }
 
-/// 强杀 utmm 进程。
+/// 强杀 utmm 进程并等待终止完成。
+/// Windows: TerminateProcess 是异步的，必须 WaitForSingleObject 确保进程完全退出，
+/// 释放所有文件句柄后再进行后续操作（如 rename 覆盖可执行文件）。
 fn killProcess(proc: ProcessRef) void {
     if (builtin.os.tag == .windows) {
         _ = TerminateProcess(proc.handle, 1);
+        // 等待进程完全退出——TerminateProcess 异步返回，文件锁可能尚未释放
+        _ = WaitForSingleObject(proc.handle, 5000); // 最多等待 5 秒
         _ = std.os.windows.CloseHandle(proc.handle);
         std.log.info("[utmmd] utmm killed, pid={d}", .{proc.pid});
     } else {
@@ -266,37 +271,150 @@ fn startUtmmWin(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.Shm
     return UtmmProcessWin{ .handle = pi.hProcess, .pid = pi.dwProcessId };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// 升级
-// ═══════════════════════════════════════════════════════════════════════════
-
-fn upgradeUtmm(io: std.Io, alloc: std.mem.Allocator, upgrade_path: []const u8) !void {
-    const dest = utmmPath();
-    std.log.info("[utmmd] upgrading: {s} → {s}", .{ upgrade_path, dest });
-
-    _ = std.Io.Dir.cwd().statFile(io, upgrade_path, .{}) catch return error.UpgradeFileNotFound;
-
-    // POSIX: 设置可执行权限
-    if (builtin.os.tag != .windows) {
-        _ = std.posix.system.chmod(@ptrCast(upgrade_path.ptr), 0o755);
-    }
-
-    // 原子替换
-    std.Io.Dir.cwd().rename(upgrade_path, std.Io.Dir.cwd(), dest, io) catch |err| {
-        if (err == error.CrossDevice) {
-            // 跨文件系统回退
-            try copyFileUpgrade(io, alloc, upgrade_path, dest);
-            if (builtin.os.tag == .macos) {
-                _ = runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest });
-            }
-            std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
-        } else return err;
-    };
-
-    std.log.info("[utmmd] upgrade complete", .{});
+fn runCmd(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
+    const r = std.process.run(alloc, io, .{ .argv = argv }) catch return false;
+    alloc.free(r.stdout);
+    alloc.free(r.stderr);
+    return r.term == .exited and r.term.exited == 0;
 }
 
-fn copyFileUpgrade(io: std.Io, alloc: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
+// ═══════════════════════════════════════════════════════════════════════════
+// 文件式升级 — utmmd 全权掌控
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 升级标记文件路径（SHA256 hex 纯文本，64 字符）。
+fn upgradeMarkerPath() []const u8 {
+    if (builtin.os.tag == .windows) return "C:\\opt\\utmm\\utmm-upgrade.sha256";
+    return "/opt/utmm/utmm-upgrade.sha256";
+}
+
+/// 待升级二进制路径（Guest 写入，utmmd 重命名为 utmmPath()）。
+fn upgradeBinPath() []const u8 {
+    if (builtin.os.tag == .windows) return "C:\\opt\\utmm\\utmm-upgrade.exe";
+    return "/opt/utmm/utmm-upgrade";
+}
+
+/// 检查是否有待处理的升级（.sha256 标记文件 + upgrade 二进制都存在）。
+/// 如果仅有标记文件（上次 rename 后 crash 残留），清理标记文件后返回 false。
+fn checkPendingUpgrade(io: std.Io) bool {
+    _ = std.Io.Dir.cwd().statFile(io, upgradeMarkerPath(), .{}) catch return false;
+    // 标记文件存在，检查升级二进制是否存在
+    if (std.Io.Dir.cwd().statFile(io, upgradeBinPath(), .{})) |_| {
+        return true;
+    } else |_| {
+        // 仅有标记残留（上次 applyUpgrade rename 成功但 marker 清理前 crash），清理后返回 false
+        std.Io.Dir.cwd().deleteFile(io, upgradeMarkerPath()) catch {};
+        return false;
+    }
+}
+
+/// 计算文件的 SHA256 hex 字符串（64 字符，allocator 分配）。
+fn computeSha256Hex(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer f.close(io);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var rbuf: [65536]u8 = undefined;
+    var rdr = f.reader(io, &rbuf);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = rdr.interface.readSliceShort(&buf) catch return error.ReadFailed;
+        if (n == 0) break;
+        hasher.update(buf[0..n]);
+    }
+
+    var hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&hash);
+    const hex = try alloc.alloc(u8, 64);
+    for (hash, 0..) |byte, i| {
+        const h = "0123456789abcdef";
+        hex[i * 2] = h[byte >> 4];
+        hex[i * 2 + 1] = h[byte & 0x0f];
+    }
+    return hex;
+}
+
+/// 读取小文件全部内容到分配内存（调用者释放）。
+fn readFileAlloc(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    const f = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+    defer f.close(io);
+    const size: usize = @intCast((try f.stat(io)).size);
+    const data = try alloc.alloc(u8, size);
+    _ = try f.readPositionalAll(io, data, 0);
+    return data;
+}
+
+/// 执行升级：验证 SHA256 → 杀进程 → 替换二进制 → 返回 restart。
+/// 调用者确保 proc 仍存活（本函数内会 killProcess）。
+fn applyUpgrade(io: std.Io, alloc: std.mem.Allocator, proc: ProcessRef) !RestartReason {
+    const marker = upgradeMarkerPath();
+    const upgrade = upgradeBinPath();
+    const dest = utmmPath();
+
+    std.log.info("[utmmd] upgrade detected: {s}", .{marker});
+
+    // 1. 读取期望的 SHA256
+    const expected_hex = try readFileAlloc(alloc, io, marker);
+    defer alloc.free(expected_hex);
+
+    // 2. 计算实际 SHA256
+    const actual_hex = try computeSha256Hex(alloc, io, upgrade);
+    defer alloc.free(actual_hex);
+
+    // 3. 对比
+    if (!std.mem.eql(u8, expected_hex, actual_hex)) {
+        std.log.err("[utmmd] upgrade SHA256 mismatch: expected={s} actual={s}", .{ expected_hex, actual_hex });
+        std.Io.Dir.cwd().deleteFile(io, marker) catch {};
+        std.Io.Dir.cwd().deleteFile(io, upgrade) catch {};
+        return error.Sha256Mismatch;
+    }
+
+    std.log.info("[utmmd] upgrade SHA256 verified", .{});
+
+    // 4. 杀 utmm 进程
+    killProcess(proc);
+
+    // 5. POSIX: 设置可执行权限
+    if (builtin.os.tag != .windows) {
+        _ = std.posix.system.chmod(@ptrCast(upgrade.ptr), 0o755);
+    }
+
+    // 6. 替换二进制（同目录 rename，不存在跨文件系统问题）
+    if (builtin.os.tag == .windows) {
+        std.Io.Dir.cwd().deleteFile(io, dest) catch {};
+    }
+    var retry: u32 = 0;
+    while (true) {
+        std.Io.Dir.cwd().rename(upgrade, std.Io.Dir.cwd(), dest, io) catch |err| {
+            if (err == error.CrossDevice) {
+                // 跨文件系统回退：copy + delete
+                try copyFileUpgradeFallback(io, alloc, upgrade, dest);
+                if (builtin.os.tag == .macos) {
+                    _ = runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest });
+                }
+                std.Io.Dir.cwd().deleteFile(io, upgrade) catch {};
+                break;
+            }
+            if (builtin.os.tag == .windows and retry < 10) {
+                retry += 1;
+                std.log.warn("[utmmd] upgrade rename retry {d}/10: {}", .{ retry, err });
+                sleepMs(io, 500);
+                continue;
+            }
+            std.log.err("[utmmd] upgrade rename failed: {}", .{err});
+            return err;
+        };
+        break;
+    }
+
+    // 7. 清理标记文件
+    std.Io.Dir.cwd().deleteFile(io, marker) catch {};
+    std.log.info("[utmmd] upgrade complete: → {s}", .{dest});
+    return .restart;
+}
+
+/// 跨文件系统回退：逐块 copy src → dst。
+fn copyFileUpgradeFallback(io: std.Io, alloc: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
     _ = alloc;
     const sf = try std.Io.Dir.cwd().openFile(io, src, .{ .mode = .read_only });
     defer sf.close(io);
@@ -315,13 +433,6 @@ fn copyFileUpgrade(io: std.Io, alloc: std.mem.Allocator, src: []const u8, dst: [
     }
     w.interface.flush() catch {};
     df.sync(io) catch {};
-}
-
-fn runCmd(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
-    const r = std.process.run(alloc, io, .{ .argv = argv }) catch return false;
-    alloc.free(r.stdout);
-    alloc.free(r.stderr);
-    return r.term == .exited and r.term.exited == 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -368,15 +479,6 @@ fn handleSigterm(_: c_int) callconv(.c) void {
 fn sleepMs(io: std.Io, ms: u64) void {
     if (ms == 0) return;
     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(ms)), .awake) catch {};
-}
-
-fn getCmdDataStr(alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmLayout) ![]const u8 {
-    // Volatile 数组 → 需要 @volatileCast 后转为 []const u8
-    const raw: [*]const u8 = @ptrCast(@volatileCast(&shm_ptr.cmd_data));
-    const slice: []const u8 = raw[0..1024];
-    const len = std.mem.indexOfScalar(u8, slice, 0) orelse slice.len;
-    if (len == 0) return error.EmptyCmdData;
-    return try alloc.dupe(u8, slice[0..len]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -538,25 +640,6 @@ fn monitorUtmm(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
         if (!isProcessAlive(proc)) {
             std.log.info("[utmmd] utmm exited", .{});
             const cmd: shm.Cmd = @enumFromInt(shm_ptr.cmd);
-            if (cmd == .upgrade) {
-                shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.accepted);
-                const up = getCmdDataStr(alloc, shm_ptr) catch |err| {
-                    std.log.err("[utmmd] bad upgrade path: {}", .{err});
-                    shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.failed);
-                    shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
-                    return .crashed;
-                };
-                defer alloc.free(up);
-                upgradeUtmm(io, alloc, up) catch |err| {
-                    std.log.err("[utmmd] upgrade failed: {}", .{err});
-                    shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.failed);
-                    shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
-                    return .crashed;
-                };
-                shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.done);
-                shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
-                return .restart;
-            }
             if (cmd == .restart) {
                 shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.done);
                 shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
@@ -566,32 +649,18 @@ fn monitorUtmm(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
             return .crashed;
         }
 
+        // 文件式升级检查：utmmd 轮询发现 .sha256 标记文件后执行全链路升级
+        if (checkPendingUpgrade(io)) {
+            return applyUpgrade(io, alloc, proc) catch |err| {
+                std.log.err("[utmmd] upgrade failed: {}", .{err});
+                killProcess(proc);
+                return .crashed;
+            };
+        }
+
         // 命令处理
         const cmd: shm.Cmd = @enumFromInt(shm_ptr.cmd);
         switch (cmd) {
-            .upgrade => {
-                shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.accepted);
-                // 在 kill 之前读取升级路径（shm 数据仍有效）
-                const up = getCmdDataStr(alloc, shm_ptr) catch |err| {
-                    std.log.err("[utmmd] bad upgrade path: {}", .{err});
-                    shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.failed);
-                    shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
-                    return .crashed;
-                };
-                defer alloc.free(up);
-                // Windows: 先杀进程释放文件锁，再 rename 覆盖 utmm.exe
-                // POSIX: 同样先杀进程，rename 后 restart 统一行为
-                killProcess(proc);
-                upgradeUtmm(io, alloc, up) catch |err| {
-                    std.log.err("[utmmd] upgrade failed: {}", .{err});
-                    shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.failed);
-                    shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
-                    return .crashed;
-                };
-                shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.done);
-                shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
-                return .restart;
-            },
             .restart => {
                 shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.accepted);
                 shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
@@ -603,7 +672,7 @@ fn monitorUtmm(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
                 killProcess(proc);
                 return .shutdown;
             },
-            .none => {},
+            .none, .upgrade => {}, // .upgrade 已迁移到文件式升级，SHM 处忽略
         }
     }
 }

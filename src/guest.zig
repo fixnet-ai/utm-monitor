@@ -12,7 +12,6 @@ const protocol = @import("protocol.zig");
 const lsa = @import("lsa.zig");
 const tcp = @import("tcp.zig");
 const svc = @import("svc.zig");
-const shm = @import("shm.zig");
 const dpipe = @import("dpipe.zig");
 const dpipe_shell = @import("dpipe_shell.zig");
 const dpipe_file = @import("dpipe_file.zig");
@@ -1156,10 +1155,10 @@ fn handleUpload(
     _ = conn.sendAndFlush(resp, 0) catch {};
 }
 
-/// 处理 upgrade_cmd（Host→Guest 直推升级）：接收二进制流 → SHA256 校验 → 通知 utmmd。
+/// 处理 upgrade_cmd（Host→Guest 直推升级）：接收二进制流 → SHA256 校验 → 写固定路径。
 ///
-/// 使用随机临时文件名（如 /opt/utmm/.utmm-<random>）避免并发冲突，
-/// 校验通过后由 utmmd 负责原子 rename 到最终路径。
+/// 二进制写入 {canonicalDir}/utmm-upgrade（与 utmm 同目录），SHA256 hex 写入同名 .sha256 文件。
+/// utmmd 轮询发现 .sha256 文件后全权执行杀进程→替换→重启流程，Guest 不参与后续步骤。
 fn handleUpgradeCmd(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1173,25 +1172,21 @@ fn handleUpgradeCmd(
 
     std.log.info("[guest] upgrade: cmd_id={s} target={s} size={d}", .{ cmd.cmd_id, cmd.target, cmd.file_size });
 
-    // 生成随机临时文件名，避免并发升级冲突
-    var rand_bytes: [8]u8 = undefined;
-    io.random(&rand_bytes);
-    var temp_hex: [16]u8 = undefined;
-    for (rand_bytes, 0..) |b, j| {
-        temp_hex[j * 2] = "0123456789abcdef"[b >> 4];
-        temp_hex[j * 2 + 1] = "0123456789abcdef"[b & 0x0F];
-    }
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}/.utmm-{s}", .{ svc.tempDir(), &temp_hex });
-    defer allocator.free(tmp_path);
-
-    // 创建临时文件（随机文件名，无需预先清理）
-    var write_buf: [65536]u8 = undefined;
-    const tmp_file = if (@import("builtin").os.tag != .windows)
-        std.Io.Dir.cwd().createFile(io, tmp_path, .{ .permissions = @enumFromInt(0o755) })
+    // 固定路径：与 utmm.exe 同目录，utmmd 轮询发现后执行升级
+    const upgrade_path = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.exe", .{svc.canonicalDir()})
     else
-        std.Io.Dir.cwd().createFile(io, tmp_path, .{});
-    const file = tmp_file catch |err| {
-        std.log.err("[guest] upgrade: create temp file {s}: {}", .{ tmp_path, err });
+        try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade", .{svc.canonicalDir()});
+    defer allocator.free(upgrade_path);
+
+    // 创建升级文件（覆盖旧残留）
+    var write_buf: [65536]u8 = undefined;
+    const up_file = if (builtin.os.tag != .windows)
+        std.Io.Dir.cwd().createFile(io, upgrade_path, .{ .truncate = true, .permissions = @enumFromInt(0o755) })
+    else
+        std.Io.Dir.cwd().createFile(io, upgrade_path, .{ .truncate = true });
+    const file = up_file catch |err| {
+        std.log.err("[guest] upgrade: create upgrade file {s}: {}", .{ upgrade_path, err });
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
         _ = conn.sendAndFlush(resp, 0) catch {};
@@ -1211,17 +1206,16 @@ fn handleUpgradeCmd(
         const slice = write_buf[0..@intCast(nr)];
         hasher.update(slice);
         _ = file.writeStreamingAll(io, slice) catch |err| {
-            std.log.err("[guest] upgrade: write temp file: {}", .{err});
+            std.log.err("[guest] upgrade: write upgrade file: {}", .{err});
             break;
         };
         remaining -= @intCast(nr);
     }
 
-    // 关闭文件（之后仅通过路径操作，避免 double-close）
     file.close(io);
 
     if (remaining != 0) {
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
         _ = conn.sendAndFlush(resp, 0) catch {};
@@ -1232,42 +1226,45 @@ fn handleUpgradeCmd(
     var computed_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&computed_hash);
 
-    // 比较 hex - cmd.sha256_hex 是 64 字符的 hex 字符串
     var hex_buf: [64]u8 = undefined;
     for (computed_hash, 0..) |byte, i| {
         const h = "0123456789abcdef";
         hex_buf[i * 2] = h[byte >> 4];
         hex_buf[i * 2 + 1] = h[byte & 0x0f];
     }
-    const hash_ok = std.mem.eql(u8, cmd.sha256_hex, &hex_buf);
-    if (!hash_ok) {
+    if (!std.mem.eql(u8, cmd.sha256_hex, &hex_buf)) {
         std.log.err("[guest] upgrade: SHA256 mismatch", .{});
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
         _ = conn.sendAndFlush(resp, 0) catch {};
         return;
     }
 
-    std.log.info("[guest] upgrade: SHA256 verified, {d} bytes → {s}", .{ cmd.file_size, tmp_path });
+    std.log.info("[guest] upgrade: SHA256 verified, {d} bytes → {s}", .{ cmd.file_size, upgrade_path });
 
     // 发送成功响应
     const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
     defer allocator.free(resp);
     _ = conn.sendAndFlush(resp, 0) catch {};
 
-    // 通过 shm 通知 utmmd 执行升级（utmmd 负责 rename temp → 最终路径）
-    if (shm.open()) |h| {
-        defer shm.detach(h);
-        h.cmd = @intFromEnum(shm.Cmd.upgrade);
-        @memset(&h.cmd_data, 0);
-        const copy_len = @min(tmp_path.len, h.cmd_data.len - 1);
-        @memcpy(h.cmd_data[0..copy_len], tmp_path[0..copy_len]);
-        h.utmm_state = @intFromEnum(shm.UtmmState.stopping);
-        std.log.info("[guest] upgrade: utmmd signalled, exiting for restart", .{});
-    } else |err| {
-        std.log.err("[guest] upgrade: shm.open failed: {}", .{err});
-    }
+    // 写入 .sha256 标记文件，utmmd 轮询发现后执行原子替换
+    const sha_path = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.sha256", .{svc.canonicalDir()})
+    else
+        try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256", .{svc.canonicalDir()});
+    defer allocator.free(sha_path);
+
+    const sha_file = std.Io.Dir.cwd().createFile(io, sha_path, .{ .truncate = true }) catch |err| {
+        std.log.err("[guest] upgrade: create sha256 file: {}", .{err});
+        return;
+    };
+    var sha_wb: [128]u8 = undefined;
+    var sw = sha_file.writer(io, &sha_wb);
+    _ = sw.interface.writeAll(&hex_buf) catch {};
+    sw.interface.flush() catch {};
+    sha_file.close(io);
+    std.log.info("[guest] upgrade: marker written, utmmd will pick up", .{});
 }
 
 /// 处理 download：dpipe_file.readFile → 原始字节流发送到 TCP。
