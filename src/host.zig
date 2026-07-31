@@ -230,7 +230,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         return;
     }
 
-    // ── Check sshpass availability (needed for scp/ssh) ──
+    // ── Check sshpass availability (needed for scp/ssh to remote VMs) ──
     const has_sshpass = blk: {
         const result = std.process.run(gpa, io, .{ .argv = &.{ "which", "sshpass" } }) catch break :blk false;
         defer {
@@ -240,10 +240,15 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         break :blk result.term == .exited and result.term.exited == 0;
     };
     if (!has_sshpass) {
-        std.debug.print("[deploy] sshpass is required for non-interactive deployment.\n", .{});
-        std.debug.print("Install: brew install sshpass   (macOS)\n", .{});
-        std.debug.print("         apt install sshpass    (Linux)\n", .{});
-        std.process.exit(1);
+        // sshpass is only needed for remote VM deployment (scp).
+        // Local deployment (compile + copy to serve-dir) was already done by the
+        // Host ensure step in main.zig — skip remote push with a clear warning.
+        std.debug.print("[deploy] sshpass is required for non-interactive deployment to remote VMs.\n", .{});
+        std.debug.print("[deploy] Local binaries have been copied to serve-dir.\n", .{});
+        std.debug.print("[deploy] To push to VMs, install sshpass:\n", .{});
+        std.debug.print("  brew install sshpass   (macOS)\n", .{});
+        std.debug.print("  apt install sshpass    (Linux)\n", .{});
+        return;
     }
 
     std.debug.print("\n[deploy] Targets ({d}):", .{deploy_list.items.len});
@@ -252,8 +257,28 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
     }
     std.debug.print("\n\n", .{});
 
-    // ── 2. Cross-compile for each target ──
-    var compiled = std.StringHashMap([]const u8).init(gpa); // target → binary path
+    // ── 2. Cross-compile all targets in parallel via zig build cross ──
+    // Replaces the old serial per-target compilation loop.
+    // zig build cross compiles all 8 deployment targets in one step.
+    std.debug.print("[deploy] Cross-compiling all targets (parallel)...\n", .{});
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "zig", "build", "cross", "-Doptimize=ReleaseSafe" },
+    }) catch |err| {
+        std.debug.print("[deploy] zig build cross failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("[deploy] Compile failed:\n{s}\n", .{result.stderr});
+        gpa.free(result.stdout);
+        gpa.free(result.stderr);
+        std.process.exit(1);
+    }
+    gpa.free(result.stdout);
+    gpa.free(result.stderr);
+    std.debug.print("[deploy] All targets compiled.\n", .{});
+
+    // Map target triple → binary path in zig-out/bin/
+    var compiled = std.StringHashMap([]const u8).init(gpa);
     defer {
         var it = compiled.iterator();
         while (it.next()) |entry| {
@@ -265,25 +290,6 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
     for (deploy_list.items) |vm| {
         if (compiled.contains(vm.target)) continue;
 
-        std.debug.print("[deploy] Compiling for {s}...\n", .{vm.target});
-        const target_flag = try std.fmt.allocPrint(gpa, "-Dtarget={s}", .{vm.target});
-        defer gpa.free(target_flag);
-        const result = std.process.run(gpa, io, .{
-            .argv = &.{ "zig", "build", target_flag },
-        }) catch |err| {
-            std.debug.print("[deploy] Compile failed: {}\n", .{err});
-            std.process.exit(1);
-        };
-        if (result.term != .exited or result.term.exited != 0) {
-            std.debug.print("[deploy] Compile failed:\n{s}\n", .{result.stderr});
-            gpa.free(result.stdout);
-            gpa.free(result.stderr);
-            std.process.exit(1);
-        }
-        gpa.free(result.stdout);
-        gpa.free(result.stderr);
-
-        // Determine binary path from target
         const bin_name = protocol.deploymentFilename(vm.target) orelse {
             std.debug.print("[deploy] Unknown target: {s}\n", .{vm.target});
             std.process.exit(1);
@@ -291,15 +297,13 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         const bin_path = try std.fmt.allocPrint(gpa, "zig-out/bin/{s}", .{bin_name});
         try compiled.put(vm.target, bin_path);
 
-        std.debug.print("[deploy]   -> {s}\n", .{bin_path});
-
         // Copy to serve-dir for future --upgrade use
         const serve_copy_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ svc.canonicalDir(), bin_name });
         defer gpa.free(serve_copy_path);
         std.Io.Dir.cwd().copyFile(bin_path, std.Io.Dir.cwd(), serve_copy_path, io, .{}) catch |err| {
             std.log.warn("[deploy] copy to serve-dir failed: {}", .{err});
         };
-        std.debug.print("[deploy]   -> serve-dir: {s}\n", .{serve_copy_path});
+        std.debug.print("[deploy]   {s} -> serve-dir\n", .{bin_name});
     }
 
     // ── 3. SCP + install for each VM ──
