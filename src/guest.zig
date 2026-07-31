@@ -1181,6 +1181,24 @@ fn handleUpgradeCmd(
         return;
     }
 
+    // 并发保护：如果已有待处理升级（.sha256 标记存在，utmmd 还未消费），
+    // 拒绝本次推送，防止两次升级并发导致二进制文件损坏。
+    {
+        const pending_marker = if (builtin.os.tag == .windows)
+            try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.sha256", .{svc.canonicalDir()})
+        else
+            try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256", .{svc.canonicalDir()});
+        defer allocator.free(pending_marker);
+
+        if (std.Io.Dir.cwd().statFile(io, pending_marker, .{})) |_| {
+            std.log.info("[guest] upgrade: pending upgrade exists, rejecting", .{});
+            const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+            defer allocator.free(resp);
+            _ = conn.sendAndFlush(resp, 0) catch {};
+            return;
+        } else |_| {}
+    }
+
     // 固定路径：与 utmm.exe 同目录，utmmd 轮询发现后执行升级
     const upgrade_path = if (builtin.os.tag == .windows)
         try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.exe", .{svc.canonicalDir()})

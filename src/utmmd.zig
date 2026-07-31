@@ -388,7 +388,7 @@ fn applyUpgrade(io: std.Io, alloc: std.mem.Allocator, proc: ProcessRef) !Restart
         std.Io.Dir.cwd().rename(upgrade, std.Io.Dir.cwd(), dest, io) catch |err| {
             if (err == error.CrossDevice) {
                 // 跨文件系统回退：copy + delete
-                try copyFileUpgradeFallback(io, alloc, upgrade, dest);
+                try copyFileUpgradeFallback(io, upgrade, dest);
                 if (builtin.os.tag == .macos) {
                     if (!runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest })) {
                         std.log.warn("[utmmd] codesign failed — checking if binary is executable...", .{});
@@ -429,8 +429,7 @@ fn applyUpgrade(io: std.Io, alloc: std.mem.Allocator, proc: ProcessRef) !Restart
 }
 
 /// 跨文件系统回退：逐块 copy src → dst。
-fn copyFileUpgradeFallback(io: std.Io, alloc: std.mem.Allocator, src: []const u8, dst: []const u8) !void {
-    _ = alloc;
+fn copyFileUpgradeFallback(io: std.Io, src: []const u8, dst: []const u8) !void {
     const sf = try std.Io.Dir.cwd().openFile(io, src, .{ .mode = .read_only });
     defer sf.close(io);
     const df = try std.Io.Dir.cwd().createFile(io, dst, .{ .truncate = true });
