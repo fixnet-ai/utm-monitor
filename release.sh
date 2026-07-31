@@ -133,11 +133,8 @@ done
 # ═══════════════════════════════════════════════════════════════════════════════
 
 echo ""
-echo "==> Adding install scripts + ver.txt..."
-cp install.sh install.bat release/
+echo "==> Adding ver.txt..."
 cp src/ver.txt release/
-echo "  install.sh → release/"
-echo "  install.bat → release/"
 echo "  ver.txt → release/"
 
 echo ""
