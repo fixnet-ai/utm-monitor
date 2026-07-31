@@ -45,7 +45,7 @@ See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
 - **SOCKS5 mesh forwarding** — every node is a SOCKS5 proxy endpoint on TCP :2121.
   Third-party tools (`curl`, `wget`, browsers) reach any mesh node through any other
   node. No SSH tunnels, no port mapping. `curl --socks5 localhost:2121 http://linuxvm:8080`
-  just works.
+  just works. **Windows: disable firewall** for BIND + UDP ASSOCIATE (dynamic ports).
 - **Self-copy install** — single `--install` handles stop→kill→copy→start.
   Upgrade = scp + `--install`. No shell scripts, no package managers.
 - **utmmd supervisor** — lightweight daemon manages utmm lifecycle via shared

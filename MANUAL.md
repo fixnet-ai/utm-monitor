@@ -1,4 +1,4 @@
-# UTM Monitor Manual — v0.15.x
+# UTM Monitor Manual — v0.16.x
 
 Complete reference for CLI commands, MCP protocol, architecture, platform
 differences, and deployment.
@@ -542,6 +542,46 @@ ssh root@macvm 'killall -9 utmm utmmd 2>/dev/null; sleep 1'
 scp utmm-new root@macvm:/opt/utmm/utmm-new
 ssh root@macvm 'cp /opt/utmm/utmm-new /opt/utmm/utmm && /opt/utmm/utmm --install --hostname macvm'
 ```
+
+### Windows Firewall blocks SOCKS5 BIND / UDP ASSOCIATE
+
+**Symptom**: SOCKS5 BIND second-stage accept times out (60s), external connector
+cannot reach the dynamically-assigned TCP port. UDP ASSOCIATE datagrams not
+received from remote peers.
+
+**Cause**: Windows Firewall blocks inbound connections to ports not explicitly
+allowed. BIND creates a TCP listener on a random port — the firewall drops
+inbound SYN packets. UDP ASSOCIATE uses a random UDP port with the same issue.
+
+**Solution — disable Windows Firewall** (recommended for VM/isolated environments):
+
+```
+# PowerShell (Administrator)
+Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+
+# Or via Control Panel:
+#   Control Panel → Windows Defender Firewall → Turn Windows Defender Firewall on or off
+#   → Turn off Windows Defender Firewall (all profiles)
+```
+
+**Verification**:
+```
+netsh advfirewall show allprofiles | findstr State
+# Should show: State    OFF
+```
+
+**Alternative — add a program rule** (if disabling entirely is not acceptable):
+```
+netsh advfirewall firewall add rule name="UTM Monitor" dir=in action=allow program="C:\opt\utmm\utmm.exe" enable=yes
+```
+
+> This is a Windows OS-level restriction, not a code defect. Linux and macOS
+> have no equivalent issue — BIND and UDP ASSOCIATE work without firewall
+> configuration on those platforms.
+>
+> SOCKS5 CONNECT (the most common operation: exec, upload, download, forwarding)
+> is NOT affected — it uses outbound connections which Windows Firewall allows
+> by default.
 
 ### pkill -f自杀 (Linux only)
 
