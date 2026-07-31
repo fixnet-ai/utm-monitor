@@ -532,22 +532,56 @@ pub fn socks4Forward(
 
 /// 本地 relay：连接 127.0.0.1:target_port，成功后 relay。
 /// 失败时发送拒绝响应给客户端。此函数不返回（void），适合在线程中调用。
+///
+/// 使用原始 socket API（而非 Zig Io.net）确保返回的 fd 与 client_fd
+/// 类型一致。Windows：Winsock2 SOCKET vs AFD 句柄不兼容。
 pub fn socks4LocalRelay(io: std.Io, client_fd: std.posix.socket_t, target_port: u16) void {
-    const local_addr = std.Io.net.IpAddress.parse("127.0.0.1", target_port) catch {
-        socks4ReplyRejected(client_fd);
-        sockClose(client_fd);
-        return;
-    };
-    const stream = local_addr.connect(io, .{ .mode = .stream }) catch {
+    _ = io; // unused — raw sockets don't need Zig Io
+    const local_fd = sockConnectLocalhost(target_port) catch {
         socks4ReplyRejected(client_fd);
         sockClose(client_fd);
         return;
     };
 
     socks4ReplyOk(client_fd);
-    socks4Relay(client_fd, stream.socket.handle);
+    socks4Relay(client_fd, local_fd);
     sockClose(client_fd);
-    sockClose(stream.socket.handle);
+    sockClose(local_fd);
+}
+
+/// 连接 127.0.0.1:port，返回与 sockAccept 兼容的 socket fd。
+/// Windows：使用 Winsock2 原始 socket（与 ws2_accept 兼容）。
+/// POSIX：使用 system.socket + system.connect（与 system.accept 兼容）。
+fn sockConnectLocalhost(port: u16) !socket_t {
+    if (builtin.os.tag == .windows) {
+        ensureWinsock2();
+        const fd = ws2_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (fd == INVALID_SOCKET) return error.ConnectFailed;
+        var addr = sockaddr_in{
+            .family = AF_INET,
+            .port = ws2_htons(port),
+            .addr = 0x0100007f, // 127.0.0.1 in network byte order (big-endian)
+        };
+        const rc = ws2_connect(fd, @ptrCast(&addr), @sizeOf(sockaddr_in));
+        if (rc != 0) {
+            _ = ws2_closesocket(fd);
+            return error.ConnectFailed;
+        }
+        return fd;
+    }
+    // POSIX: raw socket + connect (compatible with system.accept fd)
+    const fd = system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.ConnectFailed;
+    errdefer _ = system.close(fd);
+    const addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = 0x0100007f, // 127.0.0.1 in network byte order
+        .zero = [_]u8{0} ** 8,
+    };
+    const rc = system.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+    if (rc < 0) return error.ConnectFailed;
+    return fd;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
