@@ -14,24 +14,33 @@ const protocol = @import("protocol.zig");
 
 pub const SOCKS_VER: u8 = 0x05;
 pub const SOCKS_CMD_CONNECT: u8 = 0x01;
+pub const SOCKS_CMD_BIND: u8 = 0x02;
+pub const SOCKS_CMD_UDP_ASSOCIATE: u8 = 0x03;
 pub const SOCKS_AUTH_NOAUTH: u8 = 0x00;
 pub const SOCKS_AUTH_NONE_ACCEPTABLE: u8 = 0xff;
 pub const SOCKS_ATYP_IPV4: u8 = 0x01;
 pub const SOCKS_ATYP_DOMAIN: u8 = 0x03;
+pub const SOCKS_ATYP_IPV6: u8 = 0x04;
 pub const SOCKS_REP_OK: u8 = 0x00;
 pub const SOCKS_REP_GENERAL_FAILURE: u8 = 0x01;
+pub const SOCKS_REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
+pub const SOCKS_REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SOCKS5 Request Types
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Socks5Request = struct {
+    cmd: u8,
+    atyp: u8,
     hostname: []const u8,
     port: u16,
 };
 
 /// Stack-allocated SOCKS5 request parse result. hostname points into caller buffer.
 pub const Socks5RequestBuf = struct {
+    cmd: u8,
+    atyp: u8,
     hostname: []const u8,
     port: u16,
 };
@@ -88,6 +97,7 @@ fn authAccept(fd: tcp.socket_t) !void {
 /// Read SOCKS5 request into caller-provided buffer, without sending reply.
 /// Completes auth negotiation + request parsing internally.
 /// hostname is written into buf; returns Socks5RequestBuf pointing into buf.
+/// Supports CMD: CONNECT, BIND, UDP_ASSOCIATE. ATYP: IPv4, DOMAIN.
 pub fn readRequestBuf(fd: tcp.socket_t, buf: []u8) !Socks5RequestBuf {
     // Phase 1: SOCKS5 auth negotiation
     try authAccept(fd);
@@ -101,26 +111,51 @@ pub fn readRequestBuf(fd: tcp.socket_t, buf: []u8) !Socks5RequestBuf {
         off += @intCast(n);
     }
     if (hdr[0] != SOCKS_VER) return error.Socks5BadVersion;
-    if (hdr[1] != SOCKS_CMD_CONNECT) return error.Socks5BadCommand;
-    if (hdr[3] != SOCKS_ATYP_DOMAIN) return error.Socks5DomainRequired;
 
-    // Phase 3: Read hostname length (1 byte) + hostname
-    var len_byte: u8 = undefined;
-    off = 0;
-    while (off < 1) {
-        const n = tcp.sockRead(fd, @as([*]u8, @ptrCast(&len_byte)), 1);
-        if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
-        off += @intCast(n);
+    const cmd = hdr[1];
+    switch (cmd) {
+        SOCKS_CMD_CONNECT, SOCKS_CMD_BIND, SOCKS_CMD_UDP_ASSOCIATE => {},
+        else => return error.Socks5BadCommand,
     }
-    if (len_byte == 0 or len_byte > tcp.MAX_HOSTNAME) return error.Socks5BadHostname;
 
-    off = 0;
-    while (off < len_byte) {
-        const n = tcp.sockRead(fd, buf[off..].ptr, len_byte - off);
-        if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
-        off += @intCast(n);
+    const atyp = hdr[3];
+    var hostname: []const u8 = undefined;
+
+    switch (atyp) {
+        SOCKS_ATYP_IPV4 => {
+            // Read 4-byte IPv4 address
+            var ip: [4]u8 = undefined;
+            off = 0;
+            while (off < 4) {
+                const n = tcp.sockRead(fd, ip[off..].ptr, ip.len - off);
+                if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+                off += @intCast(n);
+            }
+            // Format as dotted decimal into buf
+            hostname = try std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
+        },
+        SOCKS_ATYP_DOMAIN => {
+            // Phase 3: Read hostname length (1 byte) + hostname
+            var len_byte: u8 = undefined;
+            off = 0;
+            while (off < 1) {
+                const n = tcp.sockRead(fd, @as([*]u8, @ptrCast(&len_byte)), 1);
+                if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+                off += @intCast(n);
+            }
+            if (len_byte == 0 or len_byte > tcp.MAX_HOSTNAME) return error.Socks5BadHostname;
+
+            off = 0;
+            while (off < len_byte) {
+                const n = tcp.sockRead(fd, buf[off..].ptr, len_byte - off);
+                if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+                off += @intCast(n);
+            }
+            hostname = buf[0..len_byte];
+        },
+        SOCKS_ATYP_IPV6 => return error.Socks5AddressTypeNotSupported,
+        else => return error.Socks5AddressTypeNotSupported,
     }
-    const hostname = buf[0..len_byte];
 
     // Phase 4: Read port (2 bytes BE)
     var port_buf: [2]u8 = undefined;
@@ -132,12 +167,13 @@ pub fn readRequestBuf(fd: tcp.socket_t, buf: []u8) !Socks5RequestBuf {
     }
     const dst_port = std.mem.readInt(u16, &port_buf, .big);
 
-    return Socks5RequestBuf{ .hostname = hostname, .port = dst_port };
+    return Socks5RequestBuf{ .cmd = cmd, .atyp = atyp, .hostname = hostname, .port = dst_port };
 }
 
 /// Read SOCKS5 request (with auth negotiation, for tests).
 /// Returned Socks5Request.hostname is allocator-owned; caller must free.
 /// Production code should use checkAndReply or readRequestBuf.
+/// Supports CMD: CONNECT, BIND, UDP_ASSOCIATE. ATYP: IPv4, DOMAIN.
 pub fn accept(fd: tcp.socket_t, allocator: std.mem.Allocator) !Socks5Request {
     // Phase 1: SOCKS5 auth negotiation
     try authAccept(fd);
@@ -151,27 +187,49 @@ pub fn accept(fd: tcp.socket_t, allocator: std.mem.Allocator) !Socks5Request {
         off += @intCast(n);
     }
     if (hdr[0] != SOCKS_VER) return error.Socks5BadVersion;
-    if (hdr[1] != SOCKS_CMD_CONNECT) return error.Socks5BadCommand;
-    if (hdr[3] != SOCKS_ATYP_DOMAIN) return error.Socks5DomainRequired;
 
-    // Phase 3: Read hostname length (1 byte) + hostname
-    var len_byte: u8 = undefined;
-    off = 0;
-    while (off < 1) {
-        const n = tcp.sockRead(fd, @as([*]u8, @ptrCast(&len_byte)), 1);
-        if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
-        off += @intCast(n);
+    const cmd = hdr[1];
+    switch (cmd) {
+        SOCKS_CMD_CONNECT, SOCKS_CMD_BIND, SOCKS_CMD_UDP_ASSOCIATE => {},
+        else => return error.Socks5BadCommand,
     }
-    if (len_byte == 0 or len_byte > tcp.MAX_HOSTNAME) return error.Socks5BadHostname;
 
+    const atyp = hdr[3];
     var hn_buf: [tcp.MAX_HOSTNAME]u8 = undefined;
-    off = 0;
-    while (off < len_byte) {
-        const n = tcp.sockRead(fd, hn_buf[off..].ptr, len_byte - off);
-        if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
-        off += @intCast(n);
-    }
-    const hn = hn_buf[0..len_byte];
+    const hn: []const u8 = switch (atyp) {
+        SOCKS_ATYP_IPV4 => blk: {
+            // Read 4-byte IPv4 address
+            var ip: [4]u8 = undefined;
+            off = 0;
+            while (off < 4) {
+                const n = tcp.sockRead(fd, ip[off..].ptr, ip.len - off);
+                if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+                off += @intCast(n);
+            }
+            break :blk try std.fmt.bufPrint(&hn_buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
+        },
+        SOCKS_ATYP_DOMAIN => blk: {
+            // Read hostname length (1 byte) + hostname
+            var len_byte: u8 = undefined;
+            off = 0;
+            while (off < 1) {
+                const n = tcp.sockRead(fd, @as([*]u8, @ptrCast(&len_byte)), 1);
+                if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+                off += @intCast(n);
+            }
+            if (len_byte == 0 or len_byte > tcp.MAX_HOSTNAME) return error.Socks5BadHostname;
+
+            off = 0;
+            while (off < len_byte) {
+                const n = tcp.sockRead(fd, hn_buf[off..].ptr, len_byte - off);
+                if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+                off += @intCast(n);
+            }
+            break :blk hn_buf[0..len_byte];
+        },
+        SOCKS_ATYP_IPV6 => return error.Socks5AddressTypeNotSupported,
+        else => return error.Socks5AddressTypeNotSupported,
+    };
 
     // Phase 4: Read port (2 bytes BE)
     var port_buf: [2]u8 = undefined;
@@ -183,35 +241,38 @@ pub fn accept(fd: tcp.socket_t, allocator: std.mem.Allocator) !Socks5Request {
     }
     const dst_port = std.mem.readInt(u16, &port_buf, .big);
 
-    return Socks5Request{ .hostname = try allocator.dupe(u8, hn), .port = dst_port };
+    return Socks5Request{
+        .cmd = cmd,
+        .atyp = atyp,
+        .hostname = try allocator.dupe(u8, hn),
+        .port = dst_port,
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Reply Helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Send SOCKS5 success response (10 bytes).
-pub fn replyOk(fd: tcp.socket_t) void {
+/// Send parameterized SOCKS5 reply (10 bytes).
+pub fn reply(fd: tcp.socket_t, rep: u8, bnd_addr: [4]u8, bnd_port: u16) void {
     const resp = [_]u8{
-        SOCKS_VER, SOCKS_REP_OK, // VER, REP=success
+        SOCKS_VER, rep,
         0x00, // RSV
         SOCKS_ATYP_IPV4, // ATYP=IPv4
-        0x00, 0x00, 0x00, 0x00, // BND.ADDR = 0.0.0.0
-        0x00, 0x00, // BND.PORT = 0
+        bnd_addr[0], bnd_addr[1], bnd_addr[2], bnd_addr[3],
+        @truncate(bnd_port >> 8), @truncate(bnd_port & 0xff),
     };
     _ = tcp.sockWrite(fd, &resp, resp.len);
 }
 
+/// Send SOCKS5 success response (10 bytes).
+pub fn replyOk(fd: tcp.socket_t) void {
+    reply(fd, SOCKS_REP_OK, [_]u8{ 0, 0, 0, 0 }, 0);
+}
+
 /// Send SOCKS5 rejection response (10 bytes).
 pub fn replyRejected(fd: tcp.socket_t) void {
-    const resp = [_]u8{
-        SOCKS_VER, SOCKS_REP_GENERAL_FAILURE, // VER, REP=failure
-        0x00, // RSV
-        SOCKS_ATYP_IPV4, // ATYP=IPv4
-        0x00, 0x00, 0x00, 0x00, // BND.ADDR = 0.0.0.0
-        0x00, 0x00, // BND.PORT = 0
-    };
-    _ = tcp.sockWrite(fd, &resp, resp.len);
+    reply(fd, SOCKS_REP_GENERAL_FAILURE, [_]u8{ 0, 0, 0, 0 }, 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -679,4 +740,292 @@ test "socks5CheckAndReply on non-blocking socket" {
     // Server completes SOCKS5 handshake on non-blocking socket
     const accepted = try checkAndReply(pair.a, "nbself");
     try std.testing.expect(accepted);
+}
+
+test "readRequestBuf parses BIND command" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const client_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            // Auth
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = tcp.sockWrite(fd, &auth, auth.len);
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = tcp.sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+
+            // Request: CMD=BIND, ATYP=DOMAIN, hostname="0.0.0.0", port=0
+            const req = [_]u8{
+                SOCKS_VER, SOCKS_CMD_BIND,
+                0x00, SOCKS_ATYP_DOMAIN,
+                7, '0', '.', '0', '.', '0', '.', '0',
+                0x00, 0x00,
+            };
+            _ = tcp.sockWrite(fd, &req, req.len);
+        }
+    }.run, .{pair.b});
+    defer client_thread.join();
+
+    var buf: [tcp.MAX_HOSTNAME]u8 = undefined;
+    const req = try readRequestBuf(pair.a, buf[0..]);
+    try std.testing.expectEqual(SOCKS_CMD_BIND, req.cmd);
+    try std.testing.expectEqual(SOCKS_ATYP_DOMAIN, req.atyp);
+    try std.testing.expectEqualStrings("0.0.0.0", req.hostname);
+}
+
+test "readRequestBuf parses UDP_ASSOCIATE command" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const client_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            // Auth
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = tcp.sockWrite(fd, &auth, auth.len);
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = tcp.sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+
+            // Request: CMD=UDP_ASSOCIATE, ATYP=DOMAIN, hostname="client", port=0
+            const req = [_]u8{
+                SOCKS_VER, SOCKS_CMD_UDP_ASSOCIATE,
+                0x00, SOCKS_ATYP_DOMAIN,
+                6, 'c', 'l', 'i', 'e', 'n', 't',
+                0x00, 0x00,
+            };
+            _ = tcp.sockWrite(fd, &req, req.len);
+        }
+    }.run, .{pair.b});
+    defer client_thread.join();
+
+    var buf: [tcp.MAX_HOSTNAME]u8 = undefined;
+    const req = try readRequestBuf(pair.a, buf[0..]);
+    try std.testing.expectEqual(SOCKS_CMD_UDP_ASSOCIATE, req.cmd);
+    try std.testing.expectEqualStrings("client", req.hostname);
+}
+
+test "readRequestBuf parses IPv4 ATYP" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const client_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            // Auth
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = tcp.sockWrite(fd, &auth, auth.len);
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = tcp.sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+
+            // Request: CMD=CONNECT, ATYP=IPv4, addr=192.168.1.100, port=8080
+            const req = [_]u8{
+                SOCKS_VER, SOCKS_CMD_CONNECT,
+                0x00, SOCKS_ATYP_IPV4,
+                192, 168, 1, 100, // IPv4 = 192.168.1.100
+                0x1F, 0x90, // PORT = 8080
+            };
+            _ = tcp.sockWrite(fd, &req, req.len);
+        }
+    }.run, .{pair.b});
+    defer client_thread.join();
+
+    var buf: [tcp.MAX_HOSTNAME]u8 = undefined;
+    const req = try readRequestBuf(pair.a, buf[0..]);
+    try std.testing.expectEqual(SOCKS_ATYP_IPV4, req.atyp);
+    try std.testing.expectEqualStrings("192.168.1.100", req.hostname);
+    try std.testing.expectEqual(@as(u16, 8080), req.port);
+}
+
+test "readRequestBuf rejects unknown command" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const client_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            // Auth
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = tcp.sockWrite(fd, &auth, auth.len);
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = tcp.sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+
+            // Send bad CMD=0xFF (unknown command)
+            const bad_hdr = [_]u8{ SOCKS_VER, 0xFF, 0x00, SOCKS_ATYP_DOMAIN };
+            _ = tcp.sockWrite(fd, &bad_hdr, bad_hdr.len);
+        }
+    }.run, .{pair.b});
+    defer client_thread.join();
+
+    var buf: [tcp.MAX_HOSTNAME]u8 = undefined;
+    const result = readRequestBuf(pair.a, buf[0..]);
+    try std.testing.expectError(error.Socks5BadCommand, result);
+}
+
+test "readRequestBuf rejects IPv6 ATYP" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const client_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            // Auth
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = tcp.sockWrite(fd, &auth, auth.len);
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = tcp.sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+
+            // Request: CMD=CONNECT, ATYP=IPv6 (unsupported)
+            const req = [_]u8{
+                SOCKS_VER, SOCKS_CMD_CONNECT,
+                0x00, SOCKS_ATYP_IPV6,
+            };
+            _ = tcp.sockWrite(fd, &req, req.len);
+        }
+    }.run, .{pair.b});
+    defer client_thread.join();
+
+    var buf: [tcp.MAX_HOSTNAME]u8 = undefined;
+    const result = readRequestBuf(pair.a, buf[0..]);
+    try std.testing.expectError(error.Socks5AddressTypeNotSupported, result);
+}
+
+test "readRequestBuf rejects unknown ATYP" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const client_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            // Auth
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = tcp.sockWrite(fd, &auth, auth.len);
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = tcp.sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+
+            // Request: CMD=CONNECT, ATYP=0xFF (unknown)
+            const req = [_]u8{
+                SOCKS_VER, SOCKS_CMD_CONNECT,
+                0x00, 0xFF,
+            };
+            _ = tcp.sockWrite(fd, &req, req.len);
+        }
+    }.run, .{pair.b});
+    defer client_thread.join();
+
+    var buf: [tcp.MAX_HOSTNAME]u8 = undefined;
+    const result = readRequestBuf(pair.a, buf[0..]);
+    try std.testing.expectError(error.Socks5AddressTypeNotSupported, result);
+}
+
+test "parameterized reply with bind address" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    // Send reply with specific BND.ADDR=192.168.1.1 BND.PORT=9090
+    reply(pair.a, SOCKS_REP_OK, [_]u8{ 192, 168, 1, 1 }, 9090);
+
+    var resp: [10]u8 = [_]u8{0} ** 10;
+    var off: usize = 0;
+    while (off < 10) {
+        const n = tcp.sockRead(pair.b, resp[off..].ptr, resp.len - off);
+        if (n == 0) break;
+        off += @intCast(n);
+    }
+    try std.testing.expectEqual(SOCKS_VER, resp[0]);
+    try std.testing.expectEqual(SOCKS_REP_OK, resp[1]);
+    try std.testing.expectEqual(@as(u8, 0x00), resp[2]); // RSV
+    try std.testing.expectEqual(SOCKS_ATYP_IPV4, resp[3]);
+    try std.testing.expectEqual(@as(u8, 192), resp[4]);
+    try std.testing.expectEqual(@as(u8, 168), resp[5]);
+    try std.testing.expectEqual(@as(u8, 1), resp[6]);
+    try std.testing.expectEqual(@as(u8, 1), resp[7]);
+
+    const bnd_port = std.mem.readInt(u16, resp[8..10], .big);
+    try std.testing.expectEqual(@as(u16, 9090), bnd_port);
+}
+
+test "accept returns cmd and atyp fields" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const client_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            // Auth
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = tcp.sockWrite(fd, &auth, auth.len);
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = tcp.sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+
+            // Request: CMD=CONNECT, ATYP=DOMAIN, hostname="test", port=2121
+            const req = [_]u8{
+                SOCKS_VER, SOCKS_CMD_CONNECT,
+                0x00, SOCKS_ATYP_DOMAIN,
+                4, 't', 'e', 's', 't',
+                0x08, 0x49,
+            };
+            _ = tcp.sockWrite(fd, &req, req.len);
+        }
+    }.run, .{pair.b});
+    defer client_thread.join();
+
+    const request = try accept(pair.a, std.testing.allocator);
+    defer std.testing.allocator.free(request.hostname);
+    try std.testing.expectEqual(SOCKS_CMD_CONNECT, request.cmd);
+    try std.testing.expectEqual(SOCKS_ATYP_DOMAIN, request.atyp);
+    try std.testing.expectEqualStrings("test", request.hostname);
+    try std.testing.expectEqual(@as(u16, 2121), request.port);
 }
