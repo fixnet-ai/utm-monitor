@@ -904,3 +904,34 @@ tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig
 | --download | ✅ | ✅ | ✅ | ✅ |
 | --ping | ✅ | ✅ | ✅ | ✅ |
 | SOCKS4a forward | ✅ | ✅ | ✅ (修复后) | ✅ (修复后) |
+
+### 2026-07-31 — MCP download 修复 + 全工具测试
+
+**MCP download 修复**:
+- 根因：`src/mcp.zig` `handleVmDownload` 使用 `openFile(io, local_path, .{ .mode = .write_only })`，
+  `openFile` 要求文件已存在（否则 `FileNotFound`）。CLI `cmdDownload` 正确使用 `createFile`
+- 修复：`openFile` → `createFile(io, local_path, .{})` — 创建或截断，1 行变更
+- macOS 踩坑：`cp` 覆盖 `/opt/utmm/utmm` 导致 ad-hoc 签名失效，`sudo` 运行被 SIGKILL（bug_type 309）
+  - 解决：`codesign --remove-signature` + `codesign -s -` 重新 ad-hoc 签名
+  - 建议：部署 flow 应使用 `--install` 而非裸 `cp`，install flow 内部处理签名
+
+**MCP 全工具测试（通过管道验证）**:
+| 工具 | linuxvm | 结果 |
+|------|---------|------|
+| status | — | ✅ 5 节点 online |
+| exec | uname -a | ✅ |
+| ping | — | ✅ RTT=0ms |
+| upload | 25 bytes → /opt/utmm/ | ✅ |
+| download | 25 bytes ← /opt/utmm/ | ✅ （修复后）|
+| sshpass | echo SSH-PASS-OK | ✅ exit=0 |
+
+**sshpass 测试详情**: `ssh root@192.168.64.6 echo SSH-PASS-OK` → 输出正确，exit 0 ✅
+- 管道降级 + ConPTY 动态加载在之前 session 已验证，本次直接测试正常路径
+
+**测试验证**:
+- 176 单元测试全部通过 ✅
+- 59 集成测试全部通过 ✅
+
+**修复后二进制确认**:
+- `/opt/utmm/utmm` 已包含 `createFile` 代码 + 重新 ad-hoc 签名
+- MCP 进程需重启会话才能加载新二进制（管道测试已验证功能正确）
