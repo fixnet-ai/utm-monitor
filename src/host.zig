@@ -874,13 +874,14 @@ pub fn pushUpgrade(
         return "UnknownTarget";
     };
 
-    // 3. Open binary from serve-dir
+    // 3. Open binary from serve-dir（文件名含版本号，如 utmm-aarch64-linux-0.15.10）
     var path_buf: [512]u8 = undefined;
     const serve_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ svc.canonicalDir(), filename }) catch return "PathTooLong";
 
     const bin_file = std.Io.Dir.cwd().openFile(io, serve_path, .{ .mode = .read_only }) catch |err| {
         std.log.err("[auto-upgrade] open {s}: {}", .{ serve_path, err });
-        return "BinaryNotFound";
+        std.log.err("[auto-upgrade] expected {s} in serve-dir — run 'zig build cross -Doptimize=ReleaseSafe && utmm --deploy' first", .{filename});
+        return "BinaryNotFound: run zig build cross + deploy to populate serve-dir";
     };
     defer bin_file.close(io);
 
