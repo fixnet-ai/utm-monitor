@@ -480,8 +480,8 @@ fn startHost(
     hostname: ?[]const u8,
 ) !void {
     const sd = serve_dir orelse svc.canonicalDir();
-    std.debug.print("[host] Host daemon starting (mesh UDP :{d})\n", .{mesh_port});
-    std.debug.print("[host] Serve dir: {s}\n", .{sd});
+    std.log.info("[host] daemon starting (mesh UDP :{d})", .{mesh_port});
+    std.log.info("[host] serve dir: {s}", .{sd});
 
     // 清理 Guest crash 残留的升级临时文件
     svc.cleanupStaleUpgradeTmp(block_io);
@@ -713,7 +713,7 @@ fn hostTcpListen(
                 // self:2121 — no utmm handler on Host side, just close
                 tcp.socks5ReplyOk(fd);
                 tcp.sockClose(fd);
-                std.log.info("[host] self:2121 (no handler)", .{});
+                std.log.debug("[host] self:2121 (no handler)", .{});
             } else {
                 // 本机 localhost relay
                 const t = std.Thread.spawn(.{}, tcp.socks5LocalRelay, .{ io, fd, req.port }) catch {

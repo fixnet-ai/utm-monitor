@@ -264,7 +264,7 @@ fn getMacAddress(io: std.Io, allocator: std.mem.Allocator, iface_name: []const u
         defer allocator.free(path);
 
         const content = readSysFs(io, allocator, path) catch |err| {
-            std.debug.print("[guest] Failed to read MAC ({s}): {}\n", .{ path, err });
+            std.log.err("[guest] read MAC failed: path={s} err={}", .{ path, err });
             return allocator.dupe(u8, "00:00:00:00:00:00");
         };
         return content;
@@ -345,7 +345,7 @@ fn detectUnixIp(allocator: std.mem.Allocator) !?IpInfo {
 
         const ip = try std.fmt.allocPrint(allocator, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
         const iface_name = try allocator.dupe(u8, name);
-        std.debug.print("[guest] Physical NIC {s}: {s}\n", .{ name, ip });
+        std.log.info("[guest] physical NIC: iface={s} ip={s}", .{ name, ip });
 
         // Return immediately if this is a non-NAT address (preferred)
         if (!isLikelyVmNat(bytes)) {
@@ -398,7 +398,7 @@ pub fn getSystemInfo(io: std.Io, allocator: std.mem.Allocator) !SystemInfo {
 
     while (attempt < MAX_IP_RETRIES) : (attempt += 1) {
         if (attempt > 0) {
-            std.debug.print("[guest] IP not ready (attempt {}/{}), waiting {d}ms...\n", .{ attempt + 1, MAX_IP_RETRIES, IP_RETRY_DELAY_MS });
+            std.log.info("[guest] IP not ready: attempt={}/{}, waiting={d}ms", .{ attempt + 1, MAX_IP_RETRIES, IP_RETRY_DELAY_MS });
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(IP_RETRY_DELAY_MS), .awake) catch {};
         }
 
@@ -535,7 +535,7 @@ fn getGatewayMacOS(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
 
 fn getGatewayLinux(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     const content = readSysFs(io, allocator, "/proc/net/route") catch |err| {
-        std.debug.print("[guest] Failed to read /proc/net/route: {}\n", .{err});
+        std.log.warn("[guest] read /proc/net/route failed: {}", .{err});
         return error.GatewayNotFound;
     };
     defer allocator.free(content);
@@ -1424,11 +1424,7 @@ pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig
         sysinfo.hostname = try gpa.dupe(u8, n);
     }
 
-    std.debug.print("[guest] Hostname: {s}\n", .{sysinfo.hostname});
-    std.debug.print("[guest] Target: {s}\n", .{sysinfo.target});
-    std.debug.print("[guest] IP: {s}\n", .{sysinfo.ip});
-    std.debug.print("[guest] MAC: {s}\n", .{sysinfo.mac});
-    std.debug.print("[guest] Shell: {s}\n", .{sysinfo.shell});
+    std.log.info("[guest] system: hostname={s} target={s} ip={s} mac={s} shell={s}", .{ sysinfo.hostname, sysinfo.target, sysinfo.ip, sysinfo.mac, sysinfo.shell });
 
     // Ensure CWD is /opt/utmm/ (or C:\opt\utmm\ on Windows)
     if (builtin.os.tag == .windows) {
