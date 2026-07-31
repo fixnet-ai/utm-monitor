@@ -19,25 +19,21 @@ jobs:
         with:
           version: '0.16.0'
 
-      - name: Run tests
-        run: zig build test --summary all
+      - name: Run unit tests
+        # Avoid --summary all on macOS — can trigger --listen=- protocol hang
+        run: zig build test
 
       - name: Run integration tests
-        run: zig build test-integration --summary all
+        run: zig build test-integration
 
-      - name: Build all targets
-        # zig build orchestrates a two-step build internally:
-        #   1. Build utmmd (supervisor daemon) → cp to src/embed/utmmd.bin
-        #   2. shasum utmmd.bin → src/embed/utmmd.sha256
-        #   3. Build utmm (main binary, @embedFile utmmd.bin + utmmd.sha256)
-        # Deployment filenames include version suffix (e.g. utmm-aarch64-linux-0.11.23).
+      - name: Build all targets (parallel)
+        # Single zig build cross step replaces the old serial for-loop.
+        # Compiles all 8 deployment targets in parallel via build.zig cross step.
+        run: zig build cross -Doptimize=ReleaseSafe
+
+      - name: Collect deployment binaries
         run: |
           mkdir -p release
-          targets="x86_64-windows aarch64-windows x86-windows-gnu x86_64-macos aarch64-macos x86-linux-musl x86_64-linux-musl aarch64-linux-musl"
-          for target in $targets; do
-            echo "==> Building $target ..."
-            zig build -Dtarget=$target -Doptimize=ReleaseSafe
-          done
           echo "==> Collecting deployment binaries..."
           for f in zig-out/bin/utmm-*; do
             if [ -f "$f" ]; then
@@ -45,16 +41,8 @@ jobs:
               printf "    %8s  %s\n" "$(wc -c < "$f" | tr -d ' ')" "$(basename "$f")"
             fi
           done
-          echo "==> Release artifacts:"
-          ls -lh release/
-
-      - name: Copy install scripts and version file
-        run: |
-          echo "==> Adding install scripts + ver.txt..."
-          cp install.sh release/
-          cp install.bat release/
           cp src/ver.txt release/
-          echo "==> Final release contents:"
+          echo "==> Release artifacts:"
           ls -lh release/
 
       - name: Package zip
