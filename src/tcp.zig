@@ -308,7 +308,7 @@ pub fn makeNonBlockingPair() !struct { a: socket_t, b: socket_t } {
     return .{ .a = pair.a, .b = pair.b };
 }
 
-const FIONBIO: c_int = 0x8004667e;
+const FIONBIO: c_int = @bitCast(@as(std.os.windows.ULONG, 0x8004667e));
 extern "ws2_32" fn ioctlsocket(s: std.posix.socket_t, cmd: c_int, argp: *std.os.windows.ULONG) callconv(.winapi) c_int;
 const ws2_ioctlsocket = ioctlsocket;
 
