@@ -219,7 +219,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !CliA
             cli.cmd_deploy = true;
             if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "--")) {
                 i += 1;
-                cli.deploy_target = args[i];
+                cli.deploy_target = try std.ascii.allocLowerString(allocator, args[i]);
             }
         } else if (std.mem.eql(u8, arg, "--ping")) {
             cli.cmd_ping = true;

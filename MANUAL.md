@@ -45,6 +45,13 @@ differences, and deployment.
 | `--peer-mesh ADDR` | Direct peer mesh address for local testing |
 | `--log-file PATH` | Log file path |
 
+> **Hostname normalization**: All hostnames (`--hostname`, `--exec`, `--ping`,
+> `--upload`, `--download`, `--upgrade`, `--deploy`, and MCP `vm` parameters) are
+> automatically lowercased before processing. Guest OS hostnames from
+> `gethostname()` / `COMPUTERNAME` are also lowercased at source. This ensures
+> case-insensitive matching across all code paths — `LinuxVM`, `LINUXVM`, and
+> `linuxvm` are treated identically.
+
 ### Host Options
 
 | Option | Description |
