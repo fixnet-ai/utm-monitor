@@ -57,8 +57,10 @@ Current configuration — four VM targets tracked:
 │  host.zig            Host daemon: LSA + IPC + TCP listen + SOCKS5│
 │  ipc.zig             IPC socket server (CLI/MCP entry)            │
 │  mcp.zig             MCP stdio JSON-RPC                           │
+│  sshpass.zig         Built-in SSH password auth (PTY/ConPTY)      │
 ├──────────────────────────────────────────────────────────────────┤
 │  Topology Layer                                                   │
+│  arp.zig             ARP MAC→IP reverse discovery                 │
 │  lsa.zig             LSA broadcast + node table + /etc/hosts      │
 ├──────────────────────────────────────────────────────────────────┤
 │  Transport Layer                                                  │
@@ -82,7 +84,7 @@ Current configuration — four VM targets tracked:
 │  Foundation Layer                                                 │
 │  main.zig            Entry point, CLI parsing, mode dispatch      │
 │  fail.zig            Fast-fail helpers                            │
-│  config.zig          Config persistence + file logger             │
+│  config.zig          Service config + file logger                 │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -94,24 +96,24 @@ Current configuration — four VM targets tracked:
                └──────┬──────┘
       ┌───────────────┼───────────────┐
       ↓               ↓               ↓
- ┌─────────┐    ┌─────────┐    ┌──────────┐
- │ fail.zig │    │ tcp.zig │    │ lsa.zig  │
- └─────────┘    └────┬─────┘    └──────────┘
-                     ↓
-                ┌─────────┐
-                │ dpipe   │ ← dpipe_shell / dpipe_file
-                └────┬────┘
-       ┌─────────────┼─────────────┐
-       ↓             ↓             ↓
-  ┌────────┐   ┌────────┐   ┌────────┐
-  │ guest  │   │ host   │   │  ipc   │
-  └────────┘   └───┬────┘   └───┬────┘
+ ┌─────────┐    ┌─────────┐    ┌──────────┐    ┌─────────┐
+ │ fail.zig │    │ tcp.zig │    │ lsa.zig  │    │ arp.zig │
+ └─────────┘    └────┬─────┘    └──────────┘    └────┬────┘
+                     ↓                               │
+                ┌─────────┐                          │
+                │ dpipe   │ ← dpipe_shell/dpipe_file │
+                └────┬────┘                          │
+       ┌─────────────┼─────────────┐                │
+       ↓             ↓             ↓                │
+  ┌────────┐   ┌────────┐   ┌────────┐              │
+  │ guest  │   │ host   │───│  ipc   │──────────────┘
+  └────────┘   └───┬────┘   └───┬────┘  (ARP lookup)
                    │             │
                    └──────┬──────┘
                           ↓
-                     ┌────────┐
-                     │  main  │
-                     └────────┘
+                     ┌────────┐    ┌──────────┐
+                     │  main  │────│ sshpass  │
+                     └────────┘    └──────────┘
 ```
 
 ### TCP Per-Command Model (v0.13.0+)
@@ -244,7 +246,8 @@ Threads exit when either side closes the connection.
 
 ### Wire Protocol (protocol.zig)
 
-All frames over TCP: 1-byte type + type-specific payload.
+TCP frames: 4-byte BE length prefix (tcp.zig sendFrame/recvFrame),
+then inner payload = 1-byte MsgType + type-specific payload.
 Strings null-terminated, blobs 4-byte BE length prefix, integers 4-byte BE.
 File transfers use raw TCP streaming (no chunking — TCP provides reliable delivery).
 
@@ -257,7 +260,7 @@ File transfers use raw TCP streaming (no chunking — TCP provides reliable deli
 | download_cmd | 0x14 | host→guest | Download request (cmd_id + path) |
 | upload_cmd | 0x1b | host→guest | Upload request (cmd_id + path + file_size + hash) |
 | upload_result | 0x17 | guest→host | Upload result (cmd_id + exit_code) |
-| upgrade_cmd | 0x1a | host→guest | Push upgrade binary (cmd_id + target + file_size + sha256) |
+| upgrade_cmd | 0x1a | host→guest | Push upgrade binary (cmd_id + target + file_size + sha256 + version) |
 
 > `file_chunk` (0x1c) and `file_eof` (0x1d) removed in v0.13.0 — TCP reliable
 > streaming eliminates the need for chunk-level verification.
@@ -417,6 +420,8 @@ zig build test-integration   # Integration tests (single binary, flat test files
 utmm --hostname myvm --port 2121    # Ensure Guest service (auto-installs utmmd if needed)
 utmm --svc                           # Daemon mode (internal, spawned by utmmd supervisor)
 utmm --host-ip IP                    # Override Host IP (default: auto-detect via gateway)
+utmm --mesh-port PORT                # LSA broadcast UDP port (default: 2121)
+utmm --peer-mesh ADDR                # Peer mesh address for multi-host topologies
 utmm --log-file PATH                 # Log file path
 utmm --version                       # Print version and exit (no root needed)
 utmm --install --hostname myvm       # Force install utmmd as system service
@@ -430,17 +435,18 @@ utmm --host --port 2122              # Custom mesh port
 utmm --host --serve-dir PATH         # Binary serve directory for Guest upgrade (default: exe dir)
 utmm --host --hosts-file PATH        # hosts file path (default /etc/hosts)
 utmm --host --marker TAG             # hosts marker comment text
-utmm --host --config PATH            # Config file path
 utmm --host --log-file PATH          # Log file path
 utmm --host --install                # Force install utmmd as system service (Host mode)
 utmm --host --uninstall              # Remove system service
-utmm --host --save-config            # Save current parameters to config file
 
 # Management Commands (auto-start Host if not running)
 utmm --status                        # All guest status
 utmm --exec linuxvm "uname -a"       # Remote exec (pty)
 utmm --upload file.txt linuxvm       # Upload file
 utmm --download linuxvm f.txt ./f.txt  # Download file
+utmm --ping linuxvm                  # Ping guest reachability
+utmm --upgrade linuxvm               # Push upgrade to guest
+utmm --deploy                        # Build + scp + install all guests
 utmm --gen-init linux                # Generate auto-start script (linux/macos/windows)
 utmm --version                       # Print version and exit
 ```
@@ -449,8 +455,8 @@ utmm --version                       # Print version and exit
 > the Host daemon via IPC socket (`/var/run/utmm.sock`). If the Host service is not
 > running, they auto-start it via `svc.ensure(.host)` before executing.
 > `utmm --host` also ensures the service and exits. `--host` combined with
-> a management command ensures once then executes. `--gen-init` and `--save-config`
-> do not require the Host.
+> a management command ensures once then executes. `--gen-init`
+> does not require the Host.
 
 ## Release Process
 
@@ -514,14 +520,15 @@ After release, use `utmm --deploy` to compile and copy new binaries to the
 serve-dir (`/opt/utmm/`). Then use `utmm --upgrade <vm>` to push upgrades
 to individual Guest VMs via the Host-initiated push model.
 
-## Project File Structure (17 src files + 10 test files)
+## Project File Structure (19 src files + 13 test files)
 
 ```
 src/
 ├── main.zig           Entry point, CLI parsing, mode dispatch
 ├── protocol.zig       All protocol definitions (types, serialization, VERSION, buildCmdWithMarker)
 ├── fail.zig           Fast-fail helpers (err, msg — noreturn)
-├── config.zig         Config persistence + file logger
+├── config.zig         Service config + file logger
+├── arp.zig            ARP MAC→IP reverse discovery (Linux/macOS/Windows)
 ├── lsa.zig            LSA broadcast + node table + /etc/hosts + hostname→IP lookup
 ├── tcp.zig            Frame protocol + SOCKS5 (accept/connect/forward/relay)
 ├── dpipe.zig          DuplexPipe interface + relay engine
@@ -531,6 +538,7 @@ src/
 ├── host.zig           Host daemon: LSA + IPC + TCP :2121 SOCKS5 + command dispatch
 ├── ipc.zig            IPC socket server: CLI/MCP request handling
 ├── mcp.zig            MCP stdio server: JSON-RPC stdin/stdout, IPC client to Host
+├── sshpass.zig        Built-in SSH password auth (PTY/ConPTY, 100% CLI compatible)
 ├── svc.zig            Service management (install/uninstall/forceInstall/ensure + Platform/genInit + InstallLock)
 ├── utmmd.zig          Supervisor daemon: utmm lifecycle, crash recovery, shared memory IPC
 ├── shm.zig            Shared memory protocol: utmmd↔utmm IPC, heartbeat, commands
@@ -546,11 +554,14 @@ tests/
 ├── test_exec_e2e.zig       Exec 端到端集成测试 (pub fn test_exec_e2e)
 ├── test_upload_e2e.zig     Upload 端到端集成测试 (pub fn test_upload_e2e)
 ├── test_download_e2e.zig   Download 端到端集成测试 (pub fn test_download_e2e)
-└── test_upgrade_e2e.zig    Upgrade 端到端集成测试 (pub fn test_upgrade_e2e)
+├── test_upgrade_e2e.zig    Upgrade 端到端集成测试 (pub fn test_upgrade_e2e)
+├── test_arp.zig            ARP MAC→IP 集成测试 (pub fn test_arp)
+├── test_hosts.zig          /etc/hosts 同步集成测试 (pub fn test_hosts)
+└── test_ipc_e2e.zig        IPC 端到端集成测试 (pub fn test_ipc_e2e)
 ```
 
-> v0.13.0: 20 → 17 files (10 deleted, 1 new testlib.zig). Deleted: state.zig, broadcast.zig, mesh.zig, hosts_file.zig,
-> tunproto.zig, tcpf.zig, socks5.zig, netconn.zig, cmdchan.zig, lock.zig.
+> v0.13.0: 20 → 19 files (10 deleted, 3 added in later phases: arp.zig, sshpass.zig, testlib.zig). Deleted: state.zig, broadcast.zig, mesh.zig, hosts_file.zig,
+> tunproto.zig, tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig.
 > v0.13.2: Integration tests restructured from 8 separate executables to single binary with flat `pub fn test_xxx()` modules.
 > Run via `zig build test-integration`.
 

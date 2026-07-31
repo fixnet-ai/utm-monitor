@@ -3,7 +3,7 @@
 //! The utmm --mcp command starts a stdio MCP server. Tool calls (status,
 //! exec, ping, upload, download, sshpass) are translated to IPC commands
 //! against the local Host service via /var/run/utmm.sock, benefiting from
-//! auto-ensure (Phase 52). sshpass spawns utmm as a child process for
+//! auto-ensure — auto-starts Host if not running. sshpass spawns utmm as
 //! direct SSH access to machines without utmm installed.
 //!
 //! Protocol: newline-delimited JSON, one JSON-RPC object per line.

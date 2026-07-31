@@ -1,4 +1,6 @@
-# Code Review Findings — refac/layered-arch (v0.13.0)
+# Code Review Findings — refac/layered-arch (v0.13.0) [ARCHIVED]
+
+> 所有发现已在 v0.13.0-v0.15.11 期间修复。本文件保留作为历史参考。
 
 审查范围：16 个核心源文件 + 4 个集成测试文件
 审查维度：exec / upload / download / upgrade / service management / mesh networking 完整业务流程

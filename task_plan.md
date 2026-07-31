@@ -5,7 +5,7 @@
 **最新版本**: v0.15.11 — 工作流优化 + 并行交叉编译 + 发布流水线加固
 
 - **分支**: `main`（feat/connectivity-fabric 已合并删除）
-- **源文件**: 17 src + 10 test
+- **源文件**: 19 src + 13 test
 - **测试**: 172 单元测试 + 59 集成测试，全部通过，0 泄漏
 
 ## 当前阶段: Phase 21 — sshpass 集成 + MCP 工具名去前缀 + 真机部署 ✅
@@ -16,7 +16,7 @@
 
 ## 架构概述
 
-UTM Monitor (`utmm`) 分层架构重构：20 → 17 文件，TCP per-command 连接模型，
+UTM Monitor (`utmm`) 分层架构重构：20 → 19 文件，TCP per-command 连接模型，
 DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 
 ## 实施阶段
@@ -109,7 +109,7 @@ DuplexPipe vtable 抽象，消灭 state.zig + cmdchan.zig + lock.zig。
 | 9 | `cmdchan.zig` | TCP per-command 无需跨线程命令队列 |
 | 10 | `lock.zig` | → svc.zig 内联 flock/LockFileEx |
 
-## 最终文件清单（17 文件）
+## 最终文件清单（19 文件）
 
 ```
 src/
@@ -119,7 +119,7 @@ src/
 ├── config.zig        配置持久化
 ├── arp.zig           ARP 表读取（MAC→IP 反向发现）
 ├── lsa.zig           LSA + 节点表 + /etc/hosts
-├── tcp.zig           帧协议 + SOCKS4 + 连接
+├── tcp.zig           帧协议 + SOCKS5 + 连接
 ├── dpipe.zig         DuplexPipe 接口 + relay
 ├── dpipe_shell.zig   pty→pipe
 ├── dpipe_file.zig    file→pipe
@@ -127,9 +127,11 @@ src/
 ├── host.zig          Host daemon
 ├── ipc.zig           IPC socket
 ├── mcp.zig           MCP stdio
+├── sshpass.zig       SSH 密码认证子命令（PTY/ConPTY）
 ├── svc.zig           服务管理（install/uninstall + Platform/genInit + InstallLock）
 ├── utmmd.zig         监督进程
-└── shm.zig           共享内存（utmmd↔utmm）
+├── shm.zig           共享内存（utmmd↔utmm）
+└── testlib.zig       测试模块重导出
 ```
 
 ## 关键决策记录
@@ -138,7 +140,7 @@ src/
 |---|------|------|
 | 1 | TCP per-command 连接模型 | 消除跨线程共享状态需求 |
 | 2 | DuplexPipe vtable 模式 | Zig 惯用，可扩展，可测试 |
-| 3 | SOCKS4a 内嵌在 tcp.zig | 代码量小，无需独立文件 |
+| 3 | SOCKS5 内嵌在 tcp.zig | 代码量小，无需独立文件。v0.15.0 从 SOCKS4a 迁移至 SOCKS5 |
 | 4 | 删除 file_chunk/file_eof | TCP 可靠传输无需分块校验 |
 | 5 | lsa.zig 自洽 | LSA + 节点表 + hosts 三者合一，消除数据冗余 |
 | 6 | state/cmdchan 删除 | TCP per-command 无共享状态 |

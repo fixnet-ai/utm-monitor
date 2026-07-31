@@ -509,7 +509,7 @@ fn startHost(
     var mesh_opt: ?lsa.Mesh = null;
     var mesh_thread: ?std.Thread = null;
 
-    // Allocated copies for tunnelManager (set inside start_mesh block)
+    // Allocated copies for hostMainLoop (set inside start_mesh block)
     var host_ip_copy: []const u8 = &.{};
     var host_hostname_copy: []const u8 = &.{};
 
@@ -617,7 +617,7 @@ fn startHost(
             "serving", "host", now_ms,
         );
 
-        // Allocate copies of host IP/hostname for tunnelManager (which outlives start_mesh block)
+        // Allocate copies of host IP/hostname for hostMainLoop (which outlives start_mesh block)
         host_ip_copy = try gpa.dupe(u8, host_info.ip);
         errdefer gpa.free(host_ip_copy);
         host_hostname_copy = try gpa.dupe(u8, host_info.hostname);
@@ -627,7 +627,7 @@ fn startHost(
 
     // Spawn LSA manager thread — syncs LSA→guest table, triggers auto-upgrade.
     // Must spawn before the defer below so join() runs in correct order.
-    var tun_mgr_thread = try std.Thread.spawn(.{}, tunnelManager, .{ block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy });
+    var host_loop_thread = try std.Thread.spawn(.{}, hostMainLoop, .{ block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy });
 
     // Spawn IPC server thread — Unix domain socket (POSIX) / named pipe (Windows).
     // Shares HostState and Mesh with the mesh networking layer.
@@ -646,13 +646,13 @@ fn startHost(
     defer {
         // 1. Signal all background threads to stop
         ipc_shutdown.store(true, .release);
-        // 2. Signal mesh shutdown — tunnelManager checks this each loop iteration
+        // 2. Signal mesh shutdown — hostMainLoop checks this each loop iteration
         if (mesh_opt) |*m| m.signalShutdown();
 
-        // 3. Join threads (order: IPC → TCP → tunnel mgr → mesh)
+        // 3. Join threads (order: IPC → TCP → host loop → mesh)
         ipc_thread.join();
         tcp_thread.join();
-        tun_mgr_thread.join();
+        host_loop_thread.join();
 
         // 4. Join mesh thread after all consumers have exited
         if (mesh_thread) |t| {
@@ -955,7 +955,7 @@ fn pushUpgradeThread(
     }
 }
 
-fn tunnelManager(
+fn hostMainLoop(
     io: std.Io,
     allocator: std.mem.Allocator,
     state: *GuestTable,

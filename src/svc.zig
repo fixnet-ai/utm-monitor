@@ -998,7 +998,7 @@ pub fn getOwnPid() u32 {
 
 /// Kill all utmm processes (except self) — best-effort, never fails.
 /// Uses pgrep/tasklist to enumerate PIDs, filtering out our own PID
-/// so the installer doesn't kill itself (Finding 139).
+/// so the installer doesn't kill itself.
 fn killAllUtmm(io: std.Io, alloc: std.mem.Allocator) !void {
     const my_pid = getOwnPid();
     switch (builtin.os.tag) {
@@ -1105,7 +1105,7 @@ fn countOtherUtmmProcesses(alloc: std.mem.Allocator, io: std.Io, my_pid: u32) !u
 /// Wait up to `timeout_ms` for all other utmm processes to exit.
 /// Returns true if no other utmm processes remain, false on timeout.
 /// Placed between stop() and killAllUtmm() so selfCopy has a clean
-/// filesystem — prevents "Text file busy" on Linux (Finding 135).
+/// filesystem — prevents "Text file busy" on Linux.
 fn waitForProcessExit(io: std.Io, alloc: std.mem.Allocator, timeout_ms: u64) bool {
     const my_pid = getOwnPid();
     const poll_interval_ms: u64 = 100;

@@ -53,9 +53,7 @@ differences, and deployment.
 | `--hosts-file PATH` | hosts file path (default /etc/hosts) |
 | `--serve-dir PATH` | Binary serve directory for upgrade push |
 | `--marker TAG` | Marker comment text (default "UTM-MONITOR") |
-| `--config PATH` | Config file path |
 | `--log-file PATH` | Log file path |
-| `--save-config` | Save current parameters to config file |
 
 ### Management Commands
 
@@ -314,7 +312,8 @@ git clone --config http.proxy=socks5://localhost:2121 \
 
 ### TCP Wire Protocol (protocol.zig)
 
-All frames: 1-byte type + type-specific payload.
+All frames: 4-byte BE length prefix (tcp.zig sendFrame/recvFrame), then inner
+payload = 1-byte MsgType + type-specific payload.
 
 | Type | Value | Direction | Purpose |
 |------|-------|-----------|---------|

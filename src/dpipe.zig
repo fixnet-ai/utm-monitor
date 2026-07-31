@@ -1,11 +1,12 @@
-// dpipe.zig — 双工管道抽象（DuplexPipe）
+// dpipe.zig — DuplexPipe abstraction
 //
-// 提供基于 vtable 的多态读写接口，统一 TCP socket、PTY shell、文件 I/O 的
-// 使用模式。所有 I/O 操作通过统一的 read/write/close 方法进行。
+// Vtable-based polymorphic I/O interface that unifies TCP sockets, PTY shells,
+// and file I/O behind a common read/write/close API. All I/O operations go
+// through the DuplexPipe interface.
 //
-// DuplexPipe 取代 KCP 时代的 tunnel.zig 函数指针模式 (sendFn/recvFn)，
-// 采用更简洁的 vtable 设计 — 整个管道作为一个值传递，无需为每个操作
-// 单独捕获上下文。
+// DuplexPipe replaces the KCP-era tunnel.zig function pointer pattern (sendFn/recvFn)
+// with a cleaner vtable design — the entire pipe is passed as a single value,
+// no per-operation context capture needed.
 
 const std = @import("std");
 

@@ -658,7 +658,7 @@ fn handleExec(
     };
     defer gpa.free(frame);
     tcp_conn.sendAndFlush(frame, 0) catch {
-        sendError(conn, "TunnelSendFailed");
+        sendError(conn, "SendFailed");
         return;
     };
 
@@ -782,7 +782,7 @@ fn handleUpload(
     };
     defer gpa.free(up_cmd);
     tcp_conn.sendAndFlush(up_cmd, 0) catch {
-        sendError(ipc_conn, "TunnelSendFailed");
+        sendError(ipc_conn, "SendFailed");
         return;
     };
 
@@ -901,7 +901,7 @@ fn handleDownload(
     };
     defer gpa.free(dl_cmd);
     tcp_conn.sendAndFlush(dl_cmd, 0) catch {
-        sendError(conn, "TunnelSendFailed");
+        sendError(conn, "SendFailed");
         return;
     };
 

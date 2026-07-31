@@ -309,6 +309,7 @@ pub fn printHelp() void {
         \\  --host              Ensure Host service is running (auto-installs if needed)
         \\  (no args)           Ensure Guest service is running (auto-installs if needed)
         \\  --svc               Internal: run as daemon (set by service manager)
+        \\  --mcp               Start MCP stdio JSON-RPC server (auto-starts Host)
         \\
         \\Guest options:
         \\  --hostname NAME     Local hostname (auto-detect by default)

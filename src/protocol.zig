@@ -71,7 +71,7 @@ pub fn parseDiscoveryVersion(data: []const u8) ?[]const u8 {
 /// /etc/hosts marker block
 pub const HOSTS_MARKER_BEGIN = "# UTM-MONITOR-BEGIN";
 pub const HOSTS_MARKER_END = "# UTM-MONITOR-END";
-// 旧版标记（v0.14.5 及之前），updateHosts 会自动清理
+// Legacy marker (v0.14.5 and earlier), updateHosts auto-cleans these
 pub const HOSTS_MARKER_BEGIN_OLD = "# BEGIN UTM-MONITOR";
 pub const HOSTS_MARKER_END_OLD = "# END UTM-MONITOR";
 
@@ -143,7 +143,7 @@ test "deploymentFilename - unknown target" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Tunnel protocol — binary message framing
+// Wire protocol — binary message framing
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // Messages are framed: 1-byte type + type-specific payload.
@@ -151,7 +151,6 @@ test "deploymentFilename - unknown target" {
 // Integer fields: 4-byte BE.
 //
 // Wire protocol message types — carried over TCP/SOCKS5 via tcp frame protocol.
-// Formerly over KCP tunnels (v0.11.0–v0.13.0), now over TCP per-command connections.
 
 /// Wire protocol message types (inner payload inside tcp frames).
 /// These flow over TCP/SOCKS5 connections — not directly on UDP :2121.
@@ -753,7 +752,7 @@ test "VERSION follows semver" {
     try std.testing.expect(parts.next() == null);
 }
 
-// ── Tunnel protocol tests ──
+// ── Wire protocol tests ──
 
 test "pty_spawn build" {
     const allocator = std.testing.allocator;

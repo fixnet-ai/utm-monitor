@@ -339,7 +339,7 @@ pub const Mesh = struct {
         const nonce = generateNonce();
 
         // Append nonce to node_info so remote nodes can detect process restarts
-        // via LSA nonce change (Finding 93). Build it here inside init() so
+        // via LSA nonce change. Build it here inside init() so
         // the first LSA broadcast already carries the nonce — no updateNodeInfo()
         // call window where a stale nonce-less LSA could leak out and cause a
         // double LSA restart detection on the remote side.
@@ -424,7 +424,7 @@ pub const Mesh = struct {
     pub fn updateNodeInfo(self: *Mesh, new_info: []const u8) void {
         self.allocator.free(self.node_info);
         // Append nonce so LSA restart detection can distinguish genuine
-        // process restarts from dynamic field changes (Finding 124).
+        // process restarts from dynamic field changes.
         const with_nonce = std.fmt.allocPrint(self.allocator, "{s}\nnonce:{d}", .{ new_info, self.nonce }) catch {
             self.node_info = new_info;
             return;
@@ -711,7 +711,7 @@ pub const Mesh = struct {
             // LSA restart detection: compare nonce (per-process identity) rather
             // than the full node_info string. Dynamic fields like status:/ip: must
             // not trigger restart detection — only a genuine process restart
-            // changes the nonce (Finding 124 / Task #325).
+            // changes the nonce.
             if (self.lsas.getPtr(decoded.origin)) |existing| {
                 const diff: i32 = @bitCast(decoded.seq -% existing.seq);
                 if (diff <= 0) {
@@ -727,7 +727,7 @@ pub const Mesh = struct {
                     // from an older process whose seq counter was ahead.
                     // Keep the current (lower-seq, newer-process) entry —
                     // replacing it would let the next genuine LSA trigger a
-                    // spurious second restart (Finding 93 / Task #254).
+                    // spurious second restart.
                     std.log.info("[lsa] Ignoring stale high-seq LSA from {any} (nonce differs)", .{decoded.origin});
                     return;
                 } else {
@@ -1188,9 +1188,9 @@ pub const Mesh = struct {
         return list;
     }
 
-    /// 根据 hostname 查找对应的 IP 地址。
-    /// 遍历 LSA 数据库，解析 node_info 中的 hostname: 和 ip: 字段。
-    /// 返回 allocator 分配的 IP 字符串，调用者负责释放；未找到返回 null。
+    /// Look up IP by hostname from the LSA database.
+    /// Parses node_info for hostname: and ip: fields.
+    /// Returns allocator-allocated IP string (caller owns); null if not found.
     pub fn lookupHostnameIp(self: *Mesh, allocator: std.mem.Allocator, hostname: []const u8) ?[]const u8 {
         self.lsas_mutex.lock(self.io) catch return null;
         defer self.lsas_mutex.unlock(self.io);
@@ -1256,7 +1256,7 @@ pub const HostEntry = struct {
 /// Update the marker block in the hosts file.
 /// Uses range-based replacement: finds marker boundaries in the original content
 /// and only replaces the block itself — everything outside is preserved byte-for-byte.
-/// This avoids the empty-line accumulation bug (Finding 169) caused by the old
+/// This avoids the empty-line accumulation bug caused by the old
 /// splitScalar + rebuild method, which added a spurious trailing newline on every
 /// write when the file ends with \n (as all well-formed text files do).
 ///
@@ -1277,8 +1277,8 @@ pub fn updateHosts(
     };
     defer allocator.free(original);
 
-    // ── 清理旧版标记块（v0.14.5 及之前的 # BEGIN UTM-MONITOR / # END UTM-MONITOR）──
-    // 在写入新块之前，先去除原内容中的旧标记块，避免双块并存。
+    // ── Clean legacy marker block (v0.14.5 and earlier: # BEGIN/END UTM-MONITOR) ──
+    // Remove old marker blocks before writing new ones to avoid dual blocks.
     var cleaned: std.ArrayList(u8) = .empty;
     defer cleaned.deinit(allocator);
     try cleaned.ensureTotalCapacity(allocator, original.len);
@@ -1574,7 +1574,7 @@ test "multiple entries with different IPs" {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Tests — hosts file range replacement (Finding 169 fix)
+// Tests — hosts file range replacement
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test "findMarkerLine - basic" {
