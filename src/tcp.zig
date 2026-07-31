@@ -630,9 +630,9 @@ pub fn sockAcceptTimeout(listen_fd: socket_t, timeout_ms: u32) !struct { fd: soc
             .tv_sec = @intCast(timeout_ms / 1000),
             .tv_usec = @intCast((timeout_ms % 1000) * 1000),
         };
-        var rfds: fd_set = .{ .fd_count = 0, .fd_array = [_]std.posix.socket_t{0} ** FD_SETSIZE };
-        rfds.fd_array[0] = listen_fd;
+        var rfds: fd_set = undefined;
         rfds.fd_count = 1;
+        rfds.fd_array[0] = listen_fd;
         const sel_ret = ws2_select(0, &rfds, null, null, &tv);
         if (sel_ret == 0) return error.WouldBlock;
         if (sel_ret < 0) return error.AcceptFailed;
