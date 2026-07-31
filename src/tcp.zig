@@ -144,6 +144,10 @@ extern "ws2_32" fn select(nfds: c_int, readfds: ?*fd_set, writefds: ?*fd_set, ex
 const ws2_select = select;
 extern "ws2_32" fn getsockopt(s: std.posix.socket_t, level: c_int, optname: c_int, optval: *anyopaque, optlen: *c_int) callconv(.winapi) c_int;
 const ws2_getsockopt = getsockopt;
+extern "ws2_32" fn sendto(s: std.posix.socket_t, buf: [*]const u8, len: c_int, flags: c_int, to: *const anyopaque, tolen: c_int) callconv(.winapi) c_int;
+const ws2_sendto = sendto;
+extern "ws2_32" fn recvfrom(s: std.posix.socket_t, buf: [*]u8, len: c_int, flags: c_int, from: *anyopaque, fromlen: *c_int) callconv(.winapi) c_int;
+const ws2_recvfrom = recvfrom;
 
 var ws2_initialized = false;
 fn ensureWinsock2() void {
@@ -159,7 +163,9 @@ fn ensureWinsock2() void {
 
 const AF_INET = 2;
 const SOCK_STREAM = 1;
+const SOCK_DGRAM = 2;
 const IPPROTO_TCP = 6;
+const IPPROTO_UDP = 17;
 const SO_REUSEADDR = 0x0004;
 const SO_ERROR = 0x1007;
 const SOL_SOCKET = 0xffff;
@@ -501,6 +507,166 @@ pub fn sockConnectLocalhost(port: u16) !socket_t {
     const rc = system.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
     if (rc < 0) return error.ConnectFailed;
     return fd;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UDP Transport — create, send, receive
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// UDP destination address (IPv4 only).
+pub const UdpAddr = struct {
+    ip: [4]u8,
+    port: u16,
+};
+
+/// Create a UDP socket bound to a random port (0.0.0.0:0).
+/// Returns the socket fd. Use getBoundPort() to retrieve the assigned port.
+pub fn createUdpSocket() !socket_t {
+    if (builtin.os.tag == .windows) {
+        ensureWinsock2();
+        const s = ws2_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s == INVALID_SOCKET) return error.SocketCreateFailed;
+        var addr = sockaddr_in{
+            .family = AF_INET,
+            .port = 0,
+            .addr = 0,
+        };
+        const br = ws2_bind(s, @ptrCast(&addr), @sizeOf(sockaddr_in));
+        if (br != 0) {
+            _ = ws2_closesocket(s);
+            return error.BindFailed;
+        }
+        return s;
+    }
+    const s = system.socket(std.posix.AF.INET, SOCK_DGRAM, 0);
+    if (s < 0) return error.SocketCreateFailed;
+    errdefer _ = system.close(s);
+    const addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = 0,
+        .addr = 0,
+        .zero = [_]u8{0} ** 8,
+    };
+    const addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (system.bind(s, @ptrCast(&addr), addr_len) < 0) return error.BindFailed;
+    return s;
+}
+
+/// Get the bound port of a socket (TCP or UDP).
+pub fn getBoundPort(fd: socket_t) !u16 {
+    if (builtin.os.tag == .windows) {
+        var addr: sockaddr_in = std.mem.zeroes(sockaddr_in);
+        var addr_len: std.posix.socklen_t = @sizeOf(sockaddr_in);
+        if (ws2_getsockname(fd, @ptrCast(&addr), &addr_len) != 0) return error.GetSockNameFailed;
+        return ws2_ntohs(addr.port);
+    }
+    var addr: std.posix.sockaddr.in = std.mem.zeroes(std.posix.sockaddr.in);
+    const addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (std.posix.getsockname(fd, @ptrCast(&addr), &addr_len)) {
+        return error.GetSockNameFailed;
+    } else |_| {}
+    return std.mem.bigToNative(u16, addr.port);
+}
+
+/// Send raw bytes to a UDP destination address.
+pub fn sendUdpTo(fd: socket_t, data: []const u8, to: UdpAddr) !void {
+    if (builtin.os.tag == .windows) {
+        var addr = sockaddr_in{
+            .family = AF_INET,
+            .port = ws2_htons(to.port),
+            .addr = std.mem.readInt(u32, &to.ip, .big),
+        };
+        const n = ws2_sendto(fd, data.ptr, @intCast(data.len), 0, @ptrCast(&addr), @sizeOf(sockaddr_in));
+        if (n < 0) return error.SendFailed;
+        return;
+    }
+    const addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, to.port),
+        .addr = std.mem.readInt(u32, &to.ip, .big),
+        .zero = [_]u8{0} ** 8,
+    };
+    const n = std.posix.sendto(fd, data, 0, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) catch return error.SendFailed;
+    if (n != data.len) return error.SendFailed;
+}
+
+/// Receive raw bytes from UDP, returning data length and source address.
+/// Returns { n: bytes_received, from: source_address }.
+pub fn recvUdpFrom(fd: socket_t, buf: []u8) !struct { n: usize, from: UdpAddr } {
+    if (builtin.os.tag == .windows) {
+        var from: sockaddr_in = std.mem.zeroes(sockaddr_in);
+        var from_len: c_int = @sizeOf(sockaddr_in);
+        const n = ws2_recvfrom(fd, buf.ptr, @intCast(buf.len), 0, @ptrCast(&from), &from_len);
+        if (n < 0) return error.RecvFailed;
+        const ip_bytes: [4]u8 = @bitCast(from.addr);
+        return .{
+            .n = @intCast(n),
+            .from = .{ .ip = @bitCast(ip_bytes), .port = ws2_ntohs(from.port) },
+        };
+    }
+    var from: std.posix.sockaddr.in = std.mem.zeroes(std.posix.sockaddr.in);
+    var from_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    const n = std.posix.recvfrom(fd, buf, 0, @ptrCast(&from), &from_len) catch return error.RecvFailed;
+    const ip_bytes: [4]u8 = @bitCast(from.addr);
+    return .{
+        .n = n,
+        .from = .{ .ip = @bitCast(ip_bytes), .port = std.mem.bigToNative(u16, from.port) },
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TCP Accept With Timeout — for SOCKS5 BIND
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Accept a TCP connection with timeout (ms). For SOCKS5 BIND.
+/// Returns accepted fd and the peer's address.
+/// On timeout, returns error.WouldBlock.
+pub fn sockAcceptTimeout(listen_fd: socket_t, timeout_ms: u32) !struct { fd: socket_t, addr: UdpAddr } {
+    if (builtin.os.tag == .windows) {
+        var tv: timeval = .{
+            .tv_sec = @intCast(timeout_ms / 1000),
+            .tv_usec = @intCast((timeout_ms % 1000) * 1000),
+        };
+        var rfds: fd_set = .{ .fd_count = 0, .fd_array = [_]std.posix.socket_t{0} ** FD_SETSIZE };
+        rfds.fd_array[0] = listen_fd;
+        rfds.fd_count = 1;
+        const sel_ret = ws2_select(0, &rfds, null, null, &tv);
+        if (sel_ret == 0) return error.WouldBlock;
+        if (sel_ret < 0) return error.AcceptFailed;
+
+        var addr: sockaddr_in = std.mem.zeroes(sockaddr_in);
+        var addr_len: std.posix.socklen_t = @sizeOf(sockaddr_in);
+        const raw = ws2_accept(listen_fd, @ptrCast(&addr), &addr_len);
+        if (raw == INVALID_SOCKET) return error.AcceptFailed;
+        const ip_bytes: [4]u8 = @bitCast(addr.addr);
+        return .{
+            .fd = raw,
+            .addr = .{ .ip = @bitCast(ip_bytes), .port = ws2_ntohs(addr.port) },
+        };
+    }
+    // POSIX: use poll
+    var pfd: [1]std.posix.pollfd = .{.{ .fd = @intCast(listen_fd), .events = std.posix.POLL.IN, .revents = 0 }};
+    const poll_ret = posix_poll(&pfd, 1, @intCast(timeout_ms));
+    if (poll_ret < 0) return error.AcceptFailed;
+    if (poll_ret == 0) return error.WouldBlock;
+
+    var addr: std.Io.net.IpAddress = undefined;
+    var addr_len: std.posix.socklen_t = @sizeOf(std.Io.net.IpAddress);
+    const client_fd = system.accept(listen_fd, @ptrCast(&addr), &addr_len);
+    if (client_fd < 0) return error.AcceptFailed;
+
+    const peer_ip: [4]u8 = switch (addr) {
+        .ip4 => |ip4| ip4.bytes,
+        .ip6 => return error.AddressTypeNotSupported,
+    };
+    const peer_port: u16 = switch (addr) {
+        .ip4 => |ip4| ip4.port,
+        .ip6 => return error.AddressTypeNotSupported,
+    };
+    return .{
+        .fd = client_fd,
+        .addr = .{ .ip = peer_ip, .port = peer_port },
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
