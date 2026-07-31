@@ -250,14 +250,15 @@ Params), `-32603` (Internal Error — tool-specific failure).
 ### Run Modes
 
 **Guest mode** (default): utmmd spawns utmm as Guest — UDP LSA broadcast,
-TCP listener on port 2121 (SOCKS5 accept + utmm frame protocol + chained
-forwarding), per-command pty shell. No CLI entry point for guest commands
-— all interaction goes through Host.
+TCP listener on port 2121 (SOCKS5 accept from Host + utmm frame protocol +
+localhost relay), per-command pty shell. Guest accepts SOCKS5 connections only
+from the Host — no CLI entry point for Guest commands.
 
 **Host mode** (`--host`): utmmd spawns utmm as Host — UDP LSA mesh, IPC socket
 (`/var/run/utmm.sock` on POSIX, `\\.\pipe\utmm` on Windows), TCP listener on
-port 2121 (SOCKS5 accept + forwarding, same dispatch logic as Guest),
-TCP SOCKS5 connections to Guests. CLI/MCP commands talk to Host daemon via IPC.
+port 2121 (SOCKS5 accept from Guests + chain-forward to other Guests).
+The Host is the only node that relays SOCKS5 between Guests.
+CLI/MCP commands talk to Host daemon via IPC.
 
 **MCP mode** (`--mcp`): stdio JSON-RPC server for AI agents. Auto-ensures Host
 on first use — no daemon awareness needed.
@@ -274,16 +275,16 @@ on first use — no daemon awareness needed.
 7. Host → CLI: binary frames via IPC socket → stdout
 ```
 
-### SOCKS5 Mesh Forwarding
+### SOCKS5 Forwarding (Hub-Spoke)
 
-Every utmm node (Host and Guest) is a peer SOCKS5 proxy endpoint on TCP :2121.
-Third-party tools connect through **any** node to reach **any other** node in the
-mesh — no SSH tunnels, no port mapping, no manual routing.
+The Host is the central SOCKS5 proxy. Guests accept SOCKS5 from the Host only.
+Every Guest's `/etc/hosts` has the Host's IP mapped as `gateway` — from any
+Guest, target the Host with `gateway:2121`.
 
-**Chained forwarding model:**
+**Dispatch model (Host TCP :2121):**
 
 ```
-SOCKS5 request arrives on TCP :2121:
+SOCKS5 request arrives:
   target_hostname == self ?
     ├─ target_port == 2121 → OK, utmm internal frame protocol (exec/upload/download)
     └─ target_port != 2121 → OK, connect 127.0.0.1:target_port, relay
@@ -296,26 +297,23 @@ SOCKS5 request arrives on TCP :2121:
 **Examples:**
 
 ```bash
-# Host → linuxvm:8080 web server (chained: Host → linuxvm:2121 → localhost:8080)
-curl --socks5 localhost:2121 http://linuxvm:8080
+# From Host — reach any Guest service
+curl --socks5 localhost:2121 http://linuxvm:8080       # web server on linuxvm
+curl --socks5 localhost:2121 http://macvm:22            # SSH on macvm
 
-# linuxvm → macvm:22 SSH (chained: linuxvm → Host → macvm:2121 → localhost:22)
-# (from linuxvm) curl --socks5 localhost:2121 http://macvm:22
+# From a Guest — route through the Host (gateway)
+curl --socks5 gateway:2121 http://linuxvm:8080          # Guest → Host → linuxvm
+curl --socks5 gateway:2121 http://windowsvm:3389        # Guest → Host → windowsvm
 
-# Direct local service access on the same node
-curl --socks5 localhost:2121 http://localhost:3000   # local dev server
-
-# Git clone through mesh to a VM-hosted repo
-git clone --config http.proxy=socks5://localhost:2121 \
-    http://linuxvm:8080/repo.git
+# Local service on the Host itself
+curl --socks5 localhost:2121 http://localhost:3000
 ```
 
 **Key properties:**
-- Only port 2121 needs to be reachable between mesh nodes
+- Host TCP :2121 must be reachable from all Guests
 - Each forwarded connection runs in its own thread, exits when either side closes
 - Works with any SOCKS5-compatible client: `curl`, `wget`, browsers, `git`
-- Zero configuration — hostname→IP lookup uses the existing LSA node table
-- No new CLI flags, no new ports, no new files
+- Host name `gateway` is auto-synced to every Guest's `/etc/hosts`
 
 ### TCP Wire Protocol (protocol.zig)
 

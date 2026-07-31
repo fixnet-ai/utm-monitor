@@ -31,10 +31,9 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
   System service managers just keep utmmd alive; all restart/upgrade logic
   lives in utmmd.
 - **Single port 2121** (TCP+UDP) — UDP for LSA mesh networking, TCP for SOCKS5
-  accept + utmm frame protocol + chained forwarding. Every node is a SOCKS5
-  proxy endpoint, enabling third-party tools to reach any mesh node via
-  `curl --socks5 <any-node>:2121 <target>`. CLI and MCP use local IPC socket.
-  MCP uses stdio — see `mcp.json.example`.
+  accept + utmm frame protocol. Host is the central SOCKS5 proxy; Guests route
+  through the Host via `gateway:2121` (auto-synced to every Guest's `/etc/hosts`).
+  CLI and MCP use local IPC socket. MCP uses stdio — see `mcp.json.example`.
 - **8 cross-compilation targets**: aarch64/x86_64/x86 × linux-musl/macos/windows.
 - **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
 
@@ -143,19 +142,20 @@ Per-command independent connection = no cross-thread shared state = no state.zig
 ### Two Run Modes (Same Binary)
 
 - **Guest mode (default)**: `utmmd --role guest` spawns `utmm --svc` (LSA broadcast
-  + TCP listener on :2121 + dpipe shell). TCP :2121 accepts SOCKS5 connections:
-  target==self+port==2121 → utmm frame protocol; target==self+port!=2121 → localhost
-  relay; target!=self → chained SOCKS5 forward via node table. utmmd monitors utmm
-  via shared memory (`/utmmd-shm`), handles crash recovery (exponential backoff
-  2s→60s, 5 retries), and coordinates binary upgrade.
+  + TCP listener on :2121 + dpipe shell). TCP :2121 accepts SOCKS5 connections from
+  Host: target==self+port==2121 → utmm frame protocol; target==self+port!=2121 →
+  localhost relay. utmmd monitors utmm via shared memory (`/utmmd-shm`), handles
+  crash recovery (exponential backoff 2s→60s, 5 retries), and coordinates binary
+  upgrade.
   `--install --hostname <name>`: force install as system auto-start service
   (single `utmmd` service per machine).
   `--version`: print version. No foreground mode — service model only.
 - **Host mode (`--host`)**: `utmmd --role host` spawns `utmm --host --svc`.
   UDP port 2121 mesh networking — guest registration via LSA broadcast,
-  /etc/hosts sync, TCP listener on :2121 (SOCKS5 accept + forwarding, same
-  dispatch logic as Guest), and IPC socket for CLI/MCP communication.
-  Host-initiated binary upgrade via `--upgrade <vm>` (push model). All on one port.
+  /etc/hosts sync, TCP listener on :2121 (SOCKS5 accept from Guests + chain-forward
+  to other Guests — Host is the only relay node), and IPC socket for CLI/MCP
+  communication. Host-initiated binary upgrade via `--upgrade <vm>` (push model).
+  All on one port.
 - **MCP mode (`--mcp`)**: stdio JSON-RPC server for AI agents. Talks to Host
   daemon via IPC socket (`/var/run/utmm.sock`); auto-ensures Host on first use.
 
@@ -207,8 +207,11 @@ Download (Guest→Host):
 
 ### How SOCKS5 Forwarding Flows (v0.15.0+)
 
-Every node (Guest + Host) is a peer SOCKS5 proxy endpoint. When a TCP connection
-arrives on :2121, the node reads the SOCKS5 request and dispatches:
+The Host is the central SOCKS5 relay — only the Host chain-forwards between
+Guests. Guests accept SOCKS5 from the Host only. Every Guest's `/etc/hosts`
+maps the Host IP as `gateway`.
+
+Host SOCKS5 dispatch on TCP :2121:
 
 ```
 accept → socks5ReadRequestBuf → read target_hostname, target_port
@@ -219,8 +222,7 @@ accept → socks5ReadRequestBuf → read target_hostname, target_port
        └─ not found → REJECT
 ```
 
-**Chained forwarding example** — curl on Host reaches a web server on winx64
-across a network boundary:
+**Chained forwarding example** — curl on Host reaches a web server on winx64:
 
 ```
 curl --socks5 localhost:2121 http://winx64:8080
@@ -231,13 +233,13 @@ curl --socks5 localhost:2121 http://winx64:8080
     → winx64 connects 127.0.0.1:8080, relays bidirectionally
 ```
 
-**Direct local service access:**
+**Guest → Guest via Host** — from a Guest, use `gateway:2121`:
 
 ```
-curl --socks5 localhost:2121 http://linuxvm:22
-  → Host reads SOCKS5: target=linuxvm, port=22
+curl --socks5 gateway:2121 http://linuxvm:22
+  → Guest sends SOCKS5 to Host (gateway:2121): target=linuxvm, port=22
   → Host node table: linuxvm → 192.168.64.6
-  → Host sends SOCKS5 to 192.168.64.6:2121 (target=linuxvm, port=22)
+  → Host chain-forwards SOCKS5 to 192.168.64.6:2121
     → linuxvm Guest: target==self, port!=2121 → connect 127.0.0.1:22 → relay
 ```
 
@@ -374,12 +376,12 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
 - **LSA version broadcast**: Host broadcasts version in LSA every 2s for informational
   purposes. Guest no longer takes autonomous action on version mismatch.
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
-- **Peer SOCKS5 forwarding** (v0.15.0) — every node is a SOCKS5 proxy endpoint.
+- **Hub-spoke SOCKS5 forwarding** (v0.15.0) — Host is the central SOCKS5 proxy.
   TCP :2121 accepts SOCKS5, dispatches by target hostname: self+2121 → utmm
   frame protocol, self+other-port → localhost relay, other-host → chained
-  SOCKS5 forward to target node. Third-party tools (`curl`, `wget`, browsers)
-  reach any mesh node through any other node without SSH tunnels or port mapping.
-  No new files, no new CLI flags — all through existing tcp.zig primitives.
+  SOCKS5 forward. Guests route through Host via `gateway:2121` (auto-synced
+  to every Guest's `/etc/hosts`). Third-party tools reach any Guest from the Host
+  without SSH tunnels or port mapping.
 
 ## Build & Run
 
@@ -607,13 +609,14 @@ No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
 
 - **Frame format**: 1-byte type + 4-byte BE length + payload. Length = payload bytes only.
   `tcp.zig` handles frame serialization via `sendFrame`/`recvFrame`.
-- **SOCKS5**: Built into tcp.zig. Every node accepts SOCKS5 on TCP :2121 and
+- **SOCKS5**: Extracted to socks5.zig. Host accepts SOCKS5 on TCP :2121 and
   dispatches by target hostname: self+2121 → utmm frame protocol, self+other →
-  localhost relay, other → chained SOCKS5 forward via node table.
+  localhost relay, other → chained SOCKS5 forward via node table. Guests accept
+  SOCKS5 from Host only (self+2121 → frame protocol, self+other → localhost relay).
   `socks5CheckAndReply` (accept side), `socks5Connect` (connect side),
   `socks5Forward` (chain-forward), `socks5LocalRelay` (localhost forward),
   `socks5Relay` (bidirectional relay). Host connects to Guests via SOCKS5
-  proxy (UTM network). Destination hostname embedded in SOCKS5 request after userid.
+  proxy. Guest→Guest goes through Host via `gateway:2121`.
 - **Windows socket handle compatibility**: On Windows, Zig 0.16.0's `IpAddress.connect()`
   returns AFD kernel handles which are NOT compatible with Winsock2 `recv`/`send`.
   `sockAccept` returns raw Winsock2 SOCKET handles. These two handle types cannot

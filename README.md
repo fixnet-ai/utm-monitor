@@ -91,10 +91,11 @@ utmm --deploy linuxvm
 # Mesh ping
 utmm --ping linuxvm
 
-# SOCKS5 mesh forwarding — any third-party tool reaches any node
-curl --socks5 localhost:2121 http://linuxvm:8080       # web server on linuxvm
-curl --socks5 localhost:2121 http://windowsvm:3389     # RDP on windowsvm
-git clone --config http.proxy=socks5://localhost:2121   # clone through mesh
+# SOCKS5 forwarding — reach any Guest's services from the Host
+curl --socks5 localhost:2121 http://linuxvm:8080            # web server on linuxvm
+curl --socks5 localhost:2121 http://windowsvm:3389          # RDP on windowsvm
+# From a Guest, use the Host's gateway hostname:
+#   curl --socks5 gateway:2121 http://linuxvm:8080
 ```
 
 > **ConPTY**: On Windows, `--status` shows `conpty:yes/no` for each node.

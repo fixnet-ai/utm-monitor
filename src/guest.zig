@@ -987,67 +987,10 @@ pub fn guestTcpLoop(
                 std.log.info("[guest] local relay :{d}", .{req.port});
             }
         } else {
-            // 目标不是本机 — 链式 SOCKS5 转发
-            if (mesh_opt) |*mesh| {
-                if (mesh.lookupHostnameIp(allocator, req.hostname)) |target_ip| {
-                    // 连接限制计数
-                    if (!conn_limit.tryAcquire()) {
-                        allocator.free(target_ip);
-                        socks5.replyRejected(fd);
-                        tcp.sockClose(fd);
-                        continue;
-                    }
-                    errdefer conn_limit.release();
-
-                    const next_hop = std.Io.net.IpAddress.parse(target_ip, mesh_port) catch {
-                        allocator.free(target_ip);
-                        socks5.replyRejected(fd);
-                        tcp.sockClose(fd);
-                        continue;
-                    };
-                    allocator.free(target_ip);
-
-                    const hn_copy = allocator.dupe(u8, req.hostname) catch {
-                        socks5.replyRejected(fd);
-                        tcp.sockClose(fd);
-                        continue;
-                    };
-
-                    const ctx = allocator.create(ForwardCtx) catch {
-                        allocator.free(hn_copy);
-                        socks5.replyRejected(fd);
-                        tcp.sockClose(fd);
-                        continue;
-                    };
-                    ctx.* = .{
-                        .io = io,
-                        .client_fd = fd,
-                        .next_hop_ip = next_hop,
-                        .hostname = hn_copy,
-                        .target_port = req.port,
-                        .allocator = allocator,
-                        .limit = &conn_limit,
-                    };
-
-                    const t = std.Thread.spawn(.{}, forwardThreadFn, .{ctx}) catch {
-                        allocator.destroy(ctx);
-                        allocator.free(hn_copy);
-                        socks5.replyRejected(fd);
-                        tcp.sockClose(fd);
-                        continue;
-                    };
-                    t.detach();
-                    std.log.info("[guest] forward {s}:{d}", .{ req.hostname, req.port });
-                } else {
-                    std.log.info("[guest] no route to {s}", .{req.hostname});
-                    socks5.replyRejected(fd);
-                    tcp.sockClose(fd);
-                }
-            } else {
-                std.log.info("[guest] no mesh for forward to {s}", .{req.hostname});
-                socks5.replyRejected(fd);
-                tcp.sockClose(fd);
-            }
+            // 目标不是本机 — Guest 不做链式转发，统一经 Host (gateway) 中转
+            std.log.info("[guest] reject non-self target {s}:{d}", .{ req.hostname, req.port });
+            socks5.replyRejected(fd);
+            tcp.sockClose(fd);
         }
     }
 }
