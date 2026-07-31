@@ -475,7 +475,7 @@ src/
 | 145 | `tests/integration_test.zig` 注册 test_hosts 模块 | `tests/integration_test.zig` | ✅ |
 | 146 | zig build test + test-integration 验证 | - | ✅ 161 单测 + 59 集成，0 泄漏 |
 | 147 | 版本号 bump: 0.14.5 → 0.14.6 | `src/ver.txt` | ✅ |
-| 148 | 真机部署验证（Host + 4 VM） | - | 待执行 |
+| 148 | 真机部署验证（Host + 4 VM） | - | ✅ Phase 20 中完成 |
 
 **hosts 同步集成测试（`tests/test_hosts.zig`，8 场景）**:
 
@@ -732,7 +732,7 @@ src/
 | 55 | UDP ASSOCIATE TCP 控制通道保持长连接 | RFC 1928 要求 TCP 断开时终止所有 UDP 中继 |
 | 56 | MCP 服务器名 "utmm"（非 "utm-monitor"） | utmm 是命令/二进制名，快捷易输入；UTM Monitor 是软件产品名 |
 
-### Phase 23-b: v0.16.1 — MCP 配置修正 + 规划文档同步 📋
+### Phase 23-b: v0.16.1 — MCP 配置修正 + 规划文档同步 ✅
 
 **背景**: v0.16.0 发布后，两次提交修正了 MCP 配置命名（仅 `mcp.json.example` 变更）。
 同时将 Phase 23 SOCKS5 全协议实现记录同步到规划文件中。
