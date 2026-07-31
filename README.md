@@ -59,7 +59,8 @@ Guest (windows)  ──TCP──┘   (SOCKS5 endpoint)
                          │
 Guest ←── LSA broadcast (UDP :2121) ──┘  (auto-discovery + topology)
 
-Every node TCP :2121 = SOCKS5 proxy. Third-party tools connect through any node.
+Every node TCP :2121 = SOCKS5 proxy. Reach services on any node, across LAN or
+internet — `curl --socks5 localhost:2121 http://linuxvm:8080` just works.
 ```
 
 ## CLI Quick Start
