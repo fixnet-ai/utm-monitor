@@ -893,7 +893,7 @@ pub fn pushUpgrade(
     const cmd_id = std.fmt.allocPrint(gpa, "up-{d}", .{@as(u64, @intCast(std.Io.Timestamp.now(io, .real).nanoseconds))}) catch return "AllocFailed";
     defer gpa.free(cmd_id);
 
-    const up_frame = protocol.buildUpgradeCmd(gpa, cmd_id, guest_entry.target, file_size, &sha256_hex) catch return "AllocFailed";
+    const up_frame = protocol.buildUpgradeCmd(gpa, cmd_id, guest_entry.target, file_size, &sha256_hex, protocol.VERSION) catch return "AllocFailed";
     defer gpa.free(up_frame);
 
     // Fire-and-forget: push upgrade_cmd + raw binary

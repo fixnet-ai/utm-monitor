@@ -391,7 +391,14 @@ fn applyUpgrade(io: std.Io, alloc: std.mem.Allocator, proc: ProcessRef) !Restart
                 try copyFileUpgradeFallback(io, alloc, upgrade, dest);
                 if (builtin.os.tag == .macos) {
                     if (!runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest })) {
-                        std.log.warn("[utmmd] codesign failed — binary may not run", .{});
+                        std.log.warn("[utmmd] codesign failed — checking if binary is executable...", .{});
+                        // 验证新二进制是否可执行（--version 输出版本号则说明可用）
+                        if (!runCmd(alloc, io, &.{ dest, "--version" })) {
+                            std.log.err("[utmmd] codesign failed AND binary not executable — manual recovery needed (upgrade at {s})", .{upgrade});
+                            // 不删除 upgrade 源文件，供管理员手动恢复
+                            return error.UpgradeNotExecutable;
+                        }
+                        std.log.info("[utmmd] codesign failed but binary runs — continuing", .{});
                     }
                 }
                 std.Io.Dir.cwd().deleteFile(io, upgrade) catch {};

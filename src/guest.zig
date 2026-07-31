@@ -1170,7 +1170,16 @@ fn handleUpgradeCmd(
         return;
     };
 
-    std.log.info("[guest] upgrade: cmd_id={s} target={s} size={d}", .{ cmd.cmd_id, cmd.target, cmd.file_size });
+    std.log.info("[guest] upgrade: cmd_id={s} target={s} size={d} version={s}", .{ cmd.cmd_id, cmd.target, cmd.file_size, cmd.version });
+
+    // 同版本检测：如果推送的版本与当前运行版本相同，跳过升级
+    if (std.mem.eql(u8, cmd.version, protocol.VERSION)) {
+        std.log.info("[guest] upgrade: same version ({s}), skipping", .{cmd.version});
+        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
+        defer allocator.free(resp);
+        _ = conn.sendAndFlush(resp, 0) catch {};
+        return;
+    }
 
     // 固定路径：与 utmm.exe 同目录，utmmd 轮询发现后执行升级
     const upgrade_path = if (builtin.os.tag == .windows)

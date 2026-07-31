@@ -114,7 +114,7 @@ pub fn test_upgrade_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
         defer conn.close(io);
         const fd = conn.socket.handle;
 
-        const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-1", "aarch64-linux", @intCast(fake_binary.len), sha256_hex);
+        const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-1", "aarch64-linux", @intCast(fake_binary.len), sha256_hex, protocol.VERSION);
         defer alloc.free(cmd_frame);
         try tcp.sendFrame(fd, cmd_frame);
 
@@ -176,7 +176,7 @@ pub fn test_upgrade_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
         defer conn.close(io);
         const fd = conn.socket.handle;
 
-        const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-2", "x86_64-windows", @intCast(binary.len), sha256_hex);
+        const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-2", "x86_64-windows", @intCast(binary.len), sha256_hex, protocol.VERSION);
         defer alloc.free(cmd_frame);
         try tcp.sendFrame(fd, cmd_frame);
 
@@ -239,7 +239,7 @@ pub fn test_upgrade_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
         defer conn.close(io);
         const fd = conn.socket.handle;
 
-        const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-3", "aarch64-macos", @intCast(big_binary.len), sha256_hex);
+        const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-3", "aarch64-macos", @intCast(big_binary.len), sha256_hex, protocol.VERSION);
         defer alloc.free(cmd_frame);
         try tcp.sendFrame(fd, cmd_frame);
 
@@ -277,7 +277,7 @@ pub fn test_upgrade_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
         var tc = runner.case("upgrade: upgrade_cmd 编解码");
 
         const sha256_hex = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6";
-        const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-cdc", "x86-linux", 1234567, sha256_hex);
+        const cmd_frame = try protocol.buildUpgradeCmd(alloc, "ug-cdc", "x86-linux", 1234567, sha256_hex, protocol.VERSION);
         defer alloc.free(cmd_frame);
 
         tc.expectTrue(cmd_frame[0] == @intFromEnum(protocol.MsgType.upgrade_cmd), "帧类型 = upgrade_cmd");
