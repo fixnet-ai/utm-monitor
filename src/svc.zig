@@ -281,6 +281,17 @@ pub fn tempDir() [:0]const u8 {
     return "/tmp";
 }
 
+/// Clean up stale upgrade temporary files left by a crashed Guest.
+/// Guest writes .sha256 atomically (tmp → rename); if it crashes mid-write
+/// the .sha256.tmp file persists. Call at utmm startup (both Host and Guest modes).
+pub fn cleanupStaleUpgradeTmp(io: std.Io) void {
+    const tmp_path = if (builtin.os.tag == .windows)
+        "C:\\opt\\utmm\\utmm-upgrade.sha256.tmp"
+    else
+        "/opt/utmm/utmm-upgrade.sha256.tmp";
+    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+}
+
 /// Return the canonical install path for utmmd (the supervisor daemon).
 pub fn canonicalSvcPath() []const u8 {
     if (builtin.os.tag == .windows) return CANONICAL_SVC_PATH_WIN;

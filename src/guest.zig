@@ -1360,6 +1360,9 @@ pub fn guestRun(init: std.process.Init, cli: @import("main.zig").CliArgs) !void 
 /// 启动时清理残留的临时文件（升级/上传失败遗留）。
 /// 扫描 canonicalDir 和 tempDir，删除 `.utmm-*` 和 `.utmm-upgrade-*` 前缀的文件。
 fn cleanupStaleTempFiles(io: std.Io, alloc: std.mem.Allocator) void {
+    // 原子 .sha256 写入残留（Guest crash 在 tmp→rename 之前）
+    svc.cleanupStaleUpgradeTmp(io);
+
     const dirs = [_][]const u8{ svc.canonicalDir(), svc.tempDir() };
     const prefixes = [_][]const u8{ ".utmm-upgrade-", ".utmm-" };
 
