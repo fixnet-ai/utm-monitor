@@ -200,6 +200,86 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── Cross-compile all 8 targets in parallel ──
+    // zig build cross -Doptimize=ReleaseSafe
+    const cross_step = b.step("cross", "Cross-compile all 8 deployment targets in parallel");
+
+    const cross_targets = [_]std.Target.Query{
+        .{ .cpu_arch = .x86_64, .os_tag = .windows },
+        .{ .cpu_arch = .aarch64, .os_tag = .windows },
+        .{ .cpu_arch = .x86, .os_tag = .windows, .abi = .gnu },
+        .{ .cpu_arch = .x86_64, .os_tag = .macos },
+        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+        .{ .cpu_arch = .x86, .os_tag = .linux, .abi = .musl },
+        .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
+        .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
+    };
+
+    for (cross_targets) |query| {
+        const tgt = b.resolveTargetQuery(query);
+
+        // Build utmmd for this target
+        const cross_utmmd = b.addExecutable(.{
+            .name = "utmmd",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/utmmd.zig"),
+                .target = tgt,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        if (tgt.result.os.tag == .windows) {
+            cross_utmmd.root_module.linkSystemLibrary("ws2_32", .{});
+        }
+
+        // Copy utmmd to embed dir（使用解析后的 target，非 query 可选字段）
+        const cross_embed_dir = b.fmt("{s}-{s}", .{
+            @tagName(tgt.result.cpu.arch),
+            @tagName(tgt.result.os.tag),
+        });
+        const cross_target_embed_dir = b.fmt("src/embed/{s}", .{cross_embed_dir});
+        const cross_embed_path = b.fmt("{s}/utmmd.bin", .{cross_target_embed_dir});
+
+        const cross_mkdir = b.addSystemCommand(&.{ "mkdir", "-p" });
+        cross_mkdir.addArg(cross_target_embed_dir);
+
+        const cross_copy = b.addSystemCommand(&.{ "cp", "-f" });
+        cross_copy.addFileArg(cross_utmmd.getEmittedBin());
+        cross_copy.addArg(cross_embed_path);
+        cross_copy.step.dependOn(&cross_utmmd.step);
+        cross_copy.step.dependOn(&cross_mkdir.step);
+
+        // Hash utmmd for this target
+        const cross_hash = b.addSystemCommand(&.{ "sh", "-c" });
+        cross_hash.addArg(b.fmt(
+            "shasum -a 256 {s} | cut -d' ' -f1 | tr -d '\\n' > {s}/utmmd.sha256",
+            .{ cross_embed_path, cross_target_embed_dir },
+        ));
+        cross_hash.step.dependOn(&cross_copy.step);
+
+        // Build utmm for this target
+        const cross_exe = b.addExecutable(.{
+            .name = "utmm",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = tgt,
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        cross_exe.step.dependOn(&cross_hash.step);
+        if (tgt.result.os.tag == .windows) {
+            cross_exe.root_module.linkSystemLibrary("ws2_32", .{});
+        }
+
+        // Install with deployment filename
+        const cross_filename = deploymentFilename(b, tgt.result);
+        const cross_install = b.addInstallBinFile(cross_exe.getEmittedBin(), cross_filename);
+        cross_install.step.dependOn(&cross_exe.step);
+
+        cross_step.dependOn(&cross_install.step);
+    }
+
     // ── Integration tests ──
     // Single executable with flat test files, shared setup/teardown, memory leak check.
     // Each module defines pub fn test_xxx(io, alloc, runner) — no main() needed.
