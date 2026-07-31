@@ -251,6 +251,22 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         return;
     }
 
+    // ── Windows Host: check for ssh.exe (OpenSSH Client optional feature) ──
+    if (builtin.os.tag == .windows) {
+        const has_ssh = blk: {
+            const result = std.process.run(gpa, io, .{ .argv = &.{ "where", "ssh.exe" } }) catch break :blk false;
+            defer {
+                gpa.free(result.stdout);
+                gpa.free(result.stderr);
+            }
+            break :blk result.term == .exited and result.term.exited == 0;
+        };
+        if (!has_ssh) {
+            std.debug.print("[deploy] WARNING: ssh.exe not found — OpenSSH Client is not installed.\n", .{});
+            std.debug.print("[deploy] Install it via: Settings > Apps > Optional Features > OpenSSH Client\n", .{});
+        }
+    }
+
     std.debug.print("\n[deploy] Targets ({d}):", .{deploy_list.items.len});
     for (deploy_list.items) |vm| {
         std.debug.print(" {s}", .{vm.hostname});
