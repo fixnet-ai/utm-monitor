@@ -2,13 +2,13 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.16.1 — MCP 服务器名修正 + 规划文档同步
+**最新版本**: v0.16.1 — Hub-Spoke 架构全面修正（文档 + Guest 链式转发代码）
 
-- **分支**: `main`（feat/socks5-full 已合并删除）
-- **源文件**: 20 src + 13 test（新增 socks5.zig）
+- **分支**: `main`
+- **源文件**: 20 src + 13 test
 - **测试**: 186 单元测试 + 59 集成测试，全部通过，0 泄漏
 
-## 当前阶段: Phase 23 — SOCKS5 全协议（BIND + UDP ASSOCIATE）+ 协议提取 ✅
+## 当前阶段: Phase 23-c — Hub-Spoke 架构全面修正 ✅
 
 **目标**: 实现 RFC 1928 完整 SOCKS5 协议（BIND + UDP ASSOCIATE）；将 SOCKS5 协议层从 tcp.zig 提取到独立 socks5.zig。
 - **单元测试**: 186 测试全部通过 ✅
@@ -741,8 +741,22 @@ src/
 |---|------|------|------|
 | 189 | MCP 服务器名 "utm-monitor" → "utmm" | `mcp.json.example` | ✅ 所有文档引用同步更新 |
 | 190 | 恢复产品名（main.zig header + build.zig.zon） | `src/main.zig` `build.zig.zon` | ✅ UTM Monitor = 软件名，utmm = 命令名 |
-| 191 | 更新 task_plan.md（Phase 23 + 文件清单 + 设计决策） | `task_plan.md` | 📋 当前任务 |
-| 192 | 更新 findings.md（SOCKS5/Winsock2 fd_set 发现） | `findings.md` | 📋 当前任务 |
-| 193 | 更新 progress.md（v0.16.0 发布 + 裸机测试） | `progress.md` | 📋 当前任务 |
-| 194 | 版本号 bump 0.16.0 → 0.16.1 | `src/ver.txt` | 📋 当前任务 |
-| 195 | 8 交叉编译 + GitHub Release v0.16.1 | — | 📋 当前任务 |
+| 191 | 更新 task_plan.md（Phase 23 + 文件清单 + 设计决策） | `task_plan.md` | ✅ |
+| 192 | 更新 findings.md（SOCKS5/Winsock2 fd_set 发现） | `findings.md` | ✅ Finding 194-198 |
+| 193 | 更新 progress.md（v0.16.0 发布 + 裸机测试） | `progress.md` | ✅ |
+| 194 | 版本号 bump 0.16.0 → 0.16.1 | `src/ver.txt` | ✅ |
+| 195 | 8 交叉编译 + GitHub Release v0.16.1 | — | ✅ release.sh 全流程通过 |
+
+### Phase 23-c: v0.16.1 后续 — Hub-Spoke 架构全面修正 ✅
+
+**背景**: 用户指出对 SOCKS5 转发架构理解有根本性错误 — 是 Hub-Spoke（Host 唯一中转），
+不是 peer-mesh（每节点中转）。Host IP 同步到每个 Guest 的 `/etc/hosts` 作为 `gateway`。
+所有文档（README、MANUAL、CLAUDE.md）及代码中 Guest 链式转发均需修正。
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 196 | README.md SOCKS5 示例 + Architecture 修正 | `README.md` | ✅ gateway hostname、Host 唯一中转 |
+| 197 | MANUAL.md SOCKS5 Forwarding 整节重写 | `MANUAL.md` | ✅ Hub-Spoke dispatch + gateway 示例 |
+| 198 | CLAUDE.md 5+ 处架构描述修正 | `CLAUDE.md` | ✅ 端口描述/运行模式/转发流程/设计决策 |
+| 199 | Guest 链式转发代码删除（~58 行 → REJECT） | `src/guest.zig` | ✅ Finding 199，commit `2b69c8e` |
+| 200 | 更新 findings.md + progress.md | 规划文件 | ✅ Finding 199 + 进度记录 |
