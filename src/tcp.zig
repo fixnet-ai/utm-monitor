@@ -14,6 +14,8 @@ const posix_connect = @extern(*const fn (c_int, *const anyopaque, std.posix.sock
 const posix_fcntl = @extern(*const fn (c_int, c_int, c_int) callconv(.c) c_int, .{ .name = "fcntl" });
 const posix_poll = @extern(*const fn ([*]std.posix.pollfd, std.posix.nfds_t, c_int) callconv(.c) c_int, .{ .name = "poll" });
 const posix_getsockopt = @extern(*const fn (c_int, c_int, c_int, *anyopaque, *std.posix.socklen_t) callconv(.c) c_int, .{ .name = "getsockopt" });
+const posix_sendto = @extern(*const fn (c_int, *const anyopaque, usize, c_int, *const anyopaque, std.posix.socklen_t) callconv(.c) isize, .{ .name = "sendto" });
+const posix_recvfrom = @extern(*const fn (c_int, *anyopaque, usize, c_int, *anyopaque, *std.posix.socklen_t) callconv(.c) isize, .{ .name = "recvfrom" });
 
 const F_GETFL = 3;
 const F_SETFL = 4;
@@ -561,10 +563,8 @@ pub fn getBoundPort(fd: socket_t) !u16 {
         return ws2_ntohs(addr.port);
     }
     var addr: std.posix.sockaddr.in = std.mem.zeroes(std.posix.sockaddr.in);
-    const addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-    if (std.posix.getsockname(fd, @ptrCast(&addr), &addr_len)) {
-        return error.GetSockNameFailed;
-    } else |_| {}
+    var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (system.getsockname(fd, @ptrCast(&addr), &addr_len) < 0) return error.GetSockNameFailed;
     return std.mem.bigToNative(u16, addr.port);
 }
 
@@ -586,8 +586,9 @@ pub fn sendUdpTo(fd: socket_t, data: []const u8, to: UdpAddr) !void {
         .addr = std.mem.readInt(u32, &to.ip, .big),
         .zero = [_]u8{0} ** 8,
     };
-    const n = std.posix.sendto(fd, data, 0, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) catch return error.SendFailed;
-    if (n != data.len) return error.SendFailed;
+    const sw = posix_sendto(@intCast(fd), data.ptr, data.len, 0, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in));
+    if (sw < 0) return error.SendFailed;
+    if (@as(usize, @intCast(sw)) != data.len) return error.SendFailed;
 }
 
 /// Receive raw bytes from UDP, returning data length and source address.
@@ -606,7 +607,9 @@ pub fn recvUdpFrom(fd: socket_t, buf: []u8) !struct { n: usize, from: UdpAddr } 
     }
     var from: std.posix.sockaddr.in = std.mem.zeroes(std.posix.sockaddr.in);
     var from_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-    const n = std.posix.recvfrom(fd, buf, 0, @ptrCast(&from), &from_len) catch return error.RecvFailed;
+    const rn = posix_recvfrom(@intCast(fd), buf.ptr, buf.len, 0, @ptrCast(&from), &from_len);
+    if (rn < 0) return error.RecvFailed;
+    const n: usize = @intCast(rn);
     const ip_bytes: [4]u8 = @bitCast(from.addr);
     return .{
         .n = n,

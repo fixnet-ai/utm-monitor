@@ -1215,3 +1215,74 @@ test "accept returns cmd and atyp fields" {
     try std.testing.expectEqualStrings("test", request.hostname);
     try std.testing.expectEqual(@as(u16, 2121), request.port);
 }
+
+test "readReply round-trip" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    // Send a reply with specific BND.ADDR and BND.PORT
+    reply(pair.a, SOCKS_REP_OK, [_]u8{ 10, 0, 0, 1 }, 5353);
+
+    const rep = try readReply(pair.b);
+    try std.testing.expectEqual(SOCKS_REP_OK, rep.rep);
+    try std.testing.expectEqual(@as(u8, 10), rep.bnd_addr[0]);
+    try std.testing.expectEqual(@as(u8, 1), rep.bnd_addr[3]);
+    try std.testing.expectEqual(@as(u16, 5353), rep.bnd_port);
+}
+
+test "sendRequest with BIND command" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    // Server thread: accept auth + read request
+    const server_thread = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            var buf: [tcp.MAX_HOSTNAME]u8 = undefined;
+            const req = readRequestBuf(fd, buf[0..]) catch return;
+            // Verify BIND command was received
+            std.debug.assert(req.cmd == SOCKS_CMD_BIND);
+            std.debug.assert(std.mem.eql(u8, req.hostname, "0.0.0.0"));
+        }
+    }.run, .{pair.a});
+    defer server_thread.join();
+
+    try sendRequest(pair.b, SOCKS_CMD_BIND, SOCKS_ATYP_DOMAIN, "0.0.0.0", 0);
+}
+
+test "createUdpSocket and getBoundPort" {
+    const udp_fd = try tcp.createUdpSocket();
+    defer tcp.sockClose(udp_fd);
+    const port = try tcp.getBoundPort(udp_fd);
+    // OS-assigned port should be non-zero
+    try std.testing.expect(port > 0);
+}
+
+test "socks5Bind accept timeout returns error" {
+    // Create a TCP listener that no one connects to
+    var t: std.Io.Threaded = .init_single_threaded;
+    var listener = try tcp.TcpListener.init(t.io(), 0);
+    defer listener.deinit();
+
+    // sockAcceptTimeout should timeout (50ms, short for testing)
+    const result = tcp.sockAcceptTimeout(listener.listener_fd, 50);
+    try std.testing.expectError(error.WouldBlock, result);
+}
+
+test "parameterized reply with SOCKS_REP_COMMAND_NOT_SUPPORTED" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    reply(pair.a, SOCKS_REP_COMMAND_NOT_SUPPORTED, [_]u8{ 0, 0, 0, 0 }, 0);
+
+    const rep = try readReply(pair.b);
+    try std.testing.expectEqual(SOCKS_REP_COMMAND_NOT_SUPPORTED, rep.rep);
+}
