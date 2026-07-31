@@ -276,6 +276,23 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !CliA
         }
     }
 
+    // ── Validate required parameters ──
+    if (cli.cmd_ping and cli.ping_target == null) {
+        fail.msg("arg", "--ping requires a target hostname", .{});
+    }
+    if (cli.cmd_exec and (cli.exec_target == null or cli.exec_cmd == null)) {
+        fail.msg("arg", "--exec requires TARGET and COMMAND", .{});
+    }
+    if (cli.cmd_upload and (cli.upload_target == null or cli.upload_file == null)) {
+        fail.msg("arg", "--upload requires FILE and TARGET", .{});
+    }
+    if (cli.cmd_download and (cli.download_target == null or cli.download_remote == null)) {
+        fail.msg("arg", "--download requires TARGET REMOTE_PATH [LOCAL_PATH]", .{});
+    }
+    if (cli.cmd_upgrade and cli.upgrade_target == null) {
+        fail.msg("arg", "--upgrade requires a target hostname", .{});
+    }
+
     return cli;
 }
 
