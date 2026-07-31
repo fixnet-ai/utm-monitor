@@ -37,10 +37,9 @@ See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
 - **Streaming exec** — run commands on any machine with real-time pty output,
   exit code, no timeout.
 - **File transfer** — upload/download with SHA256 verification and atomic writes.
-- **SOCKS5 mesh forwarding** — every node is a SOCKS5 proxy on TCP :2121.
-  `curl --socks5 localhost:2121 http://linuxvm:8080` reaches any node through
-  any other node — no SSH tunnels, no port mapping. **Windows: disable firewall**
-  for BIND + UDP ASSOCIATE (dynamic ports).
+- **SOCKS5 mesh forwarding** — Host acts as SOCKS5 proxy to every Guest on TCP :2121.
+  Reach any Guest's services from the Host — no SSH tunnels, no port mapping.
+  **Windows: disable firewall** for BIND + UDP ASSOCIATE (dynamic ports).
 - **sshpass built-in** — non-interactive SSH password auth, 100% CLI-compatible
   with standalone `sshpass`. POSIX PTY + Windows ConPTY (dynamic load, pipe
   fallback on older Windows).
@@ -59,7 +58,7 @@ Guest (windows)  ──TCP──┘   (SOCKS5 endpoint)
                          │
 Guest ←── LSA broadcast (UDP :2121) ──┘  (auto-discovery + topology)
 
-Every node TCP :2121 = SOCKS5 proxy. Reach services on any node, across LAN or internet.
+Host TCP :2121 = SOCKS5 proxy to every Guest. Reach services on any node from the Host.
 ```
 
 ## CLI Quick Start
