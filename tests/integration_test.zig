@@ -46,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
     // ── 按顺序执行各模块测试 ──
     std.debug.print("\n=== 集成测试开始 ===\n", .{});
 
+    // TODO: 逐个取消注释以定位 hang 原因
     test_tcp.test_tcp_frame(io, alloc, &runner) catch |err| {
         std.debug.print("test_tcp_frame 异常终止: {}\n", .{err});
     };

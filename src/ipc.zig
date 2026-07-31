@@ -635,6 +635,7 @@ fn handleExec(
         sendError(conn, "GuestNotFound");
         return;
     };
+    defer state.freeEntry(guest);
 
     // Generate cmd_id
     const cmd_id = std.fmt.allocPrint(gpa, "exec_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds}) catch {

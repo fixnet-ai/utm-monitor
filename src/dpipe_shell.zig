@@ -108,7 +108,10 @@ fn spawnPosix(allocator: std.mem.Allocator, shell: []const u8) !ShellCtx {
         _ = setsid();
 
         const slave = open(slave_name, O_RDWR, 0);
-        if (slave < 0) @panic("pty: open slave failed");
+        if (slave < 0) {
+            std.log.err("[dpipe-shell] open slave failed", .{});
+            std.process.exit(1);
+        }
 
         const TIOCSCTTY: usize = if (builtin.os.tag == .macos) 0x20007461 else 0x540E;
         _ = std.c.ioctl(slave, TIOCSCTTY, @as(usize, 0));
@@ -135,7 +138,8 @@ fn spawnPosix(allocator: std.mem.Allocator, shell: []const u8) !ShellCtx {
 
         const argv = [_:null]?[*:0]const u8{ shell_path.ptr, @as(?[*:0]const u8, @ptrFromInt(@intFromPtr("-l"))), null };
         _ = std.c.execve(shell_path.ptr, &argv, std.c.environ);
-        @panic("pty: execve failed");
+        std.log.err("[dpipe-shell] execve failed", .{});
+        std.process.exit(1);
     }
 
     // 父进程：禁用 pty 回显（master 侧，Linux 支持）

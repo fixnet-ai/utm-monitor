@@ -16,6 +16,22 @@ const builtin = @import("builtin");
 const system = std.posix.system;
 const dpipe = @import("dpipe.zig");
 
+// ── POSIX externs for non-blocking connect + poll timeout ──
+// system.connect / std.c.connect uses wrong pointer types on macOS;
+// @extern maps C library symbol name to a Zig identifier, avoiding name
+// collision with Windows ws2_32 externs (which use the same C names).
+const posix_connect = @extern(*const fn (c_int, *const anyopaque, std.posix.socklen_t) callconv(.c) c_int, .{ .name = "connect" });
+const posix_fcntl = @extern(*const fn (c_int, c_int, c_int) callconv(.c) c_int, .{ .name = "fcntl" });
+const posix_poll = @extern(*const fn ([*]std.posix.pollfd, std.posix.nfds_t, c_int) callconv(.c) c_int, .{ .name = "poll" });
+const posix_getsockopt = @extern(*const fn (c_int, c_int, c_int, *anyopaque, *std.posix.socklen_t) callconv(.c) c_int, .{ .name = "getsockopt" });
+
+const F_GETFL = 3;
+const F_SETFL = 4;
+const O_NONBLOCK = 0x0004;
+const EINPROGRESS = 36;
+const EALREADY = 37;
+const EISCONN = 56;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Platform Socket Abstraction
 // ═══════════════════════════════════════════════════════════════════════════
@@ -155,6 +171,10 @@ extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
 const ws2_getLastError = WSAGetLastError;
 extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *anyopaque) callconv(.winapi) c_int;
 const ws2_startup = WSAStartup;
+extern "ws2_32" fn select(nfds: c_int, readfds: ?*fd_set, writefds: ?*fd_set, exceptfds: ?*fd_set, timeout: ?*timeval) callconv(.winapi) c_int;
+const ws2_select = select;
+extern "ws2_32" fn getsockopt(s: std.posix.socket_t, level: c_int, optname: c_int, optval: *anyopaque, optlen: *c_int) callconv(.winapi) c_int;
+const ws2_getsockopt = getsockopt;
 
 /// Ensure Winsock2 is initialized (required for raw ws2_socket/ws2_recv etc.).
 /// Zig 0.16.0 uses AFD kernel handles for its own I/O, NOT Winsock2, so we
@@ -176,8 +196,22 @@ const AF_INET = 2;
 const SOCK_STREAM = 1;
 const IPPROTO_TCP = 6;
 const SO_REUSEADDR = 0x0004;
+const SO_ERROR = 0x1007;
 const SOL_SOCKET = 0xffff;
 const INVALID_SOCKET: std.posix.socket_t = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+
+/// Windows timeval for select() timeout.
+const timeval = extern struct {
+    tv_sec: c_int,
+    tv_usec: c_int,
+};
+
+/// Windows fd_set — count + array layout (unlike POSIX bitmask).
+const FD_SETSIZE = 64;
+const fd_set = extern struct {
+    fd_count: u32,
+    fd_array: [FD_SETSIZE]std.posix.socket_t,
+};
 
 /// Windows sockaddr_in — must match exactly what Winsock2 expects.
 /// Zig's std.Io.net.IpAddress is a tagged union with a different layout
@@ -448,6 +482,219 @@ pub fn socks5ReadRequestBuf(fd: std.posix.socket_t, buf: []u8) !Socks5RequestBuf
     return Socks5RequestBuf{ .hostname = hostname, .port = dst_port };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// TCP Connect with Timeout
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 默认 TCP connect 超时（毫秒）。
+pub const TCP_CONNECT_TIMEOUT_MS = 2000;
+
+/// 连接限制计数器。Accept 循环使用原子操作控制并发连接数。
+pub const ConnLimit = struct {
+    count: std.atomic.Value(u32),
+    max: u32,
+
+    pub fn init(max: u32) ConnLimit {
+        return .{ .count = std.atomic.Value(u32).init(0), .max = max };
+    }
+
+    /// 尝试获取一个连接槽位。成功返回 true，达到上限返回 false。
+    pub fn tryAcquire(self: *ConnLimit) bool {
+        const c = self.count.fetchAdd(1, .monotonic);
+        if (c >= self.max) {
+            _ = self.count.fetchSub(1, .monotonic);
+            return false;
+        }
+        return true;
+    }
+
+    /// 释放一个连接槽位。
+    pub fn release(self: *ConnLimit) void {
+        _ = self.count.fetchSub(1, .monotonic);
+    }
+};
+
+/// 默认最大并发连接数。
+pub const DEFAULT_MAX_CONNS: u32 = 128;
+
+/// local relay 线程包装，完成后释放连接限制槽位。
+pub fn localRelayWithLimit(io: std.Io, fd: std.posix.socket_t, port: u16, limit: *ConnLimit) !void {
+    defer limit.release();
+    socks5LocalRelay(io, fd, port);
+}
+
+/// 将 IpAddress 转为 POSIX sockaddr.in / sockaddr.in6。
+const SockAddr = union(enum) {
+    in4: std.posix.sockaddr.in,
+    in6: std.posix.sockaddr.in6,
+};
+
+fn ipToSockAddr(addr: std.Io.net.IpAddress) SockAddr {
+    return switch (addr) {
+        .ip4 => |ip4| .{ .in4 = .{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, ip4.port),
+            .addr = std.mem.readInt(u32, &ip4.bytes, .little),
+            .zero = [_]u8{0} ** 8,
+        } },
+        .ip6 => |ip6| .{ .in6 = .{
+            .family = std.posix.AF.INET6,
+            .port = std.mem.nativeToBig(u16, ip6.port),
+            .flowinfo = ip6.flow,
+            .addr = ip6.bytes,
+            .scope_id = ip6.interface.index,
+        } },
+    };
+}
+
+/// TCP connect with timeout. Uses non-blocking connect + poll/select.
+fn connectTcp(io2: std.Io, addr: *const std.Io.net.IpAddress, timeout_ms: u32) !std.Io.net.Stream {
+    if (builtin.os.tag == .windows) {
+        ensureWinsock2();
+        return connectTcpWindows(addr, timeout_ms);
+    }
+    return connectTcpPosix(io2, addr, timeout_ms);
+}
+
+fn connectTcpPosix(io2: std.Io, addr: *const std.Io.net.IpAddress, timeout_ms: u32) !std.Io.net.Stream {
+    _ = io2; // already have addr — don't need io for raw connect
+    const domain: u32 = switch (addr.*) {
+        .ip4 => @as(u32, @intCast(std.posix.AF.INET)),
+        .ip6 => @as(u32, @intCast(std.posix.AF.INET6)),
+    };
+
+    const fd = system.socket(domain, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.ConnectFailed;
+    errdefer sockClose(fd);
+
+    // 设置为非阻塞模式
+    const old_flags = posix_fcntl(@intCast(fd), F_GETFL, 0);
+    if (old_flags < 0) return error.ConnectFailed;
+    _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags | O_NONBLOCK);
+
+    // 构造 POSIX sockaddr（注意：sockaddr.in.addr 用 .little 端序）
+    const cr: isize = switch (addr.*) {
+        .ip4 => |ip4| blk: {
+            const sa = std.posix.sockaddr.in{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = std.mem.readInt(u32, &ip4.bytes, .little),
+                .zero = [_]u8{0} ** 8,
+            };
+            break :blk posix_connect(@intCast(fd), @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in));
+        },
+        .ip6 => |ip6| blk: {
+            const sa = std.posix.sockaddr.in6{
+                .family = std.posix.AF.INET6,
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = ip6.flow,
+                .addr = ip6.bytes,
+                .scope_id = ip6.interface.index,
+            };
+            break :blk posix_connect(@intCast(fd), @ptrCast(&sa), @sizeOf(std.posix.sockaddr.in6));
+        },
+    };
+
+    if (cr < 0) {
+        const e = std.posix.errno(cr);
+        if (e != .INPROGRESS and e != .ALREADY) {
+            _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+            return error.ConnectFailed;
+        }
+    }
+
+    // 用 poll() 等待连接完成或超时
+    var pfd: [1]std.posix.pollfd = .{.{ .fd = @intCast(fd), .events = std.posix.POLL.OUT, .revents = 0 }};
+    const poll_ret = posix_poll(&pfd, 1, @intCast(timeout_ms));
+    if (poll_ret < 0) {
+        _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+        return error.ConnectFailed;
+    }
+    if (poll_ret == 0) {
+        _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+        return error.ConnectTimeout;
+    }
+
+    // 检查 SO_ERROR 确认连接是否成功
+    var so_err: c_int = 0;
+    var so_err_len: std.posix.socklen_t = @sizeOf(c_int);
+    if (posix_getsockopt(@intCast(fd), SOL_SOCKET, SO_ERROR, @ptrCast(&so_err), &so_err_len) < 0) {
+        _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+        return error.ConnectFailed;
+    }
+    if (so_err != 0) {
+        _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+        return error.ConnectFailed;
+    }
+
+    // 恢复阻塞模式
+    _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+
+    return std.Io.net.Stream{ .socket = .{ .handle = fd, .address = addr.* } };
+}
+
+fn connectTcpWindows(addr: *const std.Io.net.IpAddress, timeout_ms: u32) !std.Io.net.Stream {
+    const domain: u16 = switch (addr.*) {
+        .ip4 => AF_INET,
+        .ip6 => 23, // AF_INET6
+    };
+
+    const fd = ws2_socket(domain, SOCK_STREAM, IPPROTO_TCP);
+    if (fd == INVALID_SOCKET) return error.ConnectFailed;
+    errdefer _ = ws2_closesocket(fd);
+
+    // Set non-blocking
+    var mode: std.os.windows.ULONG = 1;
+    _ = ws2_ioctlsocket(fd, FIONBIO, &mode);
+
+    // 手动构建 sockaddr：IpAddress 是 tagged union(enum)，不能 @ptrCast
+    const sa = ipToSockAddr(addr.*);
+    const cr: c_int = switch (sa) {
+        .in4 => |*v4| ws2_connect(fd, @ptrCast(v4), @sizeOf(sockaddr_in)),
+        .in6 => |*v6| ws2_connect(fd, @ptrCast(v6), @sizeOf(std.posix.sockaddr.in6)),
+    };
+    if (cr != 0) {
+        if (ws2_getLastError() != 10035) { // WSAEWOULDBLOCK
+            return error.ConnectFailed;
+        }
+    }
+
+    // Wait with select
+    var tv: timeval = .{
+        .tv_sec = @intCast(timeout_ms / 1000),
+        .tv_usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    var wfds: fd_set = .{ .fd_count = 0, .fd_array = undefined };
+    wfds.fd_array[0] = fd;
+    wfds.fd_count = 1;
+
+    const sel_ret = ws2_select(0, null, &wfds, null, &tv);
+    if (sel_ret == 0) {
+        _ = ws2_closesocket(fd);
+        return error.ConnectTimeout;
+    }
+    if (sel_ret < 0) {
+        return error.ConnectFailed;
+    }
+
+    // Check SO_ERROR
+    var so_err: c_int = 0;
+    var so_err_len: c_int = @sizeOf(c_int);
+    if (ws2_getsockopt(fd, SOL_SOCKET, SO_ERROR, @ptrCast(&so_err), &so_err_len) != 0) {
+        return error.ConnectFailed;
+    }
+    if (so_err != 0) {
+        _ = ws2_closesocket(fd);
+        return error.ConnectFailed;
+    }
+
+    // Set back to blocking
+    mode = 0;
+    _ = ws2_ioctlsocket(fd, FIONBIO, &mode);
+
+    return std.Io.net.Stream{ .socket = .{ .handle = fd, .address = addr.* } };
+}
+
 /// 发送 SOCKS5 连接请求到目标地址（含认证协商）。
 /// 返回连接成功后的 TCP socket fd（调用者负责关闭）。
 pub fn socks5Connect(
@@ -456,7 +703,7 @@ pub fn socks5Connect(
     target_hostname: []const u8,
     target_port: u16,
 ) !std.Io.net.Stream {
-    const stream = std.Io.net.IpAddress.connect(&target_ip, io, .{ .mode = .stream }) catch |err| {
+    const stream = connectTcp(io, &target_ip, TCP_CONNECT_TIMEOUT_MS) catch |err| {
         return err;
     };
     errdefer stream.close(io);
@@ -984,7 +1231,7 @@ pub fn hostConnect(io: std.Io, guest_ip: []const u8, guest_hostname: []const u8,
         return error.ConnectFailed;
     };
 
-    const stream = addr.connect(io, .{ .mode = .stream }) catch |err| {
+    const stream = connectTcp(io, &addr, TCP_CONNECT_TIMEOUT_MS) catch |err| {
         std.log.err("[tcp] connect to {s}:{d} failed: {}", .{ guest_ip, port, err });
         return error.ConnectFailed;
     };

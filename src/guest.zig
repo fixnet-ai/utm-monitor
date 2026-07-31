@@ -349,6 +349,12 @@ fn detectUnixIp(allocator: std.mem.Allocator) !?IpInfo {
 
         // Return immediately if this is a non-NAT address (preferred)
         if (!isLikelyVmNat(bytes)) {
+            // 之前如果已保存 NAT fallback，释放其分配
+            if (fallback) |*fb| {
+                allocator.free(fb.ip);
+                allocator.free(fb.iface_name);
+                fallback = null;
+            }
             return .{ .ip = ip, .iface_name = iface_name };
         }
         // Otherwise save as fallback and keep scanning for a better interface
@@ -750,12 +756,18 @@ pub const ForwardCtx = struct {
     hostname: []const u8,
     target_port: u16,
     allocator: std.mem.Allocator,
+    limit: ?*tcp.ConnLimit = null,
+
+    fn maybeReleaseLimit(self: *const ForwardCtx) void {
+        if (self.limit) |l| l.release();
+    }
 };
 
 /// 转发 detach 线程入口：释放 ctx 并调用 socks5Forward。
 pub fn forwardThreadFn(ctx: *ForwardCtx) void {
     defer ctx.allocator.destroy(ctx);
     defer ctx.allocator.free(ctx.hostname);
+    defer ctx.maybeReleaseLimit();
     tcp.socks5Forward(ctx.io, ctx.client_fd, ctx.next_hop_ip, ctx.hostname, ctx.target_port);
 }
 
@@ -884,6 +896,7 @@ pub fn guestTcpLoop(
     };
     defer listener.deinit();
 
+    var conn_limit = tcp.ConnLimit.init(tcp.DEFAULT_MAX_CONNS);
     std.log.info("[guest] TCP server listening on :{d}", .{mesh_port});
 
     while (true) {
@@ -914,7 +927,13 @@ pub fn guestTcpLoop(
         if (std.mem.eql(u8, req.hostname, info.hostname)) {
             // 目标是本机
             if (req.port == mesh_port) {
-                // utmm 内部帧协议
+                // utmm 内部帧协议 — 连接限制计数（单连接 inline 处理）
+                if (!conn_limit.tryAcquire()) {
+                    tcp.socks5ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                }
+                defer conn_limit.release();
                 tcp.socks5ReplyOk(fd);
                 var conn = tcp.Connection{ .fd = fd, .alive = true };
                 handleOneCommand(io, allocator, info, &conn, shutdown) catch |err| {
@@ -922,8 +941,14 @@ pub fn guestTcpLoop(
                 };
                 conn.deinit();
             } else {
-                // 本机 localhost relay
-                const t = std.Thread.spawn(.{}, tcp.socks5LocalRelay, .{ io, fd, req.port }) catch {
+                // 本机 localhost relay — 连接限制计数
+                if (!conn_limit.tryAcquire()) {
+                    tcp.socks5ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                }
+                errdefer conn_limit.release();
+                const t = std.Thread.spawn(.{}, tcp.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
                     tcp.socks5ReplyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
@@ -935,6 +960,15 @@ pub fn guestTcpLoop(
             // 目标不是本机 — 链式 SOCKS5 转发
             if (mesh_opt) |*mesh| {
                 if (mesh.lookupHostnameIp(allocator, req.hostname)) |target_ip| {
+                    // 连接限制计数
+                    if (!conn_limit.tryAcquire()) {
+                        allocator.free(target_ip);
+                        tcp.socks5ReplyRejected(fd);
+                        tcp.sockClose(fd);
+                        continue;
+                    }
+                    errdefer conn_limit.release();
+
                     const next_hop = std.Io.net.IpAddress.parse(target_ip, mesh_port) catch {
                         allocator.free(target_ip);
                         tcp.socks5ReplyRejected(fd);
@@ -962,6 +996,7 @@ pub fn guestTcpLoop(
                         .hostname = hn_copy,
                         .target_port = req.port,
                         .allocator = allocator,
+                        .limit = &conn_limit,
                     };
 
                     const t = std.Thread.spawn(.{}, forwardThreadFn, .{ctx}) catch {
@@ -1052,7 +1087,7 @@ fn handleExecCmd(
         std.log.err("[guest] dpipe_shell.create failed: {}", .{err});
         const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
         defer allocator.free(done_msg);
-        _ = conn.sendAndFlush(done_msg, 0) catch {};
+        _ = conn.sendAndFlush(done_msg, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
         return;
     };
     defer shell.close();
@@ -1062,7 +1097,7 @@ fn handleExecCmd(
         std.log.err("[guest] shell write failed: {}", .{err});
         const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
         defer allocator.free(done_msg);
-        _ = conn.sendAndFlush(done_msg, 0) catch {};
+        _ = conn.sendAndFlush(done_msg, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
         return;
     };
 
@@ -1086,12 +1121,12 @@ fn handleExecCmd(
             if (accumulated.items.len > 0) {
                 const output_msg = protocol.buildPtyExecOutput(allocator, input.cmd_id, accumulated.items) catch continue;
                 defer allocator.free(output_msg);
-                _ = conn.sendAndFlush(output_msg, 0) catch {};
+                _ = conn.sendAndFlush(output_msg, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
             }
 
             const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, marker_result.exit_code) catch break;
             defer allocator.free(done_msg);
-            _ = conn.sendAndFlush(done_msg, 0) catch {};
+            _ = conn.sendAndFlush(done_msg, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
             std.log.info("[guest] exec done: cmd_id={s} exit={d}", .{ input.cmd_id, marker_result.exit_code });
             return;
         }
@@ -1100,7 +1135,7 @@ fn handleExecCmd(
     // shell 异常关闭（无 MDELIM 标记）
     const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
     defer allocator.free(done_msg);
-    _ = conn.sendAndFlush(done_msg, 0) catch {};
+    _ = conn.sendAndFlush(done_msg, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
     std.log.info("[guest] exec done (shell closed): cmd_id={s}", .{input.cmd_id});
 }
 
@@ -1123,7 +1158,7 @@ fn handleUpload(
         std.log.err("[guest] writeFile failed: {}", .{err});
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
-        _ = conn.sendAndFlush(resp, 0) catch {};
+        _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
         return;
     };
     // defer file_pipe.close(); — 在 line 1078 显式关闭，避免双 close
@@ -1152,7 +1187,7 @@ fn handleUpload(
     std.log.info("[guest] upload result: cmd_id={s} exit={d}", .{ cmd.cmd_id, exit_code });
     const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, exit_code) catch return;
     defer allocator.free(resp);
-    _ = conn.sendAndFlush(resp, 0) catch {};
+    _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
 }
 
 /// 处理 upgrade_cmd（Host→Guest 直推升级）：接收二进制流 → SHA256 校验 → 写固定路径。
@@ -1177,7 +1212,7 @@ fn handleUpgradeCmd(
         std.log.info("[guest] upgrade: same version ({s}), skipping", .{cmd.version});
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
         defer allocator.free(resp);
-        _ = conn.sendAndFlush(resp, 0) catch {};
+        _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
         return;
     }
 
@@ -1194,7 +1229,7 @@ fn handleUpgradeCmd(
             std.log.info("[guest] upgrade: pending upgrade exists, rejecting", .{});
             const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
             defer allocator.free(resp);
-            _ = conn.sendAndFlush(resp, 0) catch {};
+            _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
             return;
         } else |_| {}
     }
@@ -1216,7 +1251,7 @@ fn handleUpgradeCmd(
         std.log.err("[guest] upgrade: create upgrade file {s}: {}", .{ upgrade_path, err });
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
-        _ = conn.sendAndFlush(resp, 0) catch {};
+        _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
         return;
     };
 
@@ -1245,7 +1280,7 @@ fn handleUpgradeCmd(
         std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
-        _ = conn.sendAndFlush(resp, 0) catch {};
+        _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
         return;
     }
 
@@ -1264,7 +1299,7 @@ fn handleUpgradeCmd(
         std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
-        _ = conn.sendAndFlush(resp, 0) catch {};
+        _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
         return;
     }
 
@@ -1273,7 +1308,7 @@ fn handleUpgradeCmd(
     // 发送成功响应（在写 marker 之前——即使 marker 写入失败，Host 已确认收到）
     const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
     defer allocator.free(resp);
-    _ = conn.sendAndFlush(resp, 0) catch {};
+    _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
 
     // 写入 .sha256 标记文件（原子写入：先写临时文件，再 rename 到最终路径，
     // 避免 utmmd 读到半写文件）

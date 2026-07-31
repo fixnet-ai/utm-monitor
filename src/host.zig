@@ -687,6 +687,7 @@ fn hostTcpListen(
     };
     defer listener.deinit();
 
+    var conn_limit = tcp.ConnLimit.init(tcp.DEFAULT_MAX_CONNS);
     std.log.info("[host] TCP SOCKS5 listener on :{d}", .{mesh_port});
 
     while (true) {
@@ -718,8 +719,14 @@ fn hostTcpListen(
                 tcp.sockClose(fd);
                 std.log.debug("[host] self:2121 (no handler)", .{});
             } else {
-                // 本机 localhost relay
-                const t = std.Thread.spawn(.{}, tcp.socks5LocalRelay, .{ io, fd, req.port }) catch {
+                // 本机 localhost relay — 连接限制计数
+                if (!conn_limit.tryAcquire()) {
+                    tcp.socks5ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                }
+                errdefer conn_limit.release();
+                const t = std.Thread.spawn(.{}, tcp.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
                     tcp.socks5ReplyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
@@ -730,6 +737,16 @@ fn hostTcpListen(
         } else {
             // 目标不是本机 — 链式 SOCKS5 转发
             if (state.findByHostname(req.hostname)) |guest_entry| {
+                defer state.freeEntry(guest_entry);
+
+                // 连接限制计数
+                if (!conn_limit.tryAcquire()) {
+                    tcp.socks5ReplyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                }
+                errdefer conn_limit.release();
+
                 const next_hop = std.Io.net.IpAddress.parse(guest_entry.ip, mesh_port) catch {
                     tcp.socks5ReplyRejected(fd);
                     tcp.sockClose(fd);
@@ -755,6 +772,7 @@ fn hostTcpListen(
                     .hostname = hn_copy,
                     .target_port = req.port,
                     .allocator = allocator,
+                    .limit = &conn_limit,
                 };
 
                 const t = std.Thread.spawn(.{}, guest.forwardThreadFn, .{ctx}) catch {
@@ -807,6 +825,7 @@ pub fn connectGuest(
     hostname: []const u8,
 ) !tcp.Connection {
     const guest_entry = state.findByHostname(hostname) orelse return error.GuestNotFound;
+    defer state.freeEntry(guest_entry);
 
     return tcp.hostConnect(io, guest_entry.ip, hostname, protocol.DEFAULT_PORT) catch |primary_err| {
         std.log.warn("[arp] primary connect to {s} ({s}) failed: {}", .{ hostname, guest_entry.ip, primary_err });
@@ -841,6 +860,7 @@ pub fn pushUpgrade(
 ) ?[]const u8 {
     // 1. Look up Guest entry
     const guest_entry = state.findByHostname(hostname) orelse return "GuestNotFound";
+    defer state.freeEntry(guest_entry);
 
     // 2. Determine deployment filename from target triple
     const filename = protocol.deploymentFilename(guest_entry.target) orelse {
@@ -903,7 +923,7 @@ pub fn pushUpgrade(
     defer gpa.free(up_frame);
 
     // Fire-and-forget: push upgrade_cmd + raw binary
-    tcp_conn.sendAndFlush(up_frame, 0) catch {};
+    tcp_conn.sendAndFlush(up_frame, 0) catch |e| std.log.warn("[host] auto-upgrade send frame failed: {}", .{e});
     _ = tcp.sockWrite(tcp_conn.fd, file_data.ptr, file_size);
 
     std.log.info("[auto-upgrade] {s} pushed (fire-and-forget, {d} bytes)", .{ hostname, file_size });
@@ -1115,11 +1135,39 @@ pub const GuestTable = struct {
         return null;
     }
 
+    /// Returns a copy of the guest entry with all strings owned (duped).
+    /// Caller must call freeEntry() to release the returned entry's memory.
     pub fn findByHostname(self: *GuestTable, hostname: []const u8) ?GuestEntry {
         self.mutex.lock(self.io) catch return null;
         defer self.mutex.unlock(self.io);
         const idx = self.indexOf(hostname) orelse return null;
-        return self.guests.items[idx];
+        const src = self.guests.items[idx];
+        return GuestEntry{
+            .hostname = self.allocator.dupe(u8, src.hostname) catch return null,
+            .ip = self.allocator.dupe(u8, src.ip) catch return null,
+            .target = self.allocator.dupe(u8, src.target) catch return null,
+            .mac = self.allocator.dupe(u8, src.mac) catch return null,
+            .version = self.allocator.dupe(u8, src.version) catch return null,
+            .shell = if (src.shell.len > 0) self.allocator.dupe(u8, src.shell) catch return null else "",
+            .conpty = if (src.conpty.len > 0) self.allocator.dupe(u8, src.conpty) catch return null else "",
+            .status = if (src.status.len > 0) self.allocator.dupe(u8, src.status) catch return null else "",
+            .role = if (src.role.len > 0) self.allocator.dupe(u8, src.role) catch return null else "guest",
+            .last_seen = src.last_seen,
+            .mesh_mac = src.mesh_mac,
+        };
+    }
+
+    /// Free all strings in an entry returned by findByHostname.
+    pub fn freeEntry(self: *GuestTable, entry: GuestEntry) void {
+        if (entry.hostname.len > 0) self.allocator.free(entry.hostname);
+        if (entry.ip.len > 0) self.allocator.free(entry.ip);
+        if (entry.target.len > 0) self.allocator.free(entry.target);
+        if (entry.mac.len > 0) self.allocator.free(entry.mac);
+        if (entry.version.len > 0) self.allocator.free(entry.version);
+        if (entry.shell.len > 0) self.allocator.free(entry.shell);
+        if (entry.conpty.len > 0) self.allocator.free(entry.conpty);
+        if (entry.status.len > 0) self.allocator.free(entry.status);
+        if (entry.role.len > 0) self.allocator.free(entry.role);
     }
 
     pub fn upsert(
@@ -1141,46 +1189,55 @@ pub const GuestTable = struct {
             var changed = false;
             const existing = &self.guests.items[idx];
 
-            if (!std.mem.eql(u8, existing.ip, ip)) changed = true;
-            if (!std.mem.eql(u8, existing.target, target)) changed = true;
-            if (!std.mem.eql(u8, existing.version, version)) changed = true;
-            if (!std.mem.eql(u8, existing.shell, shell)) changed = true;
-            if (!std.mem.eql(u8, existing.conpty, conpty)) changed = true;
-            if (!std.mem.eql(u8, existing.status, status)) changed = true;
-            if (!std.mem.eql(u8, existing.role, role)) changed = true;
-            if (!std.mem.eql(u8, existing.mac, mac)) changed = true;
-
+            // 更新各个字段：先 dupe 到临时变量，成功后释放旧值。
+            // 不能先 free 再 dupe — dupe 失败会留下指向已释放内存的野指针。
             if (!std.mem.eql(u8, existing.ip, ip)) {
+                const new_ip = self.allocator.dupe(u8, ip) catch return changed;
                 self.allocator.free(existing.ip);
-                existing.ip = self.allocator.dupe(u8, ip) catch existing.ip;
+                existing.ip = new_ip;
+                changed = true;
             }
             if (!std.mem.eql(u8, existing.target, target)) {
+                const new_target = self.allocator.dupe(u8, target) catch return changed;
                 self.allocator.free(existing.target);
-                existing.target = self.allocator.dupe(u8, target) catch existing.target;
+                existing.target = new_target;
+                changed = true;
             }
             if (!std.mem.eql(u8, existing.version, version)) {
+                const new_ver = self.allocator.dupe(u8, version) catch return changed;
                 self.allocator.free(existing.version);
-                existing.version = self.allocator.dupe(u8, version) catch existing.version;
+                existing.version = new_ver;
+                changed = true;
             }
             if (!std.mem.eql(u8, existing.shell, shell)) {
+                const new_shell = self.allocator.dupe(u8, shell) catch return changed;
                 if (existing.shell.len > 0) self.allocator.free(existing.shell);
-                existing.shell = self.allocator.dupe(u8, shell) catch existing.shell;
+                existing.shell = new_shell;
+                changed = true;
             }
             if (!std.mem.eql(u8, existing.conpty, conpty)) {
+                const new_conpty = self.allocator.dupe(u8, conpty) catch return changed;
                 if (existing.conpty.len > 0) self.allocator.free(existing.conpty);
-                existing.conpty = self.allocator.dupe(u8, conpty) catch existing.conpty;
+                existing.conpty = new_conpty;
+                changed = true;
             }
             if (!std.mem.eql(u8, existing.status, status)) {
+                const new_status = self.allocator.dupe(u8, status) catch return changed;
                 if (existing.status.len > 0) self.allocator.free(existing.status);
-                existing.status = self.allocator.dupe(u8, status) catch existing.status;
+                existing.status = new_status;
+                changed = true;
             }
             if (!std.mem.eql(u8, existing.role, role)) {
+                const new_role = self.allocator.dupe(u8, role) catch return changed;
                 if (existing.role.len > 0) self.allocator.free(existing.role);
-                existing.role = self.allocator.dupe(u8, role) catch existing.role;
+                existing.role = new_role;
+                changed = true;
             }
             if (!std.mem.eql(u8, existing.mac, mac)) {
+                const new_mac = self.allocator.dupe(u8, mac) catch return changed;
                 self.allocator.free(existing.mac);
-                existing.mac = self.allocator.dupe(u8, mac) catch existing.mac;
+                existing.mac = new_mac;
+                changed = true;
             }
             existing.last_seen = last_seen;
             return changed;
@@ -1299,6 +1356,7 @@ test "GuestTable upsert and findByHostname" {
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
 
     const found = table.findByHostname("linuxvm");
+    defer if (found != null) table.freeEntry(found.?);
     try std.testing.expect(found != null);
     try std.testing.expectEqualStrings("192.168.64.2", found.?.ip);
     try std.testing.expectEqualStrings("aarch64-linux-musl", found.?.target);
@@ -1321,6 +1379,7 @@ test "GuestTable upsert updates existing guest" {
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
 
     const found = table.findByHostname("linuxvm").?;
+    defer table.freeEntry(found);
     try std.testing.expectEqualStrings("192.168.64.3", found.ip);
     try std.testing.expectEqualStrings("0.14.0", found.version);
     try std.testing.expectEqualStrings("/bin/zsh", found.shell);
@@ -1341,6 +1400,7 @@ test "GuestTable upsert detects MAC change" {
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
 
     const found = table.findByHostname("linuxvm").?;
+    defer table.freeEntry(found);
     try std.testing.expectEqualStrings("11:22:33:44:55:66", found.mac);
 }
 
@@ -1368,7 +1428,9 @@ test "GuestTable remove" {
     table.remove("linuxvm");
     try std.testing.expectEqual(@as(usize, 1), table.guests.items.len);
     try std.testing.expect(table.findByHostname("linuxvm") == null);
-    try std.testing.expect(table.findByHostname("macvm") != null);
+    const mac_found = table.findByHostname("macvm");
+    defer if (mac_found != null) table.freeEntry(mac_found.?);
+    try std.testing.expect(mac_found != null);
 
     table.remove("nonexist");
 }
@@ -1397,6 +1459,7 @@ test "GuestTable findByHostname after update" {
     _ = table.upsert("winx64", "192.168.3.1", "x86_64-windows", "ff:ee:dd:cc:bb:aa", "0.13.0", "cmd.exe", "yes", "upgrading", "guest", 3000);
 
     const found = table.findByHostname("winx64").?;
+    defer table.freeEntry(found);
     try std.testing.expectEqualStrings("cmd.exe", found.shell);
     try std.testing.expectEqualStrings("upgrading", found.status);
     try std.testing.expectEqualStrings("x86_64-windows", found.target);
@@ -1413,6 +1476,7 @@ test "GuestTable updateIp" {
     // updateIp: change IP
     try std.testing.expect(table.updateIp("linuxvm", "192.168.64.99"));
     const found = table.findByHostname("linuxvm").?;
+    defer table.freeEntry(found);
     try std.testing.expectEqualStrings("192.168.64.99", found.ip);
 
     // updateIp: no change
