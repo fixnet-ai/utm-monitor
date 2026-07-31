@@ -872,3 +872,35 @@ tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig
 - 删除 KCP ARQ 协议 (~1300行)，新增 TCP+SOCKS4 传输层
 - mesh.zig 简化为纯 LSA 广播
 - 20 源文件，124 测试通过
+
+### 2026-07-31 — v0.15.0：对等 SOCKS4a 转发 + Windows 句柄兼容修复
+
+**对等 SOCKS4a 转发（v0.15.0, commit `b4a818a`）**:
+- `src/tcp.zig`：新增 `socks4ReadRequestBuf`（读取不回复）、`socks4Forward`（链式转发）、
+  `socks4LocalRelay`（本地 relay）、修复 `socks4Relay`（`!void` → `void` + SHUT_WR 传播）、
+  `TcpListener.acceptRaw()`
+- `src/lsa.zig`：新增 `Mesh.lookupHostnameIp()` — Guest 端 hostname→IP 查找
+- `src/guest.zig`：accept 循环改为三路 dispatch（self:2121 → utmm 帧协议 /
+  self:other → localhost relay / other → chain-forward）；`ForwardCtx` + `forwardThreadFn`
+- `src/host.zig`：新增 `hostTcpListen()` 线程 — Host 端 TCP :2121 SOCKS4a listener；
+  复用 `guest.ForwardCtx`/`forwardThreadFn`
+- 文档更新：CLAUDE.md、README.md、MANUAL.md
+- 0 个新文件、0 个新 CLI 参数、0 个新端口 — 全部复用已有 TCP :2121 + SOCKS4a
+- 测试：176 单元 + 59 集成 = 全部通过 ✅
+
+**Windows SOCKS4a 转发修复（commit `7a47461`）**:
+- 问题：SOCKS4a → windowsvm:22 收到 0 字节（linuxvm/macvm 正常）
+- 根因：`socks4LocalRelay` 中 `IpAddress.connect()` 返回 AFD 内核句柄，
+  `sockAccept` 返回 Winsock2 SOCKET，两种句柄类型不兼容 — `ws2_recv`/`ws2_send`
+  在 AFD 句柄上静默失败
+- 修复：新增 `sockConnectLocalhost()` — Windows 上用 `ws2_socket()`+`ws2_connect()`
+  创建 Winsock2 兼容 SOCKET，POSIX 上用原始 `socket()`+`connect()`
+
+**裸机部署测试结果（5 节点，全部通过）**:
+| Test | linuxvm | macvm | windowsvm | winx64 |
+|------|---------|-------|-----------|--------|
+| --exec | ✅ | ✅ | ✅ | ✅ |
+| --upload | ✅ | ✅ | ✅ | ✅ |
+| --download | ✅ | ✅ | ✅ | ✅ |
+| --ping | ✅ | ✅ | ✅ | ✅ |
+| SOCKS4a forward | ✅ | ✅ | ✅ (修复后) | ✅ (修复后) |

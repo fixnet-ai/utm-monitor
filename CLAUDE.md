@@ -603,6 +603,13 @@ No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
   `socks4Forward` (chain-forward), `socks4LocalRelay` (localhost forward),
   `socks4Relay` (bidirectional relay). Host connects to Guests via SOCKS4a
   proxy (UTM network). Destination hostname embedded in SOCKS4a request after userid.
+- **Windows socket handle compatibility**: On Windows, Zig 0.16.0's `IpAddress.connect()`
+  returns AFD kernel handles which are NOT compatible with Winsock2 `recv`/`send`.
+  `sockAccept` returns raw Winsock2 SOCKET handles. These two handle types cannot
+  be mixed in `sockRead`/`sockWrite`/`socks4Relay`. Use `sockConnectLocalhost()`
+  (raw Winsock2 `ws2_socket` + `ws2_connect`) for localhost connections that need
+  to relay with accept-fd handles. Same rule applies to any new outbound TCP
+  connect that will be relayed with an accept-fd — use raw Winsock2 on Windows.
 - **Per-command connections**: Every exec/upload/download opens `tcp.connect()`,
   completes one operation, and closes. No connection pooling or keep-alive.
 

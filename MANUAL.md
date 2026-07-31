@@ -1,4 +1,4 @@
-# UTM Monitor Manual — v0.14.x
+# UTM Monitor Manual — v0.15.x
 
 Complete reference for CLI commands, MCP protocol, architecture, platform
 differences, and deployment.
