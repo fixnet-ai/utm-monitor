@@ -460,17 +460,32 @@ utmm --download linuxvm /opt/utmm/test.txt /tmp/dl.txt  # download test
 
 ### zig build test hangs on macOS
 
-**Symptom**: `zig build test` never completes, no error output.
+**Symptom**: `zig build test` never completes, no error output — stuck indefinitely.
 
-**Cause**: Zig 0.16.0 `--listen=-` test runner protocol bug on macOS.
+**Cause**: Zig 0.16.0 的 `--listen=-` 测试协议在 macOS (Darwin 25) 存在 hang bug。
 
-**Workaround** — run the compiled test binary directly:
+Zig 构建系统通过 `b.addRunArtifact()` 运行测试时，自动给测试进程注入 `--listen=-` 参数。
+该参数让测试进程通过 stdio 管道与构建系统通信上报结果。构建系统会阻塞等待管道 EOF，
+但某些情况下（尤其 macOS kqueue 后端）测试进程已退出而管道未正确关闭，导致死锁。
+
+同样的原因，`zig build test --summary all` 在 CI 的 macOS runner 上也可能 hang。
+
+**解决方案** — 本项目 `build.zig` 已绕过此问题：
+
+`build.zig` 使用 `std.Build.Step.Run.create()` 手动运行测试二进制，
+以 argv 参数形式传入而非通过 `addRunArtifact`，从而绕过 `--listen=-` 协议注入。
+裸 `zig build test`（不加 `--summary all`）直接输出到终端，不走协议层。
+
+**如果仍遇到 hang**，直接运行缓存的测试二进制：
 ```bash
-# Unit tests
+# 单元测试（带 30s 超时防护）
 perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/test 2>&1 | tail -5
-# Integration tests
+# 集成测试
 perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/integration_test 2>&1
 ```
+
+**CI 注意事项**：GitHub Actions macOS runner 上应使用 `zig build test` 而非
+`zig build test --summary all`，后者可能触发相同 hang。
 
 ### Hostname not resolving for winx64
 
