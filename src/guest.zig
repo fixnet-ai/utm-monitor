@@ -924,7 +924,36 @@ pub fn guestTcpLoop(
             continue;
         };
 
-        // 三路 dispatch
+        // BIND / UDP_ASSOCIATE — handle before hostname-based routing
+        if (req.cmd == socks5.SOCKS_CMD_BIND or req.cmd == socks5.SOCKS_CMD_UDP_ASSOCIATE) {
+            if (!conn_limit.tryAcquire()) {
+                socks5.replyRejected(fd);
+                tcp.sockClose(fd);
+                continue;
+            }
+            if (req.cmd == socks5.SOCKS_CMD_BIND) {
+                const t = std.Thread.spawn(.{}, socks5.socks5BindWithLimit, .{ io, fd, &conn_limit }) catch {
+                    conn_limit.release();
+                    socks5.replyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                };
+                t.detach();
+                std.log.info("[guest] BIND accepted", .{});
+            } else {
+                const t = std.Thread.spawn(.{}, socks5.udpAssociateWithLimit, .{ fd, &conn_limit }) catch {
+                    conn_limit.release();
+                    socks5.replyRejected(fd);
+                    tcp.sockClose(fd);
+                    continue;
+                };
+                t.detach();
+                std.log.info("[guest] UDP ASSOCIATE accepted", .{});
+            }
+            continue;
+        }
+
+        // 三路 dispatch（CMD=CONNECT）
         if (std.mem.eql(u8, req.hostname, info.hostname)) {
             // 目标是本机
             if (req.port == mesh_port) {

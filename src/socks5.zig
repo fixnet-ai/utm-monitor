@@ -297,8 +297,9 @@ pub fn checkAndReply(fd: tcp.socket_t, self_hostname: []const u8) !bool {
 // SOCKS5 Connect (Client Side)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Send SOCKS5 auth negotiation + connect request (internal, via raw fd).
-fn sendRequest(fd: tcp.socket_t, hostname: []const u8, port: u16) !void {
+/// Send SOCKS5 auth negotiation + request (internal, via raw fd).
+/// Parameterized: cmd (CONNECT/BIND/UDP_ASSOCIATE), atyp (IPv4/DOMAIN).
+fn sendRequest(fd: tcp.socket_t, cmd: u8, atyp: u8, hostname: []const u8, port: u16) !void {
     // Step 1: Send auth negotiation [0x05, 0x01, 0x00] (VER, 1 method, NO AUTH)
     const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
     const n1 = tcp.sockWrite(fd, &auth, auth.len);
@@ -322,11 +323,11 @@ fn sendRequest(fd: tcp.socket_t, hostname: []const u8, port: u16) !void {
     var pos: usize = 0;
     req[pos] = SOCKS_VER;
     pos += 1;
-    req[pos] = SOCKS_CMD_CONNECT;
+    req[pos] = cmd;
     pos += 1;
     req[pos] = 0x00;
     pos += 1; // RSV
-    req[pos] = SOCKS_ATYP_DOMAIN;
+    req[pos] = atyp;
     pos += 1;
     req[pos] = @truncate(hostname.len);
     pos += 1; // 1-byte hostname length
@@ -337,6 +338,31 @@ fn sendRequest(fd: tcp.socket_t, hostname: []const u8, port: u16) !void {
 
     const n2 = tcp.sockWrite(fd, &req, pos);
     if (n2 != pos) return error.Socks5SendFailed;
+}
+
+/// SOCKS5 reply parsed from server response.
+pub const Socks5Reply = struct {
+    rep: u8,
+    bnd_addr: [4]u8,
+    bnd_port: u16,
+};
+
+/// Read SOCKS5 reply (10 bytes, IPv4 ATYP only) from fd.
+pub fn readReply(fd: tcp.socket_t) !Socks5Reply {
+    var resp: [10]u8 = undefined;
+    var off: usize = 0;
+    while (off < 10) {
+        const n = tcp.sockRead(fd, resp[off..].ptr, resp.len - off);
+        if (n == 0) return error.Socks5ResponseTooShort;
+        if (tcp.sockIsError(n)) return error.Socks5ReadFailed;
+        off += @intCast(n);
+    }
+    if (resp[0] != SOCKS_VER) return error.Socks5BadVersion;
+    return Socks5Reply{
+        .rep = resp[1],
+        .bnd_addr = resp[4..8].*,
+        .bnd_port = std.mem.readInt(u16, resp[8..10], .big),
+    };
 }
 
 /// Send SOCKS5 connect request to target address (with auth negotiation).
@@ -353,25 +379,10 @@ pub fn connect(
     errdefer stream.close(io);
 
     const fd = stream.socket.handle;
-    try sendRequest(fd, target_hostname, target_port);
+    try sendRequest(fd, SOCKS_CMD_CONNECT, SOCKS_ATYP_DOMAIN, target_hostname, target_port);
 
-    // Read SOCKS5 response: VER(1) REP(1) RSV(1) ATYP(1) BND.ADDR(var) BND.PORT(2)
-    // Minimum 10 bytes (when ATYP=IPv4)
-    var resp: [10]u8 = undefined;
-    var off: usize = 0;
-    while (off < 10) {
-        const n = tcp.sockRead(fd, resp[off..].ptr, resp.len - off);
-        if (n == 0) {
-            stream.close(io);
-            return error.Socks5ResponseTooShort;
-        }
-        off += @intCast(n);
-    }
-    if (resp[0] != SOCKS_VER) {
-        stream.close(io);
-        return error.Socks5BadVersion;
-    }
-    if (resp[1] != SOCKS_REP_OK) {
+    const rep = try readReply(fd);
+    if (rep.rep != SOCKS_REP_OK) {
         stream.close(io);
         return error.Socks5Rejected;
     }
@@ -471,6 +482,192 @@ fn relayDir(src: tcp.socket_t, dst: tcp.socket_t, done: *std.atomic.Value(bool))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// UDP ASSOCIATE Relay (RFC 1928 Section 6)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// SOCKS5 UDP ASSOCIATE relay. Binds a UDP socket, replies with BND.ADDR:BND.PORT,
+/// then relays UDP datagrams bidirectionally over the TCP connection.
+/// Does not return — runs until TCP closes or error.
+/// Only IPv4 ATYP is supported for relayed datagrams.
+pub fn udpAssociate(tcp_fd: tcp.socket_t) void {
+    const udp_fd = tcp.createUdpSocket() catch {
+        replyRejected(tcp_fd);
+        tcp.sockClose(tcp_fd);
+        return;
+    };
+    const udp_port = tcp.getBoundPort(udp_fd) catch {
+        replyRejected(tcp_fd);
+        tcp.sockClose(udp_fd);
+        tcp.sockClose(tcp_fd);
+        return;
+    };
+
+    // Reply with BND.ADDR=0.0.0.0, BND.PORT=assigned UDP port
+    reply(tcp_fd, SOCKS_REP_OK, [_]u8{ 0, 0, 0, 0 }, udp_port);
+
+    var shutdown = std.atomic.Value(bool).init(false);
+
+    // TCP→UDP thread
+    const tcp_to_udp = std.Thread.spawn(.{}, udpTcpToUdp, .{ tcp_fd, udp_fd, &shutdown }) catch {
+        tcp.sockClose(tcp_fd);
+        tcp.sockClose(udp_fd);
+        return;
+    };
+    // UDP→TCP thread (runs in current thread)
+    udpUdpToTcp(tcp_fd, udp_fd, &shutdown);
+    tcp_to_udp.join();
+
+    tcp.sockClose(tcp_fd);
+    tcp.sockClose(udp_fd);
+}
+
+/// Read SOCKS5 UDP datagrams from TCP, extract DATA, forward via UDP.
+fn udpTcpToUdp(tcp_fd: tcp.socket_t, udp_fd: tcp.socket_t, shutdown: *std.atomic.Value(bool)) void {
+    var buf: [65536]u8 = undefined;
+    while (!shutdown.load(.acquire)) {
+        // Read 2-byte BE length prefix
+        var len_buf: [2]u8 = undefined;
+        var off: usize = 0;
+        while (off < 2) {
+            const n = tcp.sockRead(tcp_fd, len_buf[off..].ptr, len_buf.len - off);
+            if (n == 0) {
+                shutdown.store(true, .release);
+                return;
+            }
+            if (tcp.sockIsError(n)) {
+                shutdown.store(true, .release);
+                return;
+            }
+            off += @intCast(n);
+        }
+        const dgram_len = std.mem.readInt(u16, &len_buf, .big);
+        if (dgram_len == 0 or dgram_len > buf.len) {
+            shutdown.store(true, .release);
+            return;
+        }
+
+        // Read UDP datagram body
+        off = 0;
+        while (off < dgram_len) {
+            const n = tcp.sockRead(tcp_fd, buf[off..].ptr, dgram_len - off);
+            if (n == 0) {
+                shutdown.store(true, .release);
+                return;
+            }
+            if (tcp.sockIsError(n)) {
+                shutdown.store(true, .release);
+                return;
+            }
+            off += @intCast(n);
+        }
+
+        const dgram = buf[0..dgram_len];
+        // Format: RSV(2) FRAG(1) ATYP(1) DST.ADDR(var) DST.PORT(2) DATA(rest)
+        if (dgram.len < 10) continue; // minimum: RSV+FRAG+ATYP+IPv4(4)+PORT(2) = 10
+
+        const frag = dgram[2];
+        if (frag != 0) continue; // fragmentation not supported
+
+        const atyp = dgram[3];
+        if (atyp != SOCKS_ATYP_IPV4) continue; // only IPv4 supported
+
+        const dst_ip: [4]u8 = dgram[4..8].*;
+        const dst_port = std.mem.readInt(u16, dgram[8..10], .big);
+        const data = dgram[10..];
+
+        const addr = tcp.UdpAddr{ .ip = dst_ip, .port = dst_port };
+        tcp.sendUdpTo(udp_fd, data, addr) catch continue;
+    }
+}
+
+/// Receive raw UDP datagrams, wrap in SOCKS5 UDP format, send via TCP.
+fn udpUdpToTcp(tcp_fd: tcp.socket_t, udp_fd: tcp.socket_t, shutdown: *std.atomic.Value(bool)) void {
+    var buf: [65536]u8 = undefined;
+    while (!shutdown.load(.acquire)) {
+        const result = tcp.recvUdpFrom(udp_fd, buf[10..]) catch {
+            // UDP socket error — shutdown
+            shutdown.store(true, .release);
+            return;
+        };
+
+        // Build SOCKS5 UDP datagram header
+        // RSV(2) + FRAG(1) + ATYP(1) + IPv4(4) + PORT(2) = 10 bytes
+        buf[0] = 0x00; // RSV high byte
+        buf[1] = 0x00; // RSV low byte
+        buf[2] = 0x00; // FRAG = no fragmentation
+        buf[3] = SOCKS_ATYP_IPV4;
+        @memcpy(buf[4..8], &result.from.ip);
+        std.mem.writeInt(u16, buf[8..10], result.from.port, .big);
+
+        const dgram = buf[0 .. 10 + result.n];
+
+        // Write 2-byte BE length prefix
+        var len_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_buf, @truncate(dgram.len), .big);
+
+        // Write to TCP (best-effort; if TCP is closed, shutdown)
+        const w1 = tcp.sockWrite(tcp_fd, &len_buf, len_buf.len);
+        if (tcp.sockIsError(w1)) {
+            shutdown.store(true, .release);
+            return;
+        }
+        const w2 = tcp.sockWrite(tcp_fd, dgram.ptr, dgram.len);
+        if (tcp.sockIsError(w2)) {
+            shutdown.store(true, .release);
+            return;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BIND Handler (RFC 1928 Section 5)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// SOCKS5 BIND handler. Creates a TCP listener, replies with BND.ADDR:BND.PORT,
+/// waits for inbound connection (60s timeout), relays client↔accepted.
+/// Does not return.
+pub fn socks5Bind(io: std.Io, client_fd: tcp.socket_t) void {
+    // Create TCP listener on random port
+    var listener = tcp.TcpListener.init(io, 0) catch {
+        replyRejected(client_fd);
+        tcp.sockClose(client_fd);
+        return;
+    };
+    defer listener.deinit();
+
+    // First reply: BND.ADDR=0.0.0.0, BND.PORT=listener's port
+    reply(client_fd, SOCKS_REP_OK, [_]u8{ 0, 0, 0, 0 }, listener.port);
+
+    // Wait for inbound connection with 60s timeout
+    const accepted = tcp.sockAcceptTimeout(listener.listener_fd, 60_000) catch {
+        // Timeout or error — send rejection as second reply
+        replyRejected(client_fd);
+        tcp.sockClose(client_fd);
+        return;
+    };
+
+    // Second reply: BND.ADDR=peer IP, BND.PORT=peer port
+    reply(client_fd, SOCKS_REP_OK, accepted.addr.ip, accepted.addr.port);
+
+    // Relay between client and accepted connection
+    relay(client_fd, accepted.fd);
+    tcp.sockClose(client_fd);
+    tcp.sockClose(accepted.fd);
+}
+
+/// Thread wrapper: socks5Bind with connection limit release.
+pub fn socks5BindWithLimit(io: std.Io, fd: tcp.socket_t, limit: *tcp.ConnLimit) void {
+    defer limit.release();
+    socks5Bind(io, fd);
+}
+
+/// Thread wrapper: udpAssociate with connection limit release.
+pub fn udpAssociateWithLimit(fd: tcp.socket_t, limit: *tcp.ConnLimit) void {
+    defer limit.release();
+    udpAssociate(fd);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Host Connect
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -492,21 +689,10 @@ pub fn hostConnect(io: std.Io, guest_ip: []const u8, guest_hostname: []const u8,
     }
 
     // Send SOCKS5 auth + request
-    try sendRequest(fd, guest_hostname, port);
+    try sendRequest(fd, SOCKS_CMD_CONNECT, SOCKS_ATYP_DOMAIN, guest_hostname, port);
 
-    // Read SOCKS5 response (10 bytes)
-    var resp: [10]u8 = undefined;
-    var off: usize = 0;
-    while (off < 10) {
-        const n = tcp.sockRead(fd, resp[off..].ptr, resp.len - off);
-        if (n == 0) {
-            stream.close(io);
-            return error.Socks5ResponseTooShort;
-        }
-        off += @intCast(n);
-    }
-
-    if (resp[1] != SOCKS_REP_OK) {
+    const rep = try readReply(fd);
+    if (rep.rep != SOCKS_REP_OK) {
         stream.close(io);
         std.log.err("[socks5] SOCKS5 rejected by {s}", .{guest_hostname});
         return error.Socks5Rejected;
