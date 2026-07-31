@@ -23,7 +23,13 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
     // Management commands: stateless, no Host daemon needed
     if (cli.cmd_status) return cmdStatus(block_io, gpa, cli.port);
     if (cli.cmd_deploy) return cmdDeploy(block_io, gpa, cli.deploy_target);
-    if (cli.cmd_ping) return cmdPing(block_io, gpa, cli.port, cli.ping_target.?);
+    if (cli.cmd_ping) {
+        const target = cli.ping_target orelse {
+            std.debug.print("[ERROR] --ping requires a target hostname\n", .{});
+            std.process.exit(1);
+        };
+        return cmdPing(block_io, gpa, cli.port, target);
+    }
     if (cli.cmd_exec) return cmdExec(block_io, gpa, cli.port, cli.exec_target.?, cli.exec_cmd.?);
     if (cli.cmd_upload) return cmdUpload(block_io, gpa, cli.port, cli.upload_target.?, cli.upload_file.?);
     if (cli.cmd_download) return cmdDownload(block_io, gpa, cli.port, cli.download_target.?, cli.download_remote.?, cli.download_local.?);
