@@ -1,6 +1,48 @@
-# Findings: v0.13.0 分层架构重构
+# Findings: UTM Monitor 技术发现与设计决策
 
 记录重要的技术发现、设计决策和 Zig 0.16.0 API 笔记。
+
+## 2026-08-01 — 工作流优化（v0.15.10→v0.15.11）
+
+### FIONBIO 常量在 aarch64-windows 上溢出 c_int
+
+`FIONBIO = 0x8004667e` (2147772030) 超出 `c_int` (i32, max 2147483647)。
+aarch64-windows 交叉编译时报错 "type 'c_int' cannot represent integer value '2147772030'"。
+x86_64-windows 不报（相同 c_int 类型），属于编译顺序问题——先失败的 target 阻断后续。
+
+**解决**: `const FIONBIO: c_int = @bitCast(@as(std.os.windows.ULONG, 0x8004667e));`
+
+Winsock2 ioctlsocket 的 cmd 参数类型是 `c_int`，但 FIONBIO 等 ioctl 码是 u32 高位置位，
+C 中隐式转换允许，Zig 严格检查需要显式 `@bitCast`。
+
+### std.Target.Query 字段是 optional
+
+`build.zig` 中 `std.Target.Query` 的 `cpu_arch`、`os_tag`、`abi` 均为 optional 类型。
+直接用 `@tagName(query.cpu_arch)` 报错 "expected enum or union; found '?Target.Cpu.Arch'"。
+必须通过 `b.resolveTargetQuery(query)` 解析后再用 `tgt.result.cpu_arch`。
+
+### standardOptimizeOption 只能调用一次
+
+Zig 构建系统中 `b.standardOptimizeOption(.{})` 注册 CLI 选项 `-Doptimize`。
+循环内多次调用会重复注册同名选项，触发 panic。必须在循环外调用一次，内部分复用。
+
+### release.sh: build-test-then-tag 模式
+
+旧模式 `tag → build → test → [失败] → 删 tag → 修 → 重 tag` 的根因是 tag 过早。
+新模式 `bump ver.txt → build → test → commit + tag + push` 确保 tag 一定指向可构建版本。
+
+关键实现细节：
+- `git status --porcelain | grep -v 'src/ver.txt'` 允许 ver.txt 未提交（脚本会 auto-commit）
+- `git rev-parse "$VERSION"` 检测 tag 是否已存在，避免覆盖已有 release
+- `gh release view "$VERSION"` 检测 release 是否已存在
+
+### macOS zig build test --listen=- 协议 hang
+
+见 MANUAL.md Troubleshooting 章节详细记录。核心：
+- `addRunArtifact()` 注入 `--listen=-` stdio 协议
+- macOS kqueue 后端管道关闭时序问题导致死锁
+- `--summary all` 同样走协议层，CI macOS runner 上应避免
+- 本项目 `build.zig` 用 `Step.Run.create` + `addArtifactArg` 绕过
 
 ---
 

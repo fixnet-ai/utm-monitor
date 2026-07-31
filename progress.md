@@ -1,3 +1,91 @@
+## 工作流优化全流程演练 v0.15.10—v0.15.11
+
+**时间**: 2026-08-01 01:30—02:30
+
+### bump → release.sh → deploy → upgrade → 验证 全流程
+
+**v0.15.10 bump + build**:
+- `src/ver.txt` 0.15.9 → 0.15.10
+- 8 目标交叉编译：aarch64-windows FIONBIO 值 `0x8004667e` 超出 `c_int` (i32) 范围
+  - 修复：`const FIONBIO: c_int = @bitCast(@as(std.os.windows.ULONG, 0x8004667e));`
+- 全部 8 目标编译通过，deploy 到 serve-dir
+- 3 台 Guest 报 `BinaryNotFound` — 因为只编译了 native 目标，跨平台二进制未更新
+- 修复后 3 台 Guest (linuxvm, windowsvm, modasiaipc) + 1 台已升级 (macvm) 全部 v0.15.10
+
+**--ping 崩溃修复**:
+- 症状：`sudo utmm --ping`（无参数）panic "attempt to use null value"
+- 根因：`cli.ping_target.?` — ping_target 为 null 时 unwrap panic
+- 修复 1（host.zig）：加 null 检查，输出 `[ERROR] --ping requires a target hostname`
+- 修复 2（main.zig）：parseArgs 返回前统一校验所有管理命令必选参数
+  - ping → 需要 target；exec → 需要 target + command；upload → 需要 file + target
+  - download → 需要 target + remote_path；upgrade → 需要 target
+
+**并行交叉编译**:
+- `build.zig` 新增 `cross` step：`zig build cross -Doptimize=ReleaseSafe`
+- 8 目标全部并行编译，替代 serial `for target in $targets; do zig build -Dtarget=$target; done`
+- `std.Target.Query` 字段是 optional，需用 `tgt.result` 而非 `query`
+- `standardOptimizeOption` 只能调用一次，循环内复用外部 `optimize` 变量
+
+**release.sh 重构**:
+- 旧流程：用户手动 commit + tag → release.sh 构建测试（失败则删 tag 重建）
+- 新流程（5 阶段）：
+  1. 校验（ver.txt 匹配 VERSION arg、工作区干净）
+  2. 单元测试 + 集成测试
+  3. `zig build cross` 并行编译 8 目标
+  4. 收集二进制 + zip 打包
+  5. commit ver.txt → tag → push → gh release create
+- 关键改进：构建测试全部通过后才打 tag，杜绝 tag 反复删除重建
+- 验证：v0.15.11 release.sh 一次性全流程通过，5 阶段全部成功
+
+**CI 脚本更新** (`.github/workflows/release.yml`):
+- 交叉编译：串行 8×`zig build` → 单步 `zig build cross`
+- 删除 `install.sh` / `install.bat` 引用（这两个文件不存在于仓库 — utmm 自带 `--install`）
+- 测试步骤去 `--summary all`（避免 macOS `--listen=-` hang）
+- 步骤数：6 → 5（合并 collect + ver.txt）
+
+**cmdDeploy 改进**:
+- sshpass 缺失不再 `exit(1)` → 改为 `return` + 明确警告
+  - 旧行为：`[deploy] sshpass is required...` + exit 1（误导：本地部署已成功）
+  - 新行为：`[deploy] Local binaries have been copied to serve-dir.` + 提示安装 sshpass
+- 串行 for 循环编译 → 单次 `zig build cross` 并行编译
+- serve-dir 复制在 cross 编译完成后统一进行
+
+**pushUpgrade 错误信息优化**:
+- `"BinaryNotFound"` → `"BinaryNotFound: run zig build cross + deploy to populate serve-dir"`
+- 同时 log 输出具体缺失文件名：`expected utmm-aarch64-linux-0.15.11 in serve-dir`
+
+**MANUAL.md 增强**:
+- "zig build test hangs on macOS" 条目扩充：
+  - `--listen=-` stdio 协议机制说明
+  - kqueue 后端死锁原因
+  - 本项目 `build.zig` 绕过方案（`Step.Run.create`）
+  - `--summary all` CI 风险提示
+
+### 部署验证 (v0.15.11)
+
+| 项目 | 结果 |
+|------|------|
+| `--status` | ✅ 5 nodes (1 Host + 4 Guest), all v0.15.11 serving |
+| `--ping` | ✅ macvm(1ms) linuxvm(1ms) windowsvm(1ms) modasiaipc(4ms) |
+| `--exec` | ✅ linuxvm, windowsvm 命令执行正常 |
+| `--upgrade` | ✅ 4 台 Guest 全部升级成功（utmmd 自动检测→验证→替换→重启） |
+| 8-target build | ✅ `zig build cross` 并行编译全部通过 |
+| Unit tests | ✅ 172 passed, 0 failed |
+| Integration tests | ✅ 59 passed, 0 failed, 0 leaks |
+| GitHub Release | ✅ v0.15.11 published |
+
+### 发现与修复汇总
+
+| # | 发现 | 严重度 | 修复 |
+|---|------|--------|------|
+| 1 | FIONBIO 值在 aarch64-windows 上超出 c_int | 高（编译阻断） | @bitCast 转换 |
+| 2 | --ping 空参数 panic | 中（用户操作崩溃） | parseArgs 前置校验 |
+| 3 | --deploy exit 1 误导（sshpass 缺失） | 低（实际已成功） | exit → return |
+| 4 | release.sh 先 tag 后构建失败要重建 | 中（流程反复） | 构建过再 tag |
+| 5 | CI 引用不存在的 install.sh/install.bat | 高（CI 必然失败） | 删除引用 |
+| 6 | linuxvm ping RTT 496659s（升级瞬态） | 低（瞬态，不影响） | 无需修复 |
+| 7 | cmdDeploy 串行编译慢 | 低（效率问题） | 改用 zig build cross |
+
 ## Clean Deploy Test v0.14.7 (第二轮 — 修复后 skill 验证)
 
 **时间**: 2026-07-31 04:13-04:15

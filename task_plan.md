@@ -1,12 +1,12 @@
-# Task Plan: v0.13.0+ — 分层架构重构
+# Task Plan: UTM Monitor — 开发任务规划
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.14.7 — sshpass 集成 + MCP 工具名去前缀
+**最新版本**: v0.15.11 — 工作流优化 + 并行交叉编译 + 发布流水线加固
 
-- **分支**: `refac/layered-arch`
-- **源文件**: 18 src + 11 test（含新增 sshpass.zig）
-- **测试**: 208 单元测试全部通过 + 59 集成测试场景（待验证）
+- **分支**: `main`（feat/connectivity-fabric 已合并删除）
+- **源文件**: 17 src + 10 test
+- **测试**: 172 单元测试 + 59 集成测试，全部通过，0 泄漏
 
 ## 当前阶段: Phase 21 — sshpass 集成 + MCP 工具名去前缀 + 真机部署 ✅
 
@@ -617,3 +617,33 @@ CLAUDE.md / README.md / task_plan.md
 | 152 | 验证 exec/upload/download 功能正常 | CLI 管理命令功能回归 |
 | 153 | 验证 MCP stdio 功能正常 | AI agent 接口功能回归 |
 | 154 | 清理旧标记块 | 手动清理旧版 `# BEGIN/END UTM-MONITOR` 残留（如存在） |
+
+### Phase 22: v0.15.10—v0.15.11 连接限制 + 连接超时 + 字节序修复 ✅
+
+**背景**: 代码审查发现缺乏连接数限制和超时保护；sockaddr 字节序 bug 导致
+集成测试 hang。后续 bump→deploy→upgrade 流程中发现多个工作流优化点。
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 170 | Connection limit (128) + TCP connect timeout (2000ms) | `src/tcp.zig`, `src/host.zig`, `src/guest.zig` | ✅ 原子计数器 + 非阻塞 connect + poll 超时 |
+| 171 | sockaddr.in.addr 字节序修复 | `src/tcp.zig` | ✅ `.big` → `.little`（LE 机器上内核期望 LE） |
+| 172 | FIONBIO aarch64-windows 溢出 | `src/tcp.zig` | ✅ `@bitCast(@as(std.os.windows.ULONG, 0x8004667e))` |
+| 173 | `--ping` 空参数 panic | `src/main.zig`, `src/host.zig` | ✅ parseArgs 阶段校验所有管理命令必选参数 |
+| 174 | `zig build cross` 并行交叉编译 | `build.zig` | ✅ 新增 cross step，8 目标并行编译 |
+| 175 | release.sh 重构 | `release.sh` | ✅ 先构建测试全过再 tag，防止失败后删 tag 重建 |
+| 176 | CI 脚本更新 | `.github/workflows/release.yml` | ✅ 并行编译 + 删除不存在文件引用 + 避免 --summary hang |
+| 177 | cmdDeploy 改进 | `src/host.zig` | ✅ sshpass 缺失不再 exit 1；编译改用 zig build cross |
+| 178 | pushUpgrade 错误信息优化 | `src/host.zig` | ✅ BinaryNotFound 时提示运行 zig build cross + deploy |
+| 179 | 真机部署验证（5 节点） | — | ✅ Host + 4 Guest 全部 v0.15.11 serving |
+| 180 | GitHub Release v0.15.11 发布 | — | ✅ release.sh 全流程通过 |
+| 181 | MANUAL.md macOS 测试 hang 文档 | `MANUAL.md` | ✅ --listen=- 协议原理 + build.zig 绕过方案 + CI 注意事项 |
+
+**设计决策**:
+
+| # | 决策 | 理由 |
+|---|------|------|
+| 46 | 连接限制用 `std.atomic.Value(u32)` + CAS | 无需 mutex，`tryAcquire`/`fetchSub(1)` 模式，性能最优 |
+| 47 | TCP connect 超时用非阻塞 + poll（不做线程） | Zig 0.16.0 single-threaded IO 的 `IpAddress.connect()` timeout 会 panic |
+| 48 | release.sh 构建过再 tag | 旧流程 tag→build→失败→删 tag→重建，改为 build→test→tag |
+| 49 | parseArgs 统一校验而非分散校验 | `fail.msg` 提前报错，避免 `.` panic 回溯误导 |
+| 50 | cmdDeploy sshpass 缺失 → return（非 exit） | 本地部署已成功，远程推送是可选的；exit 1 误导 CI/用户 |
