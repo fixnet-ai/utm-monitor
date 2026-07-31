@@ -32,26 +32,20 @@ See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
 
 ## Core Capabilities
 
-- **Streaming exec** — per-command pty shell on any Guest. Real-time output,
-  exit code, no timeout. `MDELIM` markers handled transparently.
+- **Streaming exec** — run commands on any machine with real-time pty output,
+  exit code, no timeout.
 - **File transfer** — upload/download with SHA256 verification and atomic writes.
+- **SOCKS5 mesh forwarding** — every node is a SOCKS5 proxy on TCP :2121.
+  `curl --socks5 localhost:2121 http://linuxvm:8080` reaches any node through
+  any other node — no SSH tunnels, no port mapping. **Windows: disable firewall**
+  for BIND + UDP ASSOCIATE (dynamic ports).
 - **sshpass built-in** — non-interactive SSH password auth, 100% CLI-compatible
-  with the standalone `sshpass` tool. POSIX PTY + Windows ConPTY (dynamic load
-  with pipe fallback on older Windows).
-- **MCP stdio** — AI agents control machines via `utmm --mcp`. Six tools:
-  `status`, `exec`, `ping`, `upload`, `download`, `sshpass`. Auto-ensures Host on first use.
-- **LSA mesh zero-config** — Guests auto-discover Host over the local network.
-  No fixed IPs, no DNS. `/etc/hosts` kept in sync automatically.
-- **SOCKS5 mesh forwarding** — every node is a SOCKS5 proxy endpoint on TCP :2121.
-  Third-party tools (`curl`, `wget`, browsers) reach any mesh node through any other
-  node. No SSH tunnels, no port mapping. `curl --socks5 localhost:2121 http://linuxvm:8080`
-  just works. **Windows: disable firewall** for BIND + UDP ASSOCIATE (dynamic ports).
-- **Self-copy install** — single `--install` handles stop→kill→copy→start.
-  Upgrade = scp + `--install`. No shell scripts, no package managers.
-- **utmmd supervisor** — lightweight daemon manages utmm lifecycle via shared
-  memory: heartbeat, crash recovery (exponential backoff), binary upgrade coordination.
-- **8 cross-compilation targets** — aarch64/x86_64/x86 × linux-musl/macos/windows.
-  Zero runtime dependencies.
+  with standalone `sshpass`. POSIX PTY + Windows ConPTY (dynamic load, pipe
+  fallback on older Windows).
+- **LSA mesh zero-config** — Guests auto-discover Host over the local network,
+  `/etc/hosts` kept in sync automatically.
+- **MCP stdio** — AI agents get six tools (`status`, `exec`, `ping`, `upload`,
+  `download`, `sshpass`) via `utmm --mcp`. Auto-ensures Host on first use.
 
 ## Architecture
 
