@@ -1,7 +1,7 @@
 .{
-    .name = .utmm,
+    .name = .utm_monitor,
     .version = "0.0.0",
-    .fingerprint = 0xcd0d4731c97cfef4,
+    .fingerprint = 0x4603abddd607a737,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{

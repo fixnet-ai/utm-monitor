@@ -1,4 +1,4 @@
-//! utmm — Remote machine management via TCP/SOCKS5.
+//! UTM Monitor — Remote machine management via TCP/SOCKS5.
 //!
 //! Guest mode (default): LSA mesh broadcast + TCP listener on port 2121.
 //!   Host connects to Guest via SOCKS5 proxy for exec/upload/download.
