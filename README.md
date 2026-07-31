@@ -19,7 +19,7 @@ required at runtime. AI agents get the same capabilities through MCP stdio.
 | `ping` | Ping a Guest over the mesh network and measure RTT |
 | `upload` | Upload file from Host to Guest (TCP/SOCKS5, SHA256 verified) |
 | `download` | Download file from Guest to Host (TCP/SOCKS5, SHA256 verified) |
-| `sshpass` | Non-interactive SSH password auth — direct shell access to any machine. Works on **Linux, macOS, and Windows** (ConPTY dynamic loading + pipe fallback). Bootstrap, recovery, and pre-install scenarios when the Guest daemon is down or not yet installed. |
+| `sshpass` | Non-interactive SSH password auth — direct shell access to any machine. |
 
 Example prompts your AI agent can handle:
 - "Push the new build to linuxvm and run the test suite — show me the failures"
