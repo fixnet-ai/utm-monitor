@@ -12,6 +12,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const ipc_mod = @import("ipc.zig");
+const sshpass = @import("sshpass.zig");
 
 /// Guest default upload directory — platform-aware default for remote_path.
 fn guestDefaultDir(vm: []const u8) []const u8 {
@@ -509,22 +510,25 @@ fn handleVmSshpass(gpa: std.mem.Allocator, io: std.Io, host: []const u8, user: [
     const exe_path = try std.process.executablePathAlloc(io, gpa);
     defer gpa.free(exe_path);
 
-    // Build argv: utmm sshpass -p <password> ssh <dest> <command>
+    // Build SSH command-line args (ssh <dest> <command>), ensure StrictHostKeyChecking
+    var ssh_args: std.ArrayList([]const u8) = .empty;
+    defer ssh_args.deinit(gpa);
+    try ssh_args.append(gpa, "ssh");
+    try ssh_args.append(gpa, dest);
+    var cmd_iter = std.mem.splitScalar(u8, command, ' ');
+    while (cmd_iter.next()) |arg| {
+        if (arg.len > 0) try ssh_args.append(gpa, arg);
+    }
+    try sshpass.ensureStrictHostKeyChecking(gpa, &ssh_args);
+
+    // Build argv: utmm sshpass -p <password> <ssh_args...>
     var argv = try std.ArrayList([]const u8).initCapacity(gpa, 0);
     defer argv.deinit(gpa);
     try argv.append(gpa, exe_path);
     try argv.append(gpa, "sshpass");
     try argv.append(gpa, "-p");
     try argv.append(gpa, password);
-    try argv.append(gpa, "ssh");
-    try argv.append(gpa, "-o");
-    try argv.append(gpa, "StrictHostKeyChecking=no");
-    try argv.append(gpa, dest);
-    // Split command into args on spaces (shell handles quoting on remote)
-    var cmd_iter = std.mem.splitScalar(u8, command, ' ');
-    while (cmd_iter.next()) |arg| {
-        if (arg.len > 0) try argv.append(gpa, arg);
-    }
+    try argv.appendSlice(gpa, ssh_args.items);
 
     // Spawn child process, collect output, wait
     const result = try std.process.run(gpa, io, .{

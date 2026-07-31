@@ -1175,6 +1175,32 @@ const windows = if (builtin.os.tag == .windows) struct {
     }
 } else struct {};
 
+/// 检查 SSH 命令行参数中是否已包含 StrictHostKeyChecking 选项。
+/// 匹配 "-o StrictHostKeyChecking=..." 和 "-oStrictHostKeyChecking=..." 两种形式。
+pub fn hasStrictHostKeyChecking(args: []const []const u8) bool {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-o")) {
+            if (i + 1 < args.len and std.mem.startsWith(u8, args[i + 1], "StrictHostKeyChecking")) {
+                return true;
+            }
+        }
+        if (std.mem.startsWith(u8, args[i], "-oStrictHostKeyChecking")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// 确保 SSH 命令行参数中包含 "-o StrictHostKeyChecking=no"。
+/// 如果已存在（任意值），则不添加。否则在 args[0]（"ssh" 命令）之后插入。
+/// 调用者需确保 args 至少有一个元素。
+pub fn ensureStrictHostKeyChecking(gpa: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
+    if (hasStrictHostKeyChecking(list.items)) return;
+    try list.insert(gpa, 1, "StrictHostKeyChecking=no");
+    try list.insert(gpa, 1, "-o");
+}
+
 /// Guest 检测：平台是否支持 PTY 密码注入。
 /// - POSIX：始终返回 true（posix_openpt 在所有现代系统上可用）。
 /// - Windows：动态检测 CreatePseudoConsole API 是否存在（需 Win10 1809+）。
@@ -1218,8 +1244,8 @@ pub fn main(gpa: std.mem.Allocator, args: []const []const u8) noreturn {
         },
     };
 
-    const cmd_args = actual_args[parsed.cmd_offset..];
-    if (cmd_args.len == 0) {
+    const cmd_args_raw = actual_args[parsed.cmd_offset..];
+    if (cmd_args_raw.len == 0) {
         showHelp();
         std.process.exit(0);
     }
@@ -1235,6 +1261,21 @@ pub fn main(gpa: std.mem.Allocator, args: []const []const u8) noreturn {
             }
         }
     }
+
+    // 确保 SSH 命令包含 -o StrictHostKeyChecking=no（避免 host_key_unknown）
+    var cmd_args_buf: std.ArrayList([]const u8) = .empty;
+    defer cmd_args_buf.deinit(gpa);
+    const cmd_args = if (hasStrictHostKeyChecking(cmd_args_raw))
+        cmd_args_raw
+    else blk: {
+        cmd_args_buf.appendSlice(gpa, cmd_args_raw) catch {
+            std.process.exit(@intFromEnum(ExitCode.runtime_error));
+        };
+        ensureStrictHostKeyChecking(gpa, &cmd_args_buf) catch {
+            std.process.exit(@intFromEnum(ExitCode.runtime_error));
+        };
+        break :blk cmd_args_buf.items;
+    };
 
     const exit_code: ExitCode = if (is_windows)
         windows.c.runWindows(gpa, parsed.args, cmd_args)
