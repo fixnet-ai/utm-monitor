@@ -1,13 +1,13 @@
-//! TCP transport: frame protocol + SOCKS4a proxy + connection management + forwarding
+//! TCP transport: frame protocol + SOCKS5 proxy + connection management + forwarding
 //!
 //! Guest 和 Host 共享同一套网络层：
-//!   - 监听:    TCP listen → SOCKS4a accept → dispatch (self/forward/local)
-//!   - 连接:    TCP connect → SOCKS4a connect → Connection
-//!   - 转发:    SOCKS4a chain-forward → 目标节点 :2121 → 本地 relay
+//!   - 监听:    TCP listen → SOCKS5 accept → dispatch (self/forward/local)
+//!   - 连接:    TCP connect → SOCKS5 connect → Connection
+//!   - 转发:    SOCKS5 chain-forward → 目标节点 :2121 → 本地 relay
 //!   - 本地:    127.0.0.1:port → relay
 //!
 //! 帧格式: [4-byte BE length][payload]
-//! SOCKS4a: VER(1) CMD(1) DSTPORT(2 BE) DSTIP(4 BE) USERID\0 [HOSTNAME\0]
+//! SOCKS5: auth(VER=5 NMETHODS METHOD) → VER(1) CMD(1) RSV(1) ATYP(1) [LEN(1) HOSTNAME] PORT(2 BE)
 //!
 //! 每条 TCP 连接 = 一个请求-响应周期。连接关闭表示会话结束。
 
@@ -332,61 +332,125 @@ fn sendInThread(args: SendArgs) void {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOCKS4a Protocol
+// SOCKS5 Protocol (RFC 1928)
 // ═══════════════════════════════════════════════════════════════════════════
 
-const SOCKS_VER: u8 = 0x04;
+const SOCKS_VER: u8 = 0x05;
 const SOCKS_CMD_CONNECT: u8 = 0x01;
-const SOCKS_REP_OK: u8 = 0x5a;
-const SOCKS_REP_REJECTED: u8 = 0x5b;
+const SOCKS_AUTH_NOAUTH: u8 = 0x00;
+const SOCKS_AUTH_NONE_ACCEPTABLE: u8 = 0xff;
+const SOCKS_ATYP_IPV4: u8 = 0x01;
+const SOCKS_ATYP_DOMAIN: u8 = 0x03;
+const SOCKS_REP_OK: u8 = 0x00;
+const SOCKS_REP_GENERAL_FAILURE: u8 = 0x01;
 
 /// 单个连接的最大 hostname 长度。
 pub const MAX_HOSTNAME: usize = 256;
 
-pub const Socks4Request = struct {
+pub const Socks5Request = struct {
     hostname: []const u8,
     port: u16,
 };
 
-/// 栈分配的 SOCKS4a 请求读取结果。hostname 指向调用者缓冲区。
-pub const Socks4RequestBuf = struct {
+/// 栈分配的 SOCKS5 请求读取结果。hostname 指向调用者缓冲区。
+pub const Socks5RequestBuf = struct {
     hostname: []const u8,
     port: u16,
 };
 
-/// 读取 SOCKS4a 请求到调用者提供的缓冲区，不发回复。
-/// 将 hostname 写入 buf，返回 Socks4RequestBuf（hostname 切片指向 buf）。
-pub fn socks4ReadRequestBuf(fd: std.posix.socket_t, buf: []u8) !Socks4RequestBuf {
-    // 读取固定头: VER(1) CMD(1) DSTPORT(2) DSTIP(4) = 8 bytes
-    var hdr: [8]u8 = undefined;
+/// SOCKS5 认证协商（服务端）：读取客户端 method 列表，选择 NO AUTH。
+fn socks5AuthAccept(fd: std.posix.socket_t) !void {
+    // 读取 VER(1) + NMETHODS(1)
+    var auth_hdr: [2]u8 = undefined;
     var off: usize = 0;
-    while (off < 8) {
-        const n = sockRead(fd, hdr[off..].ptr, hdr.len - off);
-        if (sockIsError(n) or n == 0) return error.Socks4HeaderTooShort;
+    while (off < 2) {
+        const n = sockRead(fd, auth_hdr[off..].ptr, auth_hdr.len - off);
+        if (sockIsError(n) or n == 0) return error.Socks5AuthFailed;
         off += @intCast(n);
     }
-    if (hdr[0] != SOCKS_VER) return error.Socks4BadVersion;
-    if (hdr[1] != SOCKS_CMD_CONNECT) return error.Socks4BadCommand;
+    if (auth_hdr[0] != SOCKS_VER) return error.Socks5BadVersion;
+    const nmethods = auth_hdr[1];
 
-    const dst_port = std.mem.readInt(u16, hdr[2..4], .big);
-    const dst_ip3 = hdr[7]; // SOCKS4a: DSTIP[3] != 0
-
-    // 跳过 USERID（读入临时缓冲后丢弃）
-    var userid_buf: [256]u8 = undefined;
-    _ = try readUntilNullBuf(fd, userid_buf[0..]);
-
-    // SOCKS4a: 如果 DSTIP[3] != 0，读取目标 hostname 到调用者 buf
-    if (dst_ip3 != 0) {
-        const hn = try readUntilNullBuf(fd, buf);
-        if (hn.len == 0 or hn.len > MAX_HOSTNAME) return error.Socks4BadHostname;
-        return Socks4RequestBuf{ .hostname = hn, .port = dst_port };
+    // 读取 method 列表
+    var methods: [256]u8 = undefined;
+    if (nmethods > 0) {
+        off = 0;
+        while (off < nmethods) {
+            const n = sockRead(fd, methods[off..].ptr, nmethods - off);
+            if (sockIsError(n) or n == 0) return error.Socks5AuthFailed;
+            off += @intCast(n);
+        }
     }
-    return error.Socks4aRequired;
+
+    // 检查是否提供了 NO AUTH
+    const found_noauth = for (methods[0..nmethods]) |m| {
+        if (m == SOCKS_AUTH_NOAUTH) break true;
+    } else false;
+
+    if (!found_noauth) {
+        const resp = [_]u8{ SOCKS_VER, SOCKS_AUTH_NONE_ACCEPTABLE };
+        _ = sockWrite(fd, &resp, resp.len);
+        return error.Socks5AuthNoMethod;
+    }
+
+    // 接受 NO AUTH
+    const resp = [_]u8{ SOCKS_VER, SOCKS_AUTH_NOAUTH };
+    const n = sockWrite(fd, &resp, resp.len);
+    if (n != resp.len) return error.Socks5AuthFailed;
 }
 
-/// 发送 SOCKS4a 连接请求到目标地址。
+/// 读取 SOCKS5 请求到调用者提供的缓冲区，不发回复。
+/// 内部完成认证协商 + 请求解析。hostname 写入 buf，返回 Socks5RequestBuf。
+pub fn socks5ReadRequestBuf(fd: std.posix.socket_t, buf: []u8) !Socks5RequestBuf {
+    // Phase 1: SOCKS5 auth negotiation
+    try socks5AuthAccept(fd);
+
+    // Phase 2: 读取请求头: VER(1) CMD(1) RSV(1) ATYP(1) = 4 bytes
+    var hdr: [4]u8 = undefined;
+    var off: usize = 0;
+    while (off < 4) {
+        const n = sockRead(fd, hdr[off..].ptr, hdr.len - off);
+        if (sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+        off += @intCast(n);
+    }
+    if (hdr[0] != SOCKS_VER) return error.Socks5BadVersion;
+    if (hdr[1] != SOCKS_CMD_CONNECT) return error.Socks5BadCommand;
+    if (hdr[3] != SOCKS_ATYP_DOMAIN) return error.Socks5DomainRequired;
+
+    // Phase 3: 读取 hostname 长度 (1 byte) + hostname
+    var len_byte: u8 = undefined;
+    off = 0;
+    while (off < 1) {
+        const n = sockRead(fd, @as([*]u8, @ptrCast(&len_byte)), 1);
+        if (sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+        off += @intCast(n);
+    }
+    if (len_byte == 0 or len_byte > MAX_HOSTNAME) return error.Socks5BadHostname;
+
+    off = 0;
+    while (off < len_byte) {
+        const n = sockRead(fd, buf[off..].ptr, len_byte - off);
+        if (sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+        off += @intCast(n);
+    }
+    const hostname = buf[0..len_byte];
+
+    // Phase 4: 读取 port (2 bytes BE)
+    var port_buf: [2]u8 = undefined;
+    off = 0;
+    while (off < 2) {
+        const n = sockRead(fd, port_buf[off..].ptr, port_buf.len - off);
+        if (sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+        off += @intCast(n);
+    }
+    const dst_port = std.mem.readInt(u16, &port_buf, .big);
+
+    return Socks5RequestBuf{ .hostname = hostname, .port = dst_port };
+}
+
+/// 发送 SOCKS5 连接请求到目标地址（含认证协商）。
 /// 返回连接成功后的 TCP socket fd（调用者负责关闭）。
-pub fn socks4Connect(
+pub fn socks5Connect(
     io: std.Io,
     target_ip: std.Io.net.IpAddress,
     target_hostname: []const u8,
@@ -397,135 +461,140 @@ pub fn socks4Connect(
     };
     errdefer stream.close(io);
 
-    // SOCKS4a 请求: VER CMD PORT DSTIP(=0.0.0.1 for 4a) USERID\0 HOSTNAME\0
-    var req_buf: [300]u8 = undefined;
-    var pos: usize = 0;
-
-    req_buf[pos] = SOCKS_VER;
-    pos += 1;
-    req_buf[pos] = SOCKS_CMD_CONNECT;
-    pos += 1;
-    std.mem.writeInt(u16, req_buf[pos..][0..2], target_port, .big);
-    pos += 2;
-    // SOCKS4a: DSTIP = 0.0.0.1（后面跟 hostname）
-    req_buf[pos..][0..4].* = .{ 0, 0, 0, 1 };
-    pos += 4;
-    // USERID（空字符串，以 \0 结束）
-    req_buf[pos] = 0;
-    pos += 1;
-    // HOSTNAME（null-terminated）
-    @memcpy(req_buf[pos..][0..target_hostname.len], target_hostname);
-    pos += target_hostname.len;
-    req_buf[pos] = 0;
-    pos += 1;
-
     const fd = stream.socket.handle;
-    const w1 = sockWrite(fd, &req_buf, pos);
-    if (w1 != pos) {
-        stream.close(io);
-        return error.Socks4SendFailed;
-    }
+    try socks5SendRequest(fd, target_hostname, target_port);
 
-    // 读取 SOCKS4 响应: VER(1) REP(1) DSTPORT(2) DSTIP(4) = 8 bytes
-    var resp: [8]u8 = undefined;
+    // 读取 SOCKS5 响应: VER(1) REP(1) RSV(1) ATYP(1) BND.ADDR(var) BND.PORT(2)
+    // 最少 10 bytes（ATYP=IPv4 时）
+    var resp: [10]u8 = undefined;
     var off: usize = 0;
-    while (off < 8) {
+    while (off < 10) {
         const n = sockRead(fd, resp[off..].ptr, resp.len - off);
         if (n == 0) {
             stream.close(io);
-            return error.Socks4ResponseTooShort;
+            return error.Socks5ResponseTooShort;
         }
         off += @intCast(n);
     }
-    if (resp[0] != 0x00) {
+    if (resp[0] != SOCKS_VER) {
         stream.close(io);
-        return error.Socks4BadVersion;
+        return error.Socks5BadVersion;
     }
     if (resp[1] != SOCKS_REP_OK) {
         stream.close(io);
-        if (resp[1] == SOCKS_REP_REJECTED) return error.Socks4Rejected;
-        return error.Socks4Failed;
+        return error.Socks5Rejected;
     }
 
     return stream;
 }
 
-/// 从已 accept 的 TCP socket 读取 SOCKS4a 请求，检查 hostname 是否匹配。
+/// 从已 accept 的 TCP socket 读取 SOCKS5 请求（含认证协商），检查 hostname 是否匹配。
 /// 匹配则发送 OK 响应并返回 true，否则发送拒绝响应并返回 false。
-pub fn socks4CheckAndReply(fd: std.posix.socket_t, self_hostname: []const u8) !bool {
-    var buf: [MAX_HOSTNAME + 1]u8 = undefined;
-    const req = try socks4ReadRequestBuf(fd, buf[0..]);
+pub fn socks5CheckAndReply(fd: std.posix.socket_t, self_hostname: []const u8) !bool {
+    var buf: [MAX_HOSTNAME]u8 = undefined;
+    const req = try socks5ReadRequestBuf(fd, buf[0..]);
     if (std.mem.eql(u8, req.hostname, self_hostname)) {
-        socks4ReplyOk(fd);
+        socks5ReplyOk(fd);
         return true;
     }
-    socks4ReplyRejected(fd);
+    socks5ReplyRejected(fd);
     return false;
 }
 
-/// 读取 SOCKS4a 请求（仅用于测试）。
-/// 返回的 Socks4Request.hostname 由 allocator 分配，调用者负责释放。
-/// 生产代码请使用 socks4CheckAndReply。
-pub fn socks4Accept(fd: std.posix.socket_t, allocator: std.mem.Allocator) !Socks4Request {
-    // 读取固定头: VER(1) CMD(1) DSTPORT(2) DSTIP(4) = 8 bytes
-    var hdr: [8]u8 = undefined;
+/// 读取 SOCKS5 请求（含认证协商，仅用于测试）。
+/// 返回的 Socks5Request.hostname 由 allocator 分配，调用者负责释放。
+/// 生产代码请使用 socks5CheckAndReply 或 socks5ReadRequestBuf。
+pub fn socks5Accept(fd: std.posix.socket_t, allocator: std.mem.Allocator) !Socks5Request {
+    // Phase 1: SOCKS5 auth negotiation
+    try socks5AuthAccept(fd);
+
+    // Phase 2: 读取请求头: VER(1) CMD(1) RSV(1) ATYP(1) = 4 bytes
+    var hdr: [4]u8 = undefined;
     var off: usize = 0;
-    while (off < 8) {
+    while (off < 4) {
         const n = sockRead(fd, hdr[off..].ptr, hdr.len - off);
-        if (sockIsError(n) or n == 0) return error.Socks4HeaderTooShort;
+        if (sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
         off += @intCast(n);
     }
-    if (hdr[0] != SOCKS_VER) return error.Socks4BadVersion;
-    if (hdr[1] != SOCKS_CMD_CONNECT) return error.Socks4BadCommand;
+    if (hdr[0] != SOCKS_VER) return error.Socks5BadVersion;
+    if (hdr[1] != SOCKS_CMD_CONNECT) return error.Socks5BadCommand;
+    if (hdr[3] != SOCKS_ATYP_DOMAIN) return error.Socks5DomainRequired;
 
-    const dst_port = std.mem.readInt(u16, hdr[2..4], .big);
-    const dst_ip3 = hdr[7]; // SOCKS4a: DSTIP[3] != 0
-
-    // 跳过 USERID（读入临时缓冲后丢弃）
-    var userid_buf: [256]u8 = undefined;
-    _ = try readUntilNullBuf(fd, userid_buf[0..]);
-
-    // SOCKS4a: 如果 DSTIP[3] != 0，读取目标 hostname
-    if (dst_ip3 != 0) {
-        var hn_buf: [MAX_HOSTNAME + 1]u8 = undefined;
-        const hn = try readUntilNullBuf(fd, hn_buf[0..]);
-        if (hn.len == 0 or hn.len > MAX_HOSTNAME) return error.Socks4BadHostname;
-        return Socks4Request{ .hostname = try allocator.dupe(u8, hn), .port = dst_port };
+    // Phase 3: 读取 hostname 长度 (1 byte) + hostname
+    var len_byte: u8 = undefined;
+    off = 0;
+    while (off < 1) {
+        const n = sockRead(fd, @as([*]u8, @ptrCast(&len_byte)), 1);
+        if (sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+        off += @intCast(n);
     }
-    return error.Socks4aRequired;
+    if (len_byte == 0 or len_byte > MAX_HOSTNAME) return error.Socks5BadHostname;
+
+    var hn_buf: [MAX_HOSTNAME]u8 = undefined;
+    off = 0;
+    while (off < len_byte) {
+        const n = sockRead(fd, hn_buf[off..].ptr, len_byte - off);
+        if (sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+        off += @intCast(n);
+    }
+    const hn = hn_buf[0..len_byte];
+
+    // Phase 4: 读取 port (2 bytes BE)
+    var port_buf: [2]u8 = undefined;
+    off = 0;
+    while (off < 2) {
+        const n = sockRead(fd, port_buf[off..].ptr, port_buf.len - off);
+        if (sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+        off += @intCast(n);
+    }
+    const dst_port = std.mem.readInt(u16, &port_buf, .big);
+
+    return Socks5Request{ .hostname = try allocator.dupe(u8, hn), .port = dst_port };
 }
 
-/// 发送 SOCKS4 成功响应。
-pub fn socks4ReplyOk(fd: std.posix.socket_t) void {
-    const resp = [_]u8{ 0x00, SOCKS_REP_OK, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+/// 发送 SOCKS5 成功响应（10 bytes）。
+pub fn socks5ReplyOk(fd: std.posix.socket_t) void {
+    const resp = [_]u8{
+        SOCKS_VER, SOCKS_REP_OK, // VER, REP=success
+        0x00, // RSV
+        SOCKS_ATYP_IPV4, // ATYP=IPv4
+        0x00, 0x00, 0x00, 0x00, // BND.ADDR = 0.0.0.0
+        0x00, 0x00, // BND.PORT = 0
+    };
     _ = sockWrite(fd, &resp, resp.len);
 }
 
-/// 发送 SOCKS4 拒绝响应。
-pub fn socks4ReplyRejected(fd: std.posix.socket_t) void {
-    const resp = [_]u8{ 0x00, SOCKS_REP_REJECTED, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+/// 发送 SOCKS5 拒绝响应（10 bytes）。
+pub fn socks5ReplyRejected(fd: std.posix.socket_t) void {
+    const resp = [_]u8{
+        SOCKS_VER, SOCKS_REP_GENERAL_FAILURE, // VER, REP=failure
+        0x00, // RSV
+        SOCKS_ATYP_IPV4, // ATYP=IPv4
+        0x00, 0x00, 0x00, 0x00, // BND.ADDR = 0.0.0.0
+        0x00, 0x00, // BND.PORT = 0
+    };
     _ = sockWrite(fd, &resp, resp.len);
 }
 
-/// SOCKS4a 链式转发：连接下一跳节点，发送原始 SOCKS4a 请求，成功后 relay。
+/// SOCKS5 链式转发：连接下一跳节点，发送 SOCKS5 请求，成功后 relay。
 /// 失败时发送拒绝响应给原始客户端。此函数不返回（void），适合在线程中调用。
-pub fn socks4Forward(
+pub fn socks5Forward(
     io: std.Io,
     client_fd: std.posix.socket_t,
     next_hop_ip: std.Io.net.IpAddress,
     target_hostname: []const u8,
     target_port: u16,
 ) void {
-    const stream = socks4Connect(io, next_hop_ip, target_hostname, target_port) catch {
-        socks4ReplyRejected(client_fd);
+    const stream = socks5Connect(io, next_hop_ip, target_hostname, target_port) catch {
+        socks5ReplyRejected(client_fd);
         sockClose(client_fd);
         return;
     };
     const next_fd = stream.socket.handle;
-    // 不 close stream — fd 所有权转移给 socks4Relay
+    // 不 close stream — fd 所有权转移给 socks5Relay
 
-    socks4ReplyOk(client_fd);
-    socks4Relay(client_fd, next_fd);
+    socks5ReplyOk(client_fd);
+    socks5Relay(client_fd, next_fd);
     sockClose(client_fd);
     sockClose(next_fd);
 }
@@ -535,16 +604,16 @@ pub fn socks4Forward(
 ///
 /// 使用原始 socket API（而非 Zig Io.net）确保返回的 fd 与 client_fd
 /// 类型一致。Windows：Winsock2 SOCKET vs AFD 句柄不兼容。
-pub fn socks4LocalRelay(io: std.Io, client_fd: std.posix.socket_t, target_port: u16) void {
+pub fn socks5LocalRelay(io: std.Io, client_fd: std.posix.socket_t, target_port: u16) void {
     _ = io; // unused — raw sockets don't need Zig Io
     const local_fd = sockConnectLocalhost(target_port) catch {
-        socks4ReplyRejected(client_fd);
+        socks5ReplyRejected(client_fd);
         sockClose(client_fd);
         return;
     };
 
-    socks4ReplyOk(client_fd);
-    socks4Relay(client_fd, local_fd);
+    socks5ReplyOk(client_fd);
+    socks5Relay(client_fd, local_fd);
     sockClose(client_fd);
     sockClose(local_fd);
 }
@@ -585,55 +654,54 @@ fn sockConnectLocalhost(port: u16) !socket_t {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SOCKS4a 辅助函数
+// SOCKS5 辅助函数
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// 逐字节读取直到遇到 null 字节。将数据写入调用者提供的 buf，返回实际内容切片。
-/// buf 必须足够大以容纳完整字段（建议至少 256 字节）。
-fn readUntilNullBuf(fd: std.posix.socket_t, buf: []u8) ![]const u8 {
-    var pos: usize = 0;
-    while (pos < buf.len) {
-        var byte: u8 = undefined;
-        const n = sockRead(fd, @as([*]u8, @ptrCast(&byte)), 1);
-        if (sockIsError(n) or n == 0) return buf[0..pos];
-        if (byte == 0) return buf[0..pos];
-        buf[pos] = byte;
-        pos += 1;
+/// 发送 SOCKS5 认证协商 + 连接请求（内部使用，通过 raw fd）。
+fn socks5SendRequest(fd: std.posix.socket_t, hostname: []const u8, port: u16) !void {
+    // Step 1: 发送认证协商 [0x05, 0x01, 0x00]（VER, 1 method, NO AUTH）
+    const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+    const n1 = sockWrite(fd, &auth, auth.len);
+    if (n1 != auth.len) return error.Socks5SendFailed;
+
+    // Step 2: 读取认证响应 [0x05, 0x00]
+    var auth_resp: [2]u8 = undefined;
+    var off: usize = 0;
+    while (off < 2) {
+        const n = sockRead(fd, auth_resp[off..].ptr, auth_resp.len - off);
+        if (sockIsError(n) or n == 0) return error.Socks5AuthFailed;
+        off += @intCast(n);
     }
-    return buf[0..pos];
-}
+    if (auth_resp[0] != SOCKS_VER or auth_resp[1] != SOCKS_AUTH_NOAUTH) {
+        return error.Socks5AuthFailed;
+    }
 
-/// 发送 SOCKS4a 连接请求（内部使用，通过 raw fd）。
-fn socks4SendRequest(fd: std.posix.socket_t, hostname: []const u8, port: u16) !void {
-    var req: [300]u8 = undefined;
+    // Step 3: 构建并发送 SOCKS5 请求
+    // VER(1) CMD(1) RSV(1) ATYP(1) LEN(1) HOSTNAME(N) PORT(2)
+    var req: [270]u8 = undefined;
     var pos: usize = 0;
-
     req[pos] = SOCKS_VER;
     pos += 1;
     req[pos] = SOCKS_CMD_CONNECT;
     pos += 1;
-    std.mem.writeInt(u16, req[pos..][0..2], port, .big);
-    pos += 2;
-    // SOCKS4a: DSTIP = 0.0.0.1
-    @memset(req[pos..][0..4], 0);
-    req[pos + 3] = 1;
-    pos += 4;
-    // USERID = "" (null only)
-    req[pos] = 0;
+    req[pos] = 0x00;
+    pos += 1; // RSV
+    req[pos] = SOCKS_ATYP_DOMAIN;
     pos += 1;
-    // HOSTNAME
+    req[pos] = @truncate(hostname.len);
+    pos += 1; // 1-byte hostname length
     @memcpy(req[pos..][0..hostname.len], hostname);
     pos += hostname.len;
-    req[pos] = 0;
-    pos += 1;
+    std.mem.writeInt(u16, req[pos..][0..2], port, .big);
+    pos += 2;
 
-    const n = sockWrite(fd, &req, pos);
-    if (n != pos) return error.Socks4SendFailed;
+    const n2 = sockWrite(fd, &req, pos);
+    if (n2 != pos) return error.Socks5SendFailed;
 }
 
 /// 双向中继：A ↔ B。两个线程各负责一个方向。
 /// 一侧关闭时 shutdown 对端写端，避免半开连接。
-pub fn socks4Relay(a_fd: std.posix.socket_t, b_fd: std.posix.socket_t) void {
+pub fn socks5Relay(a_fd: std.posix.socket_t, b_fd: std.posix.socket_t) void {
     var a_to_b_done = std.atomic.Value(bool).init(false);
 
     const relay_thread = std.Thread.spawn(.{}, relayDir, .{ b_fd, a_fd, &a_to_b_done }) catch return;
@@ -664,7 +732,7 @@ fn relayDir(src: std.posix.socket_t, dst: std.posix.socket_t, done: *std.atomic.
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Connection — TCP + SOCKS4 连接抽象
+// Connection — TCP + SOCKS5 连接抽象
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Connection = struct {
@@ -863,7 +931,7 @@ pub const TcpListener = struct {
     }
 
     /// 接受一个 TCP 连接，返回 raw socket fd。
-    /// SOCKS4a 握手和 dispatch 由调用方处理（guest.zig / host.zig）。
+    /// SOCKS5 握手和 dispatch 由调用方处理（guest.zig / host.zig）。
     pub fn acceptRaw(self: *TcpListener) !std.posix.socket_t {
         while (true) {
             if (self.use_raw_accept) {
@@ -880,15 +948,15 @@ pub const TcpListener = struct {
         }
     }
 
-    /// 接受一个 TCP 连接，完成 SOCKS4a 握手，返回 Connection。
+    /// 接受一个 TCP 连接，完成 SOCKS5 握手，返回 Connection。
     /// 只有目标是 self_hostname 才接受，否则拒绝并返回错误。
     pub fn accept(self: *TcpListener, self_hostname: []const u8) !Connection {
         while (true) {
             const fd = try self.acceptRaw();
 
-            // SOCKS4a 握手
-            const accepted = socks4CheckAndReply(fd, self_hostname) catch |err| {
-                std.log.err("[tcp] socks4CheckAndReply failed: {}", .{err});
+            // SOCKS5 握手
+            const accepted = socks5CheckAndReply(fd, self_hostname) catch |err| {
+                std.log.err("[tcp] socks5CheckAndReply failed: {}", .{err});
                 sockClose(fd);
                 continue;
             };
@@ -898,7 +966,7 @@ pub const TcpListener = struct {
                 return Connection{ .fd = fd, .alive = true };
             }
 
-            // 目标不是自己 — 已由 socks4CheckAndReply 发送拒绝响应
+            // 目标不是自己 — 已由 socks5CheckAndReply 发送拒绝响应
             std.log.info("[tcp] rejected relay target (not self={s})", .{self_hostname});
             sockClose(fd);
         }
@@ -909,7 +977,7 @@ pub const TcpListener = struct {
 // Host 端 — Connector
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// 连接到 Guest 并完成 SOCKS4a 握手，返回 Connection。
+/// 连接到 Guest 并完成 SOCKS5 握手，返回 Connection。
 pub fn hostConnect(io: std.Io, guest_ip: []const u8, guest_hostname: []const u8, port: u16) !Connection {
     const addr = std.Io.net.IpAddress.parse(guest_ip, port) catch |err| {
         std.log.err("[tcp] parse guest IP '{s}' failed: {}", .{ guest_ip, err });
@@ -926,25 +994,25 @@ pub fn hostConnect(io: std.Io, guest_ip: []const u8, guest_hostname: []const u8,
         stream.close(io);
     }
 
-    // 发送 SOCKS4a 请求
-    try socks4SendRequest(fd, guest_hostname, port);
+    // 发送 SOCKS5 认证 + 请求
+    try socks5SendRequest(fd, guest_hostname, port);
 
-    // 读取 SOCKS4 响应
-    var resp: [8]u8 = undefined;
+    // 读取 SOCKS5 响应（10 bytes）
+    var resp: [10]u8 = undefined;
     var off: usize = 0;
-    while (off < 8) {
+    while (off < 10) {
         const n = sockRead(fd, resp[off..].ptr, resp.len - off);
         if (n == 0) {
             stream.close(io);
-            return error.Socks4ResponseTooShort;
+            return error.Socks5ResponseTooShort;
         }
         off += @intCast(n);
     }
 
     if (resp[1] != SOCKS_REP_OK) {
         stream.close(io);
-        std.log.err("[tcp] SOCKS4 rejected by {s}", .{guest_hostname});
-        return error.Socks4Rejected;
+        std.log.err("[tcp] SOCKS5 rejected by {s}", .{guest_hostname});
+        return error.Socks5Rejected;
     }
 
     // 不关闭 stream — fd 所有权转移给 Connection
@@ -1027,108 +1095,135 @@ test "recvFrame multiple frames" {
     try std.testing.expectEqualStrings("second", r2);
 }
 
-// ── SOCKS4a 协议测试 ──
+// ── SOCKS5 协议测试 ──
 
-test "socks4a handshake round-trip" {
+test "socks5 handshake round-trip" {
     const pair = try makePair();
     defer {
         sockClose(pair.a);
         sockClose(pair.b);
     }
 
-    // 客户端线程：发送 SOCKS4a 请求 → 验证响应
+    // 客户端线程：发送 SOCKS5 认证 + 请求 → 验证响应
     const client_thread = try std.Thread.spawn(.{}, struct {
         fn run(fd: std.posix.socket_t) void {
+            // Auth: [0x05, 0x01, 0x00]
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = sockWrite(fd, &auth, auth.len);
+            // 读取 auth 响应
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+            std.debug.assert(auth_resp[0] == SOCKS_VER);
+            std.debug.assert(auth_resp[1] == SOCKS_AUTH_NOAUTH);
+
+            // Request: VER CMD RSV ATYP=0x03 LEN=4 "test" PORT=2121
             const req = [_]u8{
                 SOCKS_VER, SOCKS_CMD_CONNECT, // VER, CMD
+                0x00, // RSV
+                SOCKS_ATYP_DOMAIN, // ATYP=domain
+                4, // hostname len
+                't',  'e',  's',  't', // HOSTNAME
                 0x08, 0x49, // PORT = 2121
-                0x00, 0x00, 0x00, 0x01, // DSTIP = 0.0.0.1 (SOCKS4a)
-                0, // USERID = "" (null only)
-                't',  'e',  's',  't',  0, // HOSTNAME
             };
             _ = sockWrite(fd, &req, req.len);
 
-            var resp: [8]u8 = [_]u8{0} ** 8;
+            var resp: [10]u8 = [_]u8{0} ** 10;
             var off: usize = 0;
-            while (off < 8) {
+            while (off < 10) {
                 const n = sockRead(fd, resp[off..].ptr, resp.len - off);
                 if (n == 0) break;
                 off += @intCast(n);
             }
             if (off >= 2) {
-                std.debug.assert(resp[0] == 0x00);
+                std.debug.assert(resp[0] == SOCKS_VER);
                 std.debug.assert(resp[1] == SOCKS_REP_OK);
             }
         }
     }.run, .{pair.b});
     defer client_thread.join();
 
-    // 服务端：accept → 读取 SOCKS4a 请求 → 发回应
-    const request = try socks4Accept(pair.a, std.testing.allocator);
+    // 服务端：accept → 读取 SOCKS5 请求 → 发回应
+    const request = try socks5Accept(pair.a, std.testing.allocator);
     defer std.testing.allocator.free(request.hostname);
     try std.testing.expectEqualStrings("test", request.hostname);
     try std.testing.expectEqual(@as(u16, 2121), request.port);
 
-    socks4ReplyOk(pair.a);
+    socks5ReplyOk(pair.a);
 }
 
-test "socks4ReplyRejected" {
+test "socks5ReplyRejected" {
     const pair = try makePair();
     defer {
         sockClose(pair.a);
         sockClose(pair.b);
     }
 
-    socks4ReplyRejected(pair.a);
+    socks5ReplyRejected(pair.a);
 
-    var resp: [8]u8 = [_]u8{0} ** 8;
+    var resp: [10]u8 = [_]u8{0} ** 10;
     var off: usize = 0;
-    while (off < 8) {
+    while (off < 10) {
         const n = sockRead(pair.b, resp[off..].ptr, resp.len - off);
         if (n == 0) break;
         off += @intCast(n);
     }
-    try std.testing.expect(resp[1] == SOCKS_REP_REJECTED);
+    try std.testing.expect(resp[1] == SOCKS_REP_GENERAL_FAILURE);
 }
 
-test "socks4CheckAndReply matching hostname" {
+test "socks5CheckAndReply matching hostname" {
     const pair = try makePair();
     defer {
         sockClose(pair.a);
         sockClose(pair.b);
     }
 
-    // 客户端线程：发送正确 hostname 的 SOCKS4a 请求
+    // 客户端线程：发送正确 hostname 的 SOCKS5 请求
     const client_thread = try std.Thread.spawn(.{}, struct {
         fn run(fd: std.posix.socket_t) void {
+            // Auth
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = sockWrite(fd, &auth, auth.len);
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+
+            // Request: hostname="self"
             const req = [_]u8{
                 SOCKS_VER, SOCKS_CMD_CONNECT,
+                0x00, SOCKS_ATYP_DOMAIN,
+                4, 's', 'e', 'l', 'f',
                 0x08, 0x49, // PORT = 2121
-                0x00, 0x00, 0x00, 0x01, // SOCKS4a
-                0, // USERID = ""
-                's',  'e',  'l',  'f',  0, // HOSTNAME
             };
             _ = sockWrite(fd, &req, req.len);
 
-            var resp: [8]u8 = [_]u8{0} ** 8;
+            var resp: [10]u8 = [_]u8{0} ** 10;
             var off: usize = 0;
-            while (off < 8) {
+            while (off < 10) {
                 const n = sockRead(fd, resp[off..].ptr, resp.len - off);
                 if (n == 0) break;
                 off += @intCast(n);
             }
-            std.debug.assert(resp[0] == 0x00);
+            std.debug.assert(resp[0] == SOCKS_VER);
             std.debug.assert(resp[1] == SOCKS_REP_OK);
         }
     }.run, .{pair.b});
     defer client_thread.join();
 
-    // 服务端：socks4CheckAndReply 应匹配 "self" 返回 true + 发送 OK
-    const accepted = try socks4CheckAndReply(pair.a, "self");
+    // 服务端：socks5CheckAndReply 应匹配 "self" 返回 true + 发送 OK
+    const accepted = try socks5CheckAndReply(pair.a, "self");
     try std.testing.expect(accepted);
 }
 
-test "socks4CheckAndReply mismatched hostname" {
+test "socks5CheckAndReply mismatched hostname" {
     const pair = try makePair();
     defer {
         sockClose(pair.a);
@@ -1138,87 +1233,42 @@ test "socks4CheckAndReply mismatched hostname" {
     // 客户端线程：发送 "intruder" hostname
     const client_thread = try std.Thread.spawn(.{}, struct {
         fn run(fd: std.posix.socket_t) void {
+            // Auth
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = sockWrite(fd, &auth, auth.len);
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+
+            // Request: hostname="intruder"
             const req = [_]u8{
                 SOCKS_VER, SOCKS_CMD_CONNECT,
+                0x00, SOCKS_ATYP_DOMAIN,
+                8, 'i', 'n', 't', 'r', 'u', 'd', 'e', 'r',
                 0x08, 0x49,
-                0x00, 0x00, 0x00, 0x01,
-                0,
-                'i',  'n',  't',  'r',  'u',  'd',  'e',  'r',  0,
             };
             _ = sockWrite(fd, &req, req.len);
 
-            var resp: [8]u8 = [_]u8{0} ** 8;
+            var resp: [10]u8 = [_]u8{0} ** 10;
             var off: usize = 0;
-            while (off < 8) {
+            while (off < 10) {
                 const n = sockRead(fd, resp[off..].ptr, resp.len - off);
                 if (n == 0) break;
                 off += @intCast(n);
             }
-            std.debug.assert(resp[0] == 0x00);
-            std.debug.assert(resp[1] == SOCKS_REP_REJECTED);
+            std.debug.assert(resp[0] == SOCKS_VER);
+            std.debug.assert(resp[1] == SOCKS_REP_GENERAL_FAILURE);
         }
     }.run, .{pair.b});
     defer client_thread.join();
 
-    // 服务端：socks4CheckAndReply 应不匹配并返回 false + 发送拒绝
-    const accepted = try socks4CheckAndReply(pair.a, "self");
+    // 服务端：socks5CheckAndReply 应不匹配并返回 false + 发送拒绝
+    const accepted = try socks5CheckAndReply(pair.a, "self");
     try std.testing.expect(!accepted);
-}
-
-test "readUntilNullBuf basic" {
-    const pair = try makePair();
-    defer {
-        sockClose(pair.a);
-        sockClose(pair.b);
-    }
-
-    // 写入 "hello\0world\0"
-    const data = [_]u8{ 'h', 'e', 'l', 'l', 'o', 0, 'w', 'o', 'r', 'l', 'd', 0 };
-    _ = sockWrite(pair.b, &data, data.len);
-
-    var buf: [64]u8 = undefined;
-    const first = try readUntilNullBuf(pair.a, buf[0..]);
-    try std.testing.expectEqualStrings("hello", first);
-
-    const second = try readUntilNullBuf(pair.a, buf[0..]);
-    try std.testing.expectEqualStrings("world", second);
-}
-
-test "readUntilNullBuf empty field" {
-    const pair = try makePair();
-    defer {
-        sockClose(pair.a);
-        sockClose(pair.b);
-    }
-
-    // 写入空字段 "\0test\0"
-    const data = [_]u8{ 0, 't', 'e', 's', 't', 0 };
-    _ = sockWrite(pair.b, &data, data.len);
-
-    var buf: [64]u8 = undefined;
-    const first = try readUntilNullBuf(pair.a, buf[0..]);
-    try std.testing.expectEqual(@as(usize, 0), first.len);
-
-    const second = try readUntilNullBuf(pair.a, buf[0..]);
-    try std.testing.expectEqualStrings("test", second);
-}
-
-test "readUntilNullBuf buffer overflow" {
-    const pair = try makePair();
-    defer {
-        sockClose(pair.a);
-        sockClose(pair.b);
-    }
-
-    // 写入超过小缓冲区的数据（无 null）
-    var over: [32]u8 = undefined;
-    @memset(&over, 'x');
-    _ = sockWrite(pair.b, &over, over.len);
-
-    // 小缓冲区 — 应填满后返回
-    var buf: [8]u8 = undefined;
-    const result = try readUntilNullBuf(pair.a, buf[0..]);
-    try std.testing.expectEqual(buf.len, result.len);
 }
 
 // ── Connection 测试 ──
@@ -1256,7 +1306,7 @@ test "Connection recv detects close" {
 
 // ── EAGAIN 回归测试 — 非阻塞 socket 上的 I/O 重试 ──
 // 这些测试验证 sockRead/sockWrite 在非阻塞 socket 上正确重试 EAGAIN，
-// 以及依赖它们的 sendFrame/recvFrame/recvExact/socks4CheckAndReply 等。
+// 以及依赖它们的 sendFrame/recvFrame/recvExact/socks5CheckAndReply 等。
 // Bug 背景：macOS kqueue 非阻塞 socket 上 system.read() 返回 EAGAIN 时，
 // 旧代码直接当作错误处理，导致连接挂起/数据丢失。
 
@@ -1332,55 +1382,50 @@ test "recvExact handles partial reads on non-blocking socket" {
     try std.testing.expectEqualStrings(data, buf[0..n]);
 }
 
-test "socks4CheckAndReply on non-blocking socket" {
+test "socks5CheckAndReply on non-blocking socket" {
     const pair = try makeNonBlockingPair();
     defer {
         sockClose(pair.a);
         sockClose(pair.b);
     }
 
-    // 客户端线程发送 SOCKS4a 请求（hostname="nbself"）
+    // 客户端线程发送 SOCKS5 认证+请求（hostname="nbself"）
     const client_thread = try std.Thread.spawn(.{}, struct {
         fn run(fd: std.posix.socket_t) void {
+            // Auth
+            const auth = [_]u8{ SOCKS_VER, 1, SOCKS_AUTH_NOAUTH };
+            _ = sockWrite(fd, &auth, auth.len);
+            var auth_resp: [2]u8 = [_]u8{0} ** 2;
+            var aoff: usize = 0;
+            while (aoff < 2) {
+                const n = sockRead(fd, auth_resp[aoff..].ptr, auth_resp.len - aoff);
+                if (n == 0) break;
+                aoff += @intCast(n);
+            }
+
+            // Request: hostname="nbself"
             const req = [_]u8{
                 SOCKS_VER, SOCKS_CMD_CONNECT,
+                0x00, SOCKS_ATYP_DOMAIN,
+                6, 'n', 'b', 's', 'e', 'l', 'f',
                 0x08, 0x49, // PORT = 2121
-                0x00, 0x00, 0x00, 0x01, // SOCKS4a
-                0, // USERID = ""
-                'n',  'b',  's',  'e',  'l',  'f',  0, // HOSTNAME
             };
             _ = sockWrite(fd, &req, req.len);
 
-            var resp: [8]u8 = [_]u8{0} ** 8;
+            var resp: [10]u8 = [_]u8{0} ** 10;
             var off: usize = 0;
-            while (off < 8) {
+            while (off < 10) {
                 const n = sockRead(fd, resp[off..].ptr, resp.len - off);
                 if (n == 0) break;
                 off += @intCast(n);
             }
-            std.debug.assert(resp[0] == 0x00);
+            std.debug.assert(resp[0] == SOCKS_VER);
             std.debug.assert(resp[1] == SOCKS_REP_OK);
         }
     }.run, .{pair.b});
     defer client_thread.join();
 
-    // 服务端在非阻塞 socket 上完成 SOCKS4a 握手
-    const accepted = try socks4CheckAndReply(pair.a, "nbself");
+    // 服务端在非阻塞 socket 上完成 SOCKS5 握手
+    const accepted = try socks5CheckAndReply(pair.a, "nbself");
     try std.testing.expect(accepted);
-}
-
-test "readUntilNullBuf on non-blocking socket" {
-    const pair = try makeNonBlockingPair();
-    defer {
-        sockClose(pair.a);
-        sockClose(pair.b);
-    }
-
-    // 写入 "hello\0" 到非阻塞 socket
-    const data = [_]u8{ 'h', 'e', 'l', 'l', 'o', 0 };
-    _ = sockWrite(pair.b, &data, data.len);
-
-    var buf: [64]u8 = undefined;
-    const result = try readUntilNullBuf(pair.a, buf[0..]);
-    try std.testing.expectEqualStrings("hello", result);
 }

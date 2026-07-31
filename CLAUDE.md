@@ -30,10 +30,10 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
   via shared memory (heartbeat, crash recovery with exponential backoff).
   System service managers just keep utmmd alive; all restart/upgrade logic
   lives in utmmd.
-- **Single port 2121** (TCP+UDP) — UDP for LSA mesh networking, TCP for SOCKS4a
-  accept + utmm frame protocol + chained forwarding. Every node is a SOCKS4a
+- **Single port 2121** (TCP+UDP) — UDP for LSA mesh networking, TCP for SOCKS5
+  accept + utmm frame protocol + chained forwarding. Every node is a SOCKS5
   proxy endpoint, enabling third-party tools to reach any mesh node via
-  `curl --socks4a <any-node>:2121 <target>`. CLI and MCP use local IPC socket.
+  `curl --socks5 <any-node>:2121 <target>`. CLI and MCP use local IPC socket.
   MCP uses stdio — see `mcp.json.example`.
 - **8 cross-compilation targets**: aarch64/x86_64/x86 × linux-musl/macos/windows.
 - **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
@@ -53,8 +53,8 @@ Current configuration — four VM targets tracked:
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  Application Layer                                                │
-│  guest.zig           Guest daemon: TCP listen + SOCKS4a dispatch  │
-│  host.zig            Host daemon: LSA + IPC + TCP listen + SOCKS4a│
+│  guest.zig           Guest daemon: TCP listen + SOCKS5 dispatch  │
+│  host.zig            Host daemon: LSA + IPC + TCP listen + SOCKS5│
 │  ipc.zig             IPC socket server (CLI/MCP entry)            │
 │  mcp.zig             MCP stdio JSON-RPC                           │
 ├──────────────────────────────────────────────────────────────────┤
@@ -62,7 +62,7 @@ Current configuration — four VM targets tracked:
 │  lsa.zig             LSA broadcast + node table + /etc/hosts      │
 ├──────────────────────────────────────────────────────────────────┤
 │  Transport Layer                                                  │
-│  tcp.zig             Frame protocol + SOCKS4 + forwarding + conn  │
+│  tcp.zig             Frame protocol + SOCKS5 + forwarding + conn  │
 ├──────────────────────────────────────────────────────────────────┤
 │  Data Pipe Layer                                                  │
 │  dpipe.zig           DuplexPipe interface + relay engine          │
@@ -141,9 +141,9 @@ Per-command independent connection = no cross-thread shared state = no state.zig
 ### Two Run Modes (Same Binary)
 
 - **Guest mode (default)**: `utmmd --role guest` spawns `utmm --svc` (LSA broadcast
-  + TCP listener on :2121 + dpipe shell). TCP :2121 accepts SOCKS4a connections:
+  + TCP listener on :2121 + dpipe shell). TCP :2121 accepts SOCKS5 connections:
   target==self+port==2121 → utmm frame protocol; target==self+port!=2121 → localhost
-  relay; target!=self → chained SOCKS4a forward via node table. utmmd monitors utmm
+  relay; target!=self → chained SOCKS5 forward via node table. utmmd monitors utmm
   via shared memory (`/utmmd-shm`), handles crash recovery (exponential backoff
   2s→60s, 5 retries), and coordinates binary upgrade.
   `--install --hostname <name>`: force install as system auto-start service
@@ -151,7 +151,7 @@ Per-command independent connection = no cross-thread shared state = no state.zig
   `--version`: print version. No foreground mode — service model only.
 - **Host mode (`--host`)**: `utmmd --role host` spawns `utmm --host --svc`.
   UDP port 2121 mesh networking — guest registration via LSA broadcast,
-  /etc/hosts sync, TCP listener on :2121 (SOCKS4a accept + forwarding, same
+  /etc/hosts sync, TCP listener on :2121 (SOCKS5 accept + forwarding, same
   dispatch logic as Guest), and IPC socket for CLI/MCP communication.
   Host-initiated binary upgrade via `--upgrade <vm>` (push model). All on one port.
 - **MCP mode (`--mcp`)**: stdio JSON-RPC server for AI agents. Talks to Host
@@ -163,13 +163,13 @@ Per-command independent connection = no cross-thread shared state = no state.zig
                          ┌── MCP stdio ← AI Agent (utmm --mcp → auto-ensure → IPC socket)
 Guest (macvm)    ──TCP──┐
 Guest (linuxvm)  ──TCP──┤──→ Host TCP :2121 ──┼── CLI/MCP (IPC socket)
-Guest (windows)  ──TCP──┘   (SOCKS4a accept +    │   /etc/hosts sync
+Guest (windows)  ──TCP──┘   (SOCKS5 accept +    │   /etc/hosts sync
                          │    forwarding)        │
                          │                       │
 Guest ←── LSA broadcast (UDP) ──┘  (topology discovery)
 
-Every node TCP :2121 = SOCKS4a endpoint. Guest forwards to Host; Host forwards
-to Guest. Third-party tools use any node as SOCKS4a proxy to reach any other node.
+Every node TCP :2121 = SOCKS5 endpoint. Guest forwards to Host; Host forwards
+to Guest. Third-party tools use any node as SOCKS5 proxy to reach any other node.
 ```
 
 ### How a Command Flows
@@ -203,17 +203,17 @@ Download (Guest→Host):
 5. IPC response: streamed file data frames + exec_done frame with exit_code
 ```
 
-### How SOCKS4a Forwarding Flows (v0.15.0+)
+### How SOCKS5 Forwarding Flows (v0.15.0+)
 
-Every node (Guest + Host) is a peer SOCKS4a proxy endpoint. When a TCP connection
-arrives on :2121, the node reads the SOCKS4a request and dispatches:
+Every node (Guest + Host) is a peer SOCKS5 proxy endpoint. When a TCP connection
+arrives on :2121, the node reads the SOCKS5 request and dispatches:
 
 ```
-accept → socks4ReadRequestBuf → read target_hostname, target_port
+accept → socks5ReadRequestBuf → read target_hostname, target_port
   ├─ target==self, port==2121 → OK, utmm frame protocol (exec/upload/download)
   ├─ target==self, port!=2121 → OK, connect 127.0.0.1:target_port, bidirectional relay
   └─ target!=self → lookup hostname→IP from node table
-       ├─ found → OK, SOCKS4a chain-forward to target_ip:2121, relay
+       ├─ found → OK, SOCKS5 chain-forward to target_ip:2121, relay
        └─ not found → REJECT
 ```
 
@@ -221,21 +221,21 @@ accept → socks4ReadRequestBuf → read target_hostname, target_port
 across a network boundary:
 
 ```
-curl --socks4a localhost:2121 http://winx64:8080
-  → Host reads SOCKS4a: target=winx64, port=8080
+curl --socks5 localhost:2121 http://winx64:8080
+  → Host reads SOCKS5: target=winx64, port=8080
   → Host node table: winx64 → 192.168.3.108
-  → Host sends SOCKS4a to 192.168.3.108:2121 (target=winx64, port=8080)
-    → winx64 Guest reads SOCKS4a: target==self, port!=2121
+  → Host sends SOCKS5 to 192.168.3.108:2121 (target=winx64, port=8080)
+    → winx64 Guest reads SOCKS5: target==self, port!=2121
     → winx64 connects 127.0.0.1:8080, relays bidirectionally
 ```
 
 **Direct local service access:**
 
 ```
-curl --socks4a localhost:2121 http://linuxvm:22
-  → Host reads SOCKS4a: target=linuxvm, port=22
+curl --socks5 localhost:2121 http://linuxvm:22
+  → Host reads SOCKS5: target=linuxvm, port=22
   → Host node table: linuxvm → 192.168.64.6
-  → Host sends SOCKS4a to 192.168.64.6:2121 (target=linuxvm, port=22)
+  → Host sends SOCKS5 to 192.168.64.6:2121 (target=linuxvm, port=22)
     → linuxvm Guest: target==self, port!=2121 → connect 127.0.0.1:22 → relay
 ```
 
@@ -331,7 +331,7 @@ lock→stop→kill→copy→install→start.
 **Upgrade (Host-initiated push model, v0.14.0+)**: Host-controlled atomic operation:
 1. CLI: `utmm --upgrade <vm>` or `utmm --deploy` (compile + copy to serve-dir)
 2. Host reads target binary from serve-dir, computes SHA256
-3. Host connects to Guest via SOCKS4a (tcp.hostConnect)
+3. Host connects to Guest via SOCKS5 (tcp.hostConnect)
 4. Host sends `upgrade_cmd` (0x1a) frame (target + file_size + sha256_hex) + raw binary bytes
 5. Guest receives: verify SHA256 → send `upload_result` (0x17) → signal utmmd via shm
 6. utmmd stops old utmm, replaces binary, spawns new utmm — zero-downtime handoff
@@ -371,10 +371,10 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
 - **LSA version broadcast**: Host broadcasts version in LSA every 2s for informational
   purposes. Guest no longer takes autonomous action on version mismatch.
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
-- **Peer SOCKS4a forwarding** (v0.15.0) — every node is a SOCKS4a proxy endpoint.
-  TCP :2121 accepts SOCKS4a, dispatches by target hostname: self+2121 → utmm
+- **Peer SOCKS5 forwarding** (v0.15.0) — every node is a SOCKS5 proxy endpoint.
+  TCP :2121 accepts SOCKS5, dispatches by target hostname: self+2121 → utmm
   frame protocol, self+other-port → localhost relay, other-host → chained
-  SOCKS4a forward to target node. Third-party tools (`curl`, `wget`, browsers)
+  SOCKS5 forward to target node. Third-party tools (`curl`, `wget`, browsers)
   reach any mesh node through any other node without SSH tunnels or port mapping.
   No new files, no new CLI flags — all through existing tcp.zig primitives.
 
@@ -523,12 +523,12 @@ src/
 ├── fail.zig           Fast-fail helpers (err, msg — noreturn)
 ├── config.zig         Config persistence + file logger
 ├── lsa.zig            LSA broadcast + node table + /etc/hosts + hostname→IP lookup
-├── tcp.zig            Frame protocol + SOCKS4a (accept/connect/forward/relay)
+├── tcp.zig            Frame protocol + SOCKS5 (accept/connect/forward/relay)
 ├── dpipe.zig          DuplexPipe interface + relay engine
 ├── dpipe_shell.zig    pty ↔ DuplexPipe (posix_openpt/CreatePipe)
 ├── dpipe_file.zig     file ↔ DuplexPipe + SHA256 verification
-├── guest.zig          Guest daemon: TCP :2121 SOCKS4a dispatch + dpipe relay
-├── host.zig           Host daemon: LSA + IPC + TCP :2121 SOCKS4a + command dispatch
+├── guest.zig          Guest daemon: TCP :2121 SOCKS5 dispatch + dpipe relay
+├── host.zig           Host daemon: LSA + IPC + TCP :2121 SOCKS5 + command dispatch
 ├── ipc.zig            IPC socket server: CLI/MCP request handling
 ├── mcp.zig            MCP stdio server: JSON-RPC stdin/stdout, IPC client to Host
 ├── svc.zig            Service management (install/uninstall/forceInstall/ensure + Platform/genInit + InstallLock)
@@ -539,7 +539,7 @@ src/
 tests/
 ├── common.zig              Test infrastructure (TestRunner, TestCase, socket I/O, TempDir)
 ├── integration_test.zig    Single entry point: setup → all tests → leak check → summary
-├── test_tcp_frame.zig      TCP 帧协议 + SOCKS4a 集成测试 (pub fn test_tcp_frame)
+├── test_tcp_frame.zig      TCP 帧协议 + SOCKS5 集成测试 (pub fn test_tcp_frame)
 ├── test_lsa_routing.zig    LSA + Dijkstra 集成测试 (pub fn test_lsa_routing)
 ├── test_dpipe_relay.zig    DuplexPipe relay 集成测试 (pub fn test_dpipe_relay)
 ├── test_svc_install.zig    安装/卸载集成测试 (pub fn test_svc_install)
@@ -550,7 +550,7 @@ tests/
 ```
 
 > v0.13.0: 20 → 17 files (10 deleted, 1 new testlib.zig). Deleted: state.zig, broadcast.zig, mesh.zig, hosts_file.zig,
-> tunproto.zig, tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig.
+> tunproto.zig, tcpf.zig, socks5.zig, netconn.zig, cmdchan.zig, lock.zig.
 > v0.13.2: Integration tests restructured from 8 separate executables to single binary with flat `pub fn test_xxx()` modules.
 > Run via `zig build test-integration`.
 
@@ -596,17 +596,17 @@ No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
 
 - **Frame format**: 1-byte type + 4-byte BE length + payload. Length = payload bytes only.
   `tcp.zig` handles frame serialization via `sendFrame`/`recvFrame`.
-- **SOCKS4a**: Built into tcp.zig. Every node accepts SOCKS4a on TCP :2121 and
+- **SOCKS5**: Built into tcp.zig. Every node accepts SOCKS5 on TCP :2121 and
   dispatches by target hostname: self+2121 → utmm frame protocol, self+other →
-  localhost relay, other → chained SOCKS4a forward via node table.
-  `socks4CheckAndReply` (accept side), `socks4Connect` (connect side),
-  `socks4Forward` (chain-forward), `socks4LocalRelay` (localhost forward),
-  `socks4Relay` (bidirectional relay). Host connects to Guests via SOCKS4a
-  proxy (UTM network). Destination hostname embedded in SOCKS4a request after userid.
+  localhost relay, other → chained SOCKS5 forward via node table.
+  `socks5CheckAndReply` (accept side), `socks5Connect` (connect side),
+  `socks5Forward` (chain-forward), `socks5LocalRelay` (localhost forward),
+  `socks5Relay` (bidirectional relay). Host connects to Guests via SOCKS5
+  proxy (UTM network). Destination hostname embedded in SOCKS5 request after userid.
 - **Windows socket handle compatibility**: On Windows, Zig 0.16.0's `IpAddress.connect()`
   returns AFD kernel handles which are NOT compatible with Winsock2 `recv`/`send`.
   `sockAccept` returns raw Winsock2 SOCKET handles. These two handle types cannot
-  be mixed in `sockRead`/`sockWrite`/`socks4Relay`. Use `sockConnectLocalhost()`
+  be mixed in `sockRead`/`sockWrite`/`socks5Relay`. Use `sockConnectLocalhost()`
   (raw Winsock2 `ws2_socket` + `ws2_connect`) for localhost connections that need
   to relay with accept-fd handles. Same rule applies to any new outbound TCP
   connect that will be relayed with an accept-fd — use raw Winsock2 on Windows.

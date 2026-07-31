@@ -17,8 +17,8 @@ required at runtime. AI agents get the same capabilities through MCP stdio.
 | `status` | List all nodes: hostname, role, IP, OS/arch, MAC, version, status, shell, ConPTY |
 | `exec` | Execute a shell command on any Guest via per-command pty |
 | `ping` | Ping a Guest over the mesh network and measure RTT |
-| `upload` | Upload file from Host to Guest (TCP/SOCKS4, SHA256 verified) |
-| `download` | Download file from Guest to Host (TCP/SOCKS4, SHA256 verified) |
+| `upload` | Upload file from Host to Guest (TCP/SOCKS5, SHA256 verified) |
+| `download` | Download file from Guest to Host (TCP/SOCKS5, SHA256 verified) |
 | `sshpass` | Non-interactive SSH password auth — direct shell access to any machine. Works on **Linux, macOS, and Windows** (ConPTY dynamic loading + pipe fallback). Bootstrap, recovery, and pre-install scenarios when the Guest daemon is down or not yet installed. |
 
 Example prompts your AI agent can handle:
@@ -42,9 +42,9 @@ See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
   `status`, `exec`, `ping`, `upload`, `download`, `sshpass`. Auto-ensures Host on first use.
 - **LSA mesh zero-config** — Guests auto-discover Host over the local network.
   No fixed IPs, no DNS. `/etc/hosts` kept in sync automatically.
-- **SOCKS4a mesh forwarding** — every node is a SOCKS4a proxy endpoint on TCP :2121.
+- **SOCKS5 mesh forwarding** — every node is a SOCKS5 proxy endpoint on TCP :2121.
   Third-party tools (`curl`, `wget`, browsers) reach any mesh node through any other
-  node. No SSH tunnels, no port mapping. `curl --socks4a localhost:2121 http://linuxvm:8080`
+  node. No SSH tunnels, no port mapping. `curl --socks5 localhost:2121 http://linuxvm:8080`
   just works.
 - **Self-copy install** — single `--install` handles stop→kill→copy→start.
   Upgrade = scp + `--install`. No shell scripts, no package managers.
@@ -59,11 +59,11 @@ See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
                          ┌── MCP stdio ← AI Agent
 Guest (macvm)    ──TCP──┐
 Guest (linuxvm)  ──TCP──┤──→ Host TCP :2121  ──┼── CLI (IPC)
-Guest (windows)  ──TCP──┘   (SOCKS4a endpoint)
+Guest (windows)  ──TCP──┘   (SOCKS5 endpoint)
                          │
 Guest ←── LSA broadcast (UDP :2121) ──┘  (auto-discovery + topology)
 
-Every node TCP :2121 = SOCKS4a proxy. Third-party tools connect through any node.
+Every node TCP :2121 = SOCKS5 proxy. Third-party tools connect through any node.
 ```
 
 ## CLI Quick Start
@@ -96,10 +96,10 @@ utmm --deploy linuxvm
 # Mesh ping
 utmm --ping linuxvm
 
-# SOCKS4a mesh forwarding — any third-party tool reaches any node
-curl --socks4a localhost:2121 http://linuxvm:8080       # web server on linuxvm
-curl --socks4a localhost:2121 http://windowsvm:3389     # RDP on windowsvm
-git clone --config http.proxy=socks4a://localhost:2121   # clone through mesh
+# SOCKS5 mesh forwarding — any third-party tool reaches any node
+curl --socks5 localhost:2121 http://linuxvm:8080       # web server on linuxvm
+curl --socks5 localhost:2121 http://windowsvm:3389     # RDP on windowsvm
+git clone --config http.proxy=socks5://localhost:2121   # clone through mesh
 ```
 
 > **ConPTY**: On Windows, `--status` shows `conpty:yes/no` for each node.

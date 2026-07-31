@@ -133,13 +133,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run utmm");
     run_step.dependOn(&run_cmd.step);
 
+    const test_step = b.step("test", "Run all tests");
+
     // Tests — main binary tests
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
-    const run_tests = b.addRunArtifact(exe_tests);
-    const test_step = b.step("test", "Run all tests");
-    test_step.dependOn(&run_tests.step);
+    // Run test binary directly via manual Run step to avoid --listen=- protocol
+    // hang on macOS (Darwin 25). addRunArtifact would inject --listen=- which
+    // deadlocks on this platform. Manually creating the Run step and adding the
+    // artifact as argv[0] skips enableTestRunnerMode, so the binary prints results
+    // to stdout without the server protocol.
+    {
+        const run_tests = std.Build.Step.Run.create(b, "run test");
+        run_tests.addArtifactArg(exe_tests);
+        run_tests.expectExitCode(0);
+        test_step.dependOn(&run_tests.step);
+    }
 
     // Standalone test binaries for modules whose tests are not transitively
     // compiled into the main binary through main.zig's @import chain.
@@ -163,7 +173,10 @@ pub fn build(b: *std.Build) void {
             mod.linkSystemLibrary("ws2_32", .{});
         }
         const mod_tests = b.addTest(.{ .root_module = mod });
-        const run_mod_tests = b.addRunArtifact(mod_tests);
+        // Same workaround: run directly to avoid --listen=- protocol hang.
+        const run_mod_tests = std.Build.Step.Run.create(b, b.fmt("run test {s}", .{mod_src}));
+        run_mod_tests.addArtifactArg(mod_tests);
+        run_mod_tests.expectExitCode(0);
         test_step.dependOn(&run_mod_tests.step);
     }
 

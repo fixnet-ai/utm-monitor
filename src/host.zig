@@ -1,8 +1,8 @@
 //! Host mode — mesh networking daemon on UDP :2121 + TCP :2121.
 //!
-//! TCP per-command model with LSA broadcast + IPC socket + SOCKS4a forwarding.
+//! TCP per-command model with LSA broadcast + IPC socket + SOCKS5 forwarding.
 //! Management commands (--status/--exec/--upload/--download) communicate via IPC socket.
-//! TCP :2121 accepts SOCKS4a and dispatches: self→localhost relay, other→chained forward.
+//! TCP :2121 accepts SOCKS5 and dispatches: self→localhost relay, other→chained forward.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -468,7 +468,7 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Host daemon (--host): Mesh LSA + TCP/SOCKS4 connections + IPC server
+// Host daemon (--host): Mesh LSA + TCP/SOCKS5 connections + IPC server
 // ═══════════════════════════════════════════════════════════════════════════
 fn startHost(
     block_io: std.Io,
@@ -621,7 +621,7 @@ fn startHost(
         block_io, gpa, @as(*anyopaque, @ptrCast(&state)), @as(*anyopaque, @ptrCast(&mesh_opt)), &ipc_shutdown,
     });
 
-    // Spawn TCP listener thread — SOCKS4a accept + three-way dispatch.
+    // Spawn TCP listener thread — SOCKS5 accept + three-way dispatch.
     // Uses GuestTable.findByHostname for hostname→IP lookup.
     var tcp_thread = try std.Thread.spawn(.{}, hostTcpListen, .{
         block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown,
@@ -665,7 +665,7 @@ fn startHost(
     }
 }
 
-/// Host TCP listener — SOCKS4a accept + three-way dispatch.
+/// Host TCP listener — SOCKS5 accept + three-way dispatch.
 /// Uses GuestTable.findByHostname for hostname→IP lookup (vs guest's lsa.Mesh).
 fn hostTcpListen(
     io: std.Io,
@@ -681,7 +681,7 @@ fn hostTcpListen(
     };
     defer listener.deinit();
 
-    std.log.info("[host] TCP SOCKS4a listener on :{d}", .{mesh_port});
+    std.log.info("[host] TCP SOCKS5 listener on :{d}", .{mesh_port});
 
     while (true) {
         if (shutdown) |s| {
@@ -695,10 +695,10 @@ fn hostTcpListen(
             continue;
         };
 
-        // 读取 SOCKS4a 请求
+        // 读取 SOCKS5 请求
         var req_buf: [tcp.MAX_HOSTNAME + 1]u8 = undefined;
-        const req = tcp.socks4ReadRequestBuf(fd, req_buf[0..]) catch |err| {
-            std.log.err("[host] SOCKS4a read failed: {}", .{err});
+        const req = tcp.socks5ReadRequestBuf(fd, req_buf[0..]) catch |err| {
+            std.log.err("[host] SOCKS5 read failed: {}", .{err});
             tcp.sockClose(fd);
             continue;
         };
@@ -708,13 +708,13 @@ fn hostTcpListen(
             // 目标是本机
             if (req.port == mesh_port) {
                 // self:2121 — no utmm handler on Host side, just close
-                tcp.socks4ReplyOk(fd);
+                tcp.socks5ReplyOk(fd);
                 tcp.sockClose(fd);
                 std.log.info("[host] self:2121 (no handler)", .{});
             } else {
                 // 本机 localhost relay
-                const t = std.Thread.spawn(.{}, tcp.socks4LocalRelay, .{ io, fd, req.port }) catch {
-                    tcp.socks4ReplyRejected(fd);
+                const t = std.Thread.spawn(.{}, tcp.socks5LocalRelay, .{ io, fd, req.port }) catch {
+                    tcp.socks5ReplyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
@@ -722,23 +722,23 @@ fn hostTcpListen(
                 std.log.info("[host] local relay :{d}", .{req.port});
             }
         } else {
-            // 目标不是本机 — 链式 SOCKS4a 转发
+            // 目标不是本机 — 链式 SOCKS5 转发
             if (state.findByHostname(req.hostname)) |guest_entry| {
                 const next_hop = std.Io.net.IpAddress.parse(guest_entry.ip, mesh_port) catch {
-                    tcp.socks4ReplyRejected(fd);
+                    tcp.socks5ReplyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
 
                 const hn_copy = allocator.dupe(u8, req.hostname) catch {
-                    tcp.socks4ReplyRejected(fd);
+                    tcp.socks5ReplyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
 
                 const ctx = allocator.create(guest.ForwardCtx) catch {
                     allocator.free(hn_copy);
-                    tcp.socks4ReplyRejected(fd);
+                    tcp.socks5ReplyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
@@ -754,7 +754,7 @@ fn hostTcpListen(
                 const t = std.Thread.spawn(.{}, guest.forwardThreadFn, .{ctx}) catch {
                     allocator.destroy(ctx);
                     allocator.free(hn_copy);
-                    tcp.socks4ReplyRejected(fd);
+                    tcp.socks5ReplyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
@@ -762,7 +762,7 @@ fn hostTcpListen(
                 std.log.info("[host] forward {s}:{d} → {s}", .{ req.hostname, req.port, guest_entry.ip });
             } else {
                 std.log.info("[host] no route to {s}", .{req.hostname});
-                tcp.socks4ReplyRejected(fd);
+                tcp.socks5ReplyRejected(fd);
                 tcp.sockClose(fd);
             }
         }
@@ -882,7 +882,7 @@ pub fn pushUpgrade(
 
     std.log.info("[auto-upgrade] {s} ({s}): {d} bytes, sha256={s}", .{ hostname, guest_entry.target, file_size, &sha256_hex });
 
-    // 7. Connect to Guest via SOCKS4a (with ARP recovery)
+    // 7. Connect to Guest via SOCKS5 (with ARP recovery)
     var tcp_conn = connectGuest(io, gpa, state, hostname) catch |err| {
         std.log.err("[auto-upgrade] TCP connect to {s} failed: {}", .{ hostname, err });
         return "GuestConnectFailed";

@@ -1,6 +1,6 @@
 //! Guest 端模块 — 系统信息采集 + 命令处理 + LSA mesh 启动。
 //!
-//! Guest 在 TCP :2121 上侦听，通过 SOCKS4a 握手接受 Host 连接，
+//! Guest 在 TCP :2121 上侦听，通过 SOCKS5 握手接受 Host 连接，
 //! 每条 TCP 连接处理一条命令（exec/upload/download），命令结束即关闭连接。
 //! 使用 dpipe 抽象层进行 Shell 管理和文件 I/O。
 
@@ -696,7 +696,7 @@ test "zigTarget - valid format" {
 ///
 /// 1. 启动 LSA/UDP 发现线程（lsa.zig）
 /// 2. TCP 监听端口 2121
-/// 3. accept 循环 → SOCKS4a 握手 → 处理命令
+/// 3. accept 循环 → SOCKS5 握手 → 处理命令
 /// 4. 每命令独立连接，命令结束即关闭
 
 /// Periodic /etc/hosts sync for Guest: self + gateway entries.
@@ -743,7 +743,7 @@ fn guestHostsSync(
     }
 }
 
-/// SOCKS4a 转发线程上下文（堆分配，detach 线程负责释放）。
+/// SOCKS5 转发线程上下文（堆分配，detach 线程负责释放）。
 pub const ForwardCtx = struct {
     io: std.Io,
     client_fd: std.posix.socket_t,
@@ -753,11 +753,11 @@ pub const ForwardCtx = struct {
     allocator: std.mem.Allocator,
 };
 
-/// 转发 detach 线程入口：释放 ctx 并调用 socks4Forward。
+/// 转发 detach 线程入口：释放 ctx 并调用 socks5Forward。
 pub fn forwardThreadFn(ctx: *ForwardCtx) void {
     defer ctx.allocator.destroy(ctx);
     defer ctx.allocator.free(ctx.hostname);
-    tcp.socks4Forward(ctx.io, ctx.client_fd, ctx.next_hop_ip, ctx.hostname, ctx.target_port);
+    tcp.socks5Forward(ctx.io, ctx.client_fd, ctx.next_hop_ip, ctx.hostname, ctx.target_port);
 }
 
 pub fn guestTcpLoop(
@@ -895,7 +895,7 @@ pub fn guestTcpLoop(
             }
         }
 
-        // Accept TCP 连接（不含 SOCKS4a 握手）
+        // Accept TCP 连接（不含 SOCKS5 握手）
         const fd = listener.acceptRaw() catch |err| {
             if (err == error.WouldBlock) continue;
             std.log.err("[guest] accept failed: {}", .{err});
@@ -903,10 +903,10 @@ pub fn guestTcpLoop(
             continue;
         };
 
-        // 读取 SOCKS4a 请求
+        // 读取 SOCKS5 请求
         var req_buf: [tcp.MAX_HOSTNAME + 1]u8 = undefined;
-        const req = tcp.socks4ReadRequestBuf(fd, req_buf[0..]) catch |err| {
-            std.log.err("[guest] SOCKS4a read failed: {}", .{err});
+        const req = tcp.socks5ReadRequestBuf(fd, req_buf[0..]) catch |err| {
+            std.log.err("[guest] SOCKS5 read failed: {}", .{err});
             tcp.sockClose(fd);
             continue;
         };
@@ -916,7 +916,7 @@ pub fn guestTcpLoop(
             // 目标是本机
             if (req.port == mesh_port) {
                 // utmm 内部帧协议
-                tcp.socks4ReplyOk(fd);
+                tcp.socks5ReplyOk(fd);
                 var conn = tcp.Connection{ .fd = fd, .alive = true };
                 handleOneCommand(io, allocator, info, &conn, shutdown) catch |err| {
                     std.log.err("[guest] handleOneCommand: {}", .{err});
@@ -924,8 +924,8 @@ pub fn guestTcpLoop(
                 conn.deinit();
             } else {
                 // 本机 localhost relay
-                const t = std.Thread.spawn(.{}, tcp.socks4LocalRelay, .{ io, fd, req.port }) catch {
-                    tcp.socks4ReplyRejected(fd);
+                const t = std.Thread.spawn(.{}, tcp.socks5LocalRelay, .{ io, fd, req.port }) catch {
+                    tcp.socks5ReplyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
@@ -933,26 +933,26 @@ pub fn guestTcpLoop(
                 std.log.info("[guest] local relay :{d}", .{req.port});
             }
         } else {
-            // 目标不是本机 — 链式 SOCKS4a 转发
+            // 目标不是本机 — 链式 SOCKS5 转发
             if (mesh_opt) |*mesh| {
                 if (mesh.lookupHostnameIp(allocator, req.hostname)) |target_ip| {
                     const next_hop = std.Io.net.IpAddress.parse(target_ip, mesh_port) catch {
                         allocator.free(target_ip);
-                        tcp.socks4ReplyRejected(fd);
+                        tcp.socks5ReplyRejected(fd);
                         tcp.sockClose(fd);
                         continue;
                     };
                     allocator.free(target_ip);
 
                     const hn_copy = allocator.dupe(u8, req.hostname) catch {
-                        tcp.socks4ReplyRejected(fd);
+                        tcp.socks5ReplyRejected(fd);
                         tcp.sockClose(fd);
                         continue;
                     };
 
                     const ctx = allocator.create(ForwardCtx) catch {
                         allocator.free(hn_copy);
-                        tcp.socks4ReplyRejected(fd);
+                        tcp.socks5ReplyRejected(fd);
                         tcp.sockClose(fd);
                         continue;
                     };
@@ -968,7 +968,7 @@ pub fn guestTcpLoop(
                     const t = std.Thread.spawn(.{}, forwardThreadFn, .{ctx}) catch {
                         allocator.destroy(ctx);
                         allocator.free(hn_copy);
-                        tcp.socks4ReplyRejected(fd);
+                        tcp.socks5ReplyRejected(fd);
                         tcp.sockClose(fd);
                         continue;
                     };
@@ -976,12 +976,12 @@ pub fn guestTcpLoop(
                     std.log.info("[guest] forward {s}:{d}", .{ req.hostname, req.port });
                 } else {
                     std.log.info("[guest] no route to {s}", .{req.hostname});
-                    tcp.socks4ReplyRejected(fd);
+                    tcp.socks5ReplyRejected(fd);
                     tcp.sockClose(fd);
                 }
             } else {
                 std.log.info("[guest] no mesh for forward to {s}", .{req.hostname});
-                tcp.socks4ReplyRejected(fd);
+                tcp.socks5ReplyRejected(fd);
                 tcp.sockClose(fd);
             }
         }
@@ -1390,6 +1390,6 @@ pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig
         }
     }
 
-    // TCP session loop — per-command TCP connections with SOCKS4 handshake.
+    // TCP session loop — per-command TCP connections with SOCKS5 handshake.
     try guestTcpLoop(io, gpa, sysinfo, cli.mesh_port, cli.peer_mesh, shutdown);
 }

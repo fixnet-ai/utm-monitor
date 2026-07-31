@@ -824,7 +824,7 @@ fn handleUpload(
     ipc_conn.writeAll(&ok_buf) catch {};
 }
 
-/// Host→Guest 直推升级：读取 serve-dir 二进制 → SOCKS4a → upgrade_cmd → 流式推送
+/// Host→Guest 直推升级：读取 serve-dir 二进制 → SOCKS5 → upgrade_cmd → 流式推送
 fn handleUpgrade(
     io: std.Io,
     gpa: std.mem.Allocator,

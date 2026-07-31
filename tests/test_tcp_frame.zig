@@ -1,4 +1,4 @@
-//! TCP 帧协议 + SOCKS4a 集成测试
+//! TCP 帧协议 + SOCKS5 集成测试
 
 const std = @import("std");
 const lib = @import("testlib");
@@ -7,9 +7,9 @@ const tcp = lib.tcp;
 const protocol = lib.protocol;
 
 pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestRunner) !void {
-    // ── 场景 1: SOCKS4a 完整握手 ──
+    // ── 场景 1: SOCKS5 完整握手 ──
     {
-        var tc = runner.case("SOCKS4a 完整握手");
+        var tc = runner.case("SOCKS5 完整握手");
 
         const listener = common.bindAny(io) catch {
             tc.skip("无法创建监听 socket");
@@ -29,7 +29,7 @@ pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.Test
                     done.store(true, .release);
                     return;
                 };
-                const stream = tcp.socks4Connect(io2, ip, h, port) catch {
+                const stream = tcp.socks5Connect(io2, ip, h, port) catch {
                     done.store(true, .release);
                     return;
                 };
@@ -46,21 +46,21 @@ pub fn test_tcp_frame(io: std.Io, alloc: std.mem.Allocator, runner: *common.Test
         };
         defer common.sockClose(cli_fd);
 
-        const req = tcp.socks4Accept(cli_fd, alloc) catch |err| {
-            tc.expect(false, "socks4Accept 失败: {}", .{err});
+        const req = tcp.socks5Accept(cli_fd, alloc) catch |err| {
+            tc.expect(false, "socks5Accept 失败: {}", .{err});
             tc.deinit();
             return;
         };
         defer alloc.free(req.hostname);
         tc.expectStr(hostname, req.hostname, "hostname 匹配");
         tc.expectEqual(@as(u16, listener.port), req.port, "端口匹配");
-        tcp.socks4ReplyOk(cli_fd);
+        tcp.socks5ReplyOk(cli_fd);
 
         while (!client_done.load(.acquire)) {
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch {};
         }
         client_thread.join();
-        tc.expectTrue(client_ok.load(.acquire), "客户端 SOCKS4a 握手成功");
+        tc.expectTrue(client_ok.load(.acquire), "客户端 SOCKS5 握手成功");
 
         tc.deinit();
     }

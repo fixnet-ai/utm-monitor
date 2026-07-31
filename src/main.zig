@@ -1,7 +1,7 @@
-//! UTM Monitor — Remote machine management via TCP/SOCKS4a.
+//! UTM Monitor — Remote machine management via TCP/SOCKS5.
 //!
 //! Guest mode (default): LSA mesh broadcast + TCP listener on port 2121.
-//!   Host connects to Guest via SOCKS4a proxy for exec/upload/download.
+//!   Host connects to Guest via SOCKS5 proxy for exec/upload/download.
 //! Host mode (--host): LSA node table + IPC socket for CLI/MCP commands.
 //!
 //! Self-copy model: binary copies itself to canonical path /opt/utmm/utmm[.exe].
