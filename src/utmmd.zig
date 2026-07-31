@@ -294,12 +294,6 @@ fn upgradeBinPath() []const u8 {
     return "/opt/utmm/utmm-upgrade";
 }
 
-/// .sha256 临时文件路径（Guest 原子写入 .sha256 时使用，crash 后可能残留）。
-fn upgradeMarkerTmpPath() []const u8 {
-    if (builtin.os.tag == .windows) return "C:\\opt\\utmm\\utmm-upgrade.sha256.tmp";
-    return "/opt/utmm/utmm-upgrade.sha256.tmp";
-}
-
 /// 检查是否有待处理的升级（.sha256 标记文件 + upgrade 二进制都存在）。
 /// 如果仅有标记文件（上次 rename 后 crash 残留），清理标记文件后返回 false。
 fn checkPendingUpgrade(io: std.Io) bool {
@@ -539,9 +533,6 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
     var failure_count: u32 = 0;
     var backoff_sec: u32 = 1;
     shm_ptr.svc_state = @intFromEnum(shm.SvcState.running);
-
-    // 一次性清理：删除 Guest crash 残留的 .sha256.tmp 文件（原子写入未完成）
-    std.Io.Dir.cwd().deleteFile(io, upgradeMarkerTmpPath()) catch {};
 
     while (true) {
         if (sigterm_received.load(.acquire)) {
