@@ -1,4 +1,4 @@
-# MCP Server Configuration for UTM Monitor
+# MCP Server Configuration for utmm
 # =============================================================================
 # This file lets Claude Code (or any MCP client) control UTM VMs via the utmm
 # stdio MCP interface.  utmm --mcp handles auto-ensure (starts Host service if
@@ -15,15 +15,15 @@
 # QUICK INSTALL (Claude Code)
 # -----------------------------------------------------------------------------
 # Option A — claude CLI (recommended, available across all projects):
-#   claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp
+#   claude mcp add --scope user utmm -- sudo -n /opt/utmm/utmm --mcp
 #
 #   --scope user registers the server at user level in ~/.claude.json, so it's
 #   available in ALL projects. Default --scope local is project-only.
 #   Use `claude mcp list` to verify.
 #
 #   To update an existing registration:
-#     claude mcp remove utm-monitor
-#     claude mcp add --scope user utm-monitor -- sudo -n /opt/utmm/utmm --mcp
+#     claude mcp remove utmm
+#     claude mcp add --scope user utmm -- sudo -n /opt/utmm/utmm --mcp
 #
 # Option B — manual JSON config:
 #   Copy the JSON below into your MCP config. Note: project-level registrations
@@ -36,7 +36,7 @@
 # VERIFY
 # -----------------------------------------------------------------------------
 # After installation, verify the connection:
-#   claude mcp list                    # should show "utm-monitor: ... - Connected"
+#   claude mcp list                    # should show "utmm: ... - Connected"
 #
 # Or test manually:
 #   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | sudo -n /opt/utmm/utmm --mcp
@@ -55,7 +55,7 @@
 # | "No VMs online"                      | Boot the VMs, start utmm inside each |
 # | "Failed to reconnect: -32000"        | Check `claude mcp list` — may have  |
 # |                                      | stale registration. Remove & re-add:|
-# |                                      | `claude mcp remove utm-monitor`     |
+# |                                      | `claude mcp remove utmm`            |
 # |                                      | `claude mcp add --scope user ...`   |
 # | MCP tools not showing in Claude      | Restart Claude Code after config    |
 # |                                      | change; verify with `claude mcp list`|
@@ -66,7 +66,7 @@
 
 {
   "mcpServers": {
-    "utm-monitor": {
+    "utmm": {
       "command": "sudo",
       "args": ["-n", "/opt/utmm/utmm", "--mcp"]
     }
