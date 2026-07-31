@@ -579,6 +579,9 @@ fn monitorUtmm(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
                     return .crashed;
                 };
                 defer alloc.free(up);
+                // Windows: 先杀进程释放文件锁，再 rename 覆盖 utmm.exe
+                // POSIX: 同样先杀进程，rename 后 restart 统一行为
+                killProcess(proc);
                 upgradeUtmm(io, alloc, up) catch |err| {
                     std.log.err("[utmmd] upgrade failed: {}", .{err});
                     shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.failed);
@@ -587,7 +590,6 @@ fn monitorUtmm(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
                 };
                 shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.done);
                 shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
-                killProcess(proc);
                 return .restart;
             },
             .restart => {

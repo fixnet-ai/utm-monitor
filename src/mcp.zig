@@ -517,6 +517,8 @@ fn handleVmSshpass(gpa: std.mem.Allocator, io: std.Io, host: []const u8, user: [
     try argv.append(gpa, "-p");
     try argv.append(gpa, password);
     try argv.append(gpa, "ssh");
+    try argv.append(gpa, "-o");
+    try argv.append(gpa, "StrictHostKeyChecking=no");
     try argv.append(gpa, dest);
     // Split command into args on spaces (shell handles quoting on remote)
     var cmd_iter = std.mem.splitScalar(u8, command, ' ');
