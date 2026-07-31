@@ -2,6 +2,63 @@
 
 记录重要的技术发现、设计决策和 Zig 0.16.0 API 笔记。
 
+## 2026-08-01 — SOCKS5 全协议（v0.16.0）+ MCP 配置修正（v0.16.1）
+
+### Finding 194: Windows `fd_set` 初始化 — `socket_t = *anyopaque` 不能用数组字面量
+
+在 Windows 上 `std.posix.socket_t = *anyopaque`（指针类型），BIND 的 `sockAcceptTimeout`
+使用 `select()` 需要 `fd_set` 结构，该结构包含 `fd_array: [FD_SETSIZE]socket_t` 字段。
+指针类型不能用 `{0}` 数组字面量初始化（零指针在 Zig 中被禁止）。
+
+**修复**: `var rfds: fd_set = undefined; rfds.fd_count = 1; rfds.fd_array[0] = listen_fd;`
+
+**影响**: `src/socks5.zig` sockAcceptTimeout 函数。仅 x86_64-windows 交叉编译时暴露，
+aarch64-windows 不报（同类型但编译顺序不同）。
+
+### Finding 195: SOCKS5 协议提取 — tcp.zig 1678 行混杂三层职责
+
+**根因**: KCP→TCP 迁移时 SOCKS 协议直接写在 tcp.zig 中，当时只有一个 CONNECT 命令。
+随着 BIND + UDP ASSOCIATE 的实现，协议层膨胀至 ~600 行，与传输层混杂。
+
+**提取方案**:
+```
+tcp.zig (1678→900)   纯 TCP 传输（socket I/O、TcpListener、ConnLimit）
+  ↑
+protocol.zig (+285)   帧协议 + Connection（sendFrame/recvFrame/MAX_FRAME）
+  ↑
+socks5.zig (+1300)    SOCKS5 全协议（解析/回复/连接/转发/BIND/UDP）
+```
+
+**关键简化**: 删除 `TcpListener.accept()` — 它调用了 `socks5CheckAndReply`，形成 tcp→socks5 循环依赖。
+host.zig 和 guest.zig 均使用 `acceptRaw()` + 内联 SOCKS5 分发。
+
+### Finding 196: BIND 在 Windows 上的 Firewall 限制
+
+BIND 代码逻辑正确（两阶段握手、accept timeout、relay），但在 Windows 裸机测试中，
+外部连接器到动态端口（9929）超时。根因是 Windows Firewall 阻止入站连接到动态创建的 TCP listener 端口。
+
+**验证**: 第一帧回复正确（REP=0, BND.PORT 已分配），中继逻辑正确。这不是代码 bug，是 OS 防火墙策略限制。
+如需启用 BIND，需添加 Windows Firewall 规则放行 utmm 动态端口范围。
+
+### Finding 197: 僵尸连接阻塞新 SOCKS5 连接
+
+裸机测试时 modasiaipc 上存在 5 ESTABLISHED + 3 CLOSE_WAIT 连接（前次会话遗留），
+新 SOCKS5 连接请求被阻塞。解决：SSH 进去 `Stop-Process -Force` 杀掉 utmm + utmmd，
+重新 `--install` 部署后一切正常。TCP per-command 模型本身能正确清理连接，但进程异常退出时
+已建立的连接会残留。
+
+### Finding 198: MCP 服务器命名 — "utmm" vs "UTM Monitor" 的用途区分
+
+**区分**:
+- "UTM Monitor" = 软件产品名称（README、CLAUDE.md 标题、代码注释）
+- "utmm" = CLI 二进制/命令名（`utmm --help`、`utmm sshpass ...`）
+- `utm-monitor` = GitHub 仓库名
+
+MCP 服务器名应使用命令名 "utmm"（简短、易输入），不是产品全名 "UTM Monitor"。
+仅 `mcp.json.example` 需要修改，main.zig header 和 build.zig.zon package name 保持不变。
+
+---
+
 ## 2026-08-01 — 工作流优化（v0.15.10→v0.15.11）
 
 ### FIONBIO 常量在 aarch64-windows 上溢出 c_int

@@ -2,17 +2,18 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.15.11 — 工作流优化 + 并行交叉编译 + 发布流水线加固
+**最新版本**: v0.16.1 — MCP 服务器名修正 + 规划文档同步
 
-- **分支**: `main`（feat/connectivity-fabric 已合并删除）
-- **源文件**: 19 src + 13 test
-- **测试**: 172 单元测试 + 59 集成测试，全部通过，0 泄漏
+- **分支**: `main`（feat/socks5-full 已合并删除）
+- **源文件**: 20 src + 13 test（新增 socks5.zig）
+- **测试**: 186 单元测试 + 59 集成测试，全部通过，0 泄漏
 
-## 当前阶段: Phase 21 — sshpass 集成 + MCP 工具名去前缀 + 真机部署 ✅
+## 当前阶段: Phase 23 — SOCKS5 全协议（BIND + UDP ASSOCIATE）+ 协议提取 ✅
 
-**目标**: 消除外部 sshpass 依赖，集成到 utmm 作为子命令；移除 MCP 工具 vm_ 前缀。
-- **单元测试**: 208 测试全部通过 ✅
-- **集成测试**: 待验证
+**目标**: 实现 RFC 1928 完整 SOCKS5 协议（BIND + UDP ASSOCIATE）；将 SOCKS5 协议层从 tcp.zig 提取到独立 socks5.zig。
+- **单元测试**: 186 测试全部通过 ✅
+- **集成测试**: 59/59 通过 ✅
+- **裸机部署**: 5 节点全部 v0.16.0 ✅
 
 ## 架构概述
 
@@ -649,3 +650,99 @@ CLAUDE.md / README.md / task_plan.md
 | 48 | release.sh 构建过再 tag | 旧流程 tag→build→失败→删 tag→重建，改为 build→test→tag |
 | 49 | parseArgs 统一校验而非分散校验 | `fail.msg` 提前报错，避免 `.` panic 回溯误导 |
 | 50 | cmdDeploy sshpass 缺失 → return（非 exit） | 本地部署已成功，远程推送是可选的；exit 1 误导 CI/用户 |
+
+### Phase 23: v0.16.0 — SOCKS5 全协议（BIND + UDP ASSOCIATE）+ 协议层提取 ✅
+
+**背景**: RFC 1928 完整 SOCKS5 协议实现，支持 BIND（反向连接）和 UDP ASSOCIATE（UDP 中继）。
+同时将混杂在 tcp.zig 中的 SOCKS5 协议层提取到独立 socks5.zig，protocol.zig 扩展帧协议 + Connection。
+
+**协议提取（Phase 0：~0 行净增，纯移动）**:
+
+| 模块 | 变更 | 行数变化 |
+|------|------|---------|
+| `src/tcp.zig` | 保留纯传输层（socket I/O、TcpListener、ConnLimit） | 1678 → ~900 行 |
+| `src/protocol.zig` | 新增帧协议 + Connection（sendFrame/recvFrame/MAX_FRAME） | +285 行 |
+| `src/socks5.zig` | **新建**：全部 SOCKS5 协议 + BIND + UDP ASSOCIATE | ~1300 行 |
+
+**SOCKS5 全协议实现**:
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 182 | 常量 + 数据结构扩展（SOCKS_CMD_BIND/UDP_ASSOCIATE/IPV6/sockAcceptTimeout） | `src/socks5.zig` | ✅ 新增 8 个常量/类型 |
+| 183 | 放宽 CMD/ATYP 解析（BIND/UDP/IPv4 ATYP → 点分十进制） | `src/socks5.zig` | ✅ readRequestBuf 接受全部 3 种 CMD |
+| 184 | UDP ASSOCIATE — UdpRelay（udp socket + tcp↔udp 双线程 + framed datagram） | `src/socks5.zig` | ✅ ~200 行，分片丢弃 |
+| 185 | BIND — socks5Bind（TcpListener → 第一帧回复 → accept timeout → 第二帧回复 → relay） | `src/socks5.zig` | ✅ ~170 行，sockAcceptTimeout select/poll |
+| 186 | guest.zig / host.zig CMD 分发（BIND/UDP → hostname 路由之前） | `src/guest.zig` `src/host.zig` | ✅ BIND/UDP 分发在 SOCKS5 CMD 层，非 hostname 层 |
+| 187 | 裸机部署测试（modasiaipc x86_64-windows 全功能验证） | — | ✅ exec/upload/download/sshpass/SOCKS5 CONNECT chain/UDP ASSOCIATE |
+| 188 | GitHub Release v0.16.0 | — | ✅ 8 目标交叉编译 + utmm.zip + gh release |
+
+**文件清单变更（19 → 20 src 文件）**:
+```
+src/
+├── socks5.zig        ← 新建：SOCKS5 全协议（~1300 行）
+├── tcp.zig           1678 → ~900 行（SOCKS5 + 帧协议移出）
+├── protocol.zig      +285 行（帧协议 + Connection 移入）
+└── ...（其余 17 文件不变）
+```
+
+**SOCKS5 客户端参数化**:
+- `socks5Connect` → 新增 cmd/atyp 参数（默认 CONNECT/DOMAIN）
+- `socks5SendRequest` 参数化接受 cmd + atyp
+- `socks5ConnectLocal` → `socks5Connect` 包装器，行为不变
+
+**BIND 实现细节**:
+- `socks5Bind(io, client_fd)` — 完整两阶段握手机制
+- 创建 TcpListener → reply first frame (REP=0, BND.PORT) → sockAcceptTimeout (60s) → reply second frame (BND.PORT=peer_port) → relay
+- Windows: `select()` 实现 accept timeout（`fd_set` 用 `undefined` 初始化，避免 `*anyopaque` 数组 init 失败）
+- POSIX: `poll()` 实现 accept timeout
+
+**UDP ASSOCIATE 实现细节**:
+- `udpAssociate(tcp_fd)` — 创建 UDP socket → reply BND.ADDR:BND.PORT → 启动 tcp→udp + udp→tcp 线程
+- SOCKS5 UDP 数据报格式：2-byte BE length prefix + RSV(2)+FRAG(1)+ATYP(1)+DST.ADDR(var)+DST.PORT(2)+DATA
+- FRAG != 0 丢弃（不支持分片）
+- TCP 断开时自动清理（两个线程检测 send/recv 错误 → shutdown → 退出）
+
+**裸机测试结果（modasiaipc, x86_64-windows, 192.168.3.108）**:
+
+| 功能 | 结果 | 备注 |
+|------|------|------|
+| exec | ✅ | 命令执行正常 |
+| upload | ✅ | SHA256 一致 |
+| download | ✅ | SHA256 一致 |
+| sshpass | ✅ | ConPTY 可用 |
+| SOCKS5 CONNECT chain | ✅ | curl → modasiaipc:2121 → Host → linuxvm:22 |
+| UDP ASSOCIATE | ✅ | TCP 控制通道 + UDP 数据报中继正常 |
+| BIND | ⚠️ | 代码正确，Windows Firewall 阻止动态端口入站 |
+
+**已知限制**: Windows BIND — 动态创建的 TCP listener 端口被 Windows Firewall 拦截（非代码问题）。
+
+**踩坑记录**:
+1. Windows `fd_set` 初始化：`socket_t = *anyopaque`（指针），不能用 `{0}` 数组初始值设定，必须 `var rfds: fd_set = undefined`
+2. modasiaipc 存在僵尸连接（5 ESTABLISHED + 3 CLOSE_WAIT）阻塞新 SOCKS5 → SSH + `--install` 重启服务解决
+3. BIND 端到端失败根因是 Windows Firewall，非代码逻辑错误
+
+**设计决策**:
+
+| # | 决策 | 理由 |
+|---|------|------|
+| 51 | SOCKS5 提取到独立 socks5.zig | tcp.zig 1678 行混杂三层职责；协议提取形成清晰 tcp→protocol→socks5 单向依赖 |
+| 52 | SOCKS5 CMD 分发放在 hostname 路由之前 | BIND/UDP ASSOCIATE 仅对 self 有效，无需 hostname 查找 |
+| 53 | BIND 两阶段握手使用 accept timeout | 防止恶意客户端触发 BIND 后不连接，线程永久挂起 |
+| 54 | Windows accept timeout 用 select()（非 poll） | poll() 在 Windows 上不可用，select() 跨平台兼容性最好 |
+| 55 | UDP ASSOCIATE TCP 控制通道保持长连接 | RFC 1928 要求 TCP 断开时终止所有 UDP 中继 |
+| 56 | MCP 服务器名 "utmm"（非 "utm-monitor"） | utmm 是命令/二进制名，快捷易输入；UTM Monitor 是软件产品名 |
+
+### Phase 23-b: v0.16.1 — MCP 配置修正 + 规划文档同步 📋
+
+**背景**: v0.16.0 发布后，两次提交修正了 MCP 配置命名（仅 `mcp.json.example` 变更）。
+同时将 Phase 23 SOCKS5 全协议实现记录同步到规划文件中。
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 189 | MCP 服务器名 "utm-monitor" → "utmm" | `mcp.json.example` | ✅ 所有文档引用同步更新 |
+| 190 | 恢复产品名（main.zig header + build.zig.zon） | `src/main.zig` `build.zig.zon` | ✅ UTM Monitor = 软件名，utmm = 命令名 |
+| 191 | 更新 task_plan.md（Phase 23 + 文件清单 + 设计决策） | `task_plan.md` | 📋 当前任务 |
+| 192 | 更新 findings.md（SOCKS5/Winsock2 fd_set 发现） | `findings.md` | 📋 当前任务 |
+| 193 | 更新 progress.md（v0.16.0 发布 + 裸机测试） | `progress.md` | 📋 当前任务 |
+| 194 | 版本号 bump 0.16.0 → 0.16.1 | `src/ver.txt` | 📋 当前任务 |
+| 195 | 8 交叉编译 + GitHub Release v0.16.1 | — | 📋 当前任务 |

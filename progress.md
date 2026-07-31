@@ -1,4 +1,54 @@
-## 工作流优化全流程演练 v0.15.10—v0.15.11
+## v0.16.0 — SOCKS5 全协议（BIND + UDP ASSOCIATE）+ 协议层提取
+
+**时间**: 2026-08-01
+
+### feat/socks5-full 分支合并
+
+**协议提取**:
+- `src/socks5.zig` 新建（~1300 行）：SOCKS5 全部协议逻辑（解析/回复/连接/转发/BIND/UDP ASSOCIATE）
+- `src/protocol.zig` 扩展（+285 行）：帧协议 + Connection（从 tcp.zig 移入）
+- `src/tcp.zig` 精简（1678→~900 行）：纯 TCP 传输层（socket I/O、TcpListener、ConnLimit）
+- 删除 `TcpListener.accept()` — 消除 tcp→socks5 循环依赖
+- 消费者更新：guest.zig、host.zig 新增 socks5 import，SOCKS5 调用路径迁移
+
+**SOCKS5 全协议实现**:
+- BIND（RFC 1928 §4）：两阶段握手，TcpListener + accept timeout (60s) + relay
+- UDP ASSOCIATE（RFC 1928 §6）：TCP 控制通道 + UDP 数据报中继（tcp↔udp 双线程）
+- IPv4 ATYP 支持（IPv4 地址 → 点分十进制存入 hostname）
+- IPv6 ATYP 返回 ADDRESS_TYPE_NOT_SUPPORTED
+
+**关键修复**:
+1. Windows fd_set 初始化：`socket_t = *anyopaque`（指针）→ 用 `undefined` 初始化，不能用 `{0}` 数组字面量
+2. sockAcceptTimeout：Windows `select()` / POSIX `poll()` 跨平台实现
+3. UDP socket 跨平台：Windows `ws2_socket(AF_INET,SOCK_DGRAM)` / POSIX `socket(AF.INET,SOCK.DGRAM)`
+
+**测试验证**:
+- 186 单元测试 + 59 集成测试全部通过 ✅
+- 8 交叉编译目标全部通过 ✅
+
+### 裸机部署测试（modasiaipc, x86_64-windows）
+
+| 功能 | 结果 |
+|------|------|
+| exec | ✅ |
+| upload | ✅ SHA256 一致 |
+| download | ✅ SHA256 一致 |
+| sshpass (ConPTY) | ✅ |
+| SOCKS5 CONNECT chain | ✅ curl → modasiaipc:2121 → Host → linuxvm:22 |
+| UDP ASSOCIATE | ✅ |
+| BIND | ⚠️ Windows Firewall 阻止动态端口入站 |
+
+所有 5 节点确认 v0.16.0 serving。
+
+### MCP 配置修正
+
+- `mcp.json.example`：MCP 服务器名 "utm-monitor" → "utmm"
+- main.zig header + build.zig.zon package name 保持 "UTM Monitor"（软件产品名）
+- 区分：UTM Monitor = 软件名，utmm = 命令/二进制名
+
+---
+
+## v0.15.11 — 工作流优化全流程演练
 
 **时间**: 2026-08-01 01:30—02:30
 
