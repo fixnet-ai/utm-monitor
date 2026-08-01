@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const zio = @import("zio");
 const protocol = @import("protocol.zig");
 const host_mod = @import("host.zig");
 const guest = @import("guest.zig");
@@ -420,10 +421,18 @@ pub fn main(init: std.process.Init) !void {
         // 心跳在主 accept 循环中更新（不再使用独立线程）。
         // 这样 utmmd 能检测到阻塞的 utmm 进程：如果 accept 循环卡住，
         // 心跳停止更新 → utmmd 10s 超时触发重启。
+
+        // Create zio async Runtime — replaces blocking init.io with coroutine-based I/O.
+        // The Runtime owns the event loop and worker threads; rt.io() provides a
+        // std.Io backed by async I/O (io_uring/epoll/kqueue/iocp) under the hood.
+        var rt = try zio.Runtime.init(init.gpa, .{});
+        defer rt.deinit();
+        const rt_io = rt.io();
+
         if (cli.is_host) {
-            try host_mod.runWithIo(init.io, init.gpa, cli, null, shm_handle);
+            try host_mod.runWithIo(rt_io, init.gpa, cli, null, shm_handle);
         } else {
-            try guest.guestRunWithIo(init.io, init.gpa, cli, null, shm_handle);
+            try guest.guestRunWithIo(rt_io, init.gpa, cli, null, shm_handle);
         }
         if (shm_handle) |h| {
             h.utmm_state = @intFromEnum(shm.UtmmState.stopping);

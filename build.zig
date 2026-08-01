@@ -52,6 +52,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── zio dependency ──
+    const zio_dep = b.dependency("zio", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zio_mod = zio_dep.module("zio");
+
     // ── Step 1: Build utmmd (supervisor daemon) ──
     const utmmd = b.addExecutable(.{
         .name = "utmmd",
@@ -106,6 +113,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    exe.root_module.addImport("zio", zio_mod);
     exe.step.dependOn(&hash_utmmd.step);
 
     // Windows: link ws2_32 (may be needed by Zig runtime for socket operations)
@@ -268,6 +276,7 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
             }),
         });
+        cross_exe.root_module.addImport("zio", zio_mod);
         cross_exe.step.dependOn(&cross_hash.step);
         if (tgt.result.os.tag == .windows) {
             cross_exe.root_module.linkSystemLibrary("ws2_32", .{});
