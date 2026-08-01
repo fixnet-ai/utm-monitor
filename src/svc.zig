@@ -1415,6 +1415,10 @@ fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole,
         fail.err("forceInstall/selfCopy", err);
     };
 
+    // 3.1. Create/refresh symlink in system PATH so any user can
+    // run `utmm` without specifying the full /opt/utmm/utmm path.
+    ensurePathSymlink(io, alloc);
+
     // 3.5. Host mode: copy platform binaries + ver.txt to serve-dir
     // so Guests can auto-upgrade to the correct version.
     if (role == .host) {
@@ -1635,6 +1639,173 @@ pub fn genInit(platform: Platform) []const u8 {
         \\:: Host mode: change --role guest to --role host in binPath
         ,
     };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PATH symlink — make utmm globally accessible without full path
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create/refresh a symlink in the system default executable search path
+/// so any user (root, sshd login, etc.) can run `utmm` without specifying
+/// the full /opt/utmm/utmm path.
+///
+/// POSIX: /usr/local/bin/utmm → /opt/utmm/utmm
+/// Windows: Add C:\opt\utmm to system PATH via registry
+fn ensurePathSymlink(io: std.Io, alloc: std.mem.Allocator) void {
+    if (builtin.os.tag == .windows) {
+        ensureWindowsPath(io, alloc);
+    } else {
+        ensurePosixSymlink(io);
+    }
+}
+
+fn ensurePosixSymlink(io: std.Io) void {
+    const link_path: [:0]const u8 = "/usr/local/bin/utmm";
+    const target_path: [:0]const u8 = @ptrCast(canonicalPath());
+
+    // 检查软连接是否已存在且指向正确位置
+    var rlbuf: [4096]u8 = undefined;
+    const nr = std.c.readlink(link_path, &rlbuf, rlbuf.len);
+    if (nr > 0) {
+        const existing = rlbuf[0..@intCast(nr)];
+        if (std.mem.eql(u8, existing, target_path)) {
+            std.log.info("[svc] symlink ok: {s} -> {s}", .{ link_path, target_path });
+            return;
+        }
+        // 指向了错误位置 — 删除旧连接
+        std.Io.Dir.cwd().deleteFile(io, link_path) catch |err| {
+            std.log.warn("[svc] remove stale symlink {s}: {}", .{ link_path, err });
+        };
+    }
+
+    // /usr/local/bin 在所有 macOS/Linux 系统上都存在，
+    // 如果不存在则 symlink 会失败，下面会处理该错误。
+
+    // 创建 Symlink
+    if (std.c.symlink(target_path, link_path) != 0) {
+        std.log.warn("[svc] symlink {s} -> {s} failed (continuing)", .{ link_path, target_path });
+    } else {
+        std.log.info("[svc] symlink created: {s} -> {s}", .{ link_path, target_path });
+    }
+}
+
+fn ensureWindowsPath(io: std.Io, alloc: std.mem.Allocator) void {
+    _ = io;
+    const w = std.os.windows;
+
+    const HKEY_LOCAL_MACHINE: w.HKEY = @ptrFromInt(0x80000002);
+    // REGSAM 在 Zig 0.16.0 中是 ACCESS_MASK packed struct，需要用 @bitCast
+    const KEY_READ_WRITE: w.REGSAM = @bitCast(@as(w.DWORD, 0x20019 | 0x20006));
+    const REG_SZ: w.DWORD = 1;
+    const REG_EXPAND_SZ: w.DWORD = 2;
+
+    const RegOpenKeyExW = @extern(
+        *const fn (w.HKEY, [*:0]const u16, w.DWORD, w.REGSAM, *w.HKEY) callconv(.winapi) w.LSTATUS,
+        .{ .name = "RegOpenKeyExW", .library_name = "advapi32" },
+    );
+    const RegQueryValueExW = @extern(
+        *const fn (w.HKEY, [*:0]const u16, ?*w.DWORD, ?*w.DWORD, ?[*]u8, *w.DWORD) callconv(.winapi) w.LSTATUS,
+        .{ .name = "RegQueryValueExW", .library_name = "advapi32" },
+    );
+    const RegSetValueExW = @extern(
+        *const fn (w.HKEY, [*:0]const u16, w.DWORD, w.DWORD, [*]const u8, w.DWORD) callconv(.winapi) w.LSTATUS,
+        .{ .name = "RegSetValueExW", .library_name = "advapi32" },
+    );
+    const RegCloseKey = @extern(
+        *const fn (w.HKEY) callconv(.winapi) w.LSTATUS,
+        .{ .name = "RegCloseKey", .library_name = "advapi32" },
+    );
+    const SendMessageTimeoutW = @extern(
+        *const fn (w.HWND, w.UINT, w.LPARAM, w.LPARAM, w.UINT, w.UINT, ?*w.DWORD_PTR) callconv(.winapi) w.LPARAM,
+        .{ .name = "SendMessageTimeoutW", .library_name = "user32" },
+    );
+
+    const subkey_u8 = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+    const subkey_u16 = std.unicode.utf8ToUtf16LeAllocZ(alloc, subkey_u8) catch {
+        std.log.warn("[svc] PATH: utf8→utf16 failed", .{});
+        return;
+    };
+    defer alloc.free(subkey_u16);
+
+    var key: w.HKEY = undefined;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, @ptrCast(subkey_u16), 0, KEY_READ_WRITE, &key) != 0) {
+        std.log.warn("[svc] PATH: open registry key failed", .{});
+        return;
+    }
+    defer _ = RegCloseKey(key);
+
+    // 读取当前 PATH 值
+    const value_name_u8 = "Path";
+    const value_name_u16 = std.unicode.utf8ToUtf16LeAllocZ(alloc, value_name_u8) catch {
+        std.log.warn("[svc] PATH: value name utf8→utf16 failed", .{});
+        return;
+    };
+    defer alloc.free(value_name_u16);
+
+    var data_type: w.DWORD = 0;
+    var data_size: w.DWORD = 0;
+    // 先查询大小
+    _ = RegQueryValueExW(key, @ptrCast(value_name_u16), null, &data_type, null, &data_size);
+
+    if (data_size == 0) {
+        std.log.warn("[svc] PATH: empty or missing Path value", .{});
+        return;
+    }
+
+    const buf = alloc.alloc(u8, @intCast(data_size)) catch {
+        std.log.warn("[svc] PATH: alloc {d} bytes failed", .{data_size});
+        return;
+    };
+    defer alloc.free(buf);
+
+    if (RegQueryValueExW(key, @ptrCast(value_name_u16), null, &data_type, buf.ptr, &data_size) != 0) {
+        std.log.warn("[svc] PATH: query value failed", .{});
+        return;
+    }
+
+    // 检查 C:\opt\utmm 是否已在 PATH 中
+    const add_dir = "C:\\opt\\utmm";
+    // PATH 条目以 ';' 分隔，使用大小写不敏感匹配 (Windows)
+    // data_size 包含末尾 null — 去掉 null 得到实际字符串
+    const existing = buf[0 .. @as(usize, @intCast(data_size)) -| 1];
+    if (std.ascii.indexOfIgnoreCase(existing, add_dir)) |_| {
+        std.log.info("[svc] PATH: already contains {s}", .{add_dir});
+        return;
+    }
+
+    // 追加 C:\opt\utmm 到 PATH
+    var new_path: std.ArrayList(u8) = .empty;
+    defer new_path.deinit(alloc);
+    new_path.appendSlice(alloc, existing) catch {
+        std.log.warn("[svc] PATH: alloc for new path failed", .{});
+        return;
+    };
+    // 确保末尾有分号分隔
+    if (existing.len > 0 and existing[existing.len - 1] != ';') {
+        new_path.append(alloc, ';') catch return;
+    }
+    new_path.appendSlice(alloc, add_dir) catch {
+        std.log.warn("[svc] PATH: alloc for append failed", .{});
+        return;
+    };
+    // 确保以 null 结尾（REG_SZ / REG_EXPAND_SZ）
+    new_path.append(alloc, 0) catch return;
+
+    const set_type: w.DWORD = if (data_type == REG_EXPAND_SZ) REG_EXPAND_SZ else REG_SZ;
+    const set_size: w.DWORD = @intCast(new_path.items.len);
+    if (RegSetValueExW(key, @ptrCast(value_name_u16), 0, set_type, new_path.items.ptr, set_size) != 0) {
+        std.log.warn("[svc] PATH: set value failed", .{});
+        return;
+    }
+
+    // 广播环境变量变更（通知所有窗口）
+    const HWND_BROADCAST: w.HWND = @ptrFromInt(0xFFFF);
+    const WM_SETTINGCHANGE: w.UINT = 0x001A;
+    const SMTO_ABORTIFHUNG: w.UINT = 0x0002;
+    const env_ptr: isize = @bitCast(@intFromPtr("Environment"));
+    _ = SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, env_ptr, SMTO_ABORTIFHUNG, 5000, null);
+
+    std.log.info("[svc] PATH: added {s} to system PATH", .{add_dir});
 }
 
 test "Platform.detect returns valid platform" {

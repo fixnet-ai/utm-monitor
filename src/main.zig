@@ -417,25 +417,16 @@ pub fn main(init: std.process.Init) !void {
         } else |err| {
             std.log.warn("[main] shm.open failed: {} — running without supervisor heartbeat", .{err});
         }
-        // Start heartbeat thread — updates shm.utmm_heartbeat every second.
-        // utmmd monitors this; 10s timeout triggers restart.
-        const hb_thread = if (shm_handle) |h|
-            try std.Thread.spawn(.{}, heartbeatThread, .{h, init.io})
-        else
-            null;
+        // 心跳在主 accept 循环中更新（不再使用独立线程）。
+        // 这样 utmmd 能检测到阻塞的 utmm 进程：如果 accept 循环卡住，
+        // 心跳停止更新 → utmmd 10s 超时触发重启。
         if (cli.is_host) {
-            try host_mod.runWithIo(init.io, init.gpa, cli, null);
+            try host_mod.runWithIo(init.io, init.gpa, cli, null, shm_handle);
         } else {
-            try guest.guestRunWithIo(init.io, init.gpa, cli, null);
-        }
-        // Cleanup — join heartbeat thread on exit
-        if (hb_thread) |t| {
-            if (shm_handle) |h| {
-                h.utmm_state = @intFromEnum(shm.UtmmState.stopping);
-            }
-            t.join();
+            try guest.guestRunWithIo(init.io, init.gpa, cli, null, shm_handle);
         }
         if (shm_handle) |h| {
+            h.utmm_state = @intFromEnum(shm.UtmmState.stopping);
             shm.detach(h);
         }
         return;
@@ -691,19 +682,6 @@ fn copyFile(io: std.Io, alloc: std.mem.Allocator, src_path: []const u8, dst_path
     dst.sync(io) catch |err| {
         std.log.warn("[main] copyFile sync: {}", .{err});
     };
-}
-
-/// Heartbeat thread: updates shm.utmm_heartbeat every second.
-/// utmmd monitors this field; 10s without update triggers restart.
-fn heartbeatThread(h: *volatile shm.ShmLayout, io: std.Io) void {
-    while (true) {
-        const now = shm.nowMs(io);
-        h.utmm_heartbeat = now;
-        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {
-            std.log.err("[main] heartbeat sleep failed, exiting heartbeat thread", .{});
-            break;
-        };
-    }
 }
 
 /// Build extra CLI arguments to embed in service config (--hostname, --port, etc.)

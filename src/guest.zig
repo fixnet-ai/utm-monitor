@@ -17,6 +17,7 @@ const dpipe = @import("dpipe.zig");
 const dpipe_shell = @import("dpipe_shell.zig");
 const dpipe_file = @import("dpipe_file.zig");
 const sshpass = @import("sshpass.zig");
+const shm = @import("shm.zig");
 
 // libc network interface enumeration (getifaddrs)
 const in_addr = extern struct { s_addr: u32 };
@@ -779,6 +780,7 @@ pub fn guestTcpLoop(
     mesh_port: u16,
     peer_mesh: ?[]const u8,
     shutdown: ?*std.atomic.Value(bool),
+    shm_handle: ?*volatile shm.ShmLayout,
 ) !void {
     // ── LSA/UDP 发现线程 ──
     var mesh_opt: ?lsa.Mesh = null;
@@ -908,6 +910,12 @@ pub fn guestTcpLoop(
             }
         }
 
+        // 更新心跳 — utmmd 监控此字段，10s 无更新触发重启。
+        // 放在 accept 循环顶部确保每次循环迭代都刷新心跳。
+        if (shm_handle) |h| {
+            h.utmm_heartbeat = shm.nowMs(io);
+        }
+
         // Accept TCP 连接（不含 SOCKS5 握手）
         const fd = listener.acceptRaw() catch |err| {
             if (err == error.WouldBlock) continue;
@@ -966,7 +974,7 @@ pub fn guestTcpLoop(
                 defer conn_limit.release();
                 socks5.replyOk(fd);
                 var conn = protocol.Connection{ .fd = fd, .alive = true };
-                handleOneCommand(io, allocator, info, &conn, shutdown) catch |err| {
+                handleOneCommand(io, allocator, info, &conn, shutdown, shm_handle) catch |err| {
                     std.log.err("[guest] handleOneCommand: {}", .{err});
                 };
                 conn.deinit();
@@ -1003,6 +1011,7 @@ fn handleOneCommand(
     info: SystemInfo,
     conn: *protocol.Connection,
     shutdown: ?*std.atomic.Value(bool),
+    shm_handle: ?*volatile shm.ShmLayout,
 ) !void {
     var rbuf: [262144]u8 = undefined;
 
@@ -1022,7 +1031,7 @@ fn handleOneCommand(
 
     switch (msg_type) {
         @intFromEnum(protocol.MsgType.pty_exec_input) => {
-            try handleExecCmd(io, allocator, info, conn, payload);
+            try handleExecCmd(io, allocator, info, conn, payload, shm_handle);
         },
         @intFromEnum(protocol.MsgType.upload_cmd) => {
             try handleUpload(io, allocator, conn, payload);
@@ -1046,8 +1055,8 @@ fn handleExecCmd(
     info: SystemInfo,
     conn: *protocol.Connection,
     payload: []const u8,
+    shm_handle: ?*volatile shm.ShmLayout,
 ) !void {
-    _ = io;
     const input = protocol.parsePtyExecInput(payload) orelse {
         std.log.err("[guest] parsePtyExecInput failed", .{});
         return;
@@ -1080,6 +1089,12 @@ fn handleExecCmd(
     defer accumulated.deinit(allocator);
 
     while (true) {
+        // 更新心跳 — 长时间运行的命令可能在 shell.read() 阻塞。
+        // 每次成功读取后刷新心跳，避免 utmmd 误判超时。
+        if (shm_handle) |h| {
+            h.utmm_heartbeat = shm.nowMs(io);
+        }
+
         const nr = shell.read(&output_buf) catch |err| {
             std.log.err("[guest] shell read error: {}", .{err});
             break;
@@ -1413,7 +1428,7 @@ fn cleanupStaleTempFiles(io: std.Io, alloc: std.mem.Allocator) void {
     }
 }
 
-pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
+pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool), shm_handle: ?*volatile shm.ShmLayout) !void {
     // 启动时清理残留 temp 文件（升级失败/Crash 遗留）
     cleanupStaleTempFiles(io, gpa);
 
@@ -1452,5 +1467,5 @@ pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig
     }
 
     // TCP session loop — per-command TCP connections with SOCKS5 handshake.
-    try guestTcpLoop(io, gpa, sysinfo, cli.mesh_port, cli.peer_mesh, shutdown);
+    try guestTcpLoop(io, gpa, sysinfo, cli.mesh_port, cli.peer_mesh, shutdown, shm_handle);
 }

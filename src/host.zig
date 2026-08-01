@@ -15,12 +15,13 @@ const socks5 = @import("socks5.zig");
 const svc = @import("svc.zig");
 const arp = @import("arp.zig");
 const sshpass = @import("sshpass.zig");
+const shm = @import("shm.zig");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
-    return runWithIo(init.io, init.gpa, cli, null);
+    return runWithIo(init.io, init.gpa, cli, null, null);
 }
 
-pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool)) !void {
+pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool), shm_handle: ?*volatile shm.ShmLayout) !void {
     // Management commands: stateless, no Host daemon needed
     if (cli.cmd_status) return cmdStatus(block_io, gpa, cli.port);
     if (cli.cmd_deploy) return cmdDeploy(block_io, gpa, cli.deploy_target);
@@ -69,7 +70,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 
     // --host (via --svc): start Host daemon
     if (cli.is_host) {
-        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown, cli.hostname);
+        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown, cli.hostname, shm_handle);
         return;
     }
 }
@@ -505,6 +506,7 @@ fn startHost(
     peer_mesh: ?[]const u8,
     shutdown: ?*std.atomic.Value(bool),
     hostname: ?[]const u8,
+    shm_handle: ?*volatile shm.ShmLayout,
 ) !void {
     const sd = serve_dir orelse svc.canonicalDir();
     std.log.info("[host] daemon starting (mesh UDP :{d})", .{mesh_port});
@@ -644,7 +646,7 @@ fn startHost(
 
     // Spawn LSA manager thread — syncs LSA→guest table, triggers auto-upgrade.
     // Must spawn before the defer below so join() runs in correct order.
-    var host_loop_thread = try std.Thread.spawn(.{}, hostMainLoop, .{ block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy });
+    var host_loop_thread = try std.Thread.spawn(.{}, hostMainLoop, .{ block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy, shm_handle });
 
     // Spawn IPC server thread — Unix domain socket (POSIX) / named pipe (Windows).
     // Shares HostState and Mesh with the mesh networking layer.
@@ -657,7 +659,7 @@ fn startHost(
     // Spawn TCP listener thread — SOCKS5 accept + three-way dispatch.
     // Uses GuestTable.findByHostname for hostname→IP lookup.
     var tcp_thread = try std.Thread.spawn(.{}, hostTcpListen, .{
-        block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown,
+        block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown, shm_handle,
     });
 
     defer {
@@ -707,6 +709,7 @@ fn hostTcpListen(
     hostname: []const u8,
     mesh_port: u16,
     shutdown: ?*std.atomic.Value(bool),
+    shm_handle: ?*volatile shm.ShmLayout,
 ) !void {
     var listener = tcp.TcpListener.init(io, mesh_port) catch |err| {
         std.log.err("[host] TCP listen :{d} failed: {}", .{ mesh_port, err });
@@ -718,6 +721,11 @@ fn hostTcpListen(
     std.log.info("[host] TCP SOCKS5 listener on :{d}", .{mesh_port});
 
     while (true) {
+        // 更新心跳 — utmmd 10s 超时检测。
+        if (shm_handle) |h| {
+            h.utmm_heartbeat = shm.nowMs(io);
+        }
+
         if (shutdown) |s| {
             if (s.load(.acquire)) break;
         }
@@ -1008,6 +1016,7 @@ fn hostMainLoop(
     mesh_opt: *?lsa.Mesh,
     host_ip: []const u8,
     host_hostname: []const u8,
+    shm_handle: ?*volatile shm.ShmLayout,
 ) void {
     defer allocator.free(host_ip);
     defer allocator.free(host_hostname);
@@ -1027,6 +1036,11 @@ fn hostMainLoop(
     }
 
     while (true) {
+        // 更新心跳 — utmmd 10s 超时检测。
+        if (shm_handle) |h| {
+            h.utmm_heartbeat = shm.nowMs(io);
+        }
+
         // Check shutdown
         if (mesh_opt.*) |*m| {
             if (m.shutdown.load(.acquire)) break;

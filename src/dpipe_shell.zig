@@ -346,7 +346,17 @@ fn killChild(pid: std.posix.pid_t) void {
         },
         .linux, .macos => {
             _ = kill(pid, SIGKILL);
-            _ = std.posix.system.waitpid(pid, null, 0);
+            // 非阻塞等待（5s 超时）— 子进程可能卡在 E（正在退出）状态。
+            // waitpid 阻塞 → 主 accept 循环停止 → SOCKS5 握手无响应。
+            // 超时后不再等待：子进程已 SIGKILL，OS 最终会回收。
+            const WNOHANG: c_int = 1;
+            var waited_ms: u32 = 0;
+            while (waited_ms < 5000) : (waited_ms += 100) {
+                if (std.c.waitpid(pid, null, WNOHANG) != 0) break;
+                // 使用原生 nanosleep — dpipe_shell closeFn 没有 Io 参数。
+                var req = std.posix.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+                _ = std.c.nanosleep(&req, null);
+            }
         },
         else => @compileError("unsupported OS for killChild"),
     }
