@@ -28,7 +28,6 @@ need to know:
 - Each `exec` runs in a fresh shell — no `cd` or `export` persistence across calls.
 - Windows `exec` commands: use `&&` for chaining, NOT `;`.
 - LSA mesh sync takes ~10–15s after Guest restart before it appears in `status`.
-- The `--marker` / hosts-file tag is `UTM-MONITOR` (historical, not significant).
 
 ## Table of Contents
 
@@ -36,6 +35,7 @@ need to know:
 - [CLI Reference](#cli-reference)
 - [MCP Protocol](#mcp-protocol)
 - [Architecture](#architecture)
+- [Common Usage Scenarios](#common-usage-scenarios)
 - [Platform Differences](#platform-differences)
 - [Deployment Guide](#deployment-guide)
 - [Troubleshooting](#troubleshooting)
@@ -57,7 +57,7 @@ need to know:
 
 | Command | Description |
 |---------|-------------|
-| `utmm` (no args) | Ensure Guest service is running (auto-installs utmmd if needed) |
+| `utmm` (no args) | Ensure Guest service is running (auto-installs if needed) |
 | `utmm --host` | Ensure Host service is running |
 | `utmm --svc` | Internal: run as daemon (set by service manager) |
 | `utmm --mcp` | Start MCP stdio JSON-RPC server (auto-ensures Host on first use) |
@@ -87,7 +87,7 @@ need to know:
 | `--port PORT` | Service port (default 2121) |
 | `--hosts-file PATH` | hosts file path (default /etc/hosts) |
 | `--serve-dir PATH` | Binary serve directory for upgrade push |
-| `--marker TAG` | hosts-file marker comment (default "UTM-MONITOR") |
+| `--marker TAG` | hosts-file marker comment |
 | `--log-file PATH` | Log file path |
 
 ### Management Commands
@@ -255,63 +255,36 @@ Params), `-32603` (Internal Error — tool-specific failure).
 
 ## Architecture
 
-### Layered Model
-
-```
-┌─────────────────────────────────────────┐
-│  Application Layer                       │
-│  guest.zig / host.zig / ipc.zig / mcp.zig│
-├─────────────────────────────────────────┤
-│  Topology Layer                          │
-│  lsa.zig (LSA broadcast + node table)    │
-├─────────────────────────────────────────┤
-│  Transport Layer                         │
-│  tcp.zig (Frame protocol + SOCKS5 +     │
-│           forwarding + relay)            │
-├─────────────────────────────────────────┤
-│  Data Pipe Layer                         │
-│  dpipe.zig (DuplexPipe + relay engine)   │
-│  dpipe_shell.zig (pty ↔ DuplexPipe)     │
-│  dpipe_file.zig (file ↔ DuplexPipe)     │
-├─────────────────────────────────────────┤
-│  Protocol Layer                          │
-│  protocol.zig (types, serialization)     │
-├─────────────────────────────────────────┤
-│  System Service Layer                    │
-│  svc.zig / utmmd.zig / shm.zig           │
-├─────────────────────────────────────────┤
-│  Foundation Layer                        │
-│  main.zig / fail.zig / config.zig        │
-└─────────────────────────────────────────┘
-```
-
 ### Run Modes
 
-**Guest mode** (default): utmmd spawns utmm as Guest — UDP LSA broadcast,
-TCP listener on port 2121 (SOCKS5 accept from Host + utmm frame protocol +
-localhost relay), per-command pty shell. Guest accepts SOCKS5 connections only
-from the Host — no CLI entry point for Guest commands.
+**Guest mode** (default): The Guest daemon listens on TCP/UDP port 2121 for SOCKS5
+connections and mesh broadcasts. It accepts SOCKS5 connections from the Host only —
+no local CLI entry point for Guest commands. Each command (exec/upload/download)
+spawns a fresh pty session, so there is no `cd` or `export` persistence.
 
-**Host mode** (`--host`): utmmd spawns utmm as Host — UDP LSA mesh, IPC socket
-(`/var/run/utmm.sock` on POSIX, `\\.\pipe\utmm` on Windows), TCP listener on
-port 2121 (SOCKS5 accept from Guests + chain-forward to other Guests).
+**Host mode** (`--host`): The Host daemon is the central coordination node —
+it runs the LSA mesh, maintains the node table, syncs `/etc/hosts` on Guests,
+accepts SOCKS5 connections from Guests and chain-forwards them to other Guests,
+and serves CLI/MCP requests via a local IPC socket. Only one Host per mesh.
 The Host is the only node that relays SOCKS5 between Guests.
-CLI/MCP commands talk to Host daemon via IPC.
 
-**MCP mode** (`--mcp`): stdio JSON-RPC server for AI agents. Auto-ensures Host
-on first use — no daemon awareness needed.
+**MCP mode** (`--mcp`): stdio JSON-RPC server for AI agents. Auto-ensures the Host
+service on first use — no daemon awareness needed. All management commands go through
+the Host via IPC.
 
 ### How a Command Flows
 
 ```
-1. CLI: utmm --exec linuxvm "ls -la"
-2. CLI → IPC socket (/var/run/utmm.sock) → Host daemon
-3. Host → SOCKS5 → Guest TCP :2121
-4. Host sends pty_exec_input frame with "ls -la; echo MDELIM:$?\n"
-5. Guest: recv frame → dpipe_shell (pty) → fork/exec → pty output
-6. Guest → Host: pty_exec_output frames (streaming) + pty_exec_done (exit code)
-7. Host → CLI: binary frames via IPC socket → stdout
+1. User runs: utmm --exec linuxvm "ls -la"
+2. CLI connects to Host daemon via local IPC socket
+3. Host opens SOCKS5 connection to linuxvm:2121
+4. Host sends the command frame (with "ls -la; echo MDELIM:$?\n" appended)
+5. Guest spawns a fresh pty, runs the command, streams output back
+6. Host forwards output to CLI, detects exit-code marker, reports exit code
 ```
+
+Each exec/upload/download opens a fresh TCP connection, completes one operation,
+and closes — no persistent tunnels between commands.
 
 ### SOCKS5 Forwarding (Hub-Spoke)
 
@@ -322,14 +295,25 @@ Guest, target the Host with `gateway:2121`.
 **Dispatch model (Host TCP :2121):**
 
 ```
-SOCKS5 request arrives:
+SOCKS5 request arrives at Host:
   target_hostname == self ?
-    ├─ target_port == 2121 → OK, utmm internal frame protocol (exec/upload/download)
-    └─ target_port != 2121 → OK, connect 127.0.0.1:target_port, relay
+    ├─ target_port == 2121 → utmm internal frame protocol (exec/upload/download)
+    └─ target_port != 2121 → connect 127.0.0.1:target_port, relay
   target_hostname != self ?
     └─ lookup hostname→IP in node table
-        ├─ found → OK, chain-forward SOCKS5 to target_ip:2121, relay
+        ├─ found → chain-forward SOCKS5 to target_ip:2121, relay
         └─ not found → REJECT
+```
+
+**Guest SOCKS5 accept (TCP :2121):**
+
+```
+SOCKS5 request arrives from Host at Guest:
+  target_hostname == self ?
+    ├─ target_port == 2121 → utmm internal frame protocol (exec/upload/download)
+    └─ target_port != 2121 → connect 127.0.0.1:target_port, relay
+  target_hostname != self →
+    REJECT — Guests only serve local services; use gateway for other Guests
 ```
 
 **Examples:**
@@ -338,6 +322,7 @@ SOCKS5 request arrives:
 # From Host — reach any Guest service
 curl --socks5 localhost:2121 http://linuxvm:8080       # web server on linuxvm
 curl --socks5 localhost:2121 http://macvm:22            # SSH on macvm
+curl --socks5 localhost:2121 http://windowsvm:3389      # RDP on windowsvm
 
 # From a Guest — route through the Host (gateway)
 curl --socks5 gateway:2121 http://linuxvm:8080          # Guest → Host → linuxvm
@@ -345,40 +330,158 @@ curl --socks5 gateway:2121 http://windowsvm:3389        # Guest → Host → win
 
 # Local service on the Host itself
 curl --socks5 localhost:2121 http://localhost:3000
+
+# Git clone via SOCKS5
+git -c http.proxy=socks5://localhost:2121 clone http://linuxvm:8080/repo.git
 ```
 
 **Key properties:**
 - Host TCP :2121 must be reachable from all Guests
-- Each forwarded connection runs in its own thread, exits when either side closes
-- Works with any SOCKS5-compatible client: `curl`, `wget`, browsers, `git`
+- Each forwarded connection runs independently, exits when either side closes
+- Works with any SOCKS5-compatible client: `curl`, `wget`, browsers, `git`, database tools
 - Host name `gateway` is auto-synced to every Guest's `/etc/hosts`
 
-### TCP Wire Protocol (protocol.zig)
+### Mesh Networking (LSA)
 
-All frames: 4-byte BE length prefix (tcp.zig sendFrame/recvFrame), then inner
-payload = 1-byte MsgType + type-specific payload.
+The Host broadcasts Link State Advertisements (LSA) via UDP port 2121 every 2
+seconds. Each Guest listens for LSA broadcasts and the Host maintains a node table
+with all discovered machines. Nodes that miss 3 consecutive broadcasts (6 seconds)
+are marked offline.
 
-| Type | Value | Direction | Purpose |
-|------|-------|-----------|---------|
-| `pty_spawn` | 0x10 | host→guest | Trigger shell spawn |
-| `pty_exec_input` | 0x11 | host→guest | Command for shell stdin |
-| `pty_exec_output` | 0x15 | guest→host | Shell stdout |
-| `pty_exec_done` | 0x16 | guest→host | Command exit code |
-| `download_cmd` | 0x14 | host→guest | Download request |
-| `upload_cmd` | 0x1b | host→guest | Upload request |
-| `upload_result` | 0x17 | guest→host | Upload verification |
-| `upgrade_cmd` | 0x1a | host→guest | Push upgrade binary |
+LSA also carries node metadata: hostname, IP address, OS/architecture, version,
+shell type, ConPTY support, and role (host/guest). This is what powers the
+`--status` and `--ping` commands.
 
-Strings: null-terminated. Blobs: 4-byte BE length prefix. Integers: 4-byte BE.
-File data: raw TCP streaming (no chunking — TCP provides reliable delivery).
+**Mesh diagnostics:**
 
-### LSA Mesh Protocol (UDP :2121)
+```bash
+# Check which nodes the Host can see
+utmm --status
 
-First-byte dispatch: `0x01` = LSA broadcast, `0x03` = MESH_PING, `0x04` = MESH_PONG.
+# Test direct mesh reachability to a specific Guest
+utmm --ping linuxvm
 
-Host broadcasts LSA every 2 seconds. Nodes timeout after 6s (3 missed broadcasts).
-LSA node_info is key:value\\n text with fields: hostname, ip, target, version, shell,
-conpty, role, status, epoch.
+# Check if a Guest is receiving LSA broadcasts
+utmm --exec linuxvm "cat /etc/hosts | grep UTM-MONITOR"
+```
+
+---
+
+## Common Usage Scenarios
+
+### Remote Command Execution
+
+```bash
+# Basic system info
+utmm --exec linuxvm "uname -a"
+utmm --exec windowsvm "ver"
+
+# Process and resource inspection
+utmm --exec linuxvm "ps aux | head -20"
+utmm --exec linuxvm "free -h && df -h"
+utmm --exec windowsvm "tasklist | findstr /i java"
+
+# Service management on Guests
+utmm --exec linuxvm "systemctl status nginx"
+utmm --exec windowsvm "sc.exe query UTM-MonitorD"
+
+# Network diagnostics from within a Guest
+utmm --exec linuxvm "ip addr show && ping -c 3 8.8.8.8"
+utmm --exec windowsvm "ipconfig /all && ping -n 3 8.8.8.8"
+
+# Multi-step Windows commands (use && chaining)
+utmm --exec windowsvm "cd C:\opt\utmm && dir && type config.ini"
+
+# Long-running commands — output streams in real time
+utmm --exec linuxvm "find /var/log -name '*.log' -mtime -1 -exec tail -5 {} \;"
+```
+
+> **Windows note**: Always use `&&` for command chaining on Windows — `;` is not
+> recognized by `cmd.exe`. Use `findstr` instead of `grep`, `type` instead of `cat`.
+
+### File Transfer
+
+```bash
+# Upload a config file to a specific path
+utmm --upload nginx.conf linuxvm:/etc/nginx/nginx.conf
+
+# Upload to default directory (/opt/utmm/ or C:\opt\utmm\)
+utmm --upload myapp.exe windowsvm
+
+# Download log files for analysis
+utmm --download linuxvm /var/log/syslog ./syslog.txt
+
+# Download Windows event logs
+utmm --download windowsvm C:\Windows\System32\winevt\Logs\Application.evtx ./
+
+# Upload and verify — SHA256 is computed during transfer
+# The file is written to a temp location, verified, then atomically renamed
+```
+
+File transfers use direct TCP streaming with end-to-end SHA256 integrity
+verification. Uploads are atomic (temp file → verify hash → rename) so a
+failed transfer never leaves a partial file. Downloads stream directly from
+the Guest's filesystem.
+
+### SOCKS5 Tunneling
+
+The Host TCP :2121 port is a full SOCKS5 proxy. Any SOCKS5-compatible tool
+can reach any Guest through it.
+
+```bash
+# Browse a web app running on a Guest
+curl --socks5 localhost:2121 http://linuxvm:8080/api/health
+
+# SSH to a Guest through the SOCKS5 tunnel
+ssh -o ProxyCommand='nc --proxy-type socks5 --proxy localhost:2121 %h %p' root@linuxvm
+
+# Database client connecting to a database on a Guest
+psql -h linuxvm -p 5432 -U postgres  # with SOCKS5 proxy in ~/.psqlrc or env
+
+# From a Guest — use gateway:2121 (Host IP is auto-synced to /etc/hosts)
+curl --socks5 gateway:2121 http://windowsvm:8080
+
+# Browser setup: configure SOCKS5 proxy to localhost:2121, then browse
+# http://linuxvm:3000 directly in the address bar
+```
+
+### Software Upgrade
+
+```bash
+# 1. Build and stage binaries for all Guests
+utmm --deploy
+
+# 2. Push upgrade to specific Guests (Host → Guest via SOCKS5)
+utmm --upgrade linuxvm
+utmm --upgrade windowsvm
+
+# 3. Verify all Guests are on the new version
+utmm --status
+
+# Single-Guest quick upgrade cycle:
+utmm --deploy linuxvm && utmm --upgrade linuxvm && utmm --status
+```
+
+`--deploy` cross-compiles for all target platforms, SCPs binaries to each Guest,
+and stages them in the Host serve-dir. `--upgrade` pushes the binary from Host
+to Guest over the SOCKS5 channel (no SSH needed), verifies SHA256, and triggers
+a zero-downtime restart via the utmmd supervisor.
+
+### Bootstrap a New Machine
+
+```bash
+# 1. SSH in and create the install directory
+utmm sshpass -p '111' ssh root@newvm 'mkdir -p /opt/utmm'
+
+# 2. Copy the binary
+scp zig-out/bin/utmm-aarch64-linux root@newvm:/opt/utmm/utmm-new
+
+# 3. Install as a system service
+utmm sshpass -p '111' ssh root@newvm '/opt/utmm/utmm-new --install --hostname newvm'
+
+# 4. Wait for LSA sync (~10-15s), then verify
+sleep 15 && utmm --status
+```
 
 ---
 
@@ -411,7 +514,7 @@ conpty, role, status, epoch.
 |----------|---------------|------------------|
 | Linux | `/bin/bash` | `;` or `&&` |
 | macOS | `/bin/zsh` | `;` or `&&` |
-| Windows | `cmd.exe` (UTF-8) | `&&` only (SSH does NOT handle `;`) |
+| Windows | `cmd.exe` (UTF-8) | `&&` only |
 
 ### ConPTY Support Matrix
 
@@ -426,63 +529,57 @@ conpty, role, status, epoch.
 
 ## Deployment Guide
 
-### Quick Deploy (all machines)
+### Initial Setup
+
+**Host** (the control machine — typically your local workstation):
 
 ```bash
+sudo utmm --host --install
+sudo utmm --status    # verify the Host is running
+```
+
+**Guests** (managed machines) — use the automated deploy pipeline:
+
+```bash
+# Deploy to all Guests (cross-compile + SCP + install + verify)
 utmm --deploy
-```
 
-Cross-compiles for all targets, SCPs binaries to each Guest, runs `--install`,
-verifies reachability.
-
-### Host (local macOS)
-
-```bash
-zig build -Doptimize=ReleaseSafe
-sudo zig-out/bin/utmm --host --install
-sudo utmm --status    # verify
-```
-
-### Linux Guest
-
-```bash
-V=$(cat src/ver.txt)
-scp zig-out/bin/utmm-aarch64-linux-$V root@linuxvm:/opt/utmm/utmm-new
-ssh root@linuxvm '/opt/utmm/utmm-new --install --hostname linuxvm'
-```
-
-### macOS Guest
-
-```bash
-V=$(cat src/ver.txt)
-# If launchctl throttles: kill processes first, then cp + --install
-ssh root@macvm 'killall -9 utmm utmmd 2>/dev/null; sleep 1'
-scp zig-out/bin/utmm-aarch64-macos-$V root@macvm:/opt/utmm/utmm-new
-ssh root@macvm 'cp /opt/utmm/utmm-new /opt/utmm/utmm && /opt/utmm/utmm --install --hostname macvm'
-```
-
-### Windows Guest
-
-```bash
-V=$(cat src/ver.txt)
-# Must kill utmmd before install (AccessDenied if utmmd locks the exe)
-ssh Administrator@windowsvm 'taskkill /F /IM utmmd.exe 2>nul'
-scp zig-out/bin/utmm-aarch64-windows-$V.exe Administrator@windowsvm:C:/opt/utmm/utmm-new.exe
-ssh Administrator@windowsvm 'C:\opt\utmm\utmm-new.exe --install --hostname windowsvm'
-```
-
-### Upgrade via Host Push Model
-
-```bash
-# 1. Build + copy to serve-dir
+# Or deploy to a single Guest
 utmm --deploy linuxvm
-
-# 2. Push upgrade (Host → Guest via SOCKS5, no SSH needed)
-utmm --upgrade linuxvm
-
-# 3. Verify
-utmm --status
 ```
+
+`--deploy` handles cross-compilation, binary transfer, and installation in one
+command. After deployment, wait ~10–15 seconds for LSA mesh sync, then verify
+with `--status`.
+
+### Manual Guest Deployment
+
+If `--deploy` is not available (no build environment on the Host), deploy
+binaries manually:
+
+```bash
+# POSIX (Linux/macOS)
+scp utmm-<target> root@<hostname>:/opt/utmm/utmm-new
+ssh root@<hostname> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
+
+# Windows — kill utmmd first (it locks the exe → AccessDenied on rename)
+ssh Administrator@<hostname> 'taskkill /F /IM utmmd.exe 2>nul'
+scp utmm-<target>.exe Administrator@<hostname>:C:/opt/utmm/utmm-new.exe
+ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
+```
+
+### Day-to-Day Upgrades
+
+```bash
+# Push upgrade to a Guest (Host → Guest via SOCKS5, no SSH needed)
+utmm --deploy linuxvm    # build + stage
+utmm --upgrade linuxvm   # push + restart
+utmm --status            # verify version
+```
+
+The upgrade is atomic: the new binary is SHA256-verified, the utmmd supervisor
+stops the old process, renames the binary, and spawns the new one — zero-downtime
+from the caller's perspective.
 
 ### Verify Deployment
 
@@ -491,61 +588,46 @@ utmm --status                              # all Guests online + version match
 utmm --exec linuxvm "echo OK"             # exec smoke test
 utmm --exec macvm "echo OK"
 utmm --exec windowsvm "echo OK"
-utmm --exec winx64 "echo OK"
 utmm --upload /tmp/test.txt linuxvm        # upload test
-utmm --download linuxvm /opt/utmm/test.txt /tmp/dl.txt  # download test
+utmm --download linuxvm /tmp/test.txt /tmp/dl.txt  # download test
 ```
 
 ---
 
 ## Troubleshooting
 
-### zig build test hangs on macOS
+### Guest not appearing in status after install
 
-**Symptom**: `zig build test` never completes, no error output — stuck indefinitely.
+**Symptom**: `utmm --status` doesn't show a newly installed Guest.
 
-**Cause**: Zig 0.16.0 `--listen=-` test protocol has a hang bug on macOS (Darwin 25).
+**Cause**: LSA mesh sync takes ~10–15 seconds after Guest service starts.
+The Guest needs to receive at least one LSA broadcast and the Host needs to
+register it in the node table.
 
-When the build system runs tests via `b.addRunArtifact()`, it injects `--listen=-`
-into the test process. This flag makes the test process report results to the build
-system over a stdio pipe. The build system blocks waiting for pipe EOF, but on
-macOS (kqueue backend) the pipe sometimes fails to close after the test process
-exits, causing a deadlock.
-
-For the same reason, `zig build test --summary all` can also hang on macOS CI runners.
-
-**Solution** — this project's `build.zig` already works around the issue:
-
-`build.zig` uses `std.Build.Step.Run.create()` to run test binaries manually,
-passing the binary as an argv argument rather than via `addRunArtifact`, thus
-avoiding `--listen=-` injection entirely. Bare `zig build test` (without
-`--summary all`) outputs directly to the terminal, bypassing the protocol layer.
-
-**If it still hangs**, run the cached test binary directly:
+**Check**:
 ```bash
-# Unit tests (with 30s timeout guard)
-perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/test 2>&1 | tail -5
-# Integration tests
-perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/integration_test 2>&1
+# Check if Guest service is running
+utmm --exec <vm> "echo OK"   # or use sshpass if Guest not in status yet
+
+# Wait and retry
+sleep 15 && utmm --status
 ```
 
-**CI note**: On GitHub Actions macOS runners, use `zig build test` rather than
-`zig build test --summary all` — the latter can trigger the same hang.
+### Hostname not resolving for direct SSH
 
-### Hostname not resolving for winx64
+**Symptom**: `ssh: Could not resolve hostname <name>`.
 
-**Symptom**: `ssh: Could not resolve hostname winx64`.
+**Cause**: The machine is on a different IP subnet and LSA UDP broadcast may not
+traverse subnet boundaries. `/etc/hosts` sync only covers machines on the same
+broadcast domain.
 
-**Cause**: winx64 is on 192.168.3.x subnet, LSA UDP broadcast may not traverse
-subnets. `/etc/hosts` sync only covers VMs on the same broadcast domain.
-
-**Workaround**: Use the IP directly for SSH/scp operations targeting winx64:
+**Workaround**: Use the IP directly for SSH/scp operations:
 ```bash
 ssh Administrator@192.168.3.108 '<command>'
 scp file.exe Administrator@192.168.3.108:C:/opt/utmm/
 ```
 The `--status` / `--exec` / `--upload` / `--download` commands through the Host
-work correctly with hostname `winx64` — only direct SSH/scp is affected.
+work correctly with hostnames — only direct SSH/scp is affected.
 
 ### Windows service stop fails (sc.exe error 109)
 
@@ -582,25 +664,23 @@ scp utmm-new root@macvm:/opt/utmm/utmm-new
 ssh root@macvm 'cp /opt/utmm/utmm-new /opt/utmm/utmm && /opt/utmm/utmm --install --hostname macvm'
 ```
 
-### Windows Firewall blocks SOCKS5 BIND / UDP ASSOCIATE
+### Windows Firewall blocks inbound SOCKS5 connections
 
-**Symptom**: SOCKS5 BIND second-stage accept times out (60s), external connector
-cannot reach the dynamically-assigned TCP port. UDP ASSOCIATE datagrams not
-received from remote peers.
+**Symptom**: SOCKS5 connections from Host to Windows Guest time out. Exec
+commands targeting the Windows Guest fail with connection errors.
 
-**Cause**: Windows Firewall blocks inbound connections to ports not explicitly
-allowed. BIND creates a TCP listener on a random port — the firewall drops
-inbound SYN packets. UDP ASSOCIATE uses a random UDP port with the same issue.
+**Cause**: Windows Firewall blocks inbound connections to port 2121 (and other
+ports used by SOCKS5 forwarding). Linux and macOS have no equivalent issue.
 
-**Solution — disable Windows Firewall** (recommended for VM/isolated environments):
+**Solution — add a firewall rule**:
+```
+netsh advfirewall firewall add rule name="utmm" dir=in action=allow program="C:\opt\utmm\utmm.exe" enable=yes
+```
 
+**Or disable Windows Firewall entirely** (appropriate for VM/isolated environments):
 ```
 # PowerShell (Administrator)
 Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
-
-# Or via Control Panel:
-#   Control Panel → Windows Defender Firewall → Turn Windows Defender Firewall on or off
-#   → Turn off Windows Defender Firewall (all profiles)
 ```
 
 **Verification**:
@@ -609,18 +689,9 @@ netsh advfirewall show allprofiles | findstr State
 # Should show: State    OFF
 ```
 
-**Alternative — add a program rule** (if disabling entirely is not acceptable):
-```
-netsh advfirewall firewall add rule name="utmm" dir=in action=allow program="C:\opt\utmm\utmm.exe" enable=yes
-```
-
-> This is a Windows OS-level restriction, not a code defect. Linux and macOS
-> have no equivalent issue — BIND and UDP ASSOCIATE work without firewall
-> configuration on those platforms.
->
 > SOCKS5 CONNECT (the most common operation: exec, upload, download, forwarding)
-> is NOT affected — it uses outbound connections which Windows Firewall allows
-> by default.
+> uses outbound connections which Windows Firewall allows by default. Only
+> inbound connections are affected.
 
 ### pkill -f self-kill (Linux only)
 
