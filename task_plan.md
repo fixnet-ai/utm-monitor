@@ -2,18 +2,18 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.16.1 — Hub-Spoke 架构全面修正（文档 + Guest 链式转发代码）
+**最新版本**: v0.17.7 — 心跳超时崩溃循环修复（acceptRaw 内层循环阻塞 + 长传输补心跳）
 
 - **分支**: `main`
 - **源文件**: 20 src + 13 test
-- **测试**: 186 单元测试 + 59 集成测试，全部通过，0 泄漏
+- **测试**: 188 单元测试 + 59 集成测试，全部通过，0 泄漏
 
-## 当前阶段: Phase 23-c — Hub-Spoke 架构全面修正 ✅
+## 当前阶段: Phase 24-b — 心跳超时崩溃循环修复 ✅
 
-**目标**: 实现 RFC 1928 完整 SOCKS5 协议（BIND + UDP ASSOCIATE）；将 SOCKS5 协议层从 tcp.zig 提取到独立 socks5.zig。
-- **单元测试**: 186 测试全部通过 ✅
+**目标**: 修复 linuxvm 持续心跳超时崩溃循环（自 v0.17.2 预存），utmm accept 循环空闲期间心跳无法更新致 utmmd 误杀。
+- **单元测试**: 188 测试全部通过 ✅
 - **集成测试**: 59/59 通过 ✅
-- **裸机部署**: 5 节点全部 v0.16.0 ✅
+- **真机部署**: 待发布验证
 
 ## 架构概述
 
@@ -731,6 +731,10 @@ src/
 | 54 | Windows accept timeout 用 select()（非 poll） | poll() 在 Windows 上不可用，select() 跨平台兼容性最好 |
 | 55 | UDP ASSOCIATE TCP 控制通道保持长连接 | RFC 1928 要求 TCP 断开时终止所有 UDP 中继 |
 | 56 | MCP 服务器名 "utmm"（非 "utm-monitor"） | utmm 是命令/二进制名，快捷易输入；UTM Monitor 是软件产品名 |
+| 57 | utmmd IP 指纹检测用 Wyhash | 零堆分配、速度快、确定性输出；只需检测变化无需知道哪个 IP 变 |
+| 58 | IP 去抖 2 次确认（20s）| 防止 DHCP 瞬态抖动或接口 flap 导致不必要的 utmm 重启 |
+| 59 | acceptRaw 删除内层重试循环，WouldBlock 返回给调用者 | POSIX 非阻塞 socket accept 立即返回 EAGAIN，内层循环永不返回 → shm 心跳永不更新 → utmmd 超时误杀 |
+| 60 | upload/download/upgrade 长传输循环中补心跳 | 大文件传输 >10s 无心跳更新 → utmmd 误判超时杀进程 |
 
 ### Phase 23-b: v0.16.1 — MCP 配置修正 + 规划文档同步 ✅
 
@@ -760,3 +764,37 @@ src/
 | 198 | CLAUDE.md 5+ 处架构描述修正 | `CLAUDE.md` | ✅ 端口描述/运行模式/转发流程/设计决策 |
 | 199 | Guest 链式转发代码删除（~58 行 → REJECT） | `src/guest.zig` | ✅ Finding 199，commit `2b69c8e` |
 | 200 | 更新 findings.md + progress.md | 规划文件 | ✅ Finding 199 + 进度记录 |
+
+### Phase 24: v0.17.6 — utmmd IP 变更检测自动重启 ✅
+
+**背景**: 当机器 IP 因 DHCP 续约、网络切换等变化时，utmm 继续使用旧 IP 进行 LSA 广播，
+导致 Host 节点表中 Guest IP 失效、连接失败。utmm 需要重启以重新检测网关和本机 IP。
+
+**方案**: utmmd 的 `monitorUtmm` 轮询循环中增加轻量级 IP 指纹检测 — 每 10s 枚举所有非
+回环 IPv4 地址并计算 Wyhash 指纹，指纹变化后经去抖确认（连续 2 次）触发 utmm 重启。
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 201 | 新增 IP 枚举类型 + 指纹函数（POSIX getifaddrs + Windows GetAdaptersAddresses） | `src/utmmd.zig` | ✅ ~180 行，零堆分配 |
+| 202 | 修改 monitorUtmm 轮询循环增加 IP 检查 | `src/utmmd.zig` | ✅ 去抖 2 次确认（20s） |
+| 203 | 新增 IP 指纹单元测试 | `src/utmmd.zig` | ✅ 4 测试 |
+| 204 | 8 交叉编译目标构建 + 188 测试通过 | - | ✅ |
+| 205 | 部署 Host 真机验证（指纹计算正常、无异常重启） | - | ✅ |
+| 206 | 版本号 bump 0.17.5 → 0.17.6 | `src/ver.txt` | ✅ |
+
+### Phase 24-b: v0.17.7 — 心跳超时崩溃循环修复 ✅
+
+**背景**: linuxvm 自 v0.17.2 起持续心跳超时崩溃循环。排查发现是 `acceptRaw()` 内层
+`while(true)` 循环在 POSIX 非阻塞 socket 上遇到 `WouldBlock` 后永不返回到调用者，
+导致 accept 循环中的 shm 心跳更新在空闲期间从不执行。此外 upload/download/upgrade
+长传输操作（>10s 大文件）也未补心跳，可能触发伪心跳超时。
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 207 | acceptRaw 删除内层 while(true) 循环，WouldBlock 直接返回给调用者 | `src/tcp.zig` | ✅ ~14 行删除 |
+| 208 | guest.zig accept 循环 WouldBlock 后 sleep 100ms 再 continue | `src/guest.zig` | ✅ |
+| 209 | host.zig accept 循环 WouldBlock 后 sleep 100ms 再 continue | `src/host.zig` | ✅ |
+| 210 | handleUpload/handleDownload/handleUpgradeCmd 增加 shm 心跳更新 | `src/guest.zig` | ✅ 3 处，签名增加 shm_handle 参数 |
+| 211 | handleOneCommand 分发更新调用签名 | `src/guest.zig` | ✅ 传递 shm_handle |
+| 212 | zig build test + test-integration 全部通过 | - | ✅ 188+59 |
+| 213 | 版本号 bump 0.17.6 → 0.17.7 | `src/ver.txt` | ✅ commit `b850b02` tag `v0.17.7` |

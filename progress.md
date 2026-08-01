@@ -1,3 +1,103 @@
+## v0.17.7 — 心跳超时崩溃循环修复
+
+**时间**: 2026-08-02
+
+### acceptRaw 内层循环阻塞心跳 — 根因分析与修复
+
+linuxvm 自 v0.17.2 起持续心跳超时崩溃循环。排查发现根因在 `tcp.zig` 的
+`acceptRaw()` 函数。
+
+**根因**: `acceptRaw()` 内部有一个 `while(true)` 循环 — 当 `accept()` 返回
+`WouldBlock` 时 sleep 100ms 后 retry，永不返回到调用者。POSIX 非阻塞 socket
+上 `accept()` 立即返回 `EAGAIN`/`WouldBlock`（无连接时），内层循环无限重试，
+导致外层 accept 循环中的 shm 心跳更新从不执行。空闲期间 10s 后 utmmd 检测
+心跳超时 → 杀 utmm → 崩溃循环。
+
+**修复（3 个文件）**:
+
+1. `src/tcp.zig` — acceptRaw 删除内层 `while(true)`，改为直接返回 `WouldBlock`：
+```zig
+// 修复前：内层 while(true) 永不返回
+pub fn acceptRaw(self: *TcpListener) !socket_t {
+    while (true) {
+        const stream = self.server.?.accept(self.io) catch |err| {
+            if (err == error.WouldBlock) {
+                std.Io.sleep(self.io, ...) catch {};
+                continue;  // ← 永不返回！
+            }
+            return error.AcceptFailed;
+        };
+        return stream.socket.handle;
+    }
+}
+
+// 修复后：WouldBlock 直接返回给调用者
+pub fn acceptRaw(self: *TcpListener) !socket_t {
+    const stream = self.server.?.accept(self.io) catch |err| {
+        if (err == error.WouldBlock) return error.WouldBlock;
+        return error.AcceptFailed;
+    };
+    return stream.socket.handle;
+}
+```
+
+2. `src/guest.zig` — accept 循环 WouldBlock 处理增加 sleep：
+```zig
+const fd = listener.acceptRaw() catch |err| {
+    if (err == error.WouldBlock) {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+        continue;  // ← 心跳在外部 while 循环顶部更新
+    }
+};
+```
+
+3. `src/host.zig` — 同 guest.zig 模式修复。
+
+**长传输心跳补充（`src/guest.zig`）**:
+- `handleUpload` / `handleDownload` / `handleUpgradeCmd` 签名增加 `shm_handle` 参数
+- 文件传输循环中每次读写后更新心跳
+- `handleOneCommand` 分发更新三处调用传递 `shm_handle`
+
+**测试验证**:
+- 188 单元测试 + 59 集成测试全部通过 ✅
+- ReleaseSafe 构建通过 ✅
+
+**提交**: commit `b850b02`，tag `v0.17.7`
+
+### 已知遗留问题（本版本未修复）
+
+1. **Zombie 进程**: `dpipe_shell.zig` 的 `killChild()` 有 5s WNOHANG waitpid 限制，
+   子进程卡在 D 状态时无法收割
+2. **utmmd 二进制升级缺口**: push-upgrade 仅替换 utmm，不替换 utmmd。本次修复只需
+   改 utmm 代码，`--upgrade <vm>` 即可部署
+
+---
+
+## v0.17.6 — utmmd IP 变更检测自动重启
+
+**时间**: 2026-08-02
+
+### IP 指纹检测
+
+当机器 IP 因 DHCP 续约、网络切换变化时，utmmd 通过 Wyhash 指纹检测变更并自动重启 utmm。
+
+**实现** (`src/utmmd.zig`):
+- 新增 `getAllIpsFingerprint()` — 跨平台 IP 枚举（POSIX `getifaddrs` / Windows `GetAdaptersAddresses` 动态加载 iphlpapi.dll）
+- Wyhash 哈希所有非回环 IPv4 地址的原始字节 + 计数 → u64 指纹
+- 零堆分配，纯栈变量
+- monitorUtmm 轮询循环中每 10s 检查一次
+- 去抖 2 次确认（IP 需稳定 20s），防 DHCP 瞬态抖动
+- 指纹 = 0（无 IP）不触发重启
+- 4 个单元测试
+
+**验证**:
+- 188 测试全部通过 + 8 交叉编译目标 ✅
+- Host 真机指纹计算正常、无异常重启 ✅
+
+**提交**: commit `4ad00bc`，tag `v0.17.6`
+
+---
+
 ## v0.16.0 — SOCKS5 全协议（BIND + UDP ASSOCIATE）+ 协议层提取
 
 **时间**: 2026-08-01

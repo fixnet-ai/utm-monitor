@@ -666,3 +666,86 @@ defer 的第二次 close 对已释放的 ctx 操作：`self.file` 字段为垃�
 
 **影响范围**: 仅 Guest 端 SOCKS5 接受逻辑。Host 端不受影响。所有 Guest 间通信本就走 Host，
 此修复消除了 Guest 被直接连接时绕开 Host 的错误路径。
+
+---
+
+## 2026-08-02 — IP 变更检测 + 心跳超时崩溃循环修复（v0.17.6→v0.17.7）
+
+### Finding 200: acceptRaw 内层 while(true) 循环阻塞心跳更新
+
+**症状**: linuxvm 自 v0.17.2 起持续心跳超时崩溃循环，utmmd 日志：
+```
+[utmmd] heartbeat timeout: 11234ms since last update
+[utmmd] killing utmm (pid=1234)
+[utmmd] utmm restarted (pid=1235)
+...repeat every ~15s
+```
+Host 端显示 linuxvm 状态在 serving→offline 之间反复震荡。
+
+**排查过程**:
+1. 确认 shm 心跳字段正确创建、utmmd 超时阈值 10s 未变
+2. 确认 utmm accept 循环在每轮迭代顶部写入心跳（`h.utmm_heartbeat = shm.nowMs(io)`）
+3. 怀疑 accept 循环中的某条路径长时间阻塞 → 追踪 `listener.acceptRaw()`
+4. 发现 `tcp.zig:806` 的 `acceptRaw()` 内部有一个 `while(true)` 循环！
+
+**根因**: `acceptRaw()` 在 Zig 0.16.0 的 `IpAddress.listen()` 创建的 socket 上调用
+`Server.accept()`。POSIX（Linux）上 `listen()` 默认 `SOCK_NONBLOCK`，无连接时
+`accept()` 立即返回 `EAGAIN`/`WouldBlock`。内层 `while(true)` 循环捕获 WouldBlock
+后 sleep 100ms 然后 retry — 永不返回到调用者。
+
+```
+guest.zig accept 循环（外层 while true）:
+  h.utmm_heartbeat = nowMs(io);     // ← 写入心跳
+  const fd = listener.acceptRaw();   // ← 永不返回（内层循环死循环）
+  ...handle connection...
+  // heartbeat 更新从此永不执行
+```
+
+空闲期间（无 TCP 连接），acceptRaw 永不返回 → 心跳永不更新 → utmmd 10s 后
+检测超时 → 杀进程 → 崩溃循环开始。
+
+linuxvm 在崩溃恢复周期中，Host TCP 连接概率性到达（取决于 timing），偶尔一次
+心跳在连接处理间隙更新 → utmm 存活数秒 → 下一次空闲又超时。
+
+**为何之前未发现**: VPS（如 modasiaipc）可能有常驻 TCP 连接或不同 socket 行为。
+linuxvm 的 UTM 网络环境空闲期间无任何入站连接，暴露了此问题。
+
+**修复** (`src/tcp.zig:806`):
+- 删除内层 `while(true)` 循环，WouldBlock 直接返回给调用者
+- 调用者（guest.zig/host.zig）在 catch WouldBlock 后 sleep 100ms + continue
+- 外层 while 循环每轮迭代顶部更新心跳
+
+**影响文件**: `src/tcp.zig`、`src/guest.zig`、`src/host.zig`
+
+### Finding 201: upload/download/upgrade 长传输缺少心跳更新
+
+**发现**: handleUpload、handleDownload、handleUpgradeCmd 三个函数在进行大文件传输时
+（可能持续 >10s），其间没有任何 shm 心跳更新。如果文件传输时间超过 `HEARTBEAT_TIMEOUT_SEC`
+（10s），utmmd 会误判超时杀 utmm。
+
+**修复**:
+- 三个函数签名增加 `shm_handle: ?*volatile shm.ShmLayout` 参数
+- 文件传输循环中每次 `sockRead`/`sockWrite` 后调用 `shm_handle.?.utmm_heartbeat = shm.nowMs(io)`
+- `handleOneCommand` 分发更新三处调用
+
+**影响文件**: `src/guest.zig`
+
+### Finding 202: Wyhash IP 指纹 vs 字符串比较 — 栈安全与零分配
+
+**背景**: v0.17.6 IP 变更检测使用 Wyhash 指纹而非字符串列表比较。
+
+**设计理由**:
+- **零堆分配**: utmmd 是监管进程，应避免内存分配。Wyhash 只使用栈变量（u64 状态 + 逐字节喂入）
+- **确定性**: 同一组 IP 地址（无论枚举顺序）产生相同指纹。`getifaddrs` 返回的链表顺序
+  在 Linux/macOS 上是确定性的
+- **无需知道哪个 IP 变了**: 只需知道"有变化"即可触发重启，哈希比较满足需求
+- **栈安全**: 不持有任何指针或引用，指纹是纯值类型 (u64)，跨函数边界无悬垂风险
+
+**局限性**: 理论上存在哈希碰撞（两个不同 IP 集合产生相同 u64 指纹），概率约 1/2^64，
+在 IP 变更检测场景完全可接受。
+
+### Finding 203: Windows GetAdaptersAddresses 动态加载 — utmmd 自包含
+
+**设计**: utmmd 不链接 iphlpapi.dll，而是在运行时通过 `LoadLibraryA`/`GetProcAddress`
+动态加载 `GetAdaptersAddresses`。这与 utmmd 作为独立监管进程的定位一致 — 最小化静态依赖，
+Windows 服务启动时 DLL 加载失败不会导致 utmmd 崩溃。
