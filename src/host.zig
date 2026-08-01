@@ -719,6 +719,7 @@ fn hostTcpListen(
     defer listener.deinit();
 
     var conn_limit = tcp.ConnLimit.init(tcp.DEFAULT_MAX_CONNS);
+    const rt = zio.Runtime.fromIo(io);
     std.log.info("[host] TCP SOCKS5 listener on :{d}", .{mesh_port});
 
     while (true) {
@@ -757,22 +758,22 @@ fn hostTcpListen(
                 continue;
             }
             if (req.cmd == socks5.SOCKS_CMD_BIND) {
-                const t = std.Thread.spawn(.{}, socks5.socks5BindWithLimit, .{ io, fd, &conn_limit }) catch {
+                var handle = rt.spawnBlocking(socks5.socks5BindWithLimit, .{ io, fd, &conn_limit }) catch {
                     conn_limit.release();
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                t.detach();
+                handle.detach();
                 std.log.info("[host] BIND accepted", .{});
             } else {
-                const t = std.Thread.spawn(.{}, socks5.udpAssociateWithLimit, .{ fd, &conn_limit }) catch {
+                var handle = rt.spawnBlocking(socks5.udpAssociateWithLimit, .{ io, fd, &conn_limit }) catch {
                     conn_limit.release();
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                t.detach();
+                handle.detach();
                 std.log.info("[host] UDP ASSOCIATE accepted", .{});
             }
             continue;
@@ -794,12 +795,12 @@ fn hostTcpListen(
                     continue;
                 }
                 errdefer conn_limit.release();
-                const t = std.Thread.spawn(.{}, socks5.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
+                var handle = rt.spawnBlocking(socks5.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                t.detach();
+                handle.detach();
                 std.log.info("[host] local relay :{d}", .{req.port});
             }
         } else {
@@ -843,14 +844,14 @@ fn hostTcpListen(
                     .limit = &conn_limit,
                 };
 
-                const t = std.Thread.spawn(.{}, guest.forwardThreadFn, .{ctx}) catch {
+                var handle = rt.spawnBlocking(guest.forwardThreadFn, .{ctx}) catch {
                     allocator.destroy(ctx);
                     allocator.free(hn_copy);
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                t.detach();
+                handle.detach();
                 std.log.info("[host] forward {s}:{d} → {s}", .{ req.hostname, req.port, guest_entry.ip });
             } else {
                 std.log.info("[host] no route to {s}", .{req.hostname});
@@ -1161,11 +1162,12 @@ fn hostMainLoop(
                         };
 
                         const push_hostname = allocator.dupe(u8, hostname) catch continue;
-                        const thread = std.Thread.spawn(.{}, pushUpgradeThread, .{ io, allocator, state, push_hostname }) catch {
+                        const rt = zio.Runtime.fromIo(io);
+                        var handle = rt.spawnBlocking(pushUpgradeThread, .{ io, allocator, state, push_hostname }) catch {
                             allocator.free(push_hostname);
                             continue;
                         };
-                        thread.detach();
+                        handle.detach();
                     }
                 }
             }

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const zio = @import("zio");
 const tcp = @import("tcp.zig");
 const protocol = @import("protocol.zig");
 
@@ -399,7 +400,6 @@ pub fn connect(
 /// Uses raw socket API (not Zig Io.net) to ensure fd type compatibility.
 /// Windows: Winsock2 SOCKET vs AFD handles are incompatible.
 pub fn localRelay(io: std.Io, client_fd: tcp.socket_t, target_port: u16) void {
-    _ = io; // unused — raw sockets don't need Zig Io
     const local_fd = tcp.sockConnectLocalhost(target_port) catch {
         replyRejected(client_fd);
         tcp.sockClose(client_fd);
@@ -407,7 +407,7 @@ pub fn localRelay(io: std.Io, client_fd: tcp.socket_t, target_port: u16) void {
     };
 
     replyOk(client_fd);
-    relay(client_fd, local_fd);
+    relay(io, client_fd, local_fd);
     tcp.sockClose(client_fd);
     tcp.sockClose(local_fd);
 }
@@ -440,7 +440,7 @@ pub fn forward(
     // Don't close stream — fd ownership transferred to relay
 
     replyOk(client_fd);
-    relay(client_fd, next_fd);
+    relay(io, client_fd, next_fd);
     tcp.sockClose(client_fd);
     tcp.sockClose(next_fd);
 }
@@ -449,13 +449,14 @@ pub fn forward(
 // Bidirectional Relay
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Bidirectional relay: A ↔ B. Two threads, one per direction.
+/// Bidirectional relay: A ↔ B. Uses zio spawnBlocking for managed thread pool.
 /// When one side closes, shuts down write on the other side.
-pub fn relay(a_fd: tcp.socket_t, b_fd: tcp.socket_t) void {
+pub fn relay(io: std.Io, a_fd: tcp.socket_t, b_fd: tcp.socket_t) void {
+    const rt = zio.Runtime.fromIo(io);
     var a_to_b_done = std.atomic.Value(bool).init(false);
 
-    const relay_thread = std.Thread.spawn(.{}, relayDir, .{ b_fd, a_fd, &a_to_b_done }) catch return;
-    defer relay_thread.join();
+    var relay_handle = rt.spawnBlocking(relayDir, .{ b_fd, a_fd, &a_to_b_done }) catch return;
+    defer _ = relay_handle.join();
 
     relayDir(a_fd, b_fd, &a_to_b_done);
 }
@@ -489,7 +490,7 @@ fn relayDir(src: tcp.socket_t, dst: tcp.socket_t, done: *std.atomic.Value(bool))
 /// then relays UDP datagrams bidirectionally over the TCP connection.
 /// Does not return — runs until TCP closes or error.
 /// Only IPv4 ATYP is supported for relayed datagrams.
-pub fn udpAssociate(tcp_fd: tcp.socket_t) void {
+pub fn udpAssociate(io: std.Io, tcp_fd: tcp.socket_t) void {
     const udp_fd = tcp.createUdpSocket() catch {
         replyRejected(tcp_fd);
         tcp.sockClose(tcp_fd);
@@ -505,17 +506,18 @@ pub fn udpAssociate(tcp_fd: tcp.socket_t) void {
     // Reply with BND.ADDR=0.0.0.0, BND.PORT=assigned UDP port
     reply(tcp_fd, SOCKS_REP_OK, [_]u8{ 0, 0, 0, 0 }, udp_port);
 
+    const rt = zio.Runtime.fromIo(io);
     var shutdown = std.atomic.Value(bool).init(false);
 
-    // TCP→UDP thread
-    const tcp_to_udp = std.Thread.spawn(.{}, udpTcpToUdp, .{ tcp_fd, udp_fd, &shutdown }) catch {
+    // TCP→UDP on managed thread pool
+    var tcp_to_udp = rt.spawnBlocking(udpTcpToUdp, .{ tcp_fd, udp_fd, &shutdown }) catch {
         tcp.sockClose(tcp_fd);
         tcp.sockClose(udp_fd);
         return;
     };
     // UDP→TCP thread (runs in current thread)
     udpUdpToTcp(tcp_fd, udp_fd, &shutdown);
-    tcp_to_udp.join();
+    _ = tcp_to_udp.join();
 
     tcp.sockClose(tcp_fd);
     tcp.sockClose(udp_fd);
@@ -650,7 +652,7 @@ pub fn socks5Bind(io: std.Io, client_fd: tcp.socket_t) void {
     reply(client_fd, SOCKS_REP_OK, accepted.addr.ip, accepted.addr.port);
 
     // Relay between client and accepted connection
-    relay(client_fd, accepted.fd);
+    relay(io, client_fd, accepted.fd);
     tcp.sockClose(client_fd);
     tcp.sockClose(accepted.fd);
 }
@@ -662,9 +664,9 @@ pub fn socks5BindWithLimit(io: std.Io, fd: tcp.socket_t, limit: *tcp.ConnLimit) 
 }
 
 /// Thread wrapper: udpAssociate with connection limit release.
-pub fn udpAssociateWithLimit(fd: tcp.socket_t, limit: *tcp.ConnLimit) void {
+pub fn udpAssociateWithLimit(io: std.Io, fd: tcp.socket_t, limit: *tcp.ConnLimit) void {
     defer limit.release();
-    udpAssociate(fd);
+    udpAssociate(io, fd);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

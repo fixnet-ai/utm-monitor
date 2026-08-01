@@ -953,7 +953,7 @@ pub fn guestTcpLoop(
                 };
                 std.log.info("[guest] BIND accepted", .{});
             } else {
-                group.spawnBlocking(socks5.udpAssociateWithLimit, .{ fd, &conn_limit }) catch {
+                group.spawnBlocking(socks5.udpAssociateWithLimit, .{ io, fd, &conn_limit }) catch {
                     conn_limit.release();
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);

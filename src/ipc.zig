@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const zio = @import("zio");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Windows API externs (removed from std.os.windows in Zig 0.16.0)
@@ -390,14 +391,15 @@ fn startServerPosix(
             continue;
         }
 
-        // Spawn handler thread (detached — connection is short-lived)
+        // Spawn handler on managed thread pool (detached — connection is short-lived)
         const conn: Connection = .{ .fd = client_fd };
-        const thread = std.Thread.spawn(.{}, handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
+        const rt = zio.Runtime.fromIo(io);
+        var handle = rt.spawnBlocking(handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
             std.log.err("[ipc] thread spawn failed", .{});
             conn.close();
             continue;
         };
-        thread.detach();
+        handle.detach();
     }
 }
 
@@ -444,12 +446,13 @@ fn startServerWindows(
         }
 
         const conn: Connection = .{ .fd = pipe };
-        const thread = std.Thread.spawn(.{}, handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
+        const rt = zio.Runtime.fromIo(io);
+        var handle = rt.spawnBlocking(handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
             std.log.err("[ipc] thread spawn failed", .{});
             conn.close();
             continue;
         };
-        thread.detach();
+        handle.detach();
     }
 }
 
