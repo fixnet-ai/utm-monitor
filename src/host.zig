@@ -888,7 +888,19 @@ pub fn connectGuest(
     state: *GuestTable,
     hostname: []const u8,
 ) !protocol.Connection {
-    const guest_entry = state.findByHostname(hostname) orelse return error.GuestNotFound;
+    // 带重试的 hostname→IP 查找：Host 重启后 LSA 广播需要几个周期才能
+    // 填充 node table。最多等 10s（20 次 × 500ms），覆盖 5 个 LSA 周期。
+    var guest_entry: GuestEntry = undefined;
+    var found: bool = false;
+    for (0..20) |_| {
+        if (state.findByHostname(hostname)) |entry| {
+            guest_entry = entry;
+            found = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+    }
+    if (!found) return error.GuestNotFound;
     defer state.freeEntry(guest_entry);
 
     return socks5.hostConnect(io, guest_entry.ip, hostname, protocol.DEFAULT_PORT) catch |primary_err| {
@@ -922,8 +934,18 @@ pub fn pushUpgrade(
     state: *GuestTable,
     hostname: []const u8,
 ) ?[]const u8 {
-    // 1. Look up Guest entry
-    const guest_entry = state.findByHostname(hostname) orelse return "GuestNotFound";
+    // 1. Look up Guest entry（带重试，覆盖 Host 重启后 cold-start 窗口）
+    var guest_entry: GuestEntry = undefined;
+    var found: bool = false;
+    for (0..20) |_| {
+        if (state.findByHostname(hostname)) |entry| {
+            guest_entry = entry;
+            found = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
+    }
+    if (!found) return "GuestNotFound";
     defer state.freeEntry(guest_entry);
 
     // 2. Determine deployment filename from target triple
