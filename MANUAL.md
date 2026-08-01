@@ -1,10 +1,38 @@
-# UTM Monitor Manual — v0.16.x
+# utmm Reference Manual
 
-Complete reference for CLI commands, MCP protocol, architecture, platform
-differences, and deployment.
+utmm is a remote machine management tool — single binary, dual mode (Host +
+Guest). It provides command execution, file transfer, mesh networking, and
+SOCKS5 forwarding to any machine (VM, cloud instance, or bare metal) running
+the Guest daemon. AI agents interact with utmm via the MCP stdio JSON-RPC
+interface (`utmm --mcp`).
+
+## For AI Agents — Quick Start
+
+If you are an AI agent reading this via the `manual` MCP tool, here is what you
+need to know:
+
+**Available tools**: `status`, `exec`, `ping`, `upload`, `download`, `sshpass`,
+`manual` — all accessible through MCP JSON-RPC.
+
+**Typical workflow**:
+1. Call `status` to see which machines are online and their shell types.
+2. Call `exec` to run commands on a machine (check shell type first —
+   Linux/macOS use POSIX sh, Windows uses cmd.exe syntax with `&&` chaining).
+3. Use `upload`/`download` for file transfer with SHA256 integrity verification.
+4. Use `sshpass` for direct SSH to machines without utmm installed (bootstrap,
+   recovery, or one-off access).
+5. Call `ping` to test mesh network connectivity and measure RTT to a machine.
+
+**Key rules**:
+- Hostnames are case-insensitive — `LinuxVM`, `linuxvm`, `LINUXVM` are identical.
+- Each `exec` runs in a fresh shell — no `cd` or `export` persistence across calls.
+- Windows `exec` commands: use `&&` for chaining, NOT `;`.
+- LSA mesh sync takes ~10–15s after Guest restart before it appears in `status`.
+- The `--marker` / hosts-file tag is `UTM-MONITOR` (historical, not significant).
 
 ## Table of Contents
 
+- [For AI Agents — Quick Start](#for-ai-agents--quick-start)
 - [CLI Reference](#cli-reference)
 - [MCP Protocol](#mcp-protocol)
 - [Architecture](#architecture)
@@ -59,7 +87,7 @@ differences, and deployment.
 | `--port PORT` | Service port (default 2121) |
 | `--hosts-file PATH` | hosts file path (default /etc/hosts) |
 | `--serve-dir PATH` | Binary serve directory for upgrade push |
-| `--marker TAG` | Marker comment text (default "UTM-MONITOR") |
+| `--marker TAG` | hosts-file marker comment (default "UTM-MONITOR") |
 | `--log-file PATH` | Log file path |
 
 ### Management Commands
@@ -144,8 +172,8 @@ newline-delimited. Log traffic goes to stderr, JSON-RPC to stdout.
 
 ### tools/list Response
 
-Returns 6 tools: `status`, `exec`, `ping`, `upload`, `download`, `sshpass`.
-Each tool has `name`, `description`, and `inputSchema` (JSON Schema).
+Returns 7 tools: `status`, `exec`, `ping`, `upload`, `download`, `sshpass`,
+`manual`. Each tool has `name`, `description`, and `inputSchema` (JSON Schema).
 
 ### sshpass: Direct SSH from AI Agents
 
@@ -171,7 +199,7 @@ See [sshpass Subcommand](#sshpass-subcommand) for the full CLI reference.
 **status** — list all nodes:
 ```
 → {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}
-← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"**UTM Virtual Machines:**\n- **linuxvm** (guest) — aarch64-linux-musl | IP: 192.168.64.6 | MAC: 16:a0:6c:... | v0.14.7 | shell: /bin/bash | status: serving\n..."}]}}
+← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"**Connected Machines:**\n- **linuxvm** (guest) — aarch64-linux-musl | IP: 192.168.64.6 | MAC: 16:a0:6c:... | v0.14.7 | shell: bash | status: online\n..."}]}}
 ```
 
 **exec** — execute a command:
@@ -203,6 +231,16 @@ See [sshpass Subcommand](#sshpass-subcommand) for the full CLI reference.
 → {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"sshpass","arguments":{"host":"linuxvm","user":"root","password":"111","command":"uname -a"}}}
 ← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"**ssh root@linuxvm** `uname -a`\\nexit: 0\\n```\\nLinux linuxvm 6.1.0-... aarch64 GNU/Linux\\n```"}]}}
 ```
+
+**manual** — get the full reference manual (this document):
+```
+→ {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"manual","arguments":{}}}
+← {"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","text":"# utmm Reference Manual\n\n..."}]}}
+```
+
+The `manual` tool returns the entire MANUAL.md embedded at compile time — no
+arguments needed. Use it whenever you need detailed information about utmm
+usage, architecture, platform specifics, or troubleshooting.
 
 ### Error Response Format
 
@@ -388,14 +426,14 @@ conpty, role, status, epoch.
 
 ## Deployment Guide
 
-### Quick Deploy (all VMs)
+### Quick Deploy (all machines)
 
 ```bash
 utmm --deploy
 ```
 
-This cross-compiles for all targets, SCPs binaries to each Guest, runs `--install`,
-and verifies.
+Cross-compiles for all targets, SCPs binaries to each Guest, runs `--install`,
+verifies reachability.
 
 ### Host (local macOS)
 
@@ -570,7 +608,7 @@ netsh advfirewall show allprofiles | findstr State
 
 **Alternative — add a program rule** (if disabling entirely is not acceptable):
 ```
-netsh advfirewall firewall add rule name="UTM Monitor" dir=in action=allow program="C:\opt\utmm\utmm.exe" enable=yes
+netsh advfirewall firewall add rule name="utmm" dir=in action=allow program="C:\opt\utmm\utmm.exe" enable=yes
 ```
 
 > This is a Windows OS-level restriction, not a code defect. Linux and macOS
