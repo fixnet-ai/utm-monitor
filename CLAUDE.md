@@ -569,8 +569,7 @@ tests/
 
 ## Code of Conduct / Guidelines
 
-Before starting any work, read (if they exist): `./CLAUDE.md`, `./README.md`,
-`./zig-codegen.md`.
+Before starting any work, read (if they exist): `./CLAUDE.md`, `./README.md`.
 
 ### Zig 0.16.0 Key Changes
 - `std.posix.socket` removed → use `std.Io.net`
@@ -658,6 +657,11 @@ No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
   SHA256, then `rename(temp, dest)`. Hash mismatch → temp deleted, dest not created.
 - **256KB stack buffer**: `var rbuf: [262144]u8 = undefined` — large enough for
   any single frame, small enough to stack-allocate.
+
+### Pre-coding Verification
+
+- Before writing Zig code, call `zig-docs` `search_zig_docs` or `zig-mcp` `search_std_lib` to confirm 0.16.0 function signatures
+- After completion, use `plugin:zig-mcp` `zig_diagnostics` to verify no compilation errors
 
 ### Development Principles
 1. **Think before coding** — state assumptions, present trade-offs

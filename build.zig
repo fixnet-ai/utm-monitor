@@ -178,6 +178,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
+        // dpipe.zig and guest.zig import zio — make it available for standalone tests
+        mod.addImport("zio", zio_mod);
         if (target.result.os.tag == .windows) {
             mod.linkSystemLibrary("ws2_32", .{});
         }
@@ -203,6 +205,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    testlib_mod.addImport("zio", zio_mod);
     const test_common_mod = b.createModule(.{
         .root_source_file = b.path("tests/common.zig"),
         .target = target,
@@ -306,6 +309,7 @@ pub fn build(b: *std.Build) void {
     });
     integration_test.root_module.addImport("testlib", testlib_mod);
     integration_test.root_module.addImport("common", test_common_mod);
+    integration_test.root_module.addImport("zio", zio_mod);
 
     if (target.result.os.tag == .windows) {
         integration_test.root_module.linkSystemLibrary("ws2_32", .{});

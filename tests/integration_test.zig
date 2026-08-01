@@ -9,6 +9,7 @@
 //!   zig build test-integration
 
 const std = @import("std");
+const zio = @import("zio");
 const common = @import("common");
 
 const test_tcp = @import("test_tcp_frame.zig");
@@ -38,6 +39,13 @@ pub fn main(init: std.process.Init) !void {
     }
     const alloc = gpa.allocator();
 
+    // zio Runtime provides executor context for dpipe.relay()'s spawnBlocking().
+    // I/O uses std.Io.Threaded (not rt.io()) because raw system calls in
+    // common.zig (sockAccept/sockConnect) require standard blocking sockets —
+    // zio's kqueue Io creates non-blocking sockets that return EAGAIN from
+    // system.accept() before the client connects.
+    var rt = try zio.Runtime.init(alloc, .{});
+    defer rt.deinit();
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
 

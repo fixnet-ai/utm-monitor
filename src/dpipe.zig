@@ -9,6 +9,7 @@
 // no per-operation context capture needed.
 
 const std = @import("std");
+const zio = @import("zio");
 
 // ── DuplexPipe 接口 ────────────────────────────────────────────
 
@@ -49,8 +50,8 @@ pub const DuplexPipe = struct {
 
 /// 在管道 A 和 B 之间做全双工字节转发。
 ///
-/// 启动两个线程：A→B 和 B→A，任一端 EOF 或出错时通知另一端停止，
-/// 等待两个方向都退出后关闭双方管道。
+/// 使用 zio Group.spawnBlocking 启动两个并发任务：A→B 和 B→A，
+/// 任一端 EOF 或出错时通知另一端停止，等待两个方向都退出后关闭双方管道。
 ///
 /// 用于 file upload/download：Host 端 relay(TCP, FilePipe) 或
 /// Guest 端 relay(ShellPipe, TCP)。
@@ -59,17 +60,19 @@ pub const DuplexPipe = struct {
 pub fn relay(a: DuplexPipe, b: DuplexPipe) !void {
     const RelayBufferSize = 65536;
 
-    // 共享停止标志 — 任一线程设置后另一线程在下个循环检测到
+    // 共享停止标志 — 任一方向设置后另一方向在下个循环检测到
     var done = std.atomic.Value(bool).init(false);
 
-    // 线程 T1: A → B（从 A 读，写到 B）
-    const t1 = try std.Thread.spawn(.{}, relayOneWay, .{ a, b, &done, RelayBufferSize });
+    // 使用 zio Group 管理并发：spawnBlocking 在 thread pool 上运行
+    // B→A 方向，当前线程运行 A→B 方向
+    var g: zio.Group = .init;
+    try g.spawnBlocking(relayOneWay, .{ a, b, &done, RelayBufferSize });
 
-    // 主线程 T2: B → A（从 B 读，写到 A）
+    // 当前线程: B → A（从 B 读，写到 A）
     relayOneWay(b, a, &done, RelayBufferSize);
 
     // 等待两个方向都结束
-    t1.join();
+    g.wait() catch {};
 
     // 关闭双方
     a.close();

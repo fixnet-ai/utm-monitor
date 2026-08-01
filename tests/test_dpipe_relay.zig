@@ -7,6 +7,7 @@ const dpipe = lib.dpipe;
 const tcp = lib.tcp;
 
 pub fn test_dpipe_relay(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestRunner) !void {
+    _ = io; // no longer needed — relay() uses zio internally
     // ── 场景 1: BytePipe 读写 + EOF ──
     {
         var tc = runner.case("BytePipe 读写 + EOF");
@@ -100,6 +101,8 @@ pub fn test_dpipe_relay(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
     }
 
     // ── 场景 4: relay() 数据转发 ──
+    // relay() 内部使用 zio spawnBlocking，阻塞直到两个方向都完成。
+    // relay() 结束时关闭双方 pipe（调用 closeFn），之后不能再访问。
     {
         var tc = runner.case("relay() 数据转发");
 
@@ -108,32 +111,27 @@ pub fn test_dpipe_relay(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
             tc.deinit();
             return;
         };
+        // Note: bp2 not created — we only verify relay() completes without crash.
+        // relay() calls close() on both pipes which deinits BytePipe buffers.
         var bp2 = dpipe.BytePipe.create(alloc) catch {
             tc.skip("BytePipe.create 失败");
             tc.deinit();
             return;
         };
 
+        // Write test data to bp1; bp2 is empty.
+        // relay(A→B, B→A): bp1 data → bp2, then bp2 EOF → done → both exit.
         try bp1.write("bidirectional relay test");
 
         const p1 = bp1.toPipe();
         const p2 = bp2.toPipe();
 
-        var relay_done = std.atomic.Value(bool).init(false);
-        const relay_thread = try std.Thread.spawn(.{}, struct {
-            fn run(a: dpipe.DuplexPipe, b: dpipe.DuplexPipe, done: *std.atomic.Value(bool)) void {
-                dpipe.relay(a, b) catch {};
-                done.store(true, .release);
-            }
-        }.run, .{ p1, p2, &relay_done });
-
-        var waited: usize = 0;
-        while (!relay_done.load(.acquire) and waited < 200) : (waited += 1) {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch break;
-        }
-        relay_thread.join();
-
-        tc.expectTrue(relay_done.load(.acquire), "relay 正常终止（非阻塞）");
+        // relay() uses zio spawnBlocking internally — no manual thread spawn needed.
+        // Both directions run on the thread pool, relay() blocks until they complete,
+        // then closes both pipes.
+        dpipe.relay(p1, p2) catch |err| {
+            tc.expect(false, "relay 失败: {}", .{err});
+        };
 
         tc.deinit();
     }
@@ -156,21 +154,12 @@ pub fn test_dpipe_relay(io: std.Io, alloc: std.mem.Allocator, runner: *common.Te
         const p1 = bp1.toPipe();
         const p2 = bp2.toPipe();
 
-        var relay_done = std.atomic.Value(bool).init(false);
-        const relay_thread = try std.Thread.spawn(.{}, struct {
-            fn run(a: dpipe.DuplexPipe, b: dpipe.DuplexPipe, done: *std.atomic.Value(bool)) void {
-                dpipe.relay(a, b) catch {};
-                done.store(true, .release);
-            }
-        }.run, .{ p1, p2, &relay_done });
-
-        var waited: usize = 0;
-        while (!relay_done.load(.acquire) and waited < 200) : (waited += 1) {
-            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch break;
-        }
-        relay_thread.join();
-
-        tc.expectTrue(relay_done.load(.acquire), "relay 在空管道上立即退出");
+        // relay() with empty pipes: relayOneWay(b→a) reads EOF immediately,
+        // sets done flag, relayOneWay(a→b) checks done and exits.
+        // Then closes both pipes. Just verify no crash.
+        dpipe.relay(p1, p2) catch |err| {
+            tc.expect(false, "relay 失败: {}", .{err});
+        };
 
         tc.deinit();
     }
