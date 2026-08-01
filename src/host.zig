@@ -657,21 +657,14 @@ fn startHost(
         block_io, gpa, @as(*anyopaque, @ptrCast(&state)), @as(*anyopaque, @ptrCast(&mesh_opt)), &ipc_shutdown,
     });
 
-    // Spawn TCP listener task — SOCKS5 accept + three-way dispatch.
-    // Uses GuestTable.findByHostname for hostname→IP lookup.
-    var tcp_handle = try zio.spawnBlocking(hostTcpListen, .{
-        block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown, shm_handle,
-    });
-
     defer {
         // 1. Signal all background threads to stop
         ipc_shutdown.store(true, .release);
         // 2. Signal mesh shutdown — hostMainLoop checks this each loop iteration
         if (mesh_opt) |*m| m.signalShutdown();
 
-        // 3. Join tasks (order: IPC → TCP → host loop → mesh)
+        // 3. Join tasks (order: IPC → host loop → mesh)
         ipc_handle.join() catch |err| std.log.err("[host] IPC task error: {}", .{err});
-        tcp_handle.join() catch |err| std.log.err("[host] TCP task error: {}", .{err});
         host_loop_handle.join();
 
         // 4. Join mesh thread after all consumers have exited
@@ -689,16 +682,9 @@ fn startHost(
         // 6. state.deinit() runs via its own defer (declared earlier, runs later)
     }
 
-    // Block until shutdown — Host runs via Mesh + IPC threads
-    if (shutdown) |flag| {
-        while (!flag.load(.acquire)) {
-            std.Io.sleep(block_io, std.Io.Duration.fromSeconds(1), .awake) catch {};
-        }
-    } else {
-        while (true) {
-            std.Io.sleep(block_io, std.Io.Duration.fromSeconds(60), .awake) catch {};
-        }
-    }
+    // Run TCP accept loop on main executor (like guest pattern).
+    // Uses group.spawnBlocking() for per-connection handlers.
+    try hostTcpListen(block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown, shm_handle);
 }
 
 /// Host TCP listener — SOCKS5 accept + three-way dispatch.
@@ -719,7 +705,7 @@ fn hostTcpListen(
     defer listener.deinit();
 
     var conn_limit = tcp.ConnLimit.init(tcp.DEFAULT_MAX_CONNS);
-    const rt = zio.Runtime.fromIo(io);
+    var group: zio.Group = .init;
     std.log.info("[host] TCP SOCKS5 listener on :{d}", .{mesh_port});
 
     while (true) {
@@ -758,22 +744,20 @@ fn hostTcpListen(
                 continue;
             }
             if (req.cmd == socks5.SOCKS_CMD_BIND) {
-                var handle = rt.spawnBlocking(socks5.socks5BindWithLimit, .{ io, fd, &conn_limit }) catch {
+                group.spawnBlocking(socks5.socks5BindWithLimit, .{ io, fd, &conn_limit }) catch {
                     conn_limit.release();
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                handle.detach();
                 std.log.info("[host] BIND accepted", .{});
             } else {
-                var handle = rt.spawnBlocking(socks5.udpAssociateWithLimit, .{ io, fd, &conn_limit }) catch {
+                group.spawnBlocking(socks5.udpAssociateWithLimit, .{ io, fd, &conn_limit }) catch {
                     conn_limit.release();
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                handle.detach();
                 std.log.info("[host] UDP ASSOCIATE accepted", .{});
             }
             continue;
@@ -795,12 +779,11 @@ fn hostTcpListen(
                     continue;
                 }
                 errdefer conn_limit.release();
-                var handle = rt.spawnBlocking(socks5.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
+                group.spawnBlocking(socks5.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                handle.detach();
                 std.log.info("[host] local relay :{d}", .{req.port});
             }
         } else {
@@ -844,14 +827,13 @@ fn hostTcpListen(
                     .limit = &conn_limit,
                 };
 
-                var handle = rt.spawnBlocking(guest.forwardThreadFn, .{ctx}) catch {
+                group.spawnBlocking(guest.forwardThreadFn, .{ctx}) catch {
                     allocator.destroy(ctx);
                     allocator.free(hn_copy);
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                handle.detach();
                 std.log.info("[host] forward {s}:{d} → {s}", .{ req.hostname, req.port, guest_entry.ip });
             } else {
                 std.log.info("[host] no route to {s}", .{req.hostname});
