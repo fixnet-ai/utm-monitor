@@ -504,30 +504,33 @@ utmm --download linuxvm /opt/utmm/test.txt /tmp/dl.txt  # download test
 
 **Symptom**: `zig build test` never completes, no error output — stuck indefinitely.
 
-**Cause**: Zig 0.16.0 的 `--listen=-` 测试协议在 macOS (Darwin 25) 存在 hang bug。
+**Cause**: Zig 0.16.0 `--listen=-` test protocol has a hang bug on macOS (Darwin 25).
 
-Zig 构建系统通过 `b.addRunArtifact()` 运行测试时，自动给测试进程注入 `--listen=-` 参数。
-该参数让测试进程通过 stdio 管道与构建系统通信上报结果。构建系统会阻塞等待管道 EOF，
-但某些情况下（尤其 macOS kqueue 后端）测试进程已退出而管道未正确关闭，导致死锁。
+When the build system runs tests via `b.addRunArtifact()`, it injects `--listen=-`
+into the test process. This flag makes the test process report results to the build
+system over a stdio pipe. The build system blocks waiting for pipe EOF, but on
+macOS (kqueue backend) the pipe sometimes fails to close after the test process
+exits, causing a deadlock.
 
-同样的原因，`zig build test --summary all` 在 CI 的 macOS runner 上也可能 hang。
+For the same reason, `zig build test --summary all` can also hang on macOS CI runners.
 
-**解决方案** — 本项目 `build.zig` 已绕过此问题：
+**Solution** — this project's `build.zig` already works around the issue:
 
-`build.zig` 使用 `std.Build.Step.Run.create()` 手动运行测试二进制，
-以 argv 参数形式传入而非通过 `addRunArtifact`，从而绕过 `--listen=-` 协议注入。
-裸 `zig build test`（不加 `--summary all`）直接输出到终端，不走协议层。
+`build.zig` uses `std.Build.Step.Run.create()` to run test binaries manually,
+passing the binary as an argv argument rather than via `addRunArtifact`, thus
+avoiding `--listen=-` injection entirely. Bare `zig build test` (without
+`--summary all`) outputs directly to the terminal, bypassing the protocol layer.
 
-**如果仍遇到 hang**，直接运行缓存的测试二进制：
+**If it still hangs**, run the cached test binary directly:
 ```bash
-# 单元测试（带 30s 超时防护）
+# Unit tests (with 30s timeout guard)
 perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/test 2>&1 | tail -5
-# 集成测试
+# Integration tests
 perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/integration_test 2>&1
 ```
 
-**CI 注意事项**：GitHub Actions macOS runner 上应使用 `zig build test` 而非
-`zig build test --summary all`，后者可能触发相同 hang。
+**CI note**: On GitHub Actions macOS runners, use `zig build test` rather than
+`zig build test --summary all` — the latter can trigger the same hang.
 
 ### Hostname not resolving for winx64
 
@@ -619,7 +622,7 @@ netsh advfirewall firewall add rule name="utmm" dir=in action=allow program="C:\
 > is NOT affected — it uses outbound connections which Windows Firewall allows
 > by default.
 
-### pkill -f自杀 (Linux only)
+### pkill -f self-kill (Linux only)
 
 **Symptom**: Remote SSH command `pkill -9 -f utmm` kills the SSH session itself.
 
