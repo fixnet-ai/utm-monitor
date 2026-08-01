@@ -660,8 +660,12 @@ No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
 
 ### Pre-coding Verification
 
+**Zig:**
 - Before writing Zig code, call `zig-docs` `search_zig_docs` or `zig-mcp` `search_std_lib` to confirm 0.16.0 function signatures
 - After completion, use `plugin:zig-mcp` `zig_diagnostics` to verify no compilation errors
+
+**Go:**
+- Before writing Go code, call Context7 `resolve-library-id` to resolve the package, then `query-docs` to confirm function signatures
 
 ### Development Principles
 1. **Think before coding** — state assumptions, present trade-offs
