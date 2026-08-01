@@ -345,8 +345,8 @@ fn readFileAlloc(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]cons
 }
 
 /// 执行升级：验证 SHA256 → 杀进程 → 替换二进制 → 返回 restart。
-/// 调用者确保 proc 仍存活（本函数内会 killProcess）。
-fn applyUpgrade(io: std.Io, alloc: std.mem.Allocator, proc: ProcessRef) !RestartReason {
+/// proc 为 null 时跳过杀进程步骤（crash-recovery 循环中进程已死亡）。
+fn applyUpgrade(io: std.Io, alloc: std.mem.Allocator, proc: ?ProcessRef) !RestartReason {
     const marker = upgradeMarkerPath();
     const upgrade = upgradeBinPath();
     const dest = utmmPath();
@@ -371,8 +371,8 @@ fn applyUpgrade(io: std.Io, alloc: std.mem.Allocator, proc: ProcessRef) !Restart
 
     std.log.info("[utmmd] upgrade SHA256 verified", .{});
 
-    // 4. 杀 utmm 进程
-    killProcess(proc);
+    // 4. 杀 utmm 进程（null 跳过：crash-recovery 场景进程已死）
+    if (proc) |p| killProcess(p);
 
     // 5. POSIX: 设置可执行权限
     if (builtin.os.tag != .windows) {
@@ -541,6 +541,15 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
             // 杀掉 utmm 子进程防止变孤儿进程
             killUtmmByPid(shm_ptr.utmm_pid);
             return;
+        }
+
+        // 启动前检查待处理升级：utmm crash-loop 时 monitorUtmm 没机会运行，
+        // 必须在启动 utmm 之前处理升级标记文件，否则永远卡在 crash-recovery 循环。
+        if (checkPendingUpgrade(io)) {
+            _ = applyUpgrade(io, alloc, null) catch |err| {
+                std.log.err("[utmmd] pre-start upgrade failed: {}", .{err});
+            };
+            // applyUpgrade 成功后继续循环，启动新的（已升级的）utmm
         }
 
         // 启动 utmm
