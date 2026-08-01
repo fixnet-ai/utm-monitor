@@ -278,7 +278,28 @@ pub const Connection = struct {
             if (n < 0) return error.WriteFailed;
         }
     }
+
+    /// Poll the connection for readability. Returns true if data is available
+    /// within `timeout_ms` milliseconds, false if timeout expired.
+    /// POSIX only; Windows returns true immediately.
+    pub fn pollReadable(self: Connection, timeout_ms: i32) bool {
+        _ = &self;
+        if (builtin.os.tag == .windows) return true;
+        var pfds: [1]std.posix.pollfd = .{
+            .{.fd = self.fd, .events = std.posix.POLL.IN, .revents = 0},
+        };
+        const ret = std.posix.system.poll(&pfds, pfds.len, timeout_ms);
+        if (ret < 0) {
+            const err = std.posix.errno(ret);
+            if (err == .INTR) return true; // interrupted, optimistic retry
+            return false;
+        }
+        return ret > 0;
+    }
 };
+
+/// IPC client read timeout (milliseconds). After this, a blocked read returns error.IpcTimeout.
+const IPC_READ_TIMEOUT_MS: i32 = 300_000; // 5 minutes
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Server (Host daemon side)
@@ -1007,9 +1028,15 @@ fn clientConnectWindows(io: std.Io) !Connection {
 }
 
 /// Read all response data from the connection into a buffer.
+/// Uses poll-based timeout to prevent indefinite hang if Host daemon stalls.
 fn clientReadAll(conn: Connection, gpa: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
     var read_buf: [4096]u8 = undefined;
     while (true) {
+        // Poll with timeout to detect unresponsive Host daemon
+        if (!conn.pollReadable(IPC_READ_TIMEOUT_MS)) {
+            std.log.err("[ipc] read timeout after {d}s", .{@divTrunc(IPC_READ_TIMEOUT_MS, 1000)});
+            return error.IpcTimeout;
+        }
         const n = conn.readFull( &read_buf) catch |err| {
             if (err == error.EndOfStream) break;
             return err;
@@ -1325,6 +1352,11 @@ pub fn ipcDownload(
     var total_bytes: u32 = 0;
 
     while (true) {
+        // Poll with timeout to detect stalled Guest connection
+        if (!conn.pollReadable(IPC_READ_TIMEOUT_MS)) {
+            std.log.err("[ipc] download timeout after {d}s", .{@divTrunc(IPC_READ_TIMEOUT_MS, 1000)});
+            return error.IpcTimeout;
+        }
         // Read frame type byte
         const tn = conn.readFull(rbuf[0..1]) catch return error.IpcProtocolError;
         if (tn == 0) return error.IpcProtocolError;
@@ -1341,6 +1373,10 @@ pub fn ipcDownload(
                 var remaining: u32 = data_len;
                 while (remaining > 0) {
                     const to_read: usize = @min(rbuf.len, remaining);
+                    if (!conn.pollReadable(IPC_READ_TIMEOUT_MS)) {
+                        std.log.err("[ipc] download data timeout", .{});
+                        return error.IpcTimeout;
+                    }
                     const nr = conn.readFull(rbuf[0..to_read]) catch return error.IpcProtocolError;
                     if (nr == 0) return error.IpcProtocolError;
                     _ = file_writer.write(rbuf[0..nr]) catch {};

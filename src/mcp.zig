@@ -10,9 +10,44 @@
 //! Logging goes to stderr; JSON-RPC traffic goes to stdout.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const ipc_mod = @import("ipc.zig");
 const sshpass = @import("sshpass.zig");
+
+/// 60-second bidirectional idle timeout: if neither stdin nor stdout has
+/// activity for this duration, the MCP session auto-closes. Implemented via
+/// SIGALRM + alarm() — alarm is set before blocking stdin read, cancelled
+/// after each successful read. During request processing (exec etc.), alarm
+/// is NOT active, so long-running operations are never interrupted.
+/// On Windows, no idle timeout (blocking read, managed by client lifecycle).
+const IDLE_TIMEOUT_SEC: c_uint = 60;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POSIX signal/alarm externs — same pattern as utmmd.zig (Zig 0.16.0
+// std.c.Sigaction types differ cross-platform, so we declare directly)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SIGALRM: c_int = 14;
+
+extern "c" fn alarm(seconds: c_uint) c_uint;
+extern "c" fn _exit(status: c_int) noreturn;
+extern "c" fn sigaction(sig: c_int, noalias act: ?*const c_sigaction, noalias oact: ?*c_sigaction) c_int;
+
+const c_sigaction = extern struct {
+    handler: extern union {
+        handler: *const fn (c_int) callconv(.c) void,
+    },
+    mask: c_uint,
+    flags: c_int,
+};
+
+/// SIGALRM handler — 60s bidirectional idle timeout. Uses _exit() (POSIX
+/// async-signal-safe) to terminate immediately without running atexit handlers.
+fn onIdleTimeout(sig: c_int) callconv(.c) void {
+    _ = sig;
+    _exit(0);
+}
 
 /// Guest default upload directory — platform-aware default for remote_path.
 fn guestDefaultDir(vm: []const u8) []const u8 {
@@ -30,16 +65,112 @@ const SERVER_INFO = "{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\
 const TOOLS_JSON = "[{\"name\":\"status\",\"description\":\"Get status of all UTM virtual machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each connected Guest.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},{\"name\":\"exec\",\"description\":\"Execute a shell command on a UTM virtual machine. The command runs in the VM's native shell. Check status first to see each VM's shell type, then write compatible commands.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)\"}},\"required\":[\"vm\",\"command\"]}},{\"name\":\"ping\",\"description\":\"Ping a Guest over the mesh network to test connectivity and measure RTT. Returns JSON with hostname, MAC address, and rtt_ms.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"}},\"required\":[\"vm\"]}},{\"name\":\"upload\",\"description\":\"Upload a file from the Host to a Guest VM. The file is transferred through a TCP/SOCKS5 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"local_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Host filesystem\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Destination path on the Guest (e.g. /opt/utmm/file.txt). Defaults to /opt/utmm/<basename> (POSIX) or C:\\\\opt\\\\utmm\\\\<basename> (Windows) if omitted.\"}},\"required\":[\"vm\",\"local_path\"]}},{\"name\":\"download\",\"description\":\"Download a file from a Guest VM to the Host. The file is transferred through a TCP/SOCKS5 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target VM hostname\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Guest (e.g. /opt/utmm/core.dump)\"},\"local_path\":{\"type\":\"string\",\"description\":\"Local path on the Host to save the file. Defaults to ./<basename> if omitted.\"}},\"required\":[\"vm\",\"remote_path\"]}},{\"name\":\"sshpass\",\"description\":\"Execute a shell command on any machine via non-interactive SSH password authentication. Works on Linux, macOS, and Windows (ConPTY dynamic loading). Use this for direct SSH access to machines that may not have utmm installed — bootstrap, recovery, and pre-install scenarios. For machines already running utmm Guest daemon, prefer the exec tool for mesh-based command execution.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\",\"description\":\"Target hostname or IP address (e.g. 'linuxvm', '192.168.64.6')\"},\"user\":{\"type\":\"string\",\"description\":\"SSH username (e.g. 'root', 'Administrator')\"},\"password\":{\"type\":\"string\",\"description\":\"SSH password\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command to execute on the remote machine\"}},\"required\":[\"host\",\"user\",\"password\",\"command\"]}}]";
 
 /// MCP server entry point. Reads JSON-RPC from stdin, writes responses to stdout.
+/// On POSIX: uses alarm() + SIGALRM for 60s bidirectional idle timeout.
+/// On Windows: falls back to runWithPipe (blocking read, no idle timeout).
 pub fn run(io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
-    return runWithPipe(io, gpa, port, &stdin_reader.interface, &stdout_writer.interface);
+
+    if (builtin.os.tag == .windows) {
+        return runWithPipe(io, gpa, port, &stdin_reader.interface, &stdout_writer.interface);
+    }
+
+    // Install SIGALRM handler for idle timeout
+    var sa: c_sigaction = undefined;
+    sa.handler = .{ .handler = onIdleTimeout };
+    sa.mask = 0;
+    sa.flags = 0; // No SA_RESTART — alarm() interrupts blocking read()
+    _ = sigaction(SIGALRM, &sa, null);
+
+    return runWithIdleTimeout(io, gpa, port, &stdin_reader.interface, &stdout_writer.interface);
+}
+
+/// Main loop with 60s bidirectional idle timeout via alarm().
+///
+/// Alarm lifecycle:
+///   alarm(60)  → set before blocking stdin read
+///   alarm(0)   → cancel after successful read (idle timer reset)
+///
+/// During request processing (including long exec), alarm is NOT active,
+/// so active operations are never interrupted. The alarm only fires when
+/// the server is truly idle — blocked on stdin waiting for the next
+/// JSON-RPC request, with no output activity.
+///
+/// If SIGALRM fires, the handler calls _exit(0) — a clean, signal-safe
+/// termination. The kernel closes all open fds automatically.
+fn runWithIdleTimeout(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    port: u16,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+) !void {
+    var req_buf: std.ArrayList(u8) = .empty;
+    defer req_buf.deinit(gpa);
+
+    while (true) {
+        req_buf.clearRetainingCapacity();
+
+        // ppid check: if parent died we're orphaned — exit gracefully
+        if (std.posix.system.getppid() == 1) {
+            std.log.info("[mcp] orphaned (ppid=1), exiting", .{});
+            break;
+        }
+
+        // Set 60s alarm before blocking on stdin. If no new request arrives
+        // within 60s, SIGALRM fires → onIdleTimeout → _exit(0).
+        _ = alarm(IDLE_TIMEOUT_SEC);
+
+        const line = reader.takeDelimiter('\n') catch |err| {
+            // SIGALRM → _exit(0) in handler, so we never reach here on timeout.
+            // Other errors (EOF, broken pipe) fall through.
+            std.log.err("[mcp] read error: {}", .{err});
+            break;
+        };
+
+        // Cancel alarm — data received, idle timer reset
+        _ = alarm(0);
+
+        if (line == null) break; // EOF
+
+        const json_str = line.?;
+
+        // Process the request. No alarm active here — long-running exec
+        // or upload operations complete without interruption. Output
+        // flowing to stdout is implicit activity that resets the idle
+        // timer conceptually (next alarm is fresh after the response).
+        const response = processRequest(gpa, io, port, json_str) catch |err| {
+            std.log.err("[mcp] processRequest error: {}", .{err});
+            const err_resp = jsonBuildError(gpa, .{ .null = {} }, -32603, @errorName(err)) catch continue;
+            defer gpa.free(err_resp);
+            _ = writer.print("{s}\n", .{err_resp}) catch break;
+            _ = writer.flush() catch |err_flush| {
+                std.log.err("[mcp] flush error: {}", .{err_flush});
+                break;
+            };
+            continue;
+        };
+        defer gpa.free(response);
+
+        // Write response (skip empty responses for notifications).
+        // Stdout activity is bidirectional activity — the next alarm(60)
+        // is set fresh at the top of the loop.
+        if (response.len > 0) {
+            _ = writer.print("{s}\n", .{response}) catch break;
+            _ = writer.flush() catch |err_flush| {
+                std.log.err("[mcp] flush error: {}", .{err_flush});
+                break;
+            };
+        }
+    }
 }
 
 /// Core MCP loop — reads JSON-RPC from `reader`, writes responses to `writer`.
 /// Testable with Reader.fixed / Writer.fixed for protocol verification.
+/// Used by tests directly; used by `run()` on Windows only (no SIGALRM).
+/// On POSIX, `run()` uses `runWithIdleTimeout` for 60s idle detection instead.
 pub fn runWithPipe(
     io: std.Io,
     gpa: std.mem.Allocator,
