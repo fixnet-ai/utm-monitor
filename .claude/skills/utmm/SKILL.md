@@ -88,8 +88,8 @@ curl --socks5 localhost:2121 http://linuxvm:8080      # reach any Guest service
 
 ## MCP Tools
 
-`utmm --mcp` provides 6 tools via stdio JSON-RPC: `status`, `exec`, `ping`, `upload`,
-`download`, `sshpass`. See `MANUAL.md` for the full MCP protocol reference.
+`utmm --mcp` provides 7 tools via stdio JSON-RPC: `status`, `exec`, `ping`, `upload`,
+`download`, `sshpass`, `manual`. See `MANUAL.md` for the full MCP protocol reference.
 
 ## Verify
 

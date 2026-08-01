@@ -10,7 +10,7 @@ required at runtime. AI agents get the same capabilities through MCP stdio.
 
 ## MCP Integration
 
-`utmm --mcp` provides six tools over stdio JSON-RPC 2.0 for AI coding agents.
+`utmm --mcp` provides seven tools over stdio JSON-RPC 2.0 for AI coding agents.
 
 | Tool | Description |
 |------|-------------|
@@ -19,7 +19,8 @@ required at runtime. AI agents get the same capabilities through MCP stdio.
 | `ping` | Ping a Guest over the mesh network and measure RTT |
 | `upload` | Upload file from Host to Guest (TCP/SOCKS5, SHA256 verified) |
 | `download` | Download file from Guest to Host (TCP/SOCKS5, SHA256 verified) |
-| `sshpass` | Non-interactive SSH password auth — direct shell access to any machine. |
+| `sshpass` | Non-interactive SSH password auth — direct shell access to any machine |
+| `manual` | Return the full reference manual (this document embedded at compile time) |
 
 Example prompts your AI agent can handle:
 - "Push the new build to linuxvm and run the test suite — show me the failures"
@@ -45,8 +46,8 @@ See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
   fallback on older Windows).
 - **LSA mesh zero-config** — Guests auto-discover Host over the local network,
   `/etc/hosts` kept in sync automatically.
-- **MCP stdio** — AI agents get six tools (`status`, `exec`, `ping`, `upload`,
-  `download`, `sshpass`) via `utmm --mcp`. Auto-ensures Host on first use.
+- **MCP stdio** — AI agents get seven tools (`status`, `exec`, `ping`, `upload`,
+  `download`, `sshpass`, `manual`) via `utmm --mcp`. Auto-ensures Host on first use.
 
 ## Architecture
 
