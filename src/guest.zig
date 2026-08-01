@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const zio = @import("zio");
 const Io = std.Io;
 const net = std.Io.net;
 const protocol = @import("protocol.zig");
@@ -900,6 +901,7 @@ pub fn guestTcpLoop(
     defer listener.deinit();
 
     var conn_limit = tcp.ConnLimit.init(tcp.DEFAULT_MAX_CONNS);
+    var group: zio.Group = .init;
     std.log.info("[guest] TCP server listening on :{d}", .{mesh_port});
 
     while (true) {
@@ -943,22 +945,20 @@ pub fn guestTcpLoop(
                 continue;
             }
             if (req.cmd == socks5.SOCKS_CMD_BIND) {
-                const t = std.Thread.spawn(.{}, socks5.socks5BindWithLimit, .{ io, fd, &conn_limit }) catch {
+                group.spawnBlocking(socks5.socks5BindWithLimit, .{ io, fd, &conn_limit }) catch {
                     conn_limit.release();
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                t.detach();
                 std.log.info("[guest] BIND accepted", .{});
             } else {
-                const t = std.Thread.spawn(.{}, socks5.udpAssociateWithLimit, .{ fd, &conn_limit }) catch {
+                group.spawnBlocking(socks5.udpAssociateWithLimit, .{ fd, &conn_limit }) catch {
                     conn_limit.release();
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                t.detach();
                 std.log.info("[guest] UDP ASSOCIATE accepted", .{});
             }
             continue;
@@ -989,12 +989,11 @@ pub fn guestTcpLoop(
                     continue;
                 }
                 errdefer conn_limit.release();
-                const t = std.Thread.spawn(.{}, socks5.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
+                group.spawnBlocking(socks5.localRelayWithLimit, .{ io, fd, req.port, &conn_limit }) catch {
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 };
-                t.detach();
                 std.log.info("[guest] local relay :{d}", .{req.port});
             }
         } else {
