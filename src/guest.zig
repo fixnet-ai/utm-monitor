@@ -787,7 +787,7 @@ pub fn guestTcpLoop(
     var mesh_opt: ?lsa.Mesh = null;
     var mesh_thread: ?std.Thread = null;
     var mesh_socket_opt: ?std.Io.net.Socket = null;
-    var hosts_sync_thread: ?std.Thread = null;
+    var hosts_sync_handle: ?zio.JoinHandle(void) = null;
 
     start_mesh: {
         var broadcast_addrs = getSubnetBroadcasts(allocator) catch |err| {
@@ -865,10 +865,10 @@ pub fn guestTcpLoop(
     }
 
     defer {
-        if (hosts_sync_thread) |t| {
+        if (hosts_sync_handle) |*h| {
             // Signal shutdown to break the sleep loop, then join
             if (shutdown) |s| s.store(true, .release);
-            t.join();
+            _ = h.join();
         }
         if (mesh_thread) |t| {
             if (mesh_opt) |*m| m.signalShutdown();
@@ -887,10 +887,10 @@ pub fn guestTcpLoop(
     }
 
     // ── Periodic /etc/hosts sync ──
-    if (std.Thread.spawn(.{}, guestHostsSync, .{ io, allocator, info, shutdown })) |t| {
-        hosts_sync_thread = t;
+    if (zio.spawnBlocking(guestHostsSync, .{ io, allocator, info, shutdown })) |handle| {
+        hosts_sync_handle = handle;
     } else |_| {
-        std.log.warn("[guest] hostsSync thread spawn failed", .{});
+        std.log.warn("[guest] hostsSync spawnBlocking failed", .{});
     }
 
     // ── TCP accept 循环 ──
