@@ -16,6 +16,7 @@ const svc = @import("svc.zig");
 const arp = @import("arp.zig");
 const sshpass = @import("sshpass.zig");
 const shm = @import("shm.zig");
+const zio = @import("zio");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
     return runWithIo(init.io, init.gpa, cli, null, null);
@@ -616,7 +617,7 @@ fn startHost(
             break :start_mesh;
         };
 
-        // Spawn mesh.run() thread
+        // Spawn mesh.run() thread (uses its own Threaded Io — keep on std.Thread)
         mesh_thread = std.Thread.spawn(.{}, lsa.Mesh.run, .{&mesh_opt.?}) catch |err| {
             std.log.err("[host] Mesh thread spawn failed: {}", .{err});
             mesh_opt.?.deinit();
@@ -644,21 +645,21 @@ fn startHost(
 
     }
 
-    // Spawn LSA manager thread — syncs LSA→guest table, triggers auto-upgrade.
+    // Spawn LSA manager task — syncs LSA→guest table, triggers auto-upgrade.
     // Must spawn before the defer below so join() runs in correct order.
-    var host_loop_thread = try std.Thread.spawn(.{}, hostMainLoop, .{ block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy, shm_handle });
+    var host_loop_handle = try zio.spawnBlocking(hostMainLoop, .{ block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy, shm_handle });
 
-    // Spawn IPC server thread — Unix domain socket (POSIX) / named pipe (Windows).
+    // Spawn IPC server task — Unix domain socket (POSIX) / named pipe (Windows).
     // Shares HostState and Mesh with the mesh networking layer.
     var ipc_shutdown = std.atomic.Value(bool).init(false);
     const ipc_mod = @import("ipc.zig");
-    var ipc_thread = try std.Thread.spawn(.{}, ipc_mod.startServer, .{
+    var ipc_handle = try zio.spawnBlocking(ipc_mod.startServer, .{
         block_io, gpa, @as(*anyopaque, @ptrCast(&state)), @as(*anyopaque, @ptrCast(&mesh_opt)), &ipc_shutdown,
     });
 
-    // Spawn TCP listener thread — SOCKS5 accept + three-way dispatch.
+    // Spawn TCP listener task — SOCKS5 accept + three-way dispatch.
     // Uses GuestTable.findByHostname for hostname→IP lookup.
-    var tcp_thread = try std.Thread.spawn(.{}, hostTcpListen, .{
+    var tcp_handle = try zio.spawnBlocking(hostTcpListen, .{
         block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown, shm_handle,
     });
 
@@ -668,10 +669,10 @@ fn startHost(
         // 2. Signal mesh shutdown — hostMainLoop checks this each loop iteration
         if (mesh_opt) |*m| m.signalShutdown();
 
-        // 3. Join threads (order: IPC → TCP → host loop → mesh)
-        ipc_thread.join();
-        tcp_thread.join();
-        host_loop_thread.join();
+        // 3. Join tasks (order: IPC → TCP → host loop → mesh)
+        ipc_handle.join() catch |err| std.log.err("[host] IPC task error: {}", .{err});
+        tcp_handle.join() catch |err| std.log.err("[host] TCP task error: {}", .{err});
+        host_loop_handle.join();
 
         // 4. Join mesh thread after all consumers have exited
         if (mesh_thread) |t| {
