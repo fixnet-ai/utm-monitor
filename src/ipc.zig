@@ -306,18 +306,22 @@ const IPC_READ_TIMEOUT_MS: i32 = 300_000; // 5 minutes
 // Server (Host daemon side)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Start the IPC server accept loop. Runs as a zio coroutine on the main executor.
-/// Accepts connections via blockInPlace (parks → thread pool → resumes).
-/// Connection handlers are spawned via group.spawnBlocking().
+/// Start the IPC server accept loop. Runs as a blocking task on the thread pool
+/// (spawned via group.spawnBlocking). The accept loop uses raw POSIX accept
+/// (Unix domain socket) or ConnectNamedPipe (Windows), which must not run on
+/// the executor.
 ///
-/// `group`: zio task group for spawnBlocking (handler dispatch).
+/// Handler dispatch uses rt.spawnBlocking since group.spawnBlocking would require
+/// TLS executor context, which is not available from within a spawnBlocking task.
+///
+/// `rt`: zio Runtime for spawnBlocking (handler dispatch).
 /// `io`: caller's Io instance.
 /// `gpa`: allocator for connection buffers.
 /// `state_ptr`: opaque pointer to state.HostState (avoid circular import).
 /// `mesh_ptr`: opaque pointer to mesh.Mesh (for ping handler).
 /// `shutdown`: atomic flag — when true, the server exits cleanly.
 pub fn startServer(
-    group: *zio.Group,
+    rt: *zio.Runtime,
     io: std.Io,
     gpa: std.mem.Allocator,
     state_ptr: *anyopaque,
@@ -325,13 +329,12 @@ pub fn startServer(
     shutdown: *std.atomic.Value(bool),
 ) !void {
     if (builtin.os.tag == .windows) {
-        return startServerWindows(group, io, gpa, state_ptr, mesh_ptr, shutdown);
+        return startServerWindows(rt, io, gpa, state_ptr, mesh_ptr, shutdown);
     }
-    return startServerPosix(group, io, gpa, state_ptr, mesh_ptr, shutdown);
+    return startServerPosix(rt, io, gpa, state_ptr, mesh_ptr, shutdown);
 }
 
-/// blockInPlace helper: accepts one connection on a POSIX listen socket.
-/// Runs on the thread pool — the calling coroutine is parked during accept.
+/// Raw POSIX accept on a Unix domain listen socket — blocking, must run on thread pool.
 fn acceptPosixOne(listen_fd: std.c.fd_t) !std.c.fd_t {
     var client_addr: std.c.sockaddr = undefined;
     client_addr.family = std.posix.AF.UNIX;
@@ -351,8 +354,7 @@ fn acceptPosixOne(listen_fd: std.c.fd_t) !std.c.fd_t {
     return @intCast(client_fd);
 }
 
-/// blockInPlace helper: waits for a client to connect to a Windows named pipe.
-/// Runs on the thread pool.
+/// Raw blocking ConnectNamedPipe — must run on thread pool, not executor.
 fn connectNamedPipeOne(pipe: windows.HANDLE) !void {
     const connected = windows.ConnectNamedPipe(pipe, null);
     if (connected == 0) {
@@ -364,7 +366,7 @@ fn connectNamedPipeOne(pipe: windows.HANDLE) !void {
 }
 
 fn startServerPosix(
-    group: *zio.Group,
+    rt: *zio.Runtime,
     io: std.Io,
     gpa: std.mem.Allocator,
     state_ptr: *anyopaque,
@@ -403,12 +405,12 @@ fn startServerPosix(
 
     std.log.info("[ipc] listening on {s}", .{path});
 
-    // Accept loop — uses blockInPlace to yield coroutine during blocking accept.
-    // Each connection handler runs on thread pool via group.spawnBlocking.
+    // Accept loop — runs on thread pool (spawned via group.spawnBlocking).
+    // Uses raw POSIX accept (no executor integration for Unix sockets).
+    // Handler dispatch uses rt.spawnBlocking (thread-safe, no TLS needed).
     while (!shutdown.load(.acquire)) {
-        const client_fd = zio.blockInPlace(acceptPosixOne, .{fd}) catch |err| {
+        const client_fd = acceptPosixOne(fd) catch |err| {
             if (err == error.WouldBlock) {
-                // Interrupted by shutdown signal or spurious wake-up.
                 if (shutdown.load(.acquire)) break;
                 continue;
             }
@@ -423,9 +425,11 @@ fn startServerPosix(
             break;
         }
 
-        // Spawn handler on thread pool via group (fire-and-forget)
+        // Spawn handler on thread pool via rt.spawnBlocking (thread-safe, fire-and-forget).
+        // We cannot use group.spawnBlocking here — it requires TLS executor context
+        // (getCurrentExecutor()), unavailable from a spawnBlocking task.
         const conn: Connection = .{ .fd = client_fd };
-        group.spawnBlocking(handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
+        _ = rt.spawnBlocking(handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
             std.log.err("[ipc] thread spawn failed", .{});
             conn.close();
             continue;
@@ -434,15 +438,16 @@ fn startServerPosix(
 }
 
 fn startServerWindows(
-    group: *zio.Group,
+    rt: *zio.Runtime,
     io: std.Io,
     gpa: std.mem.Allocator,
     state_ptr: *anyopaque,
     mesh_ptr: *anyopaque,
     shutdown: *std.atomic.Value(bool),
 ) !void {
-    // Windows named pipe accept loop: each pipe instance handles one client.
-    // Uses blockInPlace to yield coroutine during blocking ConnectNamedPipe.
+    // Windows named pipe accept loop — runs on thread pool.
+    // Uses ConnectNamedPipe directly (blocking), no blockInPlace needed.
+    // Handler dispatch uses rt.spawnBlocking (thread-safe, no TLS needed).
     while (!shutdown.load(.acquire)) {
         const pipe = windows.CreateNamedPipeA(
             socketPathZ(),
@@ -460,8 +465,8 @@ fn startServerWindows(
             return error.NamedPipeCreateFailed;
         }
 
-        // Block until a client connects (parks coroutine via blockInPlace)
-        zio.blockInPlace(connectNamedPipeOne, .{pipe}) catch |err| {
+        // Block until a client connects (raw win32 call, on thread pool)
+        connectNamedPipeOne(pipe) catch |err| {
             std.log.err("[ipc] ConnectNamedPipe failed: {}", .{err});
             windows.CloseHandle(pipe);
             if (shutdown.load(.acquire)) break;
@@ -474,7 +479,7 @@ fn startServerWindows(
         }
 
         const conn: Connection = .{ .fd = pipe };
-        group.spawnBlocking(handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
+        _ = rt.spawnBlocking(handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
             std.log.err("[ipc] thread spawn failed", .{});
             conn.close();
             continue;

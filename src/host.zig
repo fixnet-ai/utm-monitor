@@ -19,10 +19,10 @@ const shm = @import("shm.zig");
 const zio = @import("zio");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
-    return runWithIo(init.io, init.gpa, cli, null, null);
+    return runWithIo(null, init.io, init.gpa, cli, null, null);
 }
 
-pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool), shm_handle: ?*volatile shm.ShmLayout) !void {
+pub fn runWithIo(rt: ?*zio.Runtime, block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool), shm_handle: ?*volatile shm.ShmLayout) !void {
     // Management commands: stateless, no Host daemon needed
     if (cli.cmd_status) return cmdStatus(block_io, gpa, cli.port);
     if (cli.cmd_deploy) return cmdDeploy(block_io, gpa, cli.deploy_target);
@@ -71,7 +71,7 @@ pub fn runWithIo(block_io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zi
 
     // --host (via --svc): start Host daemon
     if (cli.is_host) {
-        try startHost(block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown, cli.hostname, shm_handle);
+        try startHost(rt.?, block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown, cli.hostname, shm_handle);
         return;
     }
 }
@@ -500,6 +500,7 @@ fn cmdDownload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []co
 // Host daemon (--host): Mesh LSA + TCP/SOCKS5 connections + IPC server
 // ═══════════════════════════════════════════════════════════════════════════
 fn startHost(
+    rt: *zio.Runtime,
     block_io: std.Io,
     gpa: std.mem.Allocator,
     mesh_port: u16,
@@ -577,13 +578,8 @@ fn startHost(
         var mesh_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
         const mesh_io = mesh_threaded.io();
 
-        // Bind UDP socket for mesh
-        const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", mesh_port) catch |err| {
-            std.log.err("[host] Mesh bind addr parse: {}", .{err});
-            bc_addrs.deinit(gpa);
-            break :start_mesh;
-        };
-        const mesh_socket = bind_addr.bind(mesh_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
+        // Bind UDP socket for mesh with SO_REUSEPORT (allows Host+Guest to share port)
+        const mesh_socket = tcp.createMeshUdpSocket(mesh_port) catch |err| {
             std.log.err("[host] Mesh UDP bind :{d} failed: {}", .{ mesh_port, err });
             bc_addrs.deinit(gpa);
             break :start_mesh;
@@ -646,9 +642,11 @@ fn startHost(
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Unified executor model: LSA manager + IPC server run as coroutines on
-    // the main executor (spawned via group.spawn). The main fiber runs the TCP
-    // accept loop. All three yield cooperatively through blockInPlace.
+    // Unified executor model: LSA manager runs as coroutine on main executor.
+    // TCP accept uses direct acceptRaw() — zio's server.accept() parks the main
+    // coroutine cooperatively via kqueue, yielding to other coroutines.
+    // IPC accept runs as spawnBlocking (thread pool) since Unix socket accept is
+    // a raw POSIX syscall that can't park via the event loop.
     // Connection handlers use group.spawnBlocking() → thread pool.
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -657,12 +655,13 @@ fn startHost(
     const ipc_mod = @import("ipc.zig");
 
     // Spawn LSA manager coroutine — syncs LSA→guest table, triggers auto-upgrade.
-    // Uses blockInPlace(sleep5s) to yield during sleep intervals.
+    // Uses zio sleep inside blockInPlace to yield during sleep intervals.
     try group.spawn(hostMainLoop, .{ &group, block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy, shm_handle });
 
-    // Spawn IPC server coroutine — Unix domain socket (POSIX) / named pipe (Windows).
-    // Uses blockInPlace(accept) to yield during blocking accept calls.
-    try group.spawn(ipc_mod.startServer, .{ &group, block_io, gpa, @as(*anyopaque, @ptrCast(&state)), @as(*anyopaque, @ptrCast(&mesh_opt)), &ipc_shutdown });
+    // Spawn IPC server as a blocking task (thread pool).
+    // Unix domain socket accept is a raw POSIX syscall — must run on thread pool.
+    // Handler dispatch uses rt.spawnBlocking from within the accept loop.
+    try group.spawnBlocking(ipc_mod.startServer, .{ rt, block_io, gpa, @as(*anyopaque, @ptrCast(&state)), @as(*anyopaque, @ptrCast(&mesh_opt)), &ipc_shutdown });
 
     defer {
         // 1. Signal all coroutines to stop
@@ -697,7 +696,7 @@ fn startHost(
 
 /// Host TCP listener — SOCKS5 accept + three-way dispatch.
 /// Uses GuestTable.findByHostname for hostname→IP lookup (vs guest's lsa.Mesh).
-/// Runs on the main executor fiber; yields at each accept via blockInPlace.
+/// Call acceptRaw() directly — zio's server.accept() parks coroutine via kqueue.
 fn hostTcpListen(
     group: *zio.Group,
     io: std.Io,
@@ -727,9 +726,9 @@ fn hostTcpListen(
             if (s.load(.acquire)) break;
         }
 
-        // blockInPlace: park main fiber, run accept on thread pool, resume.
-        // Yields executor to other coroutines (LSA manager, IPC server).
-        const fd = zio.blockInPlace(acceptTcp, .{&listener}) catch |err| {
+        // Direct acceptRaw() — zio server.accept(io) parks main coroutine via
+        // kqueue, yielding to other coroutines (LSA manager, IPC handlers).
+        const fd = listener.acceptRaw() catch |err| {
             if (err == error.WouldBlock) {
                 std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
                 continue;
@@ -1169,13 +1168,6 @@ fn hostMainLoop(
         std.Io.sleep(io, std.Io.Duration.fromSeconds(5), .awake) catch {};
     }
 }
-
-/// blockInPlace helper: accepts one TCP connection on the thread pool.
-/// The calling coroutine is parked while blocking in accept().
-fn acceptTcp(listener: *tcp.TcpListener) !std.c.fd_t {
-    return listener.acceptRaw();
-}
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GuestTable — minimal guest registry

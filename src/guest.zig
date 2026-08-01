@@ -808,12 +808,7 @@ pub fn guestTcpLoop(
         var mesh_threaded = std.Io.Threaded.init(allocator, .{});
         const mesh_io = mesh_threaded.io();
 
-        const bind_addr = std.Io.net.IpAddress.parse("0.0.0.0", mesh_port) catch |err| {
-            std.log.err("[guest] Mesh bind addr parse: {}", .{err});
-            broadcast_addrs.deinit(allocator);
-            break :start_mesh;
-        };
-        const mesh_socket = bind_addr.bind(mesh_io, .{ .mode = .dgram, .allow_broadcast = true }) catch |err| {
+        const mesh_socket = tcp.createMeshUdpSocket(mesh_port) catch |err| {
             std.log.err("[guest] Mesh UDP bind :{d}: {}", .{ mesh_port, err });
             broadcast_addrs.deinit(allocator);
             break :start_mesh;

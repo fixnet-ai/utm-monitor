@@ -425,12 +425,15 @@ pub fn main(init: std.process.Init) !void {
         // Create zio async Runtime — replaces blocking init.io with coroutine-based I/O.
         // The Runtime owns the event loop and worker threads; rt.io() provides a
         // std.Io backed by async I/O (io_uring/epoll/kqueue/iocp) under the hood.
-        var rt = try zio.Runtime.init(init.gpa, .{});
+        // min_threads=8: IPC accept (1) + pushUpgrade (up to 4 concurrent) + handlers.
+        var rt = try zio.Runtime.init(init.gpa, .{
+            .thread_pool = .{ .min_threads = 8 },
+        });
         defer rt.deinit();
         const rt_io = rt.io();
 
         if (cli.is_host) {
-            try host_mod.runWithIo(rt_io, init.gpa, cli, null, shm_handle);
+            try host_mod.runWithIo(rt, rt_io, init.gpa, cli, null, shm_handle);
         } else {
             try guest.guestRunWithIo(rt_io, init.gpa, cli, null, shm_handle);
         }

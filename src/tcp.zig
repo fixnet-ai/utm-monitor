@@ -169,6 +169,7 @@ const SOCK_DGRAM = 2;
 const IPPROTO_TCP = 6;
 const IPPROTO_UDP = 17;
 const SO_REUSEADDR = 0x0004;
+const SO_BROADCAST = 0x0020;
 const SO_ERROR = 0x1007;
 const SOL_SOCKET = 0xffff;
 const INVALID_SOCKET: std.posix.socket_t = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
@@ -552,6 +553,75 @@ pub fn createUdpSocket() !socket_t {
     const addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
     if (system.bind(s, @ptrCast(&addr), addr_len) < 0) return error.BindFailed;
     return s;
+}
+
+/// Create a UDP socket with SO_REUSEADDR + SO_REUSEPORT, bound to 0.0.0.0:port.
+/// Returns std.Io.net.Socket for use with Threaded I/O (LSA mesh).
+/// Both Host and Guest bind the same port via SO_REUSEPORT on POSIX.
+pub fn createMeshUdpSocket(port: u16) !std.Io.net.Socket {
+    if (builtin.os.tag == .windows) {
+        ensureWinsock2();
+        const s = ws2_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s == INVALID_SOCKET) return error.SocketCreateFailed;
+        errdefer _ = ws2_closesocket(s);
+
+        // SO_REUSEADDR on Windows allows rebinding (no SO_REUSEPORT on Windows)
+        var reuse: c_int = 1;
+        _ = ws2_setsockopt(s, SOL_SOCKET, SO_REUSEADDR, @ptrCast(&reuse), @sizeOf(c_int));
+        _ = ws2_setsockopt(s, SOL_SOCKET, SO_BROADCAST, @ptrCast(&reuse), @sizeOf(c_int));
+
+        var addr = sockaddr_in{
+            .family = AF_INET,
+            .port = ws2_htons(port),
+            .addr = 0,
+        };
+        if (ws2_bind(s, @ptrCast(&addr), @sizeOf(sockaddr_in)) != 0) {
+            return error.AddressInUse;
+        }
+        var bound: sockaddr_in = std.mem.zeroes(sockaddr_in);
+        var bound_len: std.posix.socklen_t = @sizeOf(sockaddr_in);
+        _ = ws2_getsockname(s, @ptrCast(&bound), &bound_len);
+        return std.Io.net.Socket{
+            .handle = @ptrFromInt(@as(usize, @intCast(s))),
+            .address = .{ .ip4 = .{ .bytes = @bitCast(bound.addr), .port = ws2_ntohs(bound.port) } },
+        };
+    }
+
+    const fd = system.socket(std.posix.AF.INET, SOCK_DGRAM, 0);
+    if (fd < 0) return error.SocketCreateFailed;
+    errdefer _ = system.close(fd);
+
+    // SO_REUSEADDR — required for rebinding
+    const reuse: c_int = 1;
+    const reuse_ptr: *const anyopaque = @ptrCast(&reuse);
+    if (system.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, reuse_ptr, @sizeOf(c_int)) < 0) {
+        return error.SetSockOptFailed;
+    }
+    // SO_REUSEPORT — best-effort, allows multiple processes on same port
+    _ = system.setsockopt(fd, std.posix.SOL.SOCKET, std.c.SO.REUSEPORT, reuse_ptr, @sizeOf(c_int));
+
+    // SO_BROADCAST — required for LSA broadcast
+    if (system.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.BROADCAST, reuse_ptr, @sizeOf(c_int)) < 0) {
+        return error.SetSockOptFailed;
+    }
+
+    const bind_addr = std.posix.sockaddr.in{
+        .family = std.posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = 0,
+        .zero = [_]u8{0} ** 8,
+    };
+    const addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    if (system.bind(fd, @ptrCast(&bind_addr), addr_len) < 0) return error.AddressInUse;
+
+    var bound: std.posix.sockaddr.in = std.mem.zeroes(std.posix.sockaddr.in);
+    var bound_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+    _ = system.getsockname(fd, @ptrCast(&bound), &bound_len);
+
+    return std.Io.net.Socket{
+        .handle = fd,
+        .address = .{ .ip4 = .{ .bytes = @bitCast(bound.addr), .port = std.mem.bigToNative(u16, bound.port) } },
+    };
 }
 
 /// Get the bound port of a socket (TCP or UDP).

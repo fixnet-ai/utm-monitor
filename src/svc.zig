@@ -568,6 +568,109 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
     _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", plist_path });
 
     std.log.info("[svc] macOS service {s} installed", .{name});
+
+    // When installing as host, also install a Guest daemon so self-exec
+    // works on the Host machine without a separate process.
+    if (role == .host) {
+        try installGuestMacOS(io, alloc, extra_args, env.shell, env.home);
+    }
+}
+
+fn installGuestMacOS(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    extra_args: []const []const u8,
+    shell: []const u8,
+    home: []const u8,
+) !void {
+    // Extract hostname from extra_args (skip --host flag)
+    var hostname_opt: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < extra_args.len) : (i += 1) {
+        if (std.mem.eql(u8, extra_args[i], "--hostname") and i + 1 < extra_args.len) {
+            hostname_opt = extra_args[i + 1];
+            break;
+        }
+    }
+
+    const guest_name = "com.utmmd-guest";
+    const guest_plist_path = try std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{guest_name});
+    defer alloc.free(guest_plist_path);
+
+    const bin_path = canonicalPath();
+
+    // Build Guest ProgramArguments: utmm --svc [--hostname <name>] --port 2121
+    var guest_args: std.ArrayListAligned(u8, null) = .empty;
+    defer guest_args.deinit(alloc);
+    try guest_args.appendSlice(alloc, "        <string>");
+    try guest_args.appendSlice(alloc, bin_path);
+    try guest_args.appendSlice(alloc, "</string>\n");
+    try guest_args.appendSlice(alloc, "        <string>--svc</string>\n");
+    if (hostname_opt) |h| {
+        try guest_args.appendSlice(alloc, "        <string>--hostname</string>\n");
+        try guest_args.appendSlice(alloc, "        <string>");
+        try guest_args.appendSlice(alloc, h);
+        try guest_args.appendSlice(alloc, "</string>\n");
+    }
+    try guest_args.appendSlice(alloc, "        <string>--port</string>\n");
+    try guest_args.appendSlice(alloc, "        <string>2121</string>\n");
+
+    const log_path = "/var/log/utmmd-guest.log";
+    const err_log_path = "/var/log/utmmd-guest-err.log";
+
+    const guest_plist = try std.fmt.allocPrint(alloc,
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+        \\  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        \\<plist version="1.0">
+        \\<dict>
+        \\    <key>Label</key>
+        \\    <string>{s}</string>
+        \\    <key>ProgramArguments</key>
+        \\    <array>
+        \\{s}
+        \\    </array>
+        \\    <key>EnvironmentVariables</key>
+        \\    <dict>
+        \\        <key>SHELL</key>
+        \\        <string>{s}</string>
+        \\        <key>HOME</key>
+        \\        <string>{s}</string>
+        \\    </dict>
+        \\    <key>RunAtLoad</key>
+        \\    <true/>
+        \\    <key>KeepAlive</key>
+        \\    <true/>
+        \\    <key>StandardOutPath</key>
+        \\    <string>{s}</string>
+        \\    <key>StandardErrorPath</key>
+        \\    <string>{s}</string>
+        \\</dict>
+        \\</plist>
+    , .{ guest_name, guest_args.items, shell, home, log_path, err_log_path });
+    defer alloc.free(guest_plist);
+
+    // Write guest plist
+    {
+        const cwd = std.Io.Dir.cwd();
+        const f = cwd.createFile(io, guest_plist_path, .{ .truncate = true }) catch |err| {
+            std.log.warn("[svc] write guest plist: {} — guest won't auto-start", .{err});
+            return;
+        };
+        defer f.close(io);
+        f.writeStreamingAll(io, guest_plist) catch |err| {
+            std.log.warn("[svc] write guest plist content: {} — guest won't auto-start", .{err});
+            return;
+        };
+    }
+
+    // Bootstrap guest service
+    _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", guest_name });
+    bootoutMacOS(alloc, io, guest_name);
+    _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", guest_name });
+    _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "bootstrap", "system", guest_plist_path });
+
+    std.log.info("[svc] macOS guest service {s} installed", .{guest_name});
 }
 
 fn installLinux(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) !void {
