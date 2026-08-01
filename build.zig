@@ -161,6 +161,7 @@ pub fn build(b: *std.Build) void {
         "dpipe_file.zig",
         "guest.zig",
         "shm.zig",
+        "utmmd.zig",
     };
     for (standalone_test_modules) |mod_src| {
         const mod = b.createModule(.{

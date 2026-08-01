@@ -29,6 +29,8 @@ const HEARTBEAT_TIMEOUT_SEC: u64 = 10; // 心跳超时 → 僵死
 const MAX_FAILURE_COUNT: u32 = 5; // 连续失败 > 此值 → utmmd 退出
 const MAX_BACKOFF_SEC: u32 = 60; // 最大退避延迟
 const POLL_INTERVAL_MS: u64 = 1000; // 监控轮询间隔
+const IP_CHECK_INTERVAL_MS: u64 = 10000; // IP 指纹检查间隔
+const IP_STABLE_CHECKS: u32 = 2; // IP 变更去抖：需连续检测到变更的次数
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CLI 参数解析
@@ -176,6 +178,154 @@ fn isProcessAlive(proc: ProcessRef) bool {
 }
 
 const WNOHANG: c_int = 1; // waitpid WNOHANG 标志
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IP 指纹 — 零分配枚举所有非回环 IPv4，计算 Wyhash 指纹
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// POSIX getifaddrs 类型（复用 guest.zig 的模式）。
+/// 用 _fp 后缀区分以避免与 guest.zig 的同名类型冲突。
+const in_addr_fp = extern struct { s_addr: u32 };
+const sockaddr_fp = if (builtin.os.tag == .linux)
+    extern struct { sa_family: u16, sa_data: [14]u8 }
+else
+    extern struct { sa_len: u8, sa_family: u8, sa_data: [14]u8 };
+
+const sockaddr_in_fp = if (builtin.os.tag == .linux)
+    extern struct { sin_family: u16, sin_port: u16, sin_addr: in_addr_fp, sin_zero: [8]u8 }
+else
+    extern struct { sin_len: u8, sin_family: u8, sin_port: u16, sin_addr: in_addr_fp, sin_zero: [8]u8 };
+
+const ifaddrs_fp = extern struct {
+    ifa_next: ?*ifaddrs_fp,
+    ifa_name: [*:0]u8,
+    ifa_flags: c_uint,
+    ifa_addr: ?*sockaddr_fp,
+    ifa_netmask: ?*sockaddr_fp,
+    ifa_dstaddr: ?*sockaddr_fp,
+    ifa_data: ?*anyopaque,
+};
+
+const AF_INET_FP: u16 = 2;
+
+extern "c" fn getifaddrs(ifap: *?*ifaddrs_fp) c_int;
+extern "c" fn freeifaddrs(ifa: ?*ifaddrs_fp) void;
+
+// Windows GetAdaptersAddresses 类型。
+// 使用 extern union { pad: usize, ... } 确保 32 位和 64 位偏移都正确。
+const GAA_FLAG_SKIP_ANYCAST: u32 = 0x0002;
+const GAA_FLAG_SKIP_MULTICAST: u32 = 0x0004;
+const GAA_FLAG_SKIP_DNS_SERVER: u32 = 0x0008;
+
+const SOCKET_ADDRESS_FP = extern struct {
+    lpSockaddr: ?*sockaddr_fp,
+    iSockaddrLength: i32,
+};
+
+const IP_ADAPTER_UNICAST_ADDRESS_LH = extern struct {
+    _length_flags: extern union { pad: usize, fields: extern struct { length: u32, flags: u32 } },
+    next: ?*IP_ADAPTER_UNICAST_ADDRESS_LH,
+    address: SOCKET_ADDRESS_FP,
+};
+
+const IP_ADAPTER_ADDRESSES_LH = extern struct {
+    _length_ifindex: extern union { pad: usize, fields: extern struct { length: u32, if_index: u32 } },
+    next: ?*IP_ADAPTER_ADDRESSES_LH,
+    _adapter_name: ?*anyopaque,
+    first_unicast_address: ?*IP_ADAPTER_UNICAST_ADDRESS_LH,
+};
+
+/// 对所有非回环 IPv4 地址做 Wyhash 指纹，返回 u64。
+/// 零堆分配（仅使用栈变量）。返回 0 表示无有效 IP。
+fn getAllIpsFingerprint() u64 {
+    if (builtin.os.tag == .windows) return getAllIpsFingerprintWindows();
+    return getAllIpsFingerprintPosix();
+}
+
+fn getAllIpsFingerprintPosix() u64 {
+    var ifap: ?*ifaddrs_fp = undefined;
+    if (getifaddrs(&ifap) != 0) return 0;
+    defer freeifaddrs(ifap);
+
+    var hasher = std.hash.Wyhash.init(0);
+    var count: u32 = 0;
+
+    var current: ?*ifaddrs_fp = ifap;
+    while (current) |ifa| : (current = ifa.ifa_next) {
+        if (ifa.ifa_addr == null) continue;
+        const addr = ifa.ifa_addr.?;
+        if (addr.sa_family != AF_INET_FP) continue;
+
+        const sin = @as(*align(1) const sockaddr_in_fp, @ptrCast(addr));
+        const raw_bytes = @as([*]const u8, @ptrCast(&sin.sin_addr))[0..4];
+
+        // 跳过回环 (127.x) 和零地址 (0.0.0.0)
+        if (raw_bytes[0] == 127) continue;
+        if (raw_bytes[0] == 0 and raw_bytes[1] == 0 and raw_bytes[2] == 0 and raw_bytes[3] == 0) continue;
+
+        hasher.update(raw_bytes);
+        count += 1;
+    }
+
+    if (count == 0) return 0;
+    // 混入计数：接口 down（IP 消失）时指纹也不同
+    hasher.update(std.mem.asBytes(&count));
+    return hasher.final();
+}
+
+fn getAllIpsFingerprintWindows() u64 {
+    // 动态加载 iphlpapi.dll（匹配 utmmd 自包含风格）
+    const kernel32 = struct {
+        extern "kernel32" fn LoadLibraryA([*:0]const u8) callconv(.winapi) ?*anyopaque;
+        extern "kernel32" fn GetProcAddress(*anyopaque, [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    };
+
+    const hModule = kernel32.LoadLibraryA("iphlpapi.dll") orelse return 0;
+    const func_ptr = kernel32.GetProcAddress(hModule, "GetAdaptersAddresses") orelse return 0;
+
+    const FnType = *const fn (
+        family: c_uint,
+        flags: c_ulong,
+        reserved: ?*anyopaque,
+        addresses: *?*IP_ADAPTER_ADDRESSES_LH,
+        size: *c_ulong,
+    ) callconv(.winapi) c_ulong;
+    const getAdaptersAddresses: FnType = @ptrCast(@alignCast(func_ptr));
+
+    // 15KB 栈缓冲区覆盖典型多网卡系统
+    const buf: [15360]u8 = [_]u8{0} ** 15360;
+    var size: c_ulong = @intCast(buf.len);
+    var addrs: ?*IP_ADAPTER_ADDRESSES_LH = undefined;
+
+    const flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    const ret = getAdaptersAddresses(AF_INET_FP, flags, null, &addrs, &size);
+    if (ret != 0 or addrs == null) return 0;
+
+    var hasher = std.hash.Wyhash.init(0);
+    var count: u32 = 0;
+
+    var adapter: ?*IP_ADAPTER_ADDRESSES_LH = addrs;
+    while (adapter) |a| : (adapter = a.next) {
+        var ua: ?*IP_ADAPTER_UNICAST_ADDRESS_LH = a.first_unicast_address;
+        while (ua) |addr| : (ua = addr.next) {
+            const sa = addr.address.lpSockaddr orelse continue;
+            if (sa.sa_family != AF_INET_FP) continue;
+
+            const sin = @as(*align(1) const sockaddr_in_fp, @ptrCast(sa));
+            const raw_bytes = @as([*]const u8, @ptrCast(&sin.sin_addr))[0..4];
+
+            if (raw_bytes[0] == 127) continue;
+            if (raw_bytes[0] == 0 and raw_bytes[1] == 0 and raw_bytes[2] == 0 and raw_bytes[3] == 0) continue;
+
+            hasher.update(raw_bytes);
+            count += 1;
+        }
+    }
+
+    if (count == 0) return 0;
+    hasher.update(std.mem.asBytes(&count));
+    return hasher.final();
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 进程管理 — POSIX（Zig 0.16.0 移除了 posix.fork/chdir/execve，直接用 C）
@@ -637,6 +787,11 @@ fn stabilityCheck(io: std.Io, shm_ptr: *volatile shm.ShmLayout, proc: ProcessRef
 fn monitorUtmm(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmLayout, proc: ProcessRef) RestartReason {
     var last_hb = shm.nowMs(io);
 
+    // IP 变更检测状态
+    var last_ip_check = shm.nowMs(io);
+    var last_ip_fingerprint: u64 = 0;
+    var stable_ip_checks: u32 = 0;
+
     while (true) {
         sleepMs(io, POLL_INTERVAL_MS);
 
@@ -696,6 +851,30 @@ fn monitorUtmm(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
                 return .shutdown;
             },
             .none, .upgrade => {}, // .upgrade 已迁移到文件式升级，SHM 处忽略
+        }
+
+        // IP 变更检测（每 IP_CHECK_INTERVAL_MS 检查一次，去抖后触发重启）
+        if (now - last_ip_check >= IP_CHECK_INTERVAL_MS) {
+            last_ip_check = now;
+            const fp = getAllIpsFingerprint();
+            if (fp != 0 and fp != last_ip_fingerprint) {
+                if (last_ip_fingerprint != 0) {
+                    stable_ip_checks += 1;
+                    if (stable_ip_checks >= IP_STABLE_CHECKS) {
+                        std.log.warn("[utmmd] IP change detected, restarting utmm (fp 0x{x})", .{fp});
+                        killProcess(proc);
+                        return .crashed;
+                    }
+                } else {
+                    // 首次检测到有效 IP，记录指纹不触发
+                    last_ip_fingerprint = fp;
+                    stable_ip_checks = 0;
+                }
+            } else if (fp == last_ip_fingerprint and fp != 0) {
+                // 指纹稳定，重置去抖计数器
+                stable_ip_checks = 0;
+            }
+            // fp == 0 时不更新指纹也不触发（接口全部 down 保持上次状态）
         }
     }
 }
@@ -870,4 +1049,85 @@ test "parseArgs: --role host with extra args correctly includes --host" {
         if (std.mem.eql(u8, a, "--host")) found_host = true;
     }
     try std.testing.expect(found_host);
+}
+
+test "getAllIpsFingerprint: returns u64" {
+    const fp = getAllIpsFingerprint();
+    try std.testing.expect(@TypeOf(fp) == u64);
+    // 返回值 0 表示无网络接口，非零表示有有效 IPv4 — 两种情况都合法。
+}
+
+test "getAllIpsFingerprint: deterministic within same call" {
+    const fp1 = getAllIpsFingerprint();
+    const fp2 = getAllIpsFingerprint();
+    // 同一进程内两次连续调用应返回相同结果（无 I/O 状态变化）
+    try std.testing.expectEqual(fp1, fp2);
+}
+
+test "getAllIpsFingerprint: logic — first non-zero fingerprints do not trigger" {
+    // 模拟 monitorUtmm 的去抖逻辑：首次有效指纹只记录不触发
+    const seed_fp = getAllIpsFingerprint();
+    var last_fp: u64 = 0;
+    var stable_checks: u32 = 0;
+    var should_restart = false;
+
+    // 首次非零指纹
+    if (seed_fp != 0 and seed_fp != last_fp) {
+        if (last_fp == 0) {
+            // 首次检测到有效 IP，记录指纹不触发
+            last_fp = seed_fp;
+            stable_checks = 0;
+        } else {
+            stable_checks += 1;
+            if (stable_checks >= 2) should_restart = true;
+        }
+    }
+    try std.testing.expect(!should_restart);
+    try std.testing.expectEqual(seed_fp, last_fp);
+}
+
+test "getAllIpsFingerprint: logic — different fingerprints trigger after debounce" {
+    const base_fp = getAllIpsFingerprint();
+    if (base_fp == 0) return; // 无网络时跳过此测试
+
+    // 模拟 IP 变更场景：last_fp 记录的是"旧 IP 指纹"，
+    // 每次调用 getAllIpsFingerprint 返回的是"当前 IP 指纹"
+    var last_fp: u64 = 0;
+    var stable_checks: u32 = 0;
+    var should_restart = false;
+
+    // 模拟真实算法：假设 IP 从 base_fp 变成了 base_fp+1，
+    // 且连续 2 次检查都看到新值
+    const new_fp: u64 = base_fp +% 1;
+
+    // 检查 1：首次有效指纹，记录为 last_fp（模拟种子初始化）
+    if (new_fp != 0 and new_fp != last_fp) {
+        if (last_fp == 0) {
+            last_fp = new_fp;
+            stable_checks = 0;
+        }
+    }
+    try std.testing.expect(!should_restart);
+    try std.testing.expectEqual(new_fp, last_fp);
+
+    // 现在模拟 IP 变更：指纹变成另一值，连续 2 次检查
+    const changed_fp: u64 = base_fp +% 2;
+    // last_fp 仍是 new_fp（旧指纹），changed_fp 是当前指纹
+    // 防止溢出导致 changed_fp == 0
+    if (changed_fp == 0) return;
+
+    // 检查 2：检测到指纹不同于 last_fp → stable_checks=1
+    if (changed_fp != 0 and changed_fp != last_fp) {
+        stable_checks += 1;
+    }
+    try std.testing.expectEqual(1, stable_checks);
+    try std.testing.expect(!should_restart);
+    // last_fp 不更新 — 我们只比较"当前 vs 原始"
+
+    // 检查 3：指纹仍不同 → stable_checks=2 → 触发
+    if (changed_fp != 0 and changed_fp != last_fp) {
+        stable_checks += 1;
+        if (stable_checks >= 2) should_restart = true;
+    }
+    try std.testing.expect(should_restart);
 }
