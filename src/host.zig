@@ -731,7 +731,10 @@ fn hostTcpListen(
         }
 
         const fd = listener.acceptRaw() catch |err| {
-            if (err == error.WouldBlock) continue;
+            if (err == error.WouldBlock) {
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+                continue;
+            }
             std.log.err("[host] accept failed: {}", .{err});
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
             continue;

@@ -803,20 +803,17 @@ pub const TcpListener = struct {
 
     /// Accept a TCP connection, returning raw socket fd.
     /// SOCKS5 handshake and dispatch are handled by the caller (guest.zig / host.zig).
+    /// Returns error.WouldBlock when no connection is pending — callers MUST sleep
+    /// briefly before retrying to avoid busy-waiting and to update heartbeats.
     pub fn acceptRaw(self: *TcpListener) !socket_t {
-        while (true) {
-            if (self.use_raw_accept) {
-                return try sockAccept(self.listener_fd);
-            }
-            const stream = self.server.?.accept(self.io) catch |err| {
-                if (err == error.WouldBlock) {
-                    std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
-                    continue;
-                }
-                return error.AcceptFailed;
-            };
-            return stream.socket.handle;
+        if (self.use_raw_accept) {
+            return try sockAccept(self.listener_fd);
         }
+        const stream = self.server.?.accept(self.io) catch |err| {
+            if (err == error.WouldBlock) return error.WouldBlock;
+            return error.AcceptFailed;
+        };
+        return stream.socket.handle;
     }
 };
 

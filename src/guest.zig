@@ -918,7 +918,10 @@ pub fn guestTcpLoop(
 
         // Accept TCP 连接（不含 SOCKS5 握手）
         const fd = listener.acceptRaw() catch |err| {
-            if (err == error.WouldBlock) continue;
+            if (err == error.WouldBlock) {
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+                continue;
+            }
             std.log.err("[guest] accept failed: {}", .{err});
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
             continue;
@@ -1034,13 +1037,13 @@ fn handleOneCommand(
             try handleExecCmd(io, allocator, info, conn, payload, shm_handle);
         },
         @intFromEnum(protocol.MsgType.upload_cmd) => {
-            try handleUpload(io, allocator, conn, payload);
+            try handleUpload(io, allocator, conn, payload, shm_handle);
         },
         @intFromEnum(protocol.MsgType.download_cmd) => {
-            try handleDownload(io, allocator, conn, payload);
+            try handleDownload(io, allocator, conn, payload, shm_handle);
         },
         @intFromEnum(protocol.MsgType.upgrade_cmd) => {
-            try handleUpgradeCmd(io, allocator, conn, payload);
+            try handleUpgradeCmd(io, allocator, conn, payload, shm_handle);
         },
         else => {
             std.log.info("[guest] Unknown msg type: {d}", .{msg_type});
@@ -1133,6 +1136,7 @@ fn handleUpload(
     allocator: std.mem.Allocator,
     conn: *protocol.Connection,
     payload: []const u8,
+    shm_handle: ?*volatile shm.ShmLayout,
 ) !void {
     const cmd = protocol.parseUploadCmd(payload) orelse {
         std.log.err("[guest] parseUploadCmd failed", .{});
@@ -1155,6 +1159,11 @@ fn handleUpload(
     var buf: [65536]u8 = undefined;
     var remaining: u32 = cmd.file_size;
     while (remaining > 0) {
+        // 更新心跳 — 大文件上传可能超过 10s，需在循环中刷新。
+        if (shm_handle) |h| {
+            h.utmm_heartbeat = shm.nowMs(io);
+        }
+
         const to_read = @min(buf.len, remaining);
         const nr = tcp.sockRead(conn.fd, buf[0..to_read].ptr, to_read);
         if (nr <= 0) {
@@ -1187,6 +1196,7 @@ fn handleUpgradeCmd(
     allocator: std.mem.Allocator,
     conn: *protocol.Connection,
     payload: []const u8,
+    shm_handle: ?*volatile shm.ShmLayout,
 ) !void {
     const cmd = protocol.parseUpgradeCmd(payload) orelse {
         std.log.err("[guest] parseUpgradeCmd failed", .{});
@@ -1247,6 +1257,11 @@ fn handleUpgradeCmd(
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var remaining: u32 = cmd.file_size;
     while (remaining > 0) {
+        // 更新心跳 — 升级二进制传输可能超过 10s，需在循环中刷新。
+        if (shm_handle) |h| {
+            h.utmm_heartbeat = shm.nowMs(io);
+        }
+
         const to_read = @min(write_buf.len, remaining);
         const nr = tcp.sockRead(conn.fd, &write_buf, to_read);
         if (nr <= 0) {
@@ -1353,6 +1368,7 @@ fn handleDownload(
     allocator: std.mem.Allocator,
     conn: *protocol.Connection,
     payload: []const u8,
+    shm_handle: ?*volatile shm.ShmLayout,
 ) !void {
     const cmd = protocol.parseDownloadCmd(payload) orelse {
         std.log.err("[guest] parseDownloadCmd failed", .{});
@@ -1372,6 +1388,11 @@ fn handleDownload(
     // 从 file_pipe 流式读取 → 写入 TCP（原始字节）
     var buf: [65536]u8 = undefined;
     while (true) {
+        // 更新心跳 — 大文件下载可能超过 10s，需在循环中刷新。
+        if (shm_handle) |h| {
+            h.utmm_heartbeat = shm.nowMs(io);
+        }
+
         const nr = file_pipe.read(&buf) catch |err| {
             std.log.err("[guest] download read error: {}", .{err});
             break;
