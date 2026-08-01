@@ -645,34 +645,41 @@ fn startHost(
 
     }
 
-    // Spawn LSA manager task — syncs LSA→guest table, triggers auto-upgrade.
-    // Must spawn before the defer below so join() runs in correct order.
-    var host_loop_handle = try zio.spawnBlocking(hostMainLoop, .{ block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy, shm_handle });
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Unified executor model: LSA manager + IPC server run as coroutines on
+    // the main executor (spawned via group.spawn). The main fiber runs the TCP
+    // accept loop. All three yield cooperatively through blockInPlace.
+    // Connection handlers use group.spawnBlocking() → thread pool.
+    // ═══════════════════════════════════════════════════════════════════════════
 
-    // Spawn IPC server task — Unix domain socket (POSIX) / named pipe (Windows).
-    // Shares HostState and Mesh with the mesh networking layer.
+    var group: zio.Group = .init;
     var ipc_shutdown = std.atomic.Value(bool).init(false);
     const ipc_mod = @import("ipc.zig");
-    var ipc_handle = try zio.spawnBlocking(ipc_mod.startServer, .{
-        block_io, gpa, @as(*anyopaque, @ptrCast(&state)), @as(*anyopaque, @ptrCast(&mesh_opt)), &ipc_shutdown,
-    });
+
+    // Spawn LSA manager coroutine — syncs LSA→guest table, triggers auto-upgrade.
+    // Uses blockInPlace(sleep5s) to yield during sleep intervals.
+    try group.spawn(hostMainLoop, .{ &group, block_io, gpa, &state, &mesh_opt, host_ip_copy, host_hostname_copy, shm_handle });
+
+    // Spawn IPC server coroutine — Unix domain socket (POSIX) / named pipe (Windows).
+    // Uses blockInPlace(accept) to yield during blocking accept calls.
+    try group.spawn(ipc_mod.startServer, .{ &group, block_io, gpa, @as(*anyopaque, @ptrCast(&state)), @as(*anyopaque, @ptrCast(&mesh_opt)), &ipc_shutdown });
 
     defer {
-        // 1. Signal all background threads to stop
+        // 1. Signal all coroutines to stop
         ipc_shutdown.store(true, .release);
         // 2. Signal mesh shutdown — hostMainLoop checks this each loop iteration
         if (mesh_opt) |*m| m.signalShutdown();
 
-        // 3. Join tasks (order: IPC → host loop → mesh)
-        ipc_handle.join() catch |err| std.log.err("[host] IPC task error: {}", .{err});
-        host_loop_handle.join();
+        // 3. Wait for coroutines to complete (park main fiber via zio Futex)
+        //    Coroutines exit after checking their shutdown flags.
+        group.wait() catch |err| std.log.err("[host] group.wait failed: {}", .{err});
 
-        // 4. Join mesh thread after all consumers have exited
+        // 4. Join mesh thread after all executor consumers have exited
         if (mesh_thread) |t| {
             t.join();
         }
 
-        // 5. Deinit mesh (safe: all threads using it have exited)
+        // 5. Deinit mesh (safe: all executor tasks and threads using it have exited)
         if (mesh_opt) |*m| {
             const m_io = m.io;
             m.deinit();
@@ -682,14 +689,17 @@ fn startHost(
         // 6. state.deinit() runs via its own defer (declared earlier, runs later)
     }
 
-    // Run TCP accept loop on main executor (like guest pattern).
+    // Run TCP accept loop on main executor fiber.
+    // Uses blockInPlace(acceptTcp) to yield to coroutines during accept.
     // Uses group.spawnBlocking() for per-connection handlers.
-    try hostTcpListen(block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown, shm_handle);
+    try hostTcpListen(&group, block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown, shm_handle);
 }
 
 /// Host TCP listener — SOCKS5 accept + three-way dispatch.
 /// Uses GuestTable.findByHostname for hostname→IP lookup (vs guest's lsa.Mesh).
+/// Runs on the main executor fiber; yields at each accept via blockInPlace.
 fn hostTcpListen(
+    group: *zio.Group,
     io: std.Io,
     allocator: std.mem.Allocator,
     state: *GuestTable,
@@ -705,7 +715,6 @@ fn hostTcpListen(
     defer listener.deinit();
 
     var conn_limit = tcp.ConnLimit.init(tcp.DEFAULT_MAX_CONNS);
-    var group: zio.Group = .init;
     std.log.info("[host] TCP SOCKS5 listener on :{d}", .{mesh_port});
 
     while (true) {
@@ -718,7 +727,9 @@ fn hostTcpListen(
             if (s.load(.acquire)) break;
         }
 
-        const fd = listener.acceptRaw() catch |err| {
+        // blockInPlace: park main fiber, run accept on thread pool, resume.
+        // Yields executor to other coroutines (LSA manager, IPC server).
+        const fd = zio.blockInPlace(acceptTcp, .{&listener}) catch |err| {
             if (err == error.WouldBlock) {
                 std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
                 continue;
@@ -1019,6 +1030,7 @@ fn pushUpgradeThread(
 }
 
 fn hostMainLoop(
+    group: *zio.Group,
     io: std.Io,
     allocator: std.mem.Allocator,
     state: *GuestTable,
@@ -1144,20 +1156,24 @@ fn hostMainLoop(
                         };
 
                         const push_hostname = allocator.dupe(u8, hostname) catch continue;
-                        const rt = zio.Runtime.fromIo(io);
-                        var handle = rt.spawnBlocking(pushUpgradeThread, .{ io, allocator, state, push_hostname }) catch {
+                        group.spawnBlocking(pushUpgradeThread, .{ io, allocator, state, push_hostname }) catch {
                             allocator.free(push_hostname);
                             continue;
                         };
-                        handle.detach();
                     }
                 }
             }
         }
 
-        // Sleep 5s between scans
+        // Sleep 5s between scans — zio Io's sleep yields the coroutine on executor.
         std.Io.sleep(io, std.Io.Duration.fromSeconds(5), .awake) catch {};
     }
+}
+
+/// blockInPlace helper: accepts one TCP connection on the thread pool.
+/// The calling coroutine is parked while blocking in accept().
+fn acceptTcp(listener: *tcp.TcpListener) !std.c.fd_t {
+    return listener.acceptRaw();
 }
 
 

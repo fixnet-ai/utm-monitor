@@ -306,15 +306,18 @@ const IPC_READ_TIMEOUT_MS: i32 = 300_000; // 5 minutes
 // Server (Host daemon side)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Start the IPC server accept loop. Runs in its own background thread.
-/// Blocks until `shutdown` is set, then closes the listener and returns.
+/// Start the IPC server accept loop. Runs as a zio coroutine on the main executor.
+/// Accepts connections via blockInPlace (parks → thread pool → resumes).
+/// Connection handlers are spawned via group.spawnBlocking().
 ///
-/// `io`: caller's Io instance (shared across all Host threads).
+/// `group`: zio task group for spawnBlocking (handler dispatch).
+/// `io`: caller's Io instance.
 /// `gpa`: allocator for connection buffers.
 /// `state_ptr`: opaque pointer to state.HostState (avoid circular import).
 /// `mesh_ptr`: opaque pointer to mesh.Mesh (for ping handler).
 /// `shutdown`: atomic flag — when true, the server exits cleanly.
 pub fn startServer(
+    group: *zio.Group,
     io: std.Io,
     gpa: std.mem.Allocator,
     state_ptr: *anyopaque,
@@ -322,12 +325,46 @@ pub fn startServer(
     shutdown: *std.atomic.Value(bool),
 ) !void {
     if (builtin.os.tag == .windows) {
-        return startServerWindows(io, gpa, state_ptr, mesh_ptr, shutdown);
+        return startServerWindows(group, io, gpa, state_ptr, mesh_ptr, shutdown);
     }
-    return startServerPosix(io, gpa, state_ptr, mesh_ptr, shutdown);
+    return startServerPosix(group, io, gpa, state_ptr, mesh_ptr, shutdown);
+}
+
+/// blockInPlace helper: accepts one connection on a POSIX listen socket.
+/// Runs on the thread pool — the calling coroutine is parked during accept.
+fn acceptPosixOne(listen_fd: std.c.fd_t) !std.c.fd_t {
+    var client_addr: std.c.sockaddr = undefined;
+    client_addr.family = std.posix.AF.UNIX;
+    @memset(&client_addr.data, 0);
+    if (builtin.os.tag == .macos or builtin.os.tag == .ios or builtin.os.tag == .watchos or builtin.os.tag == .tvos or builtin.os.tag == .visionos) {
+        client_addr.len = @sizeOf(std.c.sockaddr);
+    }
+    var client_len: std.c.socklen_t = @sizeOf(std.c.sockaddr);
+    const client_fd = std.posix.system.accept(listen_fd, &client_addr, &client_len);
+    if (client_fd < 0) {
+        const err = std.posix.errno(client_fd);
+        return switch (err) {
+            .INTR, .AGAIN => error.WouldBlock,
+            else => error.AcceptFailed,
+        };
+    }
+    return @intCast(client_fd);
+}
+
+/// blockInPlace helper: waits for a client to connect to a Windows named pipe.
+/// Runs on the thread pool.
+fn connectNamedPipeOne(pipe: windows.HANDLE) !void {
+    const connected = windows.ConnectNamedPipe(pipe, null);
+    if (connected == 0) {
+        const err = windows.GetLastError();
+        if (err != .PIPE_CONNECTED) {
+            return error.PipeConnectFailed;
+        }
+    }
 }
 
 fn startServerPosix(
+    group: *zio.Group,
     io: std.Io,
     gpa: std.mem.Allocator,
     state_ptr: *anyopaque,
@@ -366,44 +403,38 @@ fn startServerPosix(
 
     std.log.info("[ipc] listening on {s}", .{path});
 
-    // Accept loop
+    // Accept loop — uses blockInPlace to yield coroutine during blocking accept.
+    // Each connection handler runs on thread pool via group.spawnBlocking.
     while (!shutdown.load(.acquire)) {
-        var client_addr: std.c.sockaddr = undefined;
-        client_addr.family = std.posix.AF.UNIX;
-        @memset(&client_addr.data, 0);
-        if (builtin.os.tag == .macos or builtin.os.tag == .ios or builtin.os.tag == .watchos or builtin.os.tag == .tvos or builtin.os.tag == .visionos) {
-            client_addr.len = @sizeOf(std.c.sockaddr);
-        }
-        var client_len: std.c.socklen_t = @sizeOf(std.c.sockaddr);
-        const client_fd = std.posix.system.accept(fd, &client_addr, &client_len);
+        const client_fd = zio.blockInPlace(acceptPosixOne, .{fd}) catch |err| {
+            if (err == error.WouldBlock) {
+                // Interrupted by shutdown signal or spurious wake-up.
+                if (shutdown.load(.acquire)) break;
+                continue;
+            }
+            std.log.err("[ipc] accept failed: {}", .{err});
+            if (shutdown.load(.acquire)) break;
+            continue;
+        };
 
         // Check if shutdown was signaled during accept
         if (shutdown.load(.acquire)) {
-            if (client_fd >= 0) _ = std.posix.system.close(client_fd);
+            _ = std.posix.system.close(client_fd);
             break;
         }
 
-        if (client_fd < 0) {
-            const err = std.posix.errno(client_fd);
-            if (err == .INTR) continue;
-            if (err == .AGAIN) continue;
-            std.log.err("[ipc] accept failed: {}", .{err});
-            continue;
-        }
-
-        // Spawn handler on managed thread pool (detached — connection is short-lived)
+        // Spawn handler on thread pool via group (fire-and-forget)
         const conn: Connection = .{ .fd = client_fd };
-        const rt = zio.Runtime.fromIo(io);
-        var handle = rt.spawnBlocking(handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
+        group.spawnBlocking(handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
             std.log.err("[ipc] thread spawn failed", .{});
             conn.close();
             continue;
         };
-        handle.detach();
     }
 }
 
 fn startServerWindows(
+    group: *zio.Group,
     io: std.Io,
     gpa: std.mem.Allocator,
     state_ptr: *anyopaque,
@@ -411,7 +442,7 @@ fn startServerWindows(
     shutdown: *std.atomic.Value(bool),
 ) !void {
     // Windows named pipe accept loop: each pipe instance handles one client.
-    // We create a pipe, wait for a client, spawn a handler, then create the next pipe.
+    // Uses blockInPlace to yield coroutine during blocking ConnectNamedPipe.
     while (!shutdown.load(.acquire)) {
         const pipe = windows.CreateNamedPipeA(
             socketPathZ(),
@@ -429,16 +460,13 @@ fn startServerWindows(
             return error.NamedPipeCreateFailed;
         }
 
-        // Block until a client connects
-        const connected = windows.ConnectNamedPipe(pipe, null);
-        if (connected == 0) {
-            const err = windows.GetLastError();
-            if (err != .PIPE_CONNECTED) {
-                std.log.err("[ipc] ConnectNamedPipe failed: {}", .{err});
-                windows.CloseHandle(pipe);
-                continue;
-            }
-        }
+        // Block until a client connects (parks coroutine via blockInPlace)
+        zio.blockInPlace(connectNamedPipeOne, .{pipe}) catch |err| {
+            std.log.err("[ipc] ConnectNamedPipe failed: {}", .{err});
+            windows.CloseHandle(pipe);
+            if (shutdown.load(.acquire)) break;
+            continue;
+        };
 
         if (shutdown.load(.acquire)) {
             windows.CloseHandle(pipe);
@@ -446,13 +474,11 @@ fn startServerWindows(
         }
 
         const conn: Connection = .{ .fd = pipe };
-        const rt = zio.Runtime.fromIo(io);
-        var handle = rt.spawnBlocking(handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
+        group.spawnBlocking(handleConnection, .{ io, gpa, state_ptr, mesh_ptr, conn }) catch {
             std.log.err("[ipc] thread spawn failed", .{});
             conn.close();
             continue;
         };
-        handle.detach();
     }
 }
 
