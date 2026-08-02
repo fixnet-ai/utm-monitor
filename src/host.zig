@@ -1035,11 +1035,56 @@ pub fn pushUpgrade(
     const up_frame = protocol.buildUpgradeCmd(gpa, cmd_id, guest_entry.target, file_size, &sha256_hex, protocol.VERSION) catch return "AllocFailed";
     defer gpa.free(up_frame);
 
-    // Fire-and-forget: push upgrade_cmd + raw binary
-    tcp_conn.sendAndFlush(up_frame, 0) catch |e| std.log.warn("[host] auto-upgrade send frame failed: {}", .{e});
-    _ = tcp.sockWrite(tcp_conn.fd, file_data.ptr, file_size);
+    // Send upgrade_cmd frame
+    tcp_conn.sendAndFlush(up_frame, 0) catch |e| {
+        std.log.err("[auto-upgrade] send frame to {s} failed: {}", .{ hostname, e });
+        return "SendFrameFailed";
+    };
 
-    std.log.info("[auto-upgrade] {s} pushed (fire-and-forget, {d} bytes)", .{ hostname, file_size });
+    // Send raw binary bytes with short-write handling.
+    // system.write on a blocking socket can return a short write for large
+    // buffers if the send buffer fills up. Loop to ensure all bytes are
+    // written before closing — without this, close() can discard pending data.
+    {
+        var written: usize = 0;
+        while (written < file_size) {
+            const w = tcp.sockWrite(tcp_conn.fd, file_data.ptr + written, file_size - written);
+            if (w < 0) {
+                std.log.err("[auto-upgrade] sockWrite to {s} failed: err={d}", .{ hostname, w });
+                return "WriteFailed";
+            }
+            if (w == 0) {
+                std.log.err("[auto-upgrade] sockWrite to {s} returned 0 (connection closed)", .{hostname});
+                return "WriteFailed";
+            }
+            written += @intCast(w);
+        }
+    }
+
+    // Read upload_result response from Guest before closing connection.
+    // This confirms the Guest received and verified the binary. Without this,
+    // close() + shutdown() can discard data still in the kernel send buffer,
+    // and a short sockWrite can go undetected.
+    {
+        var rbuf: [256]u8 = undefined;
+        const nr = tcp_conn.recv(&rbuf) catch |err| {
+            std.log.err("[auto-upgrade] recv upload_result from {s}: {}", .{ hostname, err });
+            return "ResponseReadFailed";
+        };
+        if (nr > 0 and rbuf[0] == @intFromEnum(protocol.MsgType.upload_result)) {
+            const result = protocol.parseUploadResult(rbuf[1..nr]) orelse {
+                std.log.err("[auto-upgrade] parseUploadResult from {s} failed", .{hostname});
+                return "ParseResponseFailed";
+            };
+            if (result.exit_code != 0) {
+                std.log.err("[auto-upgrade] {s} upgrade rejected: exit={d}", .{ hostname, result.exit_code });
+                return "UpgradeRejected";
+            }
+            std.log.info("[auto-upgrade] {s} confirmed upgrade receipt (exit={d})", .{ hostname, result.exit_code });
+        }
+    }
+
+    std.log.info("[auto-upgrade] {s} pushed ({d} bytes)", .{ hostname, file_size });
     return null; // success
 }
 
