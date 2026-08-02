@@ -100,8 +100,8 @@ utmm --ping <vm>                 # Ping a guest via LSA mesh
 utmm --exec <vm> "<cmd>"         # Execute command via per-command pty
 utmm --upload <file> <vm>[:path] # Upload file (SHA256 verified)
 utmm --download <vm> <rp> [lp]   # Download file (SHA256 verified)
-utmm --upgrade <vm>              # Push upgrade binary to Guest
-utmm --deploy [vm]               # Cross-compile, SCP, install & verify
+utmm --upgrade <vm>              # Push upgrade binary to Guest via SOCKS5 mesh
+utmm --deploy [vm]               # Build, SCP, install & verify (uses serve-dir cache)
 utmm --gen-init <platform>       # Generate auto-start script
 ```
 
@@ -462,26 +462,38 @@ utmm --status
 utmm --deploy linuxvm && utmm --upgrade linuxvm && utmm --status
 ```
 
-`--deploy` cross-compiles for all target platforms, SCPs binaries to each Guest,
-and stages them in the Host serve-dir. `--upgrade` pushes the binary from Host
-to Guest over the SOCKS5 channel (no SSH needed), verifies SHA256, and triggers
-a zero-downtime restart via the utmmd supervisor.
+`--deploy` cross-compiles for all target platforms (first run only — subsequent
+runs use cached binaries from serve-dir), SCPs binaries to each Guest using built-in
+`utmm sshpass` (no external sshpass needed), and stages them in the Host serve-dir.
+VM credentials are read from `/opt/utmm/deploy.json` (falls back to compile-time
+defaults). `--upgrade` pushes the binary from Host to Guest over the SOCKS5 channel
+(no SSH needed), verifies SHA256, and triggers a zero-downtime restart via the utmmd
+supervisor. Error messages include actionable guidance for common failures.
 
 ### Bootstrap a New Machine
 
 ```bash
 # 1. SSH in and create the install directory
-utmm sshpass -p '111' ssh root@newvm 'mkdir -p /opt/utmm'
+utmm sshpass -p <pass> ssh root@newvm 'mkdir -p /opt/utmm'
 
-# 2. Copy the binary
-scp zig-out/bin/utmm-aarch64-linux root@newvm:/opt/utmm/utmm-new
+# 2. Copy the binary (from Host serve-dir or zig-out/bin)
+utmm sshpass -p <pass> scp /opt/utmm/utmm-aarch64-linux-0.17.22 root@newvm:/opt/utmm/utmm-new
 
 # 3. Install as a system service
-utmm sshpass -p '111' ssh root@newvm '/opt/utmm/utmm-new --install --hostname newvm'
+utmm sshpass -p <pass> ssh root@newvm '/opt/utmm/utmm-new --install --hostname newvm'
 
 # 4. Wait for LSA sync (~10-15s), then verify
 sleep 15 && utmm --status
 ```
+
+For Windows VMs, use the `.exe` binary and Windows paths:
+```bash
+utmm sshpass -p <pass> scp /opt/utmm/utmm-x86_64-windows-0.17.22.exe Administrator@winvm:"C:\\opt\\utmm\\utmm-new.exe"
+utmm sshpass -p <pass> ssh Administrator@winvm "C:\\opt\\utmm\\utmm-new.exe --install --hostname winvm"
+```
+
+> **Note**: All password-authenticated operations use `utmm sshpass` — no external
+> sshpass binary needed. SSH agent and key-based auth are also supported directly.
 
 ---
 
@@ -538,7 +550,22 @@ sudo utmm --host --install
 sudo utmm --status    # verify the Host is running
 ```
 
-**Guests** (managed machines) — use the automated deploy pipeline:
+**Guests** (managed machines) — create a deploy.json config file at
+`/opt/utmm/deploy.json` (POSIX) or `C:\opt\utmm\deploy.json` (Windows Host):
+
+```json
+[
+  {"hostname": "linuxvm",   "target": "aarch64-linux-musl",  "ip": "192.168.64.6", "user": "root",          "password": "111", "remote_dir": "/opt/utmm"},
+  {"hostname": "macvm",     "target": "aarch64-macos",       "ip": "192.168.65.4", "user": "root",          "password": "111", "remote_dir": "/opt/utmm"},
+  {"hostname": "windowsvm", "target": "aarch64-windows",     "ip": "192.168.64.3", "user": "Administrator", "password": "111", "remote_dir": "C:\\opt\\utmm"},
+  {"hostname": "winx64",    "target": "x86_64-windows",      "ip": "192.168.3.108","user": "Administrator", "password": "111", "remote_dir": "C:\\opt\\utmm"}
+]
+```
+
+All fields are required. If the file is missing or invalid, `--deploy` falls back
+to compile-time defaults with a warning.
+
+Then use the automated deploy pipeline:
 
 ```bash
 # Deploy to all Guests (cross-compile + SCP + install + verify)
@@ -548,38 +575,51 @@ utmm --deploy
 utmm --deploy linuxvm
 ```
 
-`--deploy` handles cross-compilation, binary transfer, and installation in one
-command. After deployment, wait ~10–15 seconds for LSA mesh sync, then verify
-with `--status`.
+`--deploy` cross-compiles for all target platforms (skipped on subsequent runs
+when cached binaries exist in serve-dir), transfers binaries via built-in
+`utmm sshpass` (no external sshpass needed), and installs on each Guest. After
+deployment, wait ~10–15 seconds for LSA mesh sync, then verify with `--status`.
 
 ### Manual Guest Deployment
 
 If `--deploy` is not available (no build environment on the Host), deploy
-binaries manually:
+binaries manually using `utmm sshpass`:
 
 ```bash
 # POSIX (Linux/macOS)
-scp utmm-<target> root@<hostname>:/opt/utmm/utmm-new
-ssh root@<hostname> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
+utmm sshpass -p <pass> scp /opt/utmm/utmm-<target>-<version> root@<hostname>:/opt/utmm/utmm-new
+utmm sshpass -p <pass> ssh root@<hostname> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
 
 # Windows — kill utmmd first (it locks the exe → AccessDenied on rename)
-ssh Administrator@<hostname> 'taskkill /F /IM utmmd.exe 2>nul'
-scp utmm-<target>.exe Administrator@<hostname>:C:/opt/utmm/utmm-new.exe
-ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
+utmm sshpass -p <pass> ssh Administrator@<hostname> 'taskkill /F /IM utmmd.exe 2>nul'
+utmm sshpass -p <pass> scp /opt/utmm/utmm-<target>-<version>.exe Administrator@<hostname>:C:/opt/utmm/utmm-new.exe
+utmm sshpass -p <pass> ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
 ```
 
 ### Day-to-Day Upgrades
 
 ```bash
-# Push upgrade to a Guest (Host → Guest via SOCKS5, no SSH needed)
-utmm --deploy linuxvm    # build + stage
-utmm --upgrade linuxvm   # push + restart
-utmm --status            # verify version
+# Push upgrade to a Guest via SOCKS5 mesh (no SSH needed, zero-downtime)
+utmm --deploy                # build & stage to serve-dir (cached on re-runs)
+utmm --upgrade linuxvm       # push + restart via SOCKS5
+utmm --status                # verify version
+
+# Or deploy + upgrade in one line per Guest:
+utmm --upgrade windowsvm     # if binary already in serve-dir
 ```
 
 The upgrade is atomic: the new binary is SHA256-verified, the utmmd supervisor
 stops the old process, renames the binary, and spawns the new one — zero-downtime
 from the caller's perspective.
+
+**Error messages are now actionable:**
+
+| Error | What to do |
+|-------|-----------|
+| `GuestNotFound: ... — Use --deploy for initial setup` | VM not in mesh; run `--deploy` to bootstrap |
+| `BinaryNotFound: ... — run 'utmm --deploy' first` | Missing binary in serve-dir; run `--deploy` |
+| `UnknownTarget: ... — check deploy.json target field` | Architecture not recognized; fix config |
+| `GuestConnectFailed` | TCP/SOCKS5 connect failed; check Guest is running |
 
 ### Verify Deployment
 
