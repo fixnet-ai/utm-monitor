@@ -1,3 +1,85 @@
+## v0.17.11 — zio 协程重构完成 + macOS 自动 codesign
+
+**时间**: 2026-08-02
+
+### zio 协程重构（v0.17.8—v0.17.10）
+
+将 utmm 从 OS 线程模型迁移到 zio stackful 协程框架。
+
+**背景**: `refactor-zio` 分支，8 个 commit。目标是用协程替代 OS 线程，提升 I/O 调度效率。
+
+**重构分阶段**:
+
+1. **Phase 1 — zio 依赖**: `main.zig` `--svc` 路径创建 Runtime + Executor
+2. **Phase 2 — Guest spawnBlocking**: `guest.zig` 所有 `std.Thread.spawn` → `zio.Group.spawnBlocking`
+3. **Phase 3 — dpipe relay**: `dpipe.relay()` `std.Thread` → `zio.spawnBlocking`
+4. **Phase 4 — Host spawnBlocking**: `host.zig` 顶层服务 spawn 改用 zio
+5. **Phase 5 — Host accept loop**: Host TCP accept 循环移至主 executor
+6. **Phase 6 — spawnBlocking 统一**: 所有 `std.Thread.spawn` → `rt.spawnBlocking()`
+7. **Phase 7 — 统一主 executor**: LSA + IPC 作为协程运行在统一 executor 上
+
+**关键问题与修复**:
+
+1. **SO_REUSEPORT TCP 端口冲突** (`src/tcp.zig`):
+   - zio 的 `addr.listen()` 设置 SO_REUSEPORT（非 SO_REUSEADDR），导致内核将 :2121
+     连接负载均衡到 Host 和 Guest 两个 TCP listener
+   - 修复：TcpListener.init 改用手动原始 POSIX socket（`socket()` + `setsockopt(SO_REUSEADDR)` +
+     `bind()` + `listen()` + `fcntl(O_NONBLOCK)`），在 POSIX 和 Windows 上均只设 SO_REUSEADDR
+
+2. **Spinlock 替代 Mutex** (`src/host.zig`):
+   - zio `std.Io.Mutex.lock(io)` 内部调用 `io.futexWait()` 需要协程上下文
+   - 线程池 spawBlocking 线程上没有协程上下文，导致 hang
+   - 修复：`lockTable()` + `unlockTable()` helpers 使用 `tryLock()` 忙等 + `@prefetch`
+
+3. **Upload GuestNotFound** (`src/host.zig`):
+   - `cmdUpload` 将完整 `vm:path` 字符串（如 "macvm:/tmp/test.txt"）作为 vm 名传给 `ipcUpload`
+   - `findByHostname` 查找字面量 "macvm:/tmp/test.txt"，当然找不到
+   - 修复：在 `:` 处分割，提取 hostname
+
+4. **Host 自我处理** (`src/host.zig`):
+   - 删除独立 Guest daemon 概念 — Host 的 self:2121 SOCKS5 handler 调用
+     `guest.handleOneCommand()` 直接处理 exec/upload/download
+   - 新增 Host `getSystemInfo()` 为 self-exec 收集 SystemInfo
+   - 5 个 guest.zig handler 函数改为 `pub`：
+     `handleOneCommand`, `handleExecCmd`, `handleUpload`, `handleUpgradeCmd`, `handleDownload`
+
+5. **Windows SOCKET 类型** (`src/tcp.zig`):
+   - aarch64-windows 上 SOCKET = `*anyopaque`（指针），`@intCast` 对指针无效
+   - 修复：`.handle = s` 直接赋值（s 已是正确类型）
+
+**版本链**:
+- v0.17.8: dpipe relay + guest spawnBlocking
+- v0.17.9: host accept loop + service spawns
+- v0.17.10: SO_REUSEPORT fix + upload GuestNotFound fix + spinlock + Windows SOCKET fix
+
+### macOS 自动 Ad-Hoc Codesign（v0.17.11）
+
+**问题**: 交叉编译或 scp 传输的 Mach-O 二进制，ad-hoc 签名损坏（`cs_invalid_page`, `tainted:1`），
+Apple Silicon 内核发送 SIGKILL。
+
+**修复** (`build.zig`):
+- 原生构建后自动 `codesign --force --sign -`
+- 交叉编译循环中每个 macOS 目标独立 codesign
+- sign 步骤依赖于编译完成，install 步骤依赖于 sign 完成
+
+**验证**:
+- scp binary 到 macvm 后无需手动 codesign 即可运行 ✅
+- 188 单元测试 + 59 集成测试全部通过 ✅
+- 6/8 交叉编译目标通过（x86 的 2 个 zio 不支持，预存限制）
+
+**PR**: https://github.com/fixnet-ai/utm-monitor/pull/5
+
+**提交**: 8 个 commit（`3532190` 到 `2fffe18`），tag `v0.17.11`
+
+### 已知遗留问题（本版本未修复）
+
+1. **Zombie 进程**: `dpipe_shell.zig` killChild 5s WNOHANG waitpid 限制
+2. **utmmd 二进制升级缺口**: push-upgrade 仅替换 utmm，不替换 utmmd
+3. **x86 目标不支持**: zio `unimplemented architecture: x86`，2 个 32-bit 目标无法编译
+4. **测试输出静默**: `zig build test` stdout 无输出（ExitCode=0 但输出被吞）— 不影响 CI
+
+---
+
 ## v0.17.7 — 心跳超时崩溃循环修复
 
 **时间**: 2026-08-02

@@ -2,17 +2,20 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.17.7 — 心跳超时崩溃循环修复（acceptRaw 内层循环阻塞 + 长传输补心跳）
+**最新版本**: v0.17.11 — zio 协程重构完成 + macOS 自动 codesign
 
-- **分支**: `main`
+- **分支**: `refactor-zio`（zio 协程重构分支）
 - **源文件**: 20 src + 13 test
 - **测试**: 188 单元测试 + 59 集成测试，全部通过，0 泄漏
+- **交叉编译**: 6/8 通过（x86 的 2 个 zio 不支持）
 
-## 当前阶段: Phase 24-b — 心跳超时崩溃循环修复 ✅
+## 当前阶段: Phase 25 — zio 协程重构 ✅
 
-**目标**: 修复 linuxvm 持续心跳超时崩溃循环（自 v0.17.2 预存），utmm accept 循环空闲期间心跳无法更新致 utmmd 误杀。
+**目标**: 将 utmm 从 OS 线程模型迁移到 zio stackful 协程框架，解决 SO_REUSEPORT
+端口冲突、spinlock、upload 解析等关键问题。8 个 commit 逐步推进。
 - **单元测试**: 188 测试全部通过 ✅
 - **集成测试**: 59/59 通过 ✅
+- **真机部署**: macvm + linuxvm exec/upload/download 全部通过 ✅
 - **真机部署**: 待发布验证
 
 ## 架构概述
@@ -798,3 +801,53 @@ src/
 | 211 | handleOneCommand 分发更新调用签名 | `src/guest.zig` | ✅ 传递 shm_handle |
 | 212 | zig build test + test-integration 全部通过 | - | ✅ 188+59 |
 | 213 | 版本号 bump 0.17.6 → 0.17.7 | `src/ver.txt` | ✅ commit `b850b02` tag `v0.17.7` |
+
+### Phase 25: v0.17.8—v0.17.11 — zio 协程重构 + macOS 自动 codesign ✅
+
+**背景**: 将 utmm 从 OS 线程模型迁移到 zio stackful 协程框架。`refactor-zio` 分支，8 个 commit 逐步推进。
+
+**重构分阶段**:
+
+| 阶段 | 内容 | commit |
+|------|------|--------|
+| Phase 1 | 添加 zio 依赖 + `--svc` 路径 Runtime | `df37f87` |
+| Phase 2 | guest.zig Thread.spawn → zio Group.spawnBlocking | `3532190` |
+| Phase 3 | dpipe.relay() std.Thread → zio spawnBlocking | `3bd5961` |
+| Phase 4 | host.zig 顶层服务 spawn 改用 zio | `8194d98` |
+| Phase 5 | Host accept loop 移至主 executor | `0b7b958` |
+| Phase 6 | 统一 spawnBlocking 调用 | `6af66d5` |
+| Phase 7 | LSA + IPC 统一主 executor | `a8b8235` |
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 214 | 修复 SO_REUSEPORT TCP 端口冲突 | `src/tcp.zig` | ✅ 原始 POSIX socket + SO_REUSEADDR only |
+| 215 | Spinlock 替代 Mutex | `src/host.zig` | ✅ lockTable/unlockTable helpers with tryLock busy-loop |
+| 216 | 修复 upload GuestNotFound | `src/host.zig` | ✅ cmdUpload `:` 分割提取 hostname |
+| 217 | Host 自我处理 self:2121 | `src/host.zig`, `src/guest.zig` | ✅ handleOneCommand pub + Host getSystemInfo |
+| 218 | 修复 Windows SOCKET aarch64 | `src/tcp.zig` | ✅ `.handle = s` 直接赋值 |
+| 219 | 修复 upload debug 日志 | `src/ipc.zig` | ✅ handleUpload 增加 vm/path 日志 |
+| 220 | svc.legacy_labels 新增 com.utmmd-guest | `src/svc.zig` | ✅ 清理旧版 per-role 服务名 |
+| 221 | 删除 installGuestMacOS 函数 | `src/svc.zig` | ✅ ~95 行删除 |
+| 222 | macOS 自动 ad-hoc codesign | `build.zig` | ✅ codesign --force --sign - after build |
+| 223 | 版本号 bump 0.17.7 → 0.17.11 | `src/ver.txt` | ✅ 4 次 bump |
+| 224 | zig build test + test-integration 全部通过 | - | ✅ 188+59 |
+| 225 | macvm + linuxvm 真机 exec/upload/download 验证 | - | ✅ 全部通过 |
+
+**关键决策**:
+
+| # | 决策 | 理由 |
+|---|------|------|
+| 60 | 原始 POSIX socket 替代 zio addr.listen() | SO_REUSEPORT 导致内核负载均衡 Host/Guest TCP :2121；SO_REUSEADDR only 确保唯一进程 bind |
+| 61 | Spinlock 忙等替代 Mutex.lock(io) | futexWait 需要协程上下文，spawnBlocking 线程上没有；CPU 忙等开销可接受（临界区极短） |
+| 62 | Host self:2121 直接调用 guest.handleOneCommand | 消除独立 Guest daemon 线程，简化架构 |
+| 63 | 删除 installGuestMacOS | 统一为 utmmd --role guest/host 模型；旧 per-role 服务名已清理 |
+| 64 | build.zig 自动 codesign macOS 目标 | 交叉编译+scp 污染 ad-hoc 签名，Apple Silicon SIGKILL；自动签后无需手动 codesign |
+
+**已知遗留问题**:
+
+| # | 问题 | 影响 |
+|---|------|------|
+| 1 | Zombie 进程 | killChild 5s WNOHANG waitpid，D 状态子进程无法收割 |
+| 2 | utmmd 二进制升级缺口 | push-upgrade 只替换 utmm，utmmd 需手动更新 |
+| 3 | x86 目标不支持 | zio `unimplemented architecture: x86`，32-bit 无法编译 |
+| 4 | `zig build test` stdout 无输出 | macOS 上 ExitCode=0 但测试输出被吞，不影响 CI |
