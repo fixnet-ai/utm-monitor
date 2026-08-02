@@ -749,3 +749,158 @@ linuxvm 的 UTM 网络环境空闲期间无任何入站连接，暴露了此问�
 **设计**: utmmd 不链接 iphlpapi.dll，而是在运行时通过 `LoadLibraryA`/`GetProcAddress`
 动态加载 `GetAdaptersAddresses`。这与 utmmd 作为独立监管进程的定位一致 — 最小化静态依赖，
 Windows 服务启动时 DLL 加载失败不会导致 utmmd 崩溃。
+
+---
+
+## 2026-08-03 — zio 32 位 x86 支持调研
+
+### Finding 204: zio 不支持 x86 32 位的根因
+
+**根因**: `src/coro/coroutines.zig` 有 4 个 `switch (builtin.cpu.arch)` 语句，均未覆盖 `.x86`。
+Zig 编译目标 `x86-linux-musl` 和 `x86-windows-gnu` 的 `builtin.cpu.arch` = `.x86`，
+触发 `else => @compileError("unimplemented architecture: " ++ @tagName(arch))`。
+
+**受影响的构建目标**: 2 个（`x86-linux-musl`，`x86-windows-gnu`）。当前 6/8 目标通过，
+缺失的正是这 2 个。
+
+**已支持的架构（11 个）**: x86_64、aarch64、arm、thumb、riscv64、riscv32、loongarch64、
+powerpc64、powerpc64le、sparc64。32 位 ARM（arm/thumb）和 32 位 RISC-V（riscv32）
+已完美支持 — 32 位本身不是障碍，只是 x86 32 位尚未实现。
+
+### Finding 205: zio 协程切换的架构适配点
+
+**只需修改 1 个文件**: `src/coro/coroutines.zig`（1785 行）。共 4 个位置需要添加 `.x86` 分支：
+
+| # | 位置 | 函数 | 用途 | 预计行数 |
+|---|------|------|------|---------|
+| 1 | `:29` | `Context` | 寄存器上下文结构体定义 | ~10 行 |
+| 2 | `:115` | `setupContext` | 初始化协程寄存器状态 | ~5 行 |
+| 3 | `:190` | `switchContext` | 汇编上下文切换（核心） | ~60 行 |
+| 4 | `:1317` | `coroEntry` | 协程入口跳板 | ~15 行 |
+
+**总计约 90 行代码**，完全聚焦在一个文件。其他 zio 模块（stack.zig、thread.zig 等）
+无需改动——它们使用的页大小、mmap 等操作与架构无关。
+
+### Finding 206: x86 32 位 Context 结构设计（参考 ARM 32 位模型）
+
+**ARM 32 位 Context**（已实现，可作为参考）:
+```zig
+.arm, .thumb => extern struct {
+    sp: u32,  // r13 (stack pointer)
+    fp: u32,  // r11 (frame pointer, r7 in Thumb)
+    lr: u32,  // r14 (link register)
+    pc: u32,  // r15 (program counter)
+    stack_info: StackInfo,
+    tsan_fiber: tsan.Fiber = tsan.none,
+    pub const stack_alignment = 8;  // AAPCS
+},
+```
+
+**x86 32 位 Context**（设计）:
+```zig
+.x86 => extern struct {
+    esp: u32,  // stack pointer
+    ebp: u32,  // frame pointer (base pointer)
+    eip: u32,  // instruction pointer (resume address)
+    stack_info: StackInfo,
+    tsan_fiber: tsan.Fiber = tsan.none,
+    pub const stack_alignment = 16;  // System V ABI
+},
+```
+
+注意：x86 32 位 System V ABI 要求 16 字节栈对齐（与 x86_64 相同，与 ARM 32 的 8 字节不同）。
+这是因为 SSE 指令需要 16 字节对齐。
+
+### Finding 207: x86 32 位 switchContext 汇编实现
+
+**核心切换逻辑**（AT&T 语法）:
+```asm
+# 保存当前上下文 (current = eax, new = ecx)
+leal 0f, %edx        # 计算返回地址
+movl %esp, 0(%eax)   # 保存 sp → ctx.esp
+movl %ebp, 4(%eax)   # 保存 bp → ctx.ebp
+movl %edx, 8(%eax)   # 保存 pc → ctx.eip
+
+# 恢复新上下文
+movl 0(%ecx), %esp   # 恢复 sp ← ctx.esp
+movl 4(%ecx), %ebp   # 恢复 bp ← ctx.ebp
+jmpl *8(%ecx)        # 跳转到 ctx.eip
+0:
+```
+
+**Clobber 列表**: 所有通用寄存器 (eax/ebx/ecx/edx/esi/edi)、x87 FPU (st0-7)、
+SSE (xmm0-7)、mxcsr、eflags、fpsr、fpcr。
+
+**与 x86_64 的关键差异**:
+- 寄存器名称: `rsp/rbp/rip` → `esp/ebp/eip`（32 位）
+- 地址计算: `leaq 0f(%rip)` → `leal 0f`（无 RIP 相对寻址）
+- 数据大小: `movq` → `movl`（4 字节 vs 8 字节）
+- 无 Windows TIB 支持（初版仅 Linux musl）
+- 无 zmm/ymm 寄存器 clobber（32 位模式不支持 AVX-512）
+
+### Finding 208: x86 32 位 coroEntry 入口跳板
+
+**ARM 32 位参考**:
+```zig
+.arm => asm volatile (
+    \\ push {r0, r1}
+    \\ mov r11, sp
+    \\ mov r14, #0
+    \\ ldr r0, [sp, #12]   // context → r0 (第一参数)
+    \\ ldr r2, [sp, #8]    // func → r2
+    \\ bx r2               // 跳转到 func
+);
+```
+
+**x86 32 位设计**（cdecl 调用约定——参数在栈上）:
+```zig
+.x86 => asm volatile (
+    \\ pushl %%ebp
+    \\ movl %%esp, %%ebp
+    \\ movl 8(%%ebp), %%eax    // Entrypoint.context
+    \\ pushl %%eax             // 压栈作为 cdecl 第一参数
+    \\ call *4(%%ebp)          // 调用 Entrypoint.func(context)
+);
+```
+
+**x86_64 差异**: coroEntry 需要额外处理，因为 x86 32 位 cdecl 调用约定将参数
+通过栈传递（而非寄存器）。在跳转到目标函数之前需将 context 指针压栈。
+
+### 可行性评估
+
+| 维度 | 评估 | 说明 |
+|------|------|------|
+| **技术难度** | 中等 | 需要汇编知识，但有 ARM 32 位完整实现作为模板 |
+| **代码量** | ~90 行 | 单文件修改，4 个 switch 分支 |
+| **风险** | 中等 | 汇编错误会导致不可预测的行为（栈损坏、寄存器破坏） |
+| **测试复杂度** | 高 | 需要 QEMU 模拟或真实 x86 硬件验证；交叉编译不足以保证正确性 |
+| **上游接受度** | 高 | zio 已支持 11 个架构，x86 32 位是自然的补充 |
+
+### 实施路径
+
+```
+方案 A: 直接修改 zio 上游 (推荐)
+  1. fork lalinsky/zio
+  2. 创建分支 feat/x86-32-support
+  3. 修改 coro/coroutines.zig（4 个 switch 分支）
+  4. 用 QEMU x86 模拟器运行 zio 测试套件验证
+  5. 提 PR 到上游
+  6. 上游合并后，更新 build.zig.zon 中的 zio 依赖 hash
+  7. utm-monitor 即可启用 x86 构建目标
+
+方案 B: 本地 patch zio（临时方案）
+  1. 直接在 zig-pkg 中修改 zio 源码
+  2. 每次 zig build 后修改生效
+  3. 缺点：不持久，clean 后丢失
+  4. 不推荐，除非短期验证
+
+方案 C: 等上游支持（被动方案）
+  - 目前无相关 issue/PR
+  - 时间不确定
+```
+
+**推荐方案 A**。工作量估算：
+- 编写代码：2-3 小时
+- QEMU 测试/调试：4-8 小时（汇编 bug 难以定位）
+- 提 PR + 审查迭代：取决于上游响应速度
+- **总时间：1-3 天**

@@ -137,13 +137,13 @@ for f in zig-out/bin/utmm-*; do
     fi
 done
 
-if [ "$BINARY_COUNT" -ne 6 ]; then
+if [ "$BINARY_COUNT" -ne 8 ]; then
     echo ""
-    echo "ERROR: Expected 6 binaries, found $BINARY_COUNT. Build may have failed."
+    echo "ERROR: Expected 8 binaries, found $BINARY_COUNT. Build may have failed."
     echo "Check zig build cross output above for errors."
     exit 1
 fi
-echo "[OK] All 6 targets collected (x86 skipped — zio architecture limitation)"
+echo "[OK] All 8 targets collected"
 
 echo ""
 echo "==> Adding ver.txt..."
