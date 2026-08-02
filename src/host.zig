@@ -367,24 +367,22 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         return;
     }
 
-    // ── Check sshpass availability (needed for scp/ssh to remote VMs) ──
-    const has_sshpass = blk: {
-        const result = std.process.run(gpa, io, .{ .argv = &.{ "which", "sshpass" } }) catch break :blk false;
+    // ── Check ssh/scp availability (needed for remote VM deployment) ──
+    // utmm sshpass is used for password auth (no external sshpass needed).
+    const ssh_available = blk: {
+        const result = std.process.run(gpa, io, .{ .argv = &.{ "which", "ssh" } }) catch break :blk false;
         defer {
             gpa.free(result.stdout);
             gpa.free(result.stderr);
         }
         break :blk result.term == .exited and result.term.exited == 0;
     };
-    if (!has_sshpass) {
-        // sshpass is only needed for remote VM deployment (scp).
-        // Local deployment (compile + copy to serve-dir) was already done by the
-        // Host ensure step in main.zig — skip remote push with a clear warning.
-        std.debug.print("[deploy] sshpass is required for non-interactive deployment to remote VMs.\n", .{});
+    if (!ssh_available) {
+        std.debug.print("[deploy] ssh/scp is required for remote VM deployment.\n", .{});
         std.debug.print("[deploy] Local binaries have been copied to serve-dir.\n", .{});
-        std.debug.print("[deploy] To push to VMs, install sshpass:\n", .{});
-        std.debug.print("  brew install sshpass   (macOS)\n", .{});
-        std.debug.print("  apt install sshpass    (Linux)\n", .{});
+        std.debug.print("[deploy] To push to VMs, install OpenSSH:\n", .{});
+        std.debug.print("  brew install openssh   (macOS)\n", .{});
+        std.debug.print("  apt install openssh-client (Linux)\n", .{});
         return;
     }
 
@@ -522,7 +520,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
             const scp_dest = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ scp_target, remote_tmp });
             defer gpa.free(scp_dest);
             const scp_result = std.process.run(gpa, io, .{
-                .argv = &.{ "sshpass", "-p", vm.password, "scp", "-o", "StrictHostKeyChecking=no", bin_path, scp_dest },
+                .argv = &.{ "utmm", "sshpass", "-p", vm.password, "scp", "-o", "StrictHostKeyChecking=no", bin_path, scp_dest },
             }) catch |err| {
                 std.debug.print("[deploy]   scp failed: {}\n", .{err});
                 failed += 1;
@@ -548,7 +546,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
             defer gpa.free(install_cmd);
 
             const ssh_result = std.process.run(gpa, io, .{
-                .argv = &.{ "sshpass", "-p", vm.password, "ssh", "-o", "StrictHostKeyChecking=no", scp_target, install_cmd },
+                .argv = &.{ "utmm", "sshpass", "-p", vm.password, "ssh", "-o", "StrictHostKeyChecking=no", scp_target, install_cmd },
             }) catch |err| {
                 std.debug.print("[deploy]   ssh install failed: {}\n", .{err});
                 failed += 1;
@@ -578,7 +576,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         const scp_dest = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ scp_target, remote_tmp });
         defer gpa.free(scp_dest);
         const scp_result = std.process.run(gpa, io, .{
-            .argv = &.{ "sshpass", "-p", vm.password, "scp", "-o", "StrictHostKeyChecking=no", bin_path, scp_dest },
+            .argv = &.{ "utmm", "sshpass", "-p", vm.password, "scp", "-o", "StrictHostKeyChecking=no", bin_path, scp_dest },
         }) catch |err| {
             std.debug.print("[deploy]   scp failed: {}\n", .{err});
             failed += 1;
@@ -600,7 +598,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         defer gpa.free(install_cmd);
 
         const ssh_result = std.process.run(gpa, io, .{
-            .argv = &.{ "sshpass", "-p", vm.password, "ssh", "-o", "StrictHostKeyChecking=no", scp_target, install_cmd },
+            .argv = &.{ "utmm", "sshpass", "-p", vm.password, "ssh", "-o", "StrictHostKeyChecking=no", scp_target, install_cmd },
         }) catch |err| {
             std.debug.print("[deploy]   ssh install failed: {}\n", .{err});
             failed += 1;
