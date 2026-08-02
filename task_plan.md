@@ -7,7 +7,8 @@
 - **源文件**: 20 src + 13 test + 2 embed + 2 Python test scripts
 - **测试**: 196 单元 + 59 集成 + 2 Python (CLI 31/31 + MCP 14/14)，0 泄漏
 - **交叉编译**: 8/8 通过
-- **真机部署**: 5 节点全部 v0.17.21 serving
+- **真机部署**: 5 节点全部 v0.17.22 serving
+- **GitHub Release**: v0.17.22 published
 
 ## 下一阶段: Phase 30 — 部署体验改进（进行中）
 
@@ -22,6 +23,8 @@
 | --upgrade 错误信息差 → 可操作指引 | P3 | ✅ GuestNotFound/BinaryNotFound 改进 |
 | Guest bootstrap（从零部署到裸 VM） | P2 | 待讨论 |
 | zip 无文档 + 版本号不一致 | P2/P3 | 不做 |
+| MANUAL.md 更新 deploy.json/serve-dir/sshpass | P2 | ✅ 已更新 |
+| cmdDeploy 用 utmm sshpass 去外部依赖 | P2 | ✅ e3e78c8 |
 
 ### 待讨论: Guest Bootstrap
 
