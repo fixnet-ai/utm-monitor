@@ -1,3 +1,251 @@
+## Phase 27 P0 — installLinux systemd Restart 修复
+
+**时间**: 2026-08-02
+
+### 修复: installLinux() 缺少 systemd Restart 指令
+
+**根因**: `svc.zig` 中 `installLinux()` 和 `genInit(.linux)` 生成的 systemd service 配置不一致：
+- `installLinux()`（实际安装路径）**缺少** `Restart=on-failure`、`RestartSec=5`、`StartLimitBurst=3`、`StartLimitIntervalSec=30`
+- `genInit(.linux)`（模板生成）**已正确包含**
+
+**故障链**:
+```
+utmm 崩溃 → utmmd 重试 5 次 → utmmd 退出 → systemd 无 Restart → VM 永久离线
+```
+
+**修复** (`src/svc.zig`):
+
+1. 新增共享常量 `SYSTEMD_RESTART_CONFIG`（避免 future drift）:
+```zig
+const SYSTEMD_RESTART_CONFIG =
+    \\Restart=on-failure
+    \\RestartSec=5
+    \\StartLimitBurst=3
+    \\StartLimitIntervalSec=30
+;
+```
+
+2. `installLinux()` 模板新增 `{s}` 插值，传入 `SYSTEMD_RESTART_CONFIG`
+3. `genInit(.linux)` 模板用 `++ SYSTEMD_RESTART_CONFIG ++` 引用同一常量
+
+**生成的服务文件变化** — `installLinux()` 生成的 `/etc/systemd/system/utmmd.service`:
+```ini
+# 修复前（缺失 Restart）
+[Service]
+Type=simple
+Environment=SHELL=/bin/bash
+Environment=HOME=/root
+ExecStart=/opt/utmm/utmmd --role guest
+WorkingDirectory=/opt/utmm
+StandardOutput=journal
+
+# 修复后（与 genInit 一致）
+[Service]
+Type=simple
+Environment=SHELL=/bin/bash
+Environment=HOME=/root
+ExecStart=/opt/utmm/utmmd --role guest
+WorkingDirectory=/opt/utmm
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=30
+StandardOutput=journal
+```
+
+**测试验证**:
+- 188 单元测试全部通过 ✅
+- 59 集成测试全部通过，0 泄漏 ✅
+
+**待部署**: linuxvm 真机验证（Task 241）
+
+### linuxvm 真机验证
+
+**部署**: SCP → `--install --hostname linuxvm` → 服务文件验证 → 崩溃恢复测试
+
+**服务文件生成结果**:
+```ini
+[Service]
+ExecStart=/opt/utmm/utmmd --role guest --hostname linuxvm
+WorkingDirectory=/opt/utmm
+Restart=on-failure         ✅
+RestartSec=5               ✅
+StartLimitBurst=3          ✅
+StartLimitIntervalSec=30   ✅
+StandardOutput=journal
+```
+
+**崩溃恢复测试**:
+1. `kill -9 <utmmd PID>` → utmmd 被 SIGKILL
+2. 等待 10s
+3. systemd 自动重启 utmmd (新 PID)，utmm 也被重新 spawn
+4. `systemctl status utmmd` 确认: `"Scheduled restart job, restart counter is at 1."`
+
+**验证结果**:
+- systemd Restart=on-failure 生效 ✅
+- utmmd 退出后 systemd 10s 内自动重启 ✅
+- Host `--status` 显示 linuxvm serving (v0.17.13) ✅
+- 5 节点全部在线 ✅
+
+### 全量部署测试（macvm + windowsvm + winx64）
+
+**部署**:
+- macvm: SCP → --install ✅ (700ms stop old utmm, launchd already running)
+- windowsvm: SCP → --install ✅ (5s timeout → killAllUtmm PID 3056 → restart)
+- winx64: SCP to Temp → --install from Temp ✅ (5s timeout → killAllUtmm PID 34192 → restart)
+
+**功能验证**:
+
+| Test | linuxvm | macvm | windowsvm | winx64 |
+|------|---------|-------|-----------|--------|
+| --ping | ✅ (1ms) | ✅ (1ms) | ✅ (1ms) | ✅ (4ms) |
+| --exec | ✅ | ✅ | ✅ | ✅ |
+| --upload | ✅ | ✅ | ✅ | ✅ |
+| --download | ✅ | ✅ | ✅ | ✅ |
+| SHA256 | ✅ | ✅ | ✅ | ✅ |
+
+**全节点状态** (v0.17.13):
+```
+Role   Hostname             Version    Status
+host   dasis-macbook-air    v0.17.13   serving
+guest  linuxvm              v0.17.13   serving
+guest  macvm                v0.17.13   serving
+guest  windowsvm            v0.17.13   serving
+guest  winx64               v0.17.13   serving
+```
+
+**观察**: macvm launchd plist 缺少 `KeepAlive` 段（见 P2 待验证项）。
+
+---
+
+## v0.17.13 — zio IOCP file I/O 修复（上传/下载/升级 Windows 兼容）
+
+**时间**: 2026-08-02
+
+### Windows 文件 I/O 与 zio IOCP 不兼容
+
+**问题**: zio 的 IOCP 异步 I/O 后端无法处理 Windows 上的文件操作。`createFile`、
+`writeStreamingAll`、`deleteFile`、`rename` 等操作返回 `error.Unexpected`，
+导致 Windows Guest 上 upload/download/upgrade 全部失败。
+
+**根因**: IOCP (I/O Completion Port) 是 Windows 的异步 I/O 机制，专为网络 socket
+设计，不支持普通文件的异步操作。Windows 文件 I/O 需要使用同步 API 或
+`std.Io.Threaded`（线程池模拟异步）。
+
+**修复方案**: 对所有文件 I/O 操作使用 `std.Io.Threaded` 替代 zio `io`。
+
+**修改文件**:
+
+1. **`src/guest.zig` — `handleUpload`**:
+```zig
+var file_threaded = std.Io.Threaded.init(allocator, .{});
+const file_io = file_threaded.io();
+const file_pipe = dpipe_file.writeFile(allocator, file_io, cmd.path, cmd.hash) catch |err| { ... };
+```
+
+2. **`src/guest.zig` — `handleDownload`**:
+```zig
+var file_threaded = std.Io.Threaded.init(allocator, .{});
+const file_io = file_threaded.io();
+const file_pipe = dpipe_file.readFile(allocator, file_io, cmd.path) catch |err| { ... };
+```
+
+3. **`src/guest.zig` — `handleUpgradeCmd`** (最复杂，涉及全部文件操作):
+```zig
+var file_threaded = std.Io.Threaded.init(allocator, .{});
+const file_io = file_threaded.io();
+// 替换: statFile, createFile, writeStreamingAll, close, deleteFile, writer, rename
+// 关键: sha_file.writer(file_io, &sha_wb) — writer 内部烘焙 io 引用，
+// 后续 writeAll/flush 全部走 file_io
+```
+
+4. **`src/tcp.zig`**: 新增 `WSAEWOULDBLOCK` 常量 + `sockRead`/`sockWrite` 重试循环
+
+5. **`src/main.zig`**: SystemInfo 收集移至 zio Runtime 创建之前（避免 IOCP 与
+   `std.process.run` 冲突）
+
+6. **`src/ipc.zig`**: sockWrite 返回值处理修复（之前 `_ =` 丢弃返回值）
+
+**真机验证**:
+- winx64 (x86_64-windows): upload/download/upgrade 全部通过 ✅
+- windowsvm (aarch64-windows): upload/download/upgrade 全部通过 ✅
+
+**构建验证**:
+- 188 单元测试 + 59 集成测试全部通过 ✅
+- 6/8 交叉编译目标通过（x86 的 2 个 zio 不支持，预存限制）
+
+**发布**: https://github.com/fixnet-ai/utm-monitor/releases/tag/v0.17.13
+
+**提交**: commit `待提交`，版本号 `src/ver.txt` 0.17.12 → 0.17.13
+
+---
+
+## Phase 27 规划 — VM 离线根因调查与修复计划
+
+**时间**: 2026-08-02
+
+### 调查结果
+
+对 `--status` 反复显示 VM 离线的问题进行了系统调查，分析各 VM 系统日志、
+utmmd 日志、systemd/journald/launchd 服务配置。
+
+**离线根因汇总**:
+
+| 优先级 | VM | 根因 | 代码位置 |
+|--------|-----|------|---------|
+| **P0** | linuxvm | `installLinux()` 生成的 systemd service 缺少 `Restart=on-failure` | `src/svc.zig:593-606` |
+| **P1** | linuxvm | 心跳超时误触发 + kill 后线程创建 `SystemResources` | `src/utmmd.zig` + musl |
+| **P2** | windowsvm | utmm.exe 堆损坏 (0xc0000374) / 访问违规 (0xc0000005) | 可能与 IOCP 相关 |
+| **P2** | macvm | launchd KeepAlive 行为待验证 | `src/svc.zig` installMacOS |
+
+### P0 详细分析: installLinux vs genInit 不一致
+
+`svc.zig` 中两个函数生成 systemd service 文件，但配置不一致：
+
+- **`installLinux()`** (实际安装路径) — **缺少** `Restart=on-failure`, `RestartSec=5`,
+  `StartLimitBurst=3`, `StartLimitIntervalSec=30`
+- **`genInit()` → `genInitLinux()`** (生成 init 脚本) — **正确包含**上述指令
+
+**故障链**:
+```
+utmm 崩溃（任意原因）
+  → utmmd kill → spawn → 重试 5 次 → utmmd 退出
+  → systemd 无 Restart 指令 → 不重启 utmmd
+  → VM 永久离线
+```
+
+**修复**:
+1. `installLinux()` 添加与 `genInitLinux()` 一致的 Restart 指令
+2. 提取 systemd 配置为共享常量（单一真相源）
+3. 部署到 linuxvm，模拟崩溃验证 systemd 自动恢复
+
+### P1 详细分析: 心跳超时 + 线程创建失败
+
+linuxvm utmmd 日志显示：
+1. **心跳超时**: utmm 在阻塞 I/O（acceptRaw/dpipe.relay/SOCKS5 relay）时无法更新
+   共享内存心跳 → utmmd 10s 超时误判为僵死 → SIGKILL
+2. **线程创建失败**: kill 后立即 spawn → `std.Thread.spawn` → `error.SystemResources`
+   （musl 线程资源未释放）
+
+**v0.17.7 已修复**: acceptRaw 不再内部循环阻塞，长传输增加了心跳更新。
+**v0.17.13 可能改善**: IOCP → Threaded 文件 I/O 减少了协程阻塞。
+
+**待调查**:
+- dpipe.relay 线程是否需要心跳更新
+- SOCKS5 转发线程是否需要心跳更新
+- utmmd spawn 失败后是否应有退避延迟
+
+### P2 详细分析: Windows 堆损坏
+
+windowsvm 事件日志中反复出现 0xc0000374/0xc0000005。v0.17.13 的 IOCP 修复
+可能已解决部分问题，但需长时间运行验证。
+
+### 修复计划
+
+详见 `task_plan.md` Phase 27 完整任务列表（Task 239-250）。
+
+---
+
 ## v0.17.11 — ssh.exe 嵌入 + CLI 测试脚本
 
 **时间**: 2026-08-02
@@ -1363,4 +1611,68 @@ tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig
 
 **测试验证**:
 - 186 单元测试全通过 ✅
+- 59 集成测试全通过，无内存泄漏 ✅
+
+---
+
+## P1 误报确认 — relay/SOCKS5 心跳无需修复
+
+**时间**: 2026-08-02
+
+P1 调查项 "relay/SOCKS5 线程心跳更新" 经代码审查确认**不是问题**：
+
+### 心跳更新机制分析
+
+| 路径 | 类型 | 心跳更新 |
+|------|------|---------|
+| 主 accept 循环（host:747, guest:920） | 同步 | 每迭代顶部更新 |
+| handleExec shell read 循环（guest:1099） | 同步 | 读取后更新 |
+| handleUpload read 循环（guest:1171） | 同步 | 读取后更新 |
+| handleDownload read 循环（guest:1409） | 同步 | 读取后更新 |
+| handleUpgrade read 循环（guest:1274） | 同步 | 读取后更新 |
+| SOCKS5 relay/forward detach 线程 | 异步 | 不需要 — 不阻塞主循环 |
+| localRelayWithLimit detach 线程 | 异步 | 不需要 — 不阻塞主循环 |
+
+**关键洞察**: SOCKS5 relay/forward 线程通过 group.spawnBlocking detach 执行，
+不阻塞主 accept 循环。主循环独立更新心跳，不受 relay 线程影响。
+唯一的同步阻塞路径 handleOneCommand 已在所有读写循环中覆盖心跳更新。
+**架构设计正确，无需修改。**
+
+---
+
+## Phase 27 P0 macOS/Windows — installMacOS + installWindows 服务恢复修复
+
+**时间**: 2026-08-02
+
+### P0 macOS: installMacOS() 缺少 KeepAlive + ThrottleInterval
+
+**根因**: `installMacOS()` plist 模板只有 `RunAtLoad`，缺少 `KeepAlive`（含
+`SuccessfulExit=false`）。`RunAtLoad` 仅在开机时启动 utmmd，utmmd 退出后
+launchd 不会自动重启 → macvm 永久离线。
+
+`genInit(.macos)` 模板正确但 `installMacOS()` 不一致 — 与 linux P0 完全相同的模式。
+
+**修复** (`src/svc.zig`):
+1. 新增共享常量 `MACOS_KEEPALIVE_CONFIG`
+2. `installMacOS()` plist 插入 `{s}` 插值
+3. `genInit(.macos)` 改用 `++ MACOS_KEEPALIVE_CONFIG ++`
+
+### P0 Windows: installWindows() 缺少 sc failure 命令
+
+**根因**: `installWindows()` 只执行 `sc create ... start=auto`，没有 `sc failure`
+配置。utmmd 5 次重试后退出一 → SCM 无 failure action 不重启 → VM 永久离线。
+
+`genInit(.windows)` 正确显示了 `sc failure` 命令但 `installWindows()` 没执行。
+
+**修复**: `installWindows()` 在 `sc create` 后添加 `sc failure` 命令:
+```
+sc failure <name> reset=30 actions=restart/5000/restart/5000/restart/5000/none/5000
+```
+
+**设计**: SCM 先尝试 3 次快速重启（5s 间隔），30s 后 reset 计数。
+若 utmm 反复崩溃，utmmd 内部 5 次重试耗尽后退出，SCM 再重启 utmmd。
+双保险架构。
+
+**测试验证**:
+- 188 单元测试全通过 ✅
 - 59 集成测试全通过，无内存泄漏 ✅

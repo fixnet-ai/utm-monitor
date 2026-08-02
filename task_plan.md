@@ -2,21 +2,21 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.17.11 — ssh.exe 嵌入 + 测试脚本 + zio 协程重构 + macOS 自动 codesign
+**最新版本**: v0.17.13 — zio IOCP file I/O 修复（上传/下载/升级 Windows 兼容）
 
 - **分支**: `main`
 - **源文件**: 20 src + 13 test + 2 embed + 2 Python test scripts
 - **测试**: 188 单元测试 + 59 集成测试 + 2 Python test scripts，全部通过，0 泄漏
 - **交叉编译**: 6/8 通过（x86 的 2 个 zio 不支持）
 
-## 当前阶段: Phase 26 — ssh.exe 嵌入 + 测试脚本 ✅
+## 当前阶段: Phase 27 — VM 离线根因修复 🟢（P0 全部解决，待部署验证）
 
-**目标**: 将 utmm 从 OS 线程模型迁移到 zio stackful 协程框架，解决 SO_REUSEPORT
-端口冲突、spinlock、upload 解析等关键问题。8 个 commit 逐步推进。
-- **单元测试**: 188 测试全部通过 ✅
-- **集成测试**: 59/59 通过 ✅
-- **真机部署**: macvm + linuxvm exec/upload/download 全部通过 ✅
-- **真机部署**: 待发布验证
+**目标**: 修复各 VM 频繁离线的根因，确保 utmmd 崩溃后系统能自动恢复。
+- **P0 Linux**: ✅ `installLinux()` 补充 Restart=on-failure，提取 SYSTEMD_RESTART_CONFIG
+- **P0 macOS**: ✅ `installMacOS()` 补充 KeepAlive+ThrottleInterval，提取 MACOS_KEEPALIVE_CONFIG
+- **P0 Windows**: ✅ `installWindows()` 补充 `sc failure` 命令
+- **P1 调查**: ✅ 无需修复 — SOCKS5 relay/forward 心跳架构设计正确
+- **真机部署**: 待全量部署验证（macOS/Windows 修复需新版本）
 
 ### Phase 26: v0.17.11 — ssh.exe 嵌入 + Python 测试脚本 ✅
 
@@ -891,3 +891,163 @@ src/
 | 2 | utmmd 二进制升级缺口 | push-upgrade 只替换 utmm，utmmd 需手动更新 |
 | 3 | x86 目标不支持 | zio `unimplemented architecture: x86`，32-bit 无法编译 |
 | 4 | `zig build test` stdout 无输出 | macOS 上 ExitCode=0 但测试输出被吞，不影响 CI |
+
+---
+
+### Phase 27: VM 离线根因修复 🔴
+
+**背景**: 2026-08-02，对 `--status` 检查发现 VMs 频繁离线。深入分析各 VM 系统日志、
+utmmd 日志、systemd/journald 配置后，识别出以下根因。
+
+**离线现象汇总**:
+
+| VM | 症状 | 频率 | 根因 |
+|----|------|------|------|
+| linuxvm | utmmd 退出后不再重启 | 每次 utmmd 崩溃后 | **P0**: systemd service 无 Restart=on-failure |
+| linuxvm | 心跳超时误杀 utmm | 偶尔 | **P1**: 心跳更新路径阻塞 + 线程创建失败 |
+| macvm | utmmd 崩溃后服务停止 | 偶尔 | **P2**: macOS launchd KeepAlive 配置验证 |
+| windowsvm | utmm.exe 堆损坏崩溃 | 偶尔 | **P2**: 0xc0000374 heap corruption |
+
+---
+
+#### P0: `installLinux()` 缺少 systemd restart 指令
+
+**根因分析**:
+
+`svc.zig` 有两个生成 systemd service 文件的函数，但生成的配置**不一致**：
+
+1. **`installLinux()` (line 593-606)** — 实际安装时调用，生成的服务文件**缺少 restart 指令**：
+```ini
+[Service]
+Type=simple
+Environment=SHELL={s}
+Environment=HOME={s}
+ExecStart={s}
+WorkingDirectory=/opt/utmm
+StandardOutput=journal
+# ← 缺少: Restart=on-failure, RestartSec=5
+```
+
+2. **`genInit()` → `genInitLinux()` (line 1617-1620)** — 生成 init 脚本时调用，**正确包含** restart 指令：
+```ini
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=30
+```
+
+**影响链**:
+```
+utmm 崩溃（任何原因）
+  → utmmd 检测到心跳超时 → kill 旧 utmm → spawn 新 utmm
+  → 重复 5 次（MAX_FAILURE_COUNT）→ utmmd 退出
+  → systemd 看到 utmmd 退出
+  → 无 Restart=on-failure → systemd 不重启 utmmd
+  → VM 永久离线 ❌
+```
+
+如果 systemd service 有 `Restart=on-failure`，systemd 会在 utmmd 退出后自动重启它，
+utmmd 重新开始监控 utmm → 自动恢复。这正是 `genInit()` 中已正确定义的恢复链路。
+
+**修复方案**:
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 239 | `installLinux()` 添加 Restart 指令 | `src/svc.zig` | ✅ 与 `genInitLinux()` 保持一致：`Restart=on-failure`, `RestartSec=5`, `StartLimitBurst=3`, `StartLimitIntervalSec=30` |
+| 240 | 提取 systemd 配置为共享常量 | `src/svc.zig` | ✅ `SYSTEMD_RESTART_CONFIG` 常量，installLinux + genInit 共享 |
+| 241 | 验证修复：模拟 utmm 崩溃 → 确认 systemd 重启 utmmd | linuxvm | ✅ SIGKILL utmmd → systemd 10s 内自动重启，restart counter=1 |
+
+**代码变更详情**:
+- `src/svc.zig`：新增 `SYSTEMD_RESTART_CONFIG` 常量（4 行），`installLinux()` 模板 +1 行 `{s}`，`genInit(.linux)` 用 `++` 引用常量
+- 188 单元测试 + 59 集成测试全部通过 ✅
+
+---
+
+#### P1: linuxvm 心跳超时误触发
+
+**根因分析**:
+
+linuxvm 的 utmmd 日志显示两种异常模式：
+
+1. **心跳超时**: utmmd 在 10s 内未检测到 utmm 心跳更新 → 认为 utmm 僵死 → SIGKILL utmm → 重新 spawn。但 utmm 可能只是在阻塞 I/O 操作中（如 `acceptRaw` 内部循环），并非真正僵死。
+
+2. **线程创建 SystemResources**: utmmd kill utmm 后尝试 spawn 新 utmm → `std.Thread.spawn` 返回 `error.SystemResources`。这是 musl libc 的已知行为：进程被 SIGKILL 后，其线程资源可能不会立即释放，短时间内大量 spawn/kill 循环可能导致线程资源耗尽。
+
+**v0.17.7 已修复的部分**:
+- `guest.zig` accept 循环：WouldBlock → sleep 100ms → continue，确保心跳在外部 while 循环顶部更新
+- `host.zig`：同 guest.zig 模式
+- 长传输（upload/download/upgrade）心跳补充
+
+**仍可能存在的问题**:
+- dpipe.relay 内部双向转发线程可能长时间阻塞 I/O 操作而不更新心跳
+- SOCKS5 转发线程同样没有心跳更新机制
+
+**修复方案**:
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 242 | 调查 dpipe.relay 线程心跳更新 | `src/dpipe.zig`, `src/guest.zig` | 确认 relay 线程是否会长时间阻塞心跳 |
+| 243 | 调查 SOCKS5 转发线程心跳 | `src/tcp.zig`, `src/guest.zig` | socks5Relay/socks5LocalRelay 是否需要心跳更新 |
+| 244 | 线程创建失败后增加退避延迟 | `src/utmmd.zig` | spawn 失败后额外 sleep 2s 再重试（给系统时间释放线程资源）|
+| 245 | 心跳超时时间可配置 | `src/shm.zig`, `src/utmmd.zig` | 当前硬编码 10s，考虑增加到 15s 减少误触发 |
+
+**工作量**: 调查为主，预计 ~30-50 行代码变更。
+
+---
+
+#### P2: windowsvm utmm.exe 堆损坏崩溃
+
+**根因分析**:
+
+windowsvm 事件日志中多次出现：
+- `0xc0000374` — STATUS_HEAP_CORRUPTION（堆损坏）
+- `0xc0000005` — STATUS_ACCESS_VIOLATION（访问违规）
+
+这些崩溃**可能**与 zio IOCP 在 Windows 上的文件 I/O 不兼容有关。v0.17.13 已将
+所有文件 I/O 操作切换为 `std.Io.Threaded`，这可能修复了部分堆损坏问题。
+但 v0.17.13 部署后尚未经过长时间运行验证。
+
+**可能的其他原因**:
+- zio 协程栈与 Windows SEH (Structured Exception Handling) 的交互问题
+- 跨协程的内存别名（aliasing）问题
+- 线程池与协程调度器之间的竞态条件
+
+**修复方案**:
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 246 | 部署 v0.17.13 后监控 windowsvm 稳定性 | windowsvm | 观察 24h 内是否还有堆损坏崩溃 |
+| 247 | 验证 Windows 服务恢复配置 | windowsvm | `sc failure UTM-MonitorD` 确认 reset/restart/actions |
+| 248 | 如崩溃持续，启用 Windows 堆调试 | windowsvm | `gflags /p /enable utmm.exe` + 分析 crash dump |
+
+**工作量**: 监控为主，堆调试仅在必要时进行。
+
+---
+
+#### P2: macOS launchd KeepAlive 验证
+
+**问题**: macvm 上的 launchd plist 使用 `KeepAlive` 而非 `Restart=on-failure` 等价配置。
+需验证 `KeepAlive` 在 utmmd 退出后是否真的会重启它。
+
+**修复方案**:
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 249 | 验证 macOS launchd KeepAlive 行为 | macvm | 手动 kill utmmd → 观察 launchd 是否重启 |
+| 250 | 如不重启，添加 SuccessfulExit=false | `src/svc.zig` installMacOS | 确保 utmmd 退出（包括 exit 1）后 launchd 重启 |
+
+**工作量**: 真机测试，~5 行代码变更（如需修复）。
+
+---
+
+**Phase 27 优先级总结**:
+
+| 优先级 | 问题 | 影响 | 修复难度 |
+|--------|------|------|---------|
+| **P0** | installLinux 缺少 Restart=on-failure | linuxvm 一旦 utmmd 退出即永久离线 | 极低（~20 行代码） |
+| **P1** | 心跳超时误触发 + 线程创建失败 | 偶发 utmm 重启，通常能自动恢复 | 中（需调查） |
+| **P2** | windowsvm 堆损坏 | 偶发 utmm 崩溃，utmmd 重启恢复 | 中-高（可能已被 v0.17.13 修复） |
+| **P2** | macvm launchd KeepAlive | 偶发 utmmd 退出不重启 | 低（验证+小修复） |
+
+**建议部署顺序**: P0 修复 → 全量部署 → 监控 24h → 根据监控结果决定 P1/P2 是否仍需处理。
+**P0 状态**: ✅ 已修复并全量部署验证通过（2026-08-02）。

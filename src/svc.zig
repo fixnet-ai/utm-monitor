@@ -530,13 +530,14 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
         \\    </dict>
         \\    <key>RunAtLoad</key>
         \\    <true/>
+        \\{s}
         \\    <key>StandardOutPath</key>
         \\    <string>{s}</string>
         \\    <key>StandardErrorPath</key>
         \\    <string>{s}</string>
         \\</dict>
         \\</plist>
-    , .{ name, args_list.items, env.shell, env.home, log_path, err_log_path });
+    , .{ name, args_list.items, env.shell, env.home, MACOS_KEEPALIVE_CONFIG, log_path, err_log_path });
     defer alloc.free(plist);
 
     // Write plist file
@@ -570,6 +571,29 @@ fn installMacOS(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
     std.log.info("[svc] macOS service {s} installed", .{name});
 }
 
+/// Shared systemd service restart configuration — single source of truth
+/// for both installLinux() and genInit(.linux).
+const SYSTEMD_RESTART_CONFIG =
+    \\Restart=on-failure
+    \\RestartSec=5
+    \\StartLimitBurst=3
+    \\StartLimitIntervalSec=30
+;
+
+/// Shared launchd KeepAlive + ThrottleInterval configuration — single source
+/// of truth for both installMacOS() and genInit(.macos).
+/// SuccessfulExit=false ensures launchd restarts utmmd when it exits
+/// (regardless of exit code). ThrottleInterval=5 prevents respawn storms.
+const MACOS_KEEPALIVE_CONFIG =
+    \\    <key>KeepAlive</key>
+    \\    <dict>
+    \\        <key>SuccessfulExit</key>
+    \\        <false/>
+    \\    </dict>
+    \\    <key>ThrottleInterval</key>
+    \\    <integer>5</integer>
+;
+
 fn installLinux(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8) !void {
     const name = svcName();
     const unit_path = try std.fmt.allocPrint(alloc, "/etc/systemd/system/{s}.service", .{name});
@@ -600,6 +624,7 @@ fn installLinux(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
         \\Environment=HOME={s}
         \\ExecStart={s}
         \\WorkingDirectory=/opt/utmm
+        \\{s}
         \\StandardOutput=journal
         \\
         \\[Install]
@@ -610,6 +635,7 @@ fn installLinux(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_a
         env.shell,
         env.home,
         exec_args.items,
+        SYSTEMD_RESTART_CONFIG,
     });
     defer alloc.free(unit);
 
@@ -658,7 +684,7 @@ fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra
         std.log.warn("[svc] sc delete {s} failed (may not be installed)", .{name});
     }
 
-    // Create service — no failure actions (utmmd handles its own restart/backoff)
+    // Create service
     if (!runCmd(alloc, io, &[_][]const u8{
         "sc", "create", name,
         "binPath=", bin_path.items,
@@ -666,6 +692,16 @@ fn installWindows(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra
     })) {
         fail.msg("install/sc-create", "failed to create service {s}", .{name});
     }
+
+    // Configure failure actions — SCM restarts utmmd on crash.
+    // After 3 consecutive restarts (<30s apart), SCM stops restarting
+    // and utmmd's internal crash recovery (5 retries, exponential backoff)
+    // takes over. reset=30 clears the failure count after 30s of uptime.
+    _ = runCmd(alloc, io, &[_][]const u8{
+        "sc", "failure", name,
+        "reset=", "30",
+        "actions=", "restart/5000/restart/5000/restart/5000/none/5000",
+    });
 
     // Add firewall rule (delete any previous rule first, ignore error if not found)
     const rule_name = "UTM Monitor";
@@ -1586,13 +1622,7 @@ pub fn genInit(platform: Platform) []const u8 {
         \\    </dict>
         \\    <key>RunAtLoad</key>
         \\    <true/>
-        \\    <key>KeepAlive</key>
-        \\    <dict>
-        \\        <key>SuccessfulExit</key>
-        \\        <false/>
-        \\    </dict>
-        \\    <key>ThrottleInterval</key>
-        \\    <integer>5</integer>
+        ++ MACOS_KEEPALIVE_CONFIG ++
         \\    <key>StandardOutPath</key>
         \\    <string>/var/log/utmmd.log</string>
         \\</dict>
@@ -1614,10 +1644,7 @@ pub fn genInit(platform: Platform) []const u8 {
         \\Environment=HOME=/root
         \\ExecStart=/opt/utmm/utmmd --role guest
         \\WorkingDirectory=/opt/utmm
-        \\Restart=on-failure
-        \\RestartSec=5
-        \\StartLimitBurst=3
-        \\StartLimitIntervalSec=30
+        ++ SYSTEMD_RESTART_CONFIG ++
         \\StandardOutput=journal
         \\
         \\[Install]
