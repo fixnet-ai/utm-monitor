@@ -134,7 +134,7 @@ zig build test-integration         # Integration tests
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
-# ... plus x86_64 variants for all three platforms (6 targets total; 32-bit x86 skipped — zio limitation)
+# ... plus x86_64 and x86 variants for all three platforms (8 targets total)
 ```
 
 **Requirements**: Zig 0.16.0, macOS build host (other hosts may work, untested).
@@ -143,3 +143,14 @@ zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
 
 See [MANUAL.md](MANUAL.md) for the complete CLI reference, MCP protocol
 messages, architecture deep-dive, platform differences, and deployment guide.
+
+## Acknowledgments
+
+UTM Monitor builds on excellent open-source projects:
+
+- **[zio](https://github.com/lalinsky/zio)** — High-performance async I/O framework for Zig.
+  Powers all event-driven networking (TCP/UDP, timers, coroutines, IOCP/kqueue/epoll).
+- **[OpenSSH](https://www.openssh.com/)** — The gold standard for secure remote access.
+  Embedded `ssh.exe` (Windows) enables zero-dependency `sshpass` on all platforms.
+
+Thanks to the maintainers and contributors of these projects.
