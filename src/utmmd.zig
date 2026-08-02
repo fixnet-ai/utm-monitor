@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const shm = @import("shm.zig");
 const fail = @import("fail.zig");
+const svc = @import("svc.zig");
 
 /// utmm 规范安装路径。
 fn utmmPath() []const u8 {
@@ -431,131 +432,84 @@ fn runCmd(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
 // ═══════════════════════════════════════════════════════════════════════════
 // 文件式升级 — utmmd 全权掌控
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// v0.17.19: 单文件机制 — utmm-upgrade.<sha256hex>.tmp，SHA256 嵌入文件名。
+// OS 排他文件锁替代标记文件，进程崩溃时 OS 自动释放。
+// utmmd 通过尝试获取锁来判断文件是否写入完成。
 
-/// 升级标记文件路径（SHA256 hex 纯文本，64 字符）。
-fn upgradeMarkerPath() []const u8 {
-    if (builtin.os.tag == .windows) return "C:\\opt\\utmm\\utmm-upgrade.sha256";
-    return "/opt/utmm/utmm-upgrade.sha256";
-}
-
-/// 待升级二进制路径（Guest 写入，utmmd 重命名为 utmmPath()）。
-fn upgradeBinPath() []const u8 {
-    if (builtin.os.tag == .windows) return "C:\\opt\\utmm\\utmm-upgrade.exe";
-    return "/opt/utmm/utmm-upgrade";
-}
-
-/// 检查是否有待处理的升级（.sha256 标记文件 + upgrade 二进制都存在）。
-/// 如果仅有标记文件（上次 rename 后 crash 残留），清理标记文件后返回 false。
+/// 尝试查找并应用待处理升级。
+/// 返回 RestartReason 表示升级已应用（调用者应重启 utmm），null 表示无待处理升级。
 /// file_io: 文件 I/O 用 Io（Windows 上需为 Threaded，IOCP 不支持文件操作）。
-fn checkPendingUpgrade(file_io: std.Io) bool {
-    _ = std.Io.Dir.cwd().statFile(file_io, upgradeMarkerPath(), .{}) catch return false;
-    // 标记文件存在，检查升级二进制是否存在
-    if (std.Io.Dir.cwd().statFile(file_io, upgradeBinPath(), .{})) |_| {
-        return true;
-    } else |_| {
-        // 仅有标记残留（上次 applyUpgrade rename 成功但 marker 清理前 crash），清理后返回 false
-        std.Io.Dir.cwd().deleteFile(file_io, upgradeMarkerPath()) catch {};
-        return false;
-    }
-}
+fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator, proc: ?ProcessRef) ?RestartReason {
+    // 1. 扫描 utmm-upgrade.*.tmp 文件
+    const tmp_path = svc.findUpgradeTmp(alloc, file_io) orelse return null;
+    defer alloc.free(tmp_path);
 
-/// 计算文件的 SHA256 hex 字符串（64 字符，allocator 分配）。
-/// file_io: 文件 I/O 用 Io（Windows 上需为 Threaded，IOCP 不支持文件操作）。
-fn computeSha256Hex(alloc: std.mem.Allocator, file_io: std.Io, path: []const u8) ![]const u8 {
-    const f = try std.Io.Dir.cwd().openFile(file_io, path, .{ .mode = .read_only });
-    defer f.close(file_io);
+    // 2. 提取文件名的 SHA256 hex（用于自校验）
+    const basename = if (std.mem.lastIndexOfScalar(u8, tmp_path, '/')) |pos|
+        tmp_path[pos + 1 ..]
+    else if (std.mem.lastIndexOfScalar(u8, tmp_path, '\\')) |pos|
+        tmp_path[pos + 1 ..]
+    else
+        tmp_path;
 
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var rbuf: [65536]u8 = undefined;
-    var rdr = f.reader(file_io, &rbuf);
-    var buf: [65536]u8 = undefined;
-    while (true) {
-        const n = rdr.interface.readSliceShort(&buf) catch return error.ReadFailed;
-        if (n == 0) break;
-        hasher.update(buf[0..n]);
+    if (svc.UpgradeLock.extractSha256(basename, "utmm-upgrade") == null) {
+        // 文件名格式不对 — 清理残留
+        std.Io.Dir.cwd().deleteFile(file_io, tmp_path) catch {};
+        return null;
     }
 
-    var hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&hash);
-    const hex = try alloc.alloc(u8, 64);
-    for (hash, 0..) |byte, i| {
-        const h = "0123456789abcdef";
-        hex[i * 2] = h[byte >> 4];
-        hex[i * 2 + 1] = h[byte & 0x0f];
+    // 3. 尝试获取排他锁 — 成功 = 文件写入完成，失败 = Guest 仍在写入
+    var lock = svc.UpgradeLock.tryAcquire(tmp_path) orelse return null;
+
+    std.log.info("[utmmd] upgrade tmp file found: {s}", .{tmp_path});
+
+    // 4. 验证文件内容 SHA256 是否与文件名匹配
+    if (!svc.verifyUpgradeTmpByFilename(alloc, file_io, tmp_path, basename)) {
+        std.log.err("[utmmd] upgrade SHA256 verification failed, deleted {s}", .{tmp_path});
+        lock.release();
+        // 文件已被 verifyUpgradeTmpByFilename 删除
+        return null;
     }
-    return hex;
-}
 
-/// 读取小文件全部内容到分配内存（调用者释放）。
-/// file_io: 文件 I/O 用 Io（Windows 上需为 Threaded，IOCP 不支持文件操作）。
-fn readFileAlloc(alloc: std.mem.Allocator, file_io: std.Io, path: []const u8) ![]const u8 {
-    const f = try std.Io.Dir.cwd().openFile(file_io, path, .{ .mode = .read_only });
-    defer f.close(file_io);
-    const size: usize = @intCast((try f.stat(file_io)).size);
-    const data = try alloc.alloc(u8, size);
-    _ = try f.readPositionalAll(file_io, data, 0);
-    return data;
-}
+    std.log.info("[utmmd] upgrade SHA256 verified via filename", .{});
 
-/// 执行升级：验证 SHA256 → 杀进程 → 替换二进制 → 返回 restart。
-/// proc 为 null 时跳过杀进程步骤（crash-recovery 循环中进程已死亡）。
-/// file_io: 文件 I/O 用 Io（Windows 上需为 Threaded，IOCP 不支持文件操作）。
-fn applyUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator, proc: ?ProcessRef) !RestartReason {
-    const marker = upgradeMarkerPath();
-    const upgrade = upgradeBinPath();
     const dest = utmmPath();
 
-    std.log.info("[utmmd] upgrade detected: {s}", .{marker});
-
-    // 1. 读取期望的 SHA256
-    const expected_hex = try readFileAlloc(alloc, file_io, marker);
-    defer alloc.free(expected_hex);
-
-    // 2. 计算实际 SHA256
-    const actual_hex = try computeSha256Hex(alloc, file_io, upgrade);
-    defer alloc.free(actual_hex);
-
-    // 3. 对比
-    if (!std.mem.eql(u8, expected_hex, actual_hex)) {
-        std.log.err("[utmmd] upgrade SHA256 mismatch: expected={s} actual={s}", .{ expected_hex, actual_hex });
-        std.Io.Dir.cwd().deleteFile(file_io, marker) catch {};
-        std.Io.Dir.cwd().deleteFile(file_io, upgrade) catch {};
-        return error.Sha256Mismatch;
-    }
-
-    std.log.info("[utmmd] upgrade SHA256 verified", .{});
-
-    // 4. 杀 utmm 进程（null 跳过：crash-recovery 场景进程已死）
+    // 5. 杀 utmm 进程（null 跳过：crash-recovery 场景进程已死）
     if (proc) |p| killProcess(p);
 
-    // 5. POSIX: 设置可执行权限
+    // 6. POSIX: 设置可执行权限
     if (builtin.os.tag != .windows) {
-        _ = std.posix.system.chmod(@ptrCast(upgrade.ptr), 0o755);
+        _ = std.posix.system.chmod(@ptrCast(tmp_path.ptr), 0o755);
     }
 
-    // 6. 替换二进制。
+    // 7. 替换二进制。
     // POSIX: rename 原子替换目标文件。
-    // Windows: rename 不覆盖已有文件，需先删后重命名。为避免删后重命名失败导致
-    // 系统无 utmm 二进制，仅在首次 rename 失败后才删目标文件再重试。
+    // Windows: rename 不覆盖已有文件，需先删后重命名。
     var retry: u32 = 0;
     while (true) {
-        std.Io.Dir.cwd().rename(upgrade, std.Io.Dir.cwd(), dest, file_io) catch |err| {
+        std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), dest, file_io) catch |err| {
             if (err == error.CrossDevice) {
                 // 跨文件系统回退：copy + delete
-                try copyFileUpgradeFallback(file_io, upgrade, dest);
+                copyFileUpgradeFallback(file_io, tmp_path, dest) catch |e| {
+                    std.log.err("[utmmd] copyFileUpgradeFallback failed: {}", .{e});
+                    lock.release();
+                    std.Io.Dir.cwd().deleteFile(file_io, tmp_path) catch {};
+                    return null;
+                };
                 if (builtin.os.tag == .macos) {
                     if (!runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest })) {
                         std.log.warn("[utmmd] codesign failed — checking if binary is executable...", .{});
-                        // 验证新二进制是否可执行（--version 输出版本号则说明可用）
                         if (!runCmd(alloc, io, &.{ dest, "--version" })) {
-                            std.log.err("[utmmd] codesign failed AND binary not executable — manual recovery needed (upgrade at {s})", .{upgrade});
-                            // 不删除 upgrade 源文件，供管理员手动恢复
-                            return error.UpgradeNotExecutable;
+                            std.log.err("[utmmd] codesign failed AND binary not executable — manual recovery needed (upgrade at {s})", .{tmp_path});
+                            lock.release();
+                            return null;
                         }
                         std.log.info("[utmmd] codesign failed but binary runs — continuing", .{});
                     }
                 }
-                std.Io.Dir.cwd().deleteFile(file_io, upgrade) catch {};
+                std.Io.Dir.cwd().deleteFile(file_io, tmp_path) catch {};
                 break;
             }
             if (builtin.os.tag == .windows and retry < 10) {
@@ -568,16 +522,16 @@ fn applyUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator, proc: ?Pr
                 sleepMs(io, 500);
                 continue;
             }
-            // 永久失败：清理 marker 避免死循环（upgrade 二进制保留可手动恢复）
+            // 永久失败：保留 .tmp 文件供手动恢复
             std.log.err("[utmmd] upgrade rename failed: {}", .{err});
-            std.Io.Dir.cwd().deleteFile(file_io, marker) catch {};
-            return err;
+            lock.release();
+            return null;
         };
         break;
     }
 
-    // 7. 清理标记文件
-    std.Io.Dir.cwd().deleteFile(file_io, marker) catch {};
+    // 8. 释放锁
+    lock.release();
     std.log.info("[utmmd] upgrade complete: → {s}", .{dest});
     return .restart;
 }
@@ -708,12 +662,9 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
         }
 
         // 启动前检查待处理升级：utmm crash-loop 时 monitorUtmm 没机会运行，
-        // 必须在启动 utmm 之前处理升级标记文件，否则永远卡在 crash-recovery 循环。
-        if (checkPendingUpgrade(file_io)) {
-            _ = applyUpgrade(file_io, io, alloc, null) catch |err| {
-                std.log.err("[utmmd] pre-start upgrade failed: {}", .{err});
-            };
-            // applyUpgrade 成功后继续循环，启动新的（已升级的）utmm
+        // 必须在启动 utmm 之前处理升级文件，否则永远卡在 crash-recovery 循环。
+        if (tryApplyPendingUpgrade(file_io, io, alloc, null)) |_| {
+            // 升级已应用，继续循环启动新的（已升级的）utmm
         }
 
         // 启动 utmm
@@ -842,13 +793,9 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
             return .crashed;
         }
 
-        // 文件式升级检查：utmmd 轮询发现 .sha256 标记文件后执行全链路升级
-        if (checkPendingUpgrade(file_io)) {
-            return applyUpgrade(file_io, io, alloc, proc) catch |err| {
-                std.log.err("[utmmd] upgrade failed: {}", .{err});
-                killProcess(proc);
-                return .crashed;
-            };
+        // 文件式升级检查：utmmd 扫描 .tmp 文件 → 尝试锁 → 校验 → 应用升级
+        if (tryApplyPendingUpgrade(file_io, io, alloc, proc)) |reason| {
+            return reason;
         }
 
         // 命令处理

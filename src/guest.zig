@@ -1131,7 +1131,77 @@ pub fn handleExecCmd(
     std.log.info("[guest] exec done (shell closed): cmd_id={s}", .{input.cmd_id});
 }
 
-/// 处理 upload：upload_cmd 帧后的原始字节 → dpipe_file.writeFile → upload_result。
+/// 通用文件接收：从 TCP 连接读取二进制流，写入 {prefix}.<sha256>.tmp 临时文件。
+/// 使用 OS 排他锁（flock/dwShareMode=0），进程崩溃时自动释放。
+/// 成功返回锁（仍持有）和路径；调用者决定 release 还是 release+rename。
+/// 失败时已自动 cleanup（releaseAndDelete），调用者只需发送错误响应。
+fn receiveFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    fd: tcp.socket_t,
+    comptime prefix: []const u8,
+    expected_sha256: []const u8,
+    file_size: u32,
+    shm_handle: ?*volatile shm.ShmLayout,
+) !struct { lock: svc.UpgradeLock, path: []const u8 } {
+    const tmp_path = svc.UpgradeLock.tmpPath(allocator, prefix, expected_sha256) catch |err| {
+        std.log.err("[guest] {s}: alloc tmp path: {}", .{ prefix, err });
+        return error.OutOfMemory;
+    };
+    errdefer allocator.free(tmp_path);
+
+    var lock = svc.UpgradeLock.create(tmp_path) catch |err| {
+        std.log.err("[guest] {s}: create locked file {s}: {}", .{ prefix, tmp_path, err });
+        return error.LockFailed;
+    };
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var remaining: u32 = file_size;
+    var buf: [65536]u8 = undefined;
+
+    while (remaining > 0) {
+        // 更新心跳 — 大文件传输可能超过 10s，需在循环中刷新。
+        if (shm_handle) |h| {
+            h.utmm_heartbeat = shm.nowMs(io);
+        }
+
+        const to_read = @min(buf.len, remaining);
+        const nr = tcp.sockRead(fd, &buf, to_read);
+        if (nr <= 0) {
+            std.log.err("[guest] {s}: short read ({d} remaining)", .{ prefix, remaining });
+            lock.releaseAndDelete(tmp_path);
+            return error.ShortRead;
+        }
+        const slice = buf[0..@intCast(nr)];
+        hasher.update(slice);
+        lock.writeAll(slice) catch |err| {
+            std.log.err("[guest] {s}: write file: {}", .{ prefix, err });
+            lock.releaseAndDelete(tmp_path);
+            return error.WriteFailed;
+        };
+        remaining -= @intCast(nr);
+    }
+
+    // SHA256 校验
+    var computed: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&computed);
+
+    var hex_buf: [64]u8 = undefined;
+    for (computed, 0..) |byte, i| {
+        hex_buf[i * 2] = "0123456789abcdef"[byte >> 4];
+        hex_buf[i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+    if (!std.mem.eql(u8, expected_sha256, &hex_buf)) {
+        std.log.err("[guest] {s}: SHA256 mismatch", .{prefix});
+        lock.releaseAndDelete(tmp_path);
+        return error.HashMismatch;
+    }
+
+    std.log.info("[guest] {s}: SHA256 verified, {d} bytes → {s}", .{ prefix, file_size, tmp_path });
+    return .{ .lock = lock, .path = tmp_path };
+}
+
+/// 处理 upload：upload_cmd 帧后的原始字节 → receiveFile → rename 到目标路径。
 pub fn handleUpload(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1146,58 +1216,52 @@ pub fn handleUpload(
 
     std.log.info("[guest] upload: cmd_id={s} path={s} size={d}", .{ cmd.cmd_id, cmd.path, cmd.file_size });
 
-    // 使用独立的 blocking I/O 进行文件操作。在 Windows 上，zio 的 IOCP
-    // I/O 不兼容文件 I/O（createFile/writeStreamingAll/rename 会报
-    // error.Unexpected）。与 guestHostsSync 使用 std.Io.Threaded 的原因相同。
-    var file_threaded = std.Io.Threaded.init(allocator, .{});
-    const file_io = file_threaded.io();
-
-    // 创建目标管道（写入 temp 文件，验证 SHA256，atomic rename）
-    const file_pipe = dpipe_file.writeFile(allocator, file_io, cmd.path, cmd.file_hash) catch |err| {
-        std.log.err("[guest] writeFile failed: {}", .{err});
+    // 接收文件流 → upload.<sha256>.tmp（OS 排他锁 + 文件名内嵌 SHA256）
+    const result = receiveFile(io, allocator, conn.fd, "upload", cmd.file_hash, cmd.file_size, shm_handle) catch |err| {
+        std.log.err("[guest] upload receive failed: {}", .{err});
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
         _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
         return;
     };
-    // defer file_pipe.close(); — 在 line 1078 显式关闭，避免双 close
+    defer allocator.free(result.path);
 
-    // 从 TCP 直接读取原始字节（无帧协议）→ 写入 file_pipe
-    var buf: [65536]u8 = undefined;
-    var remaining: u32 = cmd.file_size;
-    while (remaining > 0) {
-        // 更新心跳 — 大文件上传可能超过 10s，需在循环中刷新。
-        if (shm_handle) |h| {
-            h.utmm_heartbeat = shm.nowMs(io);
+    // 释放锁并 rename 到目标路径
+    result.lock.release();
+
+    // 文件 I/O 使用独立 Threaded Io（Windows IOCP 不兼容 rename/deleteFile）
+    var file_threaded = std.Io.Threaded.init(allocator, .{});
+    const file_io = file_threaded.io();
+
+    std.Io.Dir.cwd().deleteFile(file_io, cmd.path) catch {};
+    const cwd = std.Io.Dir.cwd();
+    cwd.rename(result.path, cwd, cmd.path, file_io) catch |err| {
+        if (err == error.CrossDevice) {
+            dpipe_file.copyAndDelete(file_io, result.path, cmd.path) catch |ce| {
+                std.log.err("[guest] upload cross-device copy failed: {}", .{ce});
+                const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+                defer allocator.free(resp);
+                _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
+                return;
+            };
+        } else {
+            std.log.err("[guest] upload rename failed: {}", .{err});
+            const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
+            defer allocator.free(resp);
+            _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
+            return;
         }
+    };
 
-        const to_read = @min(buf.len, remaining);
-        const nr = tcp.sockRead(conn.fd, buf[0..to_read].ptr, to_read);
-        if (nr <= 0) {
-            std.log.err("[guest] upload: short read ({d} remaining)", .{remaining});
-            break;
-        }
-        file_pipe.write(buf[0..@intCast(nr)]) catch |err| {
-            std.log.err("[guest] upload: write failed: {}", .{err});
-            break;
-        };
-        remaining -= @intCast(nr);
-    }
-
-    // close 验证 SHA256 + atomic rename
-    file_pipe.close();
-
-    const exit_code: i32 = if (remaining == 0) 0 else -1;
-    std.log.info("[guest] upload result: cmd_id={s} exit={d}", .{ cmd.cmd_id, exit_code });
-    const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, exit_code) catch return;
+    std.log.info("[guest] upload complete: {s}", .{cmd.path});
+    const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
     defer allocator.free(resp);
     _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
 }
 
-/// 处理 upgrade_cmd（Host→Guest 直推升级）：接收二进制流 → SHA256 校验 → 写固定路径。
-///
-/// 二进制写入 {canonicalDir}/utmm-upgrade（与 utmm 同目录），SHA256 hex 写入同名 .sha256 文件。
-/// utmmd 轮询发现 .sha256 文件后全权执行杀进程→替换→重启流程，Guest 不参与后续步骤。
+/// 处理 upgrade_cmd（Host→Guest 直推升级）：接收二进制流 → SHA256 校验 →
+/// 写入 utmm-upgrade.<sha256hex>.tmp。utmmd 扫描发现 .tmp 文件后全权执行
+/// 杀进程→替换→重启流程，Guest 不参与后续步骤。
 pub fn handleUpgradeCmd(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1221,157 +1285,23 @@ pub fn handleUpgradeCmd(
         return;
     }
 
-    // 使用独立的 blocking I/O 进行文件操作，避免 Windows zio IOCP 不兼容
-    // 文件 I/O（createFile/writeStreamingAll/deleteFile/rename 会报 error.Unexpected）。
-    var file_threaded = std.Io.Threaded.init(allocator, .{});
-    const file_io = file_threaded.io();
-
-    // 并发保护：如果已有待处理升级（.sha256 标记存在，utmmd 还未消费），
-    // 拒绝本次推送，防止两次升级并发导致二进制文件损坏。
-    {
-        const pending_marker = if (builtin.os.tag == .windows)
-            try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.sha256", .{svc.canonicalDir()})
-        else
-            try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256", .{svc.canonicalDir()});
-        defer allocator.free(pending_marker);
-
-        if (std.Io.Dir.cwd().statFile(file_io, pending_marker, .{})) |_| {
-            std.log.info("[guest] upgrade: pending upgrade exists, rejecting", .{});
-            const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
-            defer allocator.free(resp);
-            _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
-            return;
-        } else |_| {}
-    }
-
-    // 固定路径：与 utmm.exe 同目录，utmmd 轮询发现后执行升级
-    const upgrade_path = if (builtin.os.tag == .windows)
-        try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.exe", .{svc.canonicalDir()})
-    else
-        try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade", .{svc.canonicalDir()});
-    defer allocator.free(upgrade_path);
-
-    // 创建升级文件（覆盖旧残留）
-    var write_buf: [65536]u8 = undefined;
-    const up_file = if (builtin.os.tag != .windows)
-        std.Io.Dir.cwd().createFile(file_io, upgrade_path, .{ .truncate = true, .permissions = @enumFromInt(0o755) })
-    else
-        std.Io.Dir.cwd().createFile(file_io, upgrade_path, .{ .truncate = true });
-    const file = up_file catch |err| {
-        std.log.err("[guest] upgrade: create upgrade file {s}: {}", .{ upgrade_path, err });
+    // 接收文件流 → utmm-upgrade.<sha256>.tmp
+    const result = receiveFile(io, allocator, conn.fd, "utmm-upgrade", cmd.sha256_hex, cmd.file_size, shm_handle) catch |err| {
+        std.log.err("[guest] upgrade receive failed: {}", .{err});
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
         _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
         return;
     };
+    defer allocator.free(result.path);
 
-    // 增量 SHA256 计算
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    var remaining: u32 = cmd.file_size;
-    while (remaining > 0) {
-        // 更新心跳 — 升级二进制传输可能超过 10s，需在循环中刷新。
-        if (shm_handle) |h| {
-            h.utmm_heartbeat = shm.nowMs(io);
-        }
-
-        const to_read = @min(write_buf.len, remaining);
-        const nr = tcp.sockRead(conn.fd, &write_buf, to_read);
-        if (nr <= 0) {
-            std.log.err("[guest] upgrade: short read ({d} remaining)", .{remaining});
-            break;
-        }
-        const slice = write_buf[0..@intCast(nr)];
-        hasher.update(slice);
-        _ = file.writeStreamingAll(file_io, slice) catch |err| {
-            std.log.err("[guest] upgrade: write upgrade file: {}", .{err});
-            break;
-        };
-        remaining -= @intCast(nr);
-    }
-
-    file.close(file_io);
-
-    if (remaining != 0) {
-        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
-        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
-        defer allocator.free(resp);
-        _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
-        return;
-    }
-
-    // SHA256 校验
-    var computed_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    hasher.final(&computed_hash);
-
-    var hex_buf: [64]u8 = undefined;
-    for (computed_hash, 0..) |byte, i| {
-        const h = "0123456789abcdef";
-        hex_buf[i * 2] = h[byte >> 4];
-        hex_buf[i * 2 + 1] = h[byte & 0x0f];
-    }
-    if (!std.mem.eql(u8, cmd.sha256_hex, &hex_buf)) {
-        std.log.err("[guest] upgrade: SHA256 mismatch", .{});
-        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
-        const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
-        defer allocator.free(resp);
-        _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
-        return;
-    }
-
-    std.log.info("[guest] upgrade: SHA256 verified, {d} bytes → {s}", .{ cmd.file_size, upgrade_path });
-
-    // 发送成功响应（在写 marker 之前——即使 marker 写入失败，Host 已确认收到）
+    // 发送成功响应，释放锁（文件保留在磁盘，utmmd 接管后续步骤）
     const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
     defer allocator.free(resp);
     _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
 
-    // 写入 .sha256 标记文件（原子写入：先写临时文件，再 rename 到最终路径，
-    // 避免 utmmd 读到半写文件）
-    const sha_path = if (builtin.os.tag == .windows)
-        try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.sha256", .{svc.canonicalDir()})
-    else
-        try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256", .{svc.canonicalDir()});
-    defer allocator.free(sha_path);
-
-    // 临时文件：写完整内容后原子 rename，避免 utmmd 读到空/半写文件
-    const sha_tmp = if (builtin.os.tag == .windows)
-        try std.fmt.allocPrint(allocator, "{s}\\utmm-upgrade.sha256.tmp", .{svc.canonicalDir()})
-    else
-        try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256.tmp", .{svc.canonicalDir()});
-    defer allocator.free(sha_tmp);
-
-    const sha_file = std.Io.Dir.cwd().createFile(file_io, sha_tmp, .{ .truncate = true }) catch |err| {
-        std.log.err("[guest] upgrade: create sha256 tmp file: {}", .{err});
-        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
-        return;
-    };
-
-    var sha_wb: [128]u8 = undefined;
-    var sw = sha_file.writer(file_io, &sha_wb);
-    sw.interface.writeAll(&hex_buf) catch |err| {
-        std.log.err("[guest] upgrade: write sha256: {}", .{err});
-        sha_file.close(file_io);
-        std.Io.Dir.cwd().deleteFile(file_io, sha_tmp) catch {};
-        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
-        return;
-    };
-    sw.interface.flush() catch |err| {
-        std.log.err("[guest] upgrade: flush sha256: {}", .{err});
-        sha_file.close(file_io);
-        std.Io.Dir.cwd().deleteFile(file_io, sha_tmp) catch {};
-        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
-        return;
-    };
-    sha_file.close(file_io);
-
-    // 原子 rename：tmp → 最终路径，utmmd 看到 marker 时内容已完整
-    std.Io.Dir.cwd().rename(sha_tmp, std.Io.Dir.cwd(), sha_path, file_io) catch |err| {
-        std.log.err("[guest] upgrade: rename sha256: {}", .{err});
-        std.Io.Dir.cwd().deleteFile(file_io, sha_tmp) catch {};
-        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
-        return;
-    };
-    std.log.info("[guest] upgrade: marker written, utmmd will pick up", .{});
+    result.lock.release();
+    std.log.info("[guest] upgrade: file ready, lock released — utmmd will pick up", .{});
 }
 
 /// 处理 download：dpipe_file.readFile → 原始字节流发送到 TCP。
@@ -1442,8 +1372,7 @@ pub fn guestRun(init: std.process.Init, cli: @import("main.zig").CliArgs) !void 
 /// 启动时清理残留的临时文件（升级/上传失败遗留）。
 /// 扫描 canonicalDir 和 tempDir，删除 `.utmm-*` 和 `.utmm-upgrade-*` 前缀的文件。
 fn cleanupStaleTempFiles(io: std.Io, alloc: std.mem.Allocator) void {
-    // 原子 .sha256 写入残留（Guest crash 在 tmp→rename 之前）
-    svc.cleanupStaleUpgradeTmp(io);
+    svc.cleanupStaleUpgradeTmp(io, alloc);
 
     const dirs = [_][]const u8{ svc.canonicalDir(), svc.tempDir() };
     const prefixes = [_][]const u8{ ".utmm-upgrade-", ".utmm-" };

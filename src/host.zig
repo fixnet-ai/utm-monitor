@@ -522,10 +522,7 @@ fn startHost(
     std.log.info("[host] serve dir: {s}", .{sd});
 
     // 清理 Guest crash 残留的升级临时文件
-    svc.cleanupStaleUpgradeTmp(block_io);
-
-    // 清理 Guest crash 残留的升级临时文件
-    svc.cleanupStaleUpgradeTmp(block_io);
+    svc.cleanupStaleUpgradeTmp(block_io, gpa);
 
     // Initialize guest table
     var state = GuestTable.init(gpa, block_io);

@@ -201,7 +201,7 @@ fn writeFileCloseFn(ctx: *anyopaque) void {
 }
 
 /// 跨文件系统复制 + 删除源文件。
-fn copyAndDelete(io: std.Io, src: []const u8, dst: []const u8) !void {
+pub fn copyAndDelete(io: std.Io, src: []const u8, dst: []const u8) !void {
     const sf = try std.Io.Dir.cwd().openFile(io, src, .{ .mode = .read_only });
     defer sf.close(io);
     const df = try std.Io.Dir.cwd().createFile(io, dst, .{ .truncate = true });

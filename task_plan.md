@@ -2,21 +2,21 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.17.15 — 升级推送修复 + 三平台 P0 修复
+**最新版本**: v0.17.19 — 升级文件机制重构 + 文件传输统一 + Gatekeeper 隔离清除
 
 - **分支**: `main`
 - **源文件**: 20 src + 13 test + 2 embed + 2 Python test scripts
 - **测试**: 188 单元测试 + 59 集成测试 + 2 Python test scripts，全部通过，0 泄漏
 - **交叉编译**: 6/8 通过（x86 的 2 个 zio 不支持）
 
-## 当前阶段: Phase 27 — VM 离线根因修复 🟢（P0 全部解决，待部署验证）
+## 当前阶段: Phase 28 — 升级文件机制重构 + 文件传输统一 🟢
 
-**目标**: 修复各 VM 频繁离线的根因，确保 utmmd 崩溃后系统能自动恢复。
-- **P0 Linux**: ✅ `installLinux()` 补充 Restart=on-failure，提取 SYSTEMD_RESTART_CONFIG
-- **P0 macOS**: ✅ `installMacOS()` 补充 KeepAlive+ThrottleInterval，提取 MACOS_KEEPALIVE_CONFIG
-- **P0 Windows**: ✅ `installWindows()` 补充 `sc failure` 命令
-- **P1 调查**: ✅ 无需修复 — SOCKS5 relay/forward 心跳架构设计正确
-- **真机部署**: 待全量部署验证（macOS/Windows 修复需新版本）
+**目标**: 统一升级/上传/下载的文件传输机制，消除重复代码。
+
+- **v0.17.19 升级文件机制重构**: ✅ UpgradeLock 替代 .sha256 标记文件
+- **v0.17.19 文件传输统一**: ✅ receiveFile 统一 upload/upgrade 接收逻辑
+- **v0.17.19 Gatekeeper 隔离清除**: ✅ macOS 安装前清除 com.apple.quarantine
+- **真机部署**: 待全量部署验证
 
 ### Phase 26: v0.17.11 — ssh.exe 嵌入 + Python 测试脚本 ✅
 

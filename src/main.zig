@@ -667,6 +667,9 @@ fn extractUtmmd(io: std.Io, alloc: std.mem.Allocator) !void {
 
     std.log.info("[main] utmmd extracted to {s} ({d} bytes)", .{ dest, utmmd_bin.len });
 
+    // macOS: clear Gatekeeper quarantine so utmmd can run
+    svc.clearQuarantine(alloc, io, dest);
+
     // Also extract ssh.exe for Windows sshpass (best-effort, no hard error)
     extractSshExeIfMissing(io, alloc) catch {};
 }

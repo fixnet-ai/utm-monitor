@@ -1,3 +1,108 @@
+## v0.17.19 — 升级文件机制重构：SHA256 嵌入文件名 + 文件锁替代 .sha256 标记
+
+**时间**: 2026-08-02
+
+### 背景
+
+旧机制用两个文件（`utmm-upgrade` 二进制 + `utmm-upgrade.sha256` 标记），
+存在以下问题：
+- `.sha256` 标记可能成为过期残留（Guest crash 在写标记之后，utmmd IOCP bug
+  导致无法消费标记），阻止后续升级推送
+- 两文件分离，同步清理复杂
+
+### 新设计
+
+**单文件机制**: `utmm-upgrade.<sha256hex>.tmp`
+
+- SHA256 嵌入文件名（64 字符 hex），文件内容自校验
+- OS 排他文件锁（POSIX flock + LOCK_EX；Windows CreateFileW dwShareMode=0）
+  替代标记文件作为"写入完成"信号
+- 进程崩溃时 OS 自动释放锁 — 零残留状态文件
+
+### 修改文件
+
+1. **`src/svc.zig`** — 新增 `UpgradeLock` 命名空间:
+   - `tmpPath(allocator, sha256_hex)` — 构建临时文件路径
+   - `extractSha256(basename)` — 从文件名提取 SHA256
+   - `create(path)` — 创建文件 + 排他锁（阻塞，Guest 用）
+   - `tryAcquire(path)` — 尝试获取排他锁（非阻塞，utmmd 用）
+   - `writeAll(data)` / `release()` / `releaseAndDelete(path)` — 文件操作
+   - POSIX: open + flock + write + close
+   - Windows: CreateFileW(dwShareMode=0) + WriteFile + CloseHandle
+   - `verifyUpgradeTmpByFilename()` — 文件名 SHA256 vs 内容 SHA256 自校验
+   - `findUpgradeTmp()` — 扫码 canonicalDir 中的 .tmp 文件
+   - `cleanupStaleUpgradeTmp()` 重写 — 过渡期兼容清理旧机制残留
+
+2. **`src/guest.zig` — `handleUpgradeCmd`** 重构:
+   - 移除 `.sha256` 标记文件机制（tmp → rename 原子写入）
+   - 移除并发保护 statFile 检查
+   - 移除 `std.Io.Threaded` 文件 I/O（改用原始 OS write）
+   - 改用 `UpgradeLock.create` + `writeAll` + `release`/`releaseAndDelete`
+
+3. **`src/utmmd.zig`** 重构升级检测+应用:
+   - 新增 `tryApplyPendingUpgrade()` 合并 checkPendingUpgrade + applyUpgrade
+   - 扫码 .tmp → 尝试锁 → 文件名自校验 → 替换二进制
+   - 移除 `upgradeMarkerPath`、`upgradeBinPath`、`readFileAlloc`、`computeSha256Hex`
+   - 新增 `const svc = @import("svc.zig")`
+
+4. **`src/host.zig`**: `cleanupStaleUpgradeTmp` 调用签名更新
+
+### 测试结果
+
+- 188 单元测试全部通过 ✅
+- 59 集成测试全部通过 ✅
+- 无内存泄漏
+
+### v0.17.19-b — 文件传输统一：receiveFile 消除 upload/upgrade 重复
+
+**时间**: 2026-08-03
+
+**背景**: 升级、上传、下载三套文件传输机制各不一样 — handleUpgradeCmd 用
+UpgradeLock + 原始 OS write，handleUpload 用 dpipe_file.writeFile + Zig Io 层，
+handleDownload 读文件发 TCP。TCP 读循环 + SHA256 校验在 upload 和 upgrade 中
+完全重复（~80 行）。
+
+**统一方案**: 提取 `receiveFile()` 通用函数，UpgradeLock 模式推广为所有文件接收
+的统一方式。
+
+**修改**:
+1. `src/svc.zig`:
+   - `UpgradeLock.tmpPath(allocator, prefix, sha256_hex)` — 接受 comptime prefix 参数
+   - `UpgradeLock.extractSha256(basename, prefix)` — 接受 comptime prefix 参数
+   - `cleanupStaleUpgradeTmp` 扩展 — 同时清理 `upload.*.tmp` 和 `utmm-upgrade.*.tmp`
+
+2. `src/guest.zig`:
+   - 新增 `receiveFile(io, allocator, fd, prefix, sha256, size, shm)` 通用函数
+     (~60 行): TCP 读循环 + heartbeat + hasher + UpgradeLock.writeAll + SHA256 校验
+   - `handleUpload` 重构 (~60→~40 行): receiveFile("upload", ...) + rename 到目标
+   - `handleUpgradeCmd` 重构 (~100→~35 行): receiveFile("utmm-upgrade", ...) + lock.release
+   - 移除 handleUpload 对 `dpipe_file.writeFile` 和 `std.Io.Threaded` 的依赖
+
+3. `src/dpipe_file.zig`: `copyAndDelete` 改为 pub（upload rename CrossDevice fallback 用）
+4. `src/utmmd.zig`: extractSha256 调用传 prefix
+
+**净收益**:
+- 删除 ~110 行重复代码
+- Upload 获得 OS 排他锁保护 + 文件名自描述 temp 文件
+- Upload 不再依赖 `std.Io.Threaded`（Windows 兼容性更好）
+- 所有文件接收使用统一的文件名内嵌 SHA256 模式
+
+### v0.17.19-c — macOS Gatekeeper 隔离清除
+
+**时间**: 2026-08-03
+
+**问题**: macOS 上 scp/下载的二进制被标记 `com.apple.quarantine`，首次运行时
+弹窗阻止，需要手动到"系统设置"中批准。
+
+**修改**:
+1. `src/svc.zig`: 新增 `pub fn clearQuarantine(alloc, io, path)` — macOS 调用
+   `xattr -d com.apple.quarantine <path>`，best-effort（忽略错误）
+2. `src/main.zig`: `extractUtmmd` 写入 `/opt/utmm/utmmd` 后调用
+3. `src/svc.zig`: `forceInstallInternal` selfCopy 后对 `/opt/utmm/utmm` 和
+   `/opt/utmm/utmmd` 调用
+
+---
+
 ## Phase 27 P0 — installLinux systemd Restart 修复
 
 **时间**: 2026-08-02
