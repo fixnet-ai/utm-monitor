@@ -179,6 +179,136 @@ const VmDeployConfig = struct {
     remote_dir: []const u8,
 };
 
+/// Load VM deploy configuration from <dir>/deploy.json.
+/// If dir is null, uses svc.canonicalDir().
+/// Falls back to VM_DEPLOY_TABLE if the file is missing, unreadable, or invalid.
+/// Caller must call freeDeployConfig() to release memory.
+fn loadDeployConfig(gpa: std.mem.Allocator, io: std.Io, dir: ?[]const u8) ![]const VmDeployConfig {
+    const base_dir = dir orelse svc.canonicalDir();
+    // Build path: <base_dir>/deploy.json
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/deploy.json", .{base_dir}) catch {
+        std.log.warn("[deploy] deploy.json path too long, using defaults", .{});
+        return VM_DEPLOY_TABLE;
+    };
+
+    // Read file (max 64KB) — readFileAlloc handles open+read+close in one call
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, Io.Limit.limited(65536)) catch |err| {
+        switch (err) {
+            error.FileNotFound => std.log.info("[deploy] deploy.json not found, using hard-coded defaults", .{}),
+            else => std.log.warn("[deploy] deploy.json read error: {} — using defaults", .{err}),
+        }
+        return VM_DEPLOY_TABLE;
+    };
+    defer gpa.free(content);
+
+    if (content.len == 0) {
+        std.log.warn("[deploy] deploy.json is empty, using defaults", .{});
+        return VM_DEPLOY_TABLE;
+    }
+
+    // Parse JSON using the project's standard dynamic Value pattern
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, content, .{ .allocate = .alloc_always }) catch |err| {
+        std.log.warn("[deploy] deploy.json parse error: {} — using defaults", .{err});
+        return VM_DEPLOY_TABLE;
+    };
+    defer parsed.deinit();
+
+    const array = switch (parsed.value) {
+        .array => |arr| arr,
+        else => {
+            std.log.warn("[deploy] deploy.json: top-level must be an array, using defaults", .{});
+            return VM_DEPLOY_TABLE;
+        },
+    };
+
+    if (array.items.len == 0) {
+        std.log.warn("[deploy] deploy.json: empty array, using defaults", .{});
+        return VM_DEPLOY_TABLE;
+    }
+
+    var list: std.ArrayListAligned(VmDeployConfig, null) = .empty;
+    errdefer {
+        for (list.items) |entry| {
+            gpa.free(entry.hostname);
+            gpa.free(entry.target);
+            gpa.free(entry.ip);
+            gpa.free(entry.user);
+            gpa.free(entry.password);
+            gpa.free(entry.remote_dir);
+        }
+        list.deinit(gpa);
+    }
+
+    for (array.items, 0..) |item, idx| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => {
+                std.log.warn("[deploy] deploy.json entry #{}: not an object, skipping", .{idx});
+                continue;
+            },
+        };
+
+        const hostname = protocol.jsonGetString(obj, "hostname") orelse {
+            std.log.warn("[deploy] deploy.json entry #{}: missing 'hostname', skipping", .{idx});
+            continue;
+        };
+        const target = protocol.jsonGetString(obj, "target") orelse {
+            std.log.warn("[deploy] deploy.json entry #{}: missing 'target', skipping", .{idx});
+            continue;
+        };
+        const ip = protocol.jsonGetString(obj, "ip") orelse {
+            std.log.warn("[deploy] deploy.json entry #{}: missing 'ip', skipping", .{idx});
+            continue;
+        };
+        const user = protocol.jsonGetString(obj, "user") orelse {
+            std.log.warn("[deploy] deploy.json entry #{}: missing 'user', skipping", .{idx});
+            continue;
+        };
+        const password = protocol.jsonGetString(obj, "password") orelse {
+            std.log.warn("[deploy] deploy.json entry #{}: missing 'password', skipping", .{idx});
+            continue;
+        };
+        const remote_dir = protocol.jsonGetString(obj, "remote_dir") orelse {
+            std.log.warn("[deploy] deploy.json entry #{}: missing 'remote_dir', skipping", .{idx});
+            continue;
+        };
+
+        const entry = VmDeployConfig{
+            .hostname = try gpa.dupe(u8, hostname),
+            .target = try gpa.dupe(u8, target),
+            .ip = try gpa.dupe(u8, ip),
+            .user = try gpa.dupe(u8, user),
+            .password = try gpa.dupe(u8, password),
+            .remote_dir = try gpa.dupe(u8, remote_dir),
+        };
+        try list.append(gpa, entry);
+    }
+
+    if (list.items.len == 0) {
+        std.log.warn("[deploy] deploy.json: no valid entries, using defaults", .{});
+        return VM_DEPLOY_TABLE;
+    }
+
+    std.log.info("[deploy] loaded {} VM(s) from deploy.json", .{list.items.len});
+    return list.toOwnedSlice(gpa);
+}
+
+/// Free a config slice returned by loadDeployConfig.
+/// No-op if the config is the compile-time VM_DEPLOY_TABLE.
+fn freeDeployConfig(gpa: std.mem.Allocator, config: []const VmDeployConfig) void {
+    if (@intFromPtr(config.ptr) == @intFromPtr(&VM_DEPLOY_TABLE[0])) return;
+    for (config) |entry| {
+        gpa.free(entry.hostname);
+        gpa.free(entry.target);
+        gpa.free(entry.ip);
+        gpa.free(entry.user);
+        gpa.free(entry.password);
+        gpa.free(entry.remote_dir);
+    }
+    gpa.free(config);
+}
+
 /// Hard-coded VM deploy table. Override with utmm-deploy.json if present.
 const VM_DEPLOY_TABLE: []const VmDeployConfig = &[_]VmDeployConfig{
     .{ .hostname = "linuxvm", .target = "aarch64-linux-musl", .ip = "192.168.64.2", .user = "root", .password = "111", .remote_dir = "/opt/utmm" },
@@ -188,9 +318,9 @@ const VM_DEPLOY_TABLE: []const VmDeployConfig = &[_]VmDeployConfig{
 };
 
 /// Look up a VM's remote canonical directory by hostname.
-/// Returns null if hostname not found in VM_DEPLOY_TABLE.
-fn vmRemoteDir(hostname: []const u8) ?[]const u8 {
-    for (VM_DEPLOY_TABLE) |vm| {
+/// Returns null if hostname not found in the config.
+fn vmRemoteDir(config: []const VmDeployConfig, hostname: []const u8) ?[]const u8 {
+    for (config) |vm| {
         if (std.mem.eql(u8, vm.hostname, hostname)) return vm.remote_dir;
     }
     return null;
@@ -199,13 +329,17 @@ fn vmRemoteDir(hostname: []const u8) ?[]const u8 {
 /// One-shot deploy: cross-compile → SCP → SSH install → verify.
 /// Uses sshpass for non-interactive password auth.
 fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void {
+    // ── 0. Load deploy config (file or defaults) ──
+    const deploy_config = try loadDeployConfig(gpa, io, null);
+    defer freeDeployConfig(gpa, deploy_config);
+
     // ── 1. Look up VM(s) to deploy ──
     var deploy_list: std.ArrayListAligned(VmDeployConfig, null) = .empty;
     defer deploy_list.deinit(gpa);
 
     if (target_opt) |t| {
         var found = false;
-        for (VM_DEPLOY_TABLE) |vm| {
+        for (deploy_config) |vm| {
             if (std.mem.eql(u8, vm.hostname, t)) {
                 try deploy_list.append(gpa, vm);
                 found = true;
@@ -215,7 +349,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         if (!found) {
             std.debug.print("[deploy] Unknown target: {s}\n", .{t});
             std.debug.print("Known targets:", .{});
-            for (VM_DEPLOY_TABLE) |vm| {
+            for (deploy_config) |vm| {
                 std.debug.print(" {s}", .{vm.hostname});
             }
             std.debug.print("\n", .{});
@@ -223,7 +357,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         }
     } else {
         // Deploy all
-        for (VM_DEPLOY_TABLE) |vm| {
+        for (deploy_config) |vm| {
             try deploy_list.append(gpa, vm);
         }
     }
@@ -276,27 +410,8 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
     }
     std.debug.print("\n\n", .{});
 
-    // ── 2. Cross-compile all targets in parallel via zig build cross ──
-    // Replaces the old serial per-target compilation loop.
-    // zig build cross compiles all 8 deployment targets in one step.
-    std.debug.print("[deploy] Cross-compiling all targets (parallel)...\n", .{});
-    const result = std.process.run(gpa, io, .{
-        .argv = &.{ "zig", "build", "cross", "-Doptimize=ReleaseSafe" },
-    }) catch |err| {
-        std.debug.print("[deploy] zig build cross failed: {}\n", .{err});
-        std.process.exit(1);
-    };
-    if (result.term != .exited or result.term.exited != 0) {
-        std.debug.print("[deploy] Compile failed:\n{s}\n", .{result.stderr});
-        gpa.free(result.stdout);
-        gpa.free(result.stderr);
-        std.process.exit(1);
-    }
-    gpa.free(result.stdout);
-    gpa.free(result.stderr);
-    std.debug.print("[deploy] All targets compiled.\n", .{});
-
-    // Map target triple → binary path in zig-out/bin/
+    // ── 2. Check serve-dir for existing binaries (skip compilation when cached) ──
+    // Map target triple → binary path (either serve-dir cache or zig-out/bin/)
     var compiled = std.StringHashMap([]const u8).init(gpa);
     defer {
         var it = compiled.iterator();
@@ -306,6 +421,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         compiled.deinit();
     }
 
+    var all_cached = true;
     for (deploy_list.items) |vm| {
         if (compiled.contains(vm.target)) continue;
 
@@ -313,16 +429,75 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
             std.debug.print("[deploy] Unknown target: {s}\n", .{vm.target});
             std.process.exit(1);
         };
-        const bin_path = try std.fmt.allocPrint(gpa, "zig-out/bin/{s}", .{bin_name});
-        try compiled.put(vm.target, bin_path);
+        const serve_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ svc.canonicalDir(), bin_name });
+        errdefer gpa.free(serve_path);
 
-        // Copy to serve-dir for future --upgrade use
-        const serve_copy_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ svc.canonicalDir(), bin_name });
-        defer gpa.free(serve_copy_path);
-        std.Io.Dir.cwd().copyFile(bin_path, std.Io.Dir.cwd(), serve_copy_path, io, .{}) catch |err| {
-            std.log.warn("[deploy] copy to serve-dir failed: {}", .{err});
+        // Check if binary exists in serve-dir with non-zero size
+        const cached = std.Io.Dir.cwd().openFile(io, serve_path, .{ .mode = .read_only }) catch null;
+        if (cached) |f| {
+            const stat = f.stat(io) catch { f.close(io); all_cached = false; gpa.free(serve_path); break; };
+            f.close(io);
+            if (stat.size == 0) {
+                all_cached = false;
+                gpa.free(serve_path);
+                break;
+            }
+            try compiled.put(vm.target, serve_path);
+        } else {
+            all_cached = false;
+            gpa.free(serve_path);
+            break;
+        }
+    }
+
+    if (all_cached) {
+        std.debug.print("[deploy] All binaries found in serve-dir, skipping compilation.\n", .{});
+    } else {
+        // Free any partial serve_path entries from the cache check
+        {
+            var it = compiled.iterator();
+            while (it.next()) |entry| {
+                gpa.free(entry.value_ptr.*);
+            }
+            compiled.clearRetainingCapacity();
+        }
+
+        // ── Cross-compile all targets in parallel via zig build cross ──
+        std.debug.print("[deploy] Cross-compiling all targets (parallel)...\n", .{});
+        const result = std.process.run(gpa, io, .{
+            .argv = &.{ "zig", "build", "cross", "-Doptimize=ReleaseSafe" },
+        }) catch |err| {
+            std.debug.print("[deploy] zig build cross failed: {}\n", .{err});
+            std.process.exit(1);
         };
-        std.debug.print("[deploy]   {s} -> serve-dir\n", .{bin_name});
+        if (result.term != .exited or result.term.exited != 0) {
+            std.debug.print("[deploy] Compile failed:\n{s}\n", .{result.stderr});
+            gpa.free(result.stdout);
+            gpa.free(result.stderr);
+            std.process.exit(1);
+        }
+        gpa.free(result.stdout);
+        gpa.free(result.stderr);
+        std.debug.print("[deploy] All targets compiled.\n", .{});
+
+        for (deploy_list.items) |vm| {
+            if (compiled.contains(vm.target)) continue;
+
+            const bin_name = protocol.deploymentFilename(vm.target) orelse {
+                std.debug.print("[deploy] Unknown target: {s}\n", .{vm.target});
+                std.process.exit(1);
+            };
+            const bin_path = try std.fmt.allocPrint(gpa, "zig-out/bin/{s}", .{bin_name});
+            try compiled.put(vm.target, bin_path);
+
+            // Copy to serve-dir for future --upgrade use and --deploy cache hits
+            const serve_copy_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ svc.canonicalDir(), bin_name });
+            defer gpa.free(serve_copy_path);
+            std.Io.Dir.cwd().copyFile(bin_path, std.Io.Dir.cwd(), serve_copy_path, io, .{}) catch |err| {
+                std.log.warn("[deploy] copy to serve-dir failed: {}", .{err});
+            };
+            std.debug.print("[deploy]   {s} -> serve-dir\n", .{bin_name});
+        }
     }
 
     // ── 3. SCP + install for each VM ──
@@ -334,12 +509,62 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
 
         std.debug.print("\n[deploy] === {s} ({s}) ===\n", .{ vm.hostname, vm.target });
 
-        // Windows: use SMB/copy or skip — scp/ssh not available natively.
-        // For now, provide manual instructions.
+        const scp_target = try std.fmt.allocPrint(gpa, "{s}@{s}", .{ vm.user, vm.ip });
+        defer gpa.free(scp_target);
+
         if (std.mem.indexOf(u8, vm.target, "windows") != null) {
-            std.debug.print("[deploy]   Windows target — manual deploy required.\n", .{});
-            std.debug.print("[deploy]   Copy {s} → {s}@{s}:{s}/utmm-new.exe\n", .{ bin_path, vm.user, vm.ip, vm.remote_dir });
-            std.debug.print("[deploy]   Then run: {s}\\utmm-new.exe --install --hostname {s}\n", .{ vm.remote_dir, vm.hostname });
+            // Windows: scp to temp name → SSH remote install (stop → kill → move → start)
+            const remote_tmp = try std.fmt.allocPrint(gpa, "{s}\\utmm-new.exe", .{vm.remote_dir});
+            defer gpa.free(remote_tmp);
+
+            // scp binary → VM
+            std.debug.print("[deploy]   scp {s} → {s}:{s}...\n", .{ bin_path, scp_target, remote_tmp });
+            const scp_dest = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ scp_target, remote_tmp });
+            defer gpa.free(scp_dest);
+            const scp_result = std.process.run(gpa, io, .{
+                .argv = &.{ "sshpass", "-p", vm.password, "scp", "-o", "StrictHostKeyChecking=no", bin_path, scp_dest },
+            }) catch |err| {
+                std.debug.print("[deploy]   scp failed: {}\n", .{err});
+                failed += 1;
+                continue;
+            };
+            if (scp_result.term != .exited or scp_result.term.exited != 0) {
+                std.debug.print("[deploy]   scp failed:\n{s}\n", .{scp_result.stderr});
+                gpa.free(scp_result.stdout);
+                gpa.free(scp_result.stderr);
+                failed += 1;
+                continue;
+            }
+            gpa.free(scp_result.stdout);
+            gpa.free(scp_result.stderr);
+
+            // SSH: stop service → kill processes → replace binary → start service
+            std.debug.print("[deploy]   ssh install (Windows)...\n", .{});
+            const utmm_path = try std.fmt.allocPrint(gpa, "{s}\\utmm.exe", .{vm.remote_dir});
+            defer gpa.free(utmm_path);
+            const install_cmd = try std.fmt.allocPrint(gpa,
+                \\sc stop UTM-MonitorD 2>nul & timeout /t 3 /nobreak >nul & taskkill /f /im utmm.exe 2>nul & taskkill /f /im utmmd.exe 2>nul & timeout /t 2 /nobreak >nul & move /Y {s} {s} & sc start UTM-MonitorD
+            , .{ remote_tmp, utmm_path });
+            defer gpa.free(install_cmd);
+
+            const ssh_result = std.process.run(gpa, io, .{
+                .argv = &.{ "sshpass", "-p", vm.password, "ssh", "-o", "StrictHostKeyChecking=no", scp_target, install_cmd },
+            }) catch |err| {
+                std.debug.print("[deploy]   ssh install failed: {}\n", .{err});
+                failed += 1;
+                continue;
+            };
+            if (ssh_result.term != .exited or ssh_result.term.exited != 0) {
+                std.debug.print("[deploy]   ssh install failed (exit={}):\n{s}\n", .{ ssh_result.term, ssh_result.stderr });
+                gpa.free(ssh_result.stdout);
+                gpa.free(ssh_result.stderr);
+                failed += 1;
+                continue;
+            }
+            gpa.free(ssh_result.stdout);
+            gpa.free(ssh_result.stderr);
+
+            std.debug.print("[deploy]   {s} deployed successfully.\n", .{vm.hostname});
             success += 1;
             continue;
         }
@@ -348,15 +573,12 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         const remote_tmp = try std.fmt.allocPrint(gpa, "{s}/utmm-new", .{vm.remote_dir});
         defer gpa.free(remote_tmp);
 
-        const scp_target = try std.fmt.allocPrint(gpa, "{s}@{s}", .{ vm.user, vm.ip });
-        defer gpa.free(scp_target);
-
         // scp binary → VM
         std.debug.print("[deploy]   scp {s} → {s}:{s}...\n", .{ bin_path, scp_target, remote_tmp });
         const scp_dest = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ scp_target, remote_tmp });
         defer gpa.free(scp_dest);
         const scp_result = std.process.run(gpa, io, .{
-            .argv = &.{ "sshpass", "-p", vm.password, "scp", bin_path, scp_dest },
+            .argv = &.{ "sshpass", "-p", vm.password, "scp", "-o", "StrictHostKeyChecking=no", bin_path, scp_dest },
         }) catch |err| {
             std.debug.print("[deploy]   scp failed: {}\n", .{err});
             failed += 1;
@@ -378,7 +600,7 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
         defer gpa.free(install_cmd);
 
         const ssh_result = std.process.run(gpa, io, .{
-            .argv = &.{ "sshpass", "-p", vm.password, "ssh", scp_target, install_cmd },
+            .argv = &.{ "sshpass", "-p", vm.password, "ssh", "-o", "StrictHostKeyChecking=no", scp_target, install_cmd },
         }) catch |err| {
             std.debug.print("[deploy]   ssh install failed: {}\n", .{err});
             failed += 1;
@@ -444,7 +666,7 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
         target;
 
     const basename = std.fs.path.basename(local_file);
-    const remote_dir = vmRemoteDir(vm) orelse "/opt/utmm";
+    const remote_dir = vmRemoteDir(VM_DEPLOY_TABLE, vm) orelse "/opt/utmm";
     // Always use forward slash — Windows accepts both / and \ in file paths,
     // and the Host may not be running on Windows even when the Guest is.
     const dest = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ remote_dir, basename });
@@ -968,13 +1190,13 @@ pub fn pushUpgrade(
         }
         std.Io.sleep(io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
     }
-    if (!found) return "GuestNotFound";
+    if (!found) return "GuestNotFound: VM not in mesh — is the Guest running? Use --deploy for initial setup";
     defer state.freeEntry(guest_entry);
 
     // 2. Determine deployment filename from target triple
     const filename = protocol.deploymentFilename(guest_entry.target) orelse {
         std.log.err("[auto-upgrade] unknown guest target: {s}", .{guest_entry.target});
-        return "UnknownTarget";
+        return "UnknownTarget: unsupported architecture — check deploy.json target field";
     };
 
     // 3. Open binary from serve-dir（文件名含版本号，如 utmm-aarch64-linux-0.15.10）
@@ -983,8 +1205,9 @@ pub fn pushUpgrade(
 
     const bin_file = std.Io.Dir.cwd().openFile(io, serve_path, .{ .mode = .read_only }) catch |err| {
         std.log.err("[auto-upgrade] open {s}: {}", .{ serve_path, err });
-        std.log.err("[auto-upgrade] expected {s} in serve-dir — run 'zig build cross -Doptimize=ReleaseSafe && utmm --deploy' first", .{filename});
-        return "BinaryNotFound: run zig build cross + deploy to populate serve-dir";
+        std.log.err("[auto-upgrade] expected {s} in serve-dir", .{filename});
+        std.log.err("[auto-upgrade] run 'utmm --deploy' to build and populate serve-dir", .{});
+        return "BinaryNotFound: serve-dir missing binary — run 'utmm --deploy' first";
     };
     defer bin_file.close(io);
 
@@ -1656,4 +1879,128 @@ test "GuestTable updateIp" {
 
     // updateIp: nonexistent hostname
     try std.testing.expect(!table.updateIp("noexist", "10.0.0.1"));
+}
+
+test "loadDeployConfig: missing file falls back to defaults" {
+    const allocator = std.testing.allocator;
+    const io = testIo();
+    // Use a non-existent directory
+    const config = try loadDeployConfig(allocator, io, "/tmp/utmm-__nonexist__");
+    defer freeDeployConfig(allocator, config);
+    // Should return the compile-time default
+    try std.testing.expect(@intFromPtr(config.ptr) == @intFromPtr(&VM_DEPLOY_TABLE[0]));
+    try std.testing.expect(config.len >= 4);
+}
+
+/// Helper: create a temp dir, write deploy.json, call loadDeployConfig, return config.
+/// Cleans up dir on completion.
+fn testLoadDeployConfig(gpa: std.mem.Allocator, io: std.Io, dir_name: []const u8, json_src: ?[]const u8) ![]const VmDeployConfig {
+    std.Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try std.Io.Dir.cwd().createDir(io, dir_name, .default_dir);
+    errdefer std.Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    if (json_src) |src| {
+        const fname = try std.fmt.allocPrint(gpa, "{s}/deploy.json", .{dir_name});
+        defer gpa.free(fname);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = fname, .data = src });
+    }
+
+    return try loadDeployConfig(gpa, io, dir_name);
+}
+
+test "loadDeployConfig: valid JSON produces correct config" {
+    const allocator = std.testing.allocator;
+    const io = testIo();
+
+    const config = try testLoadDeployConfig(allocator, io, "utmm-test-valid",
+        \\[
+        \\  {"hostname":"testvm","target":"aarch64-linux-musl","ip":"10.0.0.1","user":"root","password":"secret","remote_dir":"/opt/utmm"},
+        \\  {"hostname":"testwin","target":"x86_64-windows","ip":"10.0.0.2","user":"Admin","password":"pass","remote_dir":"C:\\opt\\utmm"}
+        \\]
+    );
+    defer {
+        freeDeployConfig(allocator, config);
+        std.Io.Dir.cwd().deleteTree(io, "utmm-test-valid") catch {};
+    }
+
+    try std.testing.expect(@intFromPtr(config.ptr) != @intFromPtr(&VM_DEPLOY_TABLE[0]));
+    try std.testing.expectEqual(@as(usize, 2), config.len);
+    try std.testing.expectEqualStrings("testvm", config[0].hostname);
+    try std.testing.expectEqualStrings("secret", config[0].password);
+    try std.testing.expectEqualStrings("testwin", config[1].hostname);
+}
+
+test "loadDeployConfig: invalid JSON falls back to defaults" {
+    const allocator = std.testing.allocator;
+    const io = testIo();
+
+    const config = try testLoadDeployConfig(allocator, io, "utmm-test-invalid", "not valid json {{{");
+    defer {
+        freeDeployConfig(allocator, config);
+        std.Io.Dir.cwd().deleteTree(io, "utmm-test-invalid") catch {};
+    }
+    try std.testing.expect(@intFromPtr(config.ptr) == @intFromPtr(&VM_DEPLOY_TABLE[0]));
+}
+
+test "loadDeployConfig: partial valid entries skips invalid ones" {
+    const allocator = std.testing.allocator;
+    const io = testIo();
+
+    const config = try testLoadDeployConfig(allocator, io, "utmm-test-partial",
+        \\[
+        \\  {"hostname":"goodvm","target":"aarch64-linux-musl","ip":"10.0.0.1","user":"root","password":"ok","remote_dir":"/opt"},
+        \\  {"hostname":"badvm","target":"aarch64-linux-musl","ip":"10.0.0.2","user":"root","remote_dir":"/opt"},
+        \\  "not_an_object",
+        \\  {"hostname":"good2","target":"x86_64-macos","ip":"10.0.0.3","user":"admin","password":"yes","remote_dir":"/opt/utmm"}
+        \\]
+    );
+    defer {
+        freeDeployConfig(allocator, config);
+        std.Io.Dir.cwd().deleteTree(io, "utmm-test-partial") catch {};
+    }
+
+    try std.testing.expect(@intFromPtr(config.ptr) != @intFromPtr(&VM_DEPLOY_TABLE[0]));
+    try std.testing.expectEqual(@as(usize, 2), config.len);
+    try std.testing.expectEqualStrings("goodvm", config[0].hostname);
+    try std.testing.expectEqualStrings("good2", config[1].hostname);
+}
+
+test "loadDeployConfig: empty array falls back to defaults" {
+    const allocator = std.testing.allocator;
+    const io = testIo();
+
+    const config = try testLoadDeployConfig(allocator, io, "utmm-test-empty", "[]");
+    defer {
+        freeDeployConfig(allocator, config);
+        std.Io.Dir.cwd().deleteTree(io, "utmm-test-empty") catch {};
+    }
+    try std.testing.expect(@intFromPtr(config.ptr) == @intFromPtr(&VM_DEPLOY_TABLE[0]));
+}
+
+test "loadDeployConfig: non-array top-level falls back" {
+    const allocator = std.testing.allocator;
+    const io = testIo();
+
+    const config = try testLoadDeployConfig(allocator, io, "utmm-test-nonarr", "{\"hostname\":\"x\"}");
+    defer {
+        freeDeployConfig(allocator, config);
+        std.Io.Dir.cwd().deleteTree(io, "utmm-test-nonarr") catch {};
+    }
+    try std.testing.expect(@intFromPtr(config.ptr) == @intFromPtr(&VM_DEPLOY_TABLE[0]));
+}
+
+test "freeDeployConfig: no-op on compile-time slice" {
+    const allocator = std.testing.allocator;
+    // This should not crash or double-free
+    freeDeployConfig(allocator, VM_DEPLOY_TABLE);
+}
+
+test "vmRemoteDir: finds hostname in config" {
+    const config: [2]VmDeployConfig = .{
+        .{ .hostname = "aaa", .target = "x86_64-linux-musl", .ip = "1.1.1.1", .user = "r", .password = "p", .remote_dir = "/a" },
+        .{ .hostname = "bbb", .target = "aarch64-macos", .ip = "2.2.2.2", .user = "r", .password = "p", .remote_dir = "/b" },
+    };
+    try std.testing.expectEqualStrings("/a", vmRemoteDir(&config, "aaa").?);
+    try std.testing.expectEqualStrings("/b", vmRemoteDir(&config, "bbb").?);
+    try std.testing.expect(vmRemoteDir(&config, "ccc") == null);
 }

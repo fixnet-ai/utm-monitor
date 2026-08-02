@@ -680,7 +680,7 @@ fn handleExec(
     // Per-command TCP connection (with ARP recovery)
     var tcp_conn = host_mod.connectGuest(io, gpa, state, vm) catch |err| {
         std.log.err("[ipc-exec] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(conn, if (err == error.GuestNotFound) "GuestNotFound" else "GuestNotConnected");
+        sendError(conn, if (err == error.GuestNotFound) "GuestNotFound: VM not in mesh" else "GuestNotConnected: TCP connect failed");
         return;
     };
     defer tcp_conn.deinit();
@@ -956,7 +956,7 @@ fn handleDownload(
     // Per-command TCP connection (with ARP recovery)
     var tcp_conn = host_mod.connectGuest(io, gpa, state, vm) catch |err| {
         std.log.err("[ipc-download] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(conn, if (err == error.GuestNotFound) "GuestNotFound" else "GuestNotConnected");
+        sendError(conn, if (err == error.GuestNotFound) "GuestNotFound: VM not in mesh" else "GuestNotConnected: TCP connect failed");
         return;
     };
     defer tcp_conn.deinit();

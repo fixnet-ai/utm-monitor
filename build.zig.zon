@@ -4,6 +4,10 @@
     .fingerprint = 0x4603abddd607a737,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        // Uses local path (not URL) because the x86-32 support is in a fork
+        // (https://github.com/fixnet-ai/zio, branch feat/x86-32).
+        // Clone it with: git clone https://github.com/fixnet-ai/zio.git ../zio
+        // Will switch to upstream URL once PR #646 is merged.
         .zio = .{
             .path = "../zio",
         },

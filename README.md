@@ -139,6 +139,19 @@ zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
 
 **Requirements**: Zig 0.16.0, macOS build host (other hosts may work, untested).
 
+### Build Prerequisites
+
+The `build.zig.zon` references zio as a local-path dependency (`../zio`).
+Before building, clone the zio fork with x86-32 support:
+
+```bash
+git clone https://github.com/fixnet-ai/zio.git ../zio
+cd ../zio && git checkout feat/x86-32
+```
+
+This is temporary — once the x86-32 PR is merged upstream, the dependency will
+switch to a URL and Zig's package manager will fetch it automatically.
+
 ## Full Reference
 
 See [MANUAL.md](MANUAL.md) for the complete CLI reference, MCP protocol
