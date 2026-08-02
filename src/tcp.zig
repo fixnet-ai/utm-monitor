@@ -582,7 +582,7 @@ pub fn createMeshUdpSocket(port: u16) !std.Io.net.Socket {
         var bound_len: std.posix.socklen_t = @sizeOf(sockaddr_in);
         _ = ws2_getsockname(s, @ptrCast(&bound), &bound_len);
         return std.Io.net.Socket{
-            .handle = @ptrFromInt(@as(usize, @intCast(s))),
+            .handle = s,
             .address = .{ .ip4 = .{ .bytes = @bitCast(bound.addr), .port = ws2_ntohs(bound.port) } },
         };
     }
