@@ -16,7 +16,7 @@
 - **v0.17.19 升级文件机制重构**: ✅ UpgradeLock 替代 .sha256 标记文件
 - **v0.17.19 文件传输统一**: ✅ receiveFile 统一 upload/upgrade 接收逻辑
 - **v0.17.19 Gatekeeper 隔离清除**: ✅ macOS 安装前清除 com.apple.quarantine
-- **真机部署**: 待全量部署验证
+- **真机部署**: ✅ 全量部署完成 (2026-08-03) — 含 Windows VM SSH 手动升级
 
 ### Phase 26: v0.17.11 — ssh.exe 嵌入 + Python 测试脚本 ✅
 

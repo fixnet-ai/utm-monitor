@@ -101,6 +101,35 @@ handleDownload 读文件发 TCP。TCP 读循环 + SHA256 校验在 upload 和 up
 3. `src/svc.zig`: `forceInstallInternal` selfCopy 后对 `/opt/utmm/utmm` 和
    `/opt/utmm/utmmd` 调用
 
+### v0.17.19-d — 全量部署 + Windows VM 手动升级
+
+**时间**: 2026-08-03
+
+**背景**: v0.17.19-c 发布后，macvm 和 linuxvm 已通过 --upgrade 推送升级成功。
+Windows VM 的旧 utmmd (v0.17.18) 无法识别新格式 `.tmp` 升级文件，
+`--upgrade push` 虽然成功传输二进制但 utmmd 无法消费。
+
+**手动升级流程**:
+1. 构建 Windows 二进制 (aarch64 + x86_64)
+2. `utmm --upload` 上传二进制到 Windows VM
+3. `utmm sshpass` SSH + `--install` 执行安装
+4. 修正 hostname（Windows 自动检测电脑名覆盖了 --hostname 设置）
+
+**部署结果**:
+
+| VM | 升级方式 | 结果 |
+|----|---------|------|
+| Host (macOS) | 本地构建 | ✅ v0.17.19 serving |
+| macvm | --upgrade 推送 | ✅ v0.17.19 serving |
+| linuxvm | --upgrade 推送 | ✅ v0.17.19 serving |
+| winx64 | SSH + upload + install | ✅ v0.17.19 serving |
+| windowsvm | SSH + upload + install | ✅ v0.17.19 serving |
+
+**功能验证**（exec + version 检查）: 全部通过 ✅
+
+**教训**: Upgrade 文件格式不兼容时需要手动干预。后续版本若格式再变，应先更新 utmmd
+升级检测逻辑以向后兼容旧格式，或提供自动 fallback。
+
 ---
 
 ## Phase 27 P0 — installLinux systemd Restart 修复
