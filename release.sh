@@ -215,6 +215,39 @@ zig build -Doptimize=ReleaseSafe
 echo "  zig-out/bin/utmm restored to native arch"
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Phase 6: macOS code-signing (Apple Silicon kills unsigned binaries with SIGKILL)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SIGN_NEEDED=0
+if [ "$(uname -s)" = "Darwin" ]; then
+    echo ""
+    echo "==> Phase 6: macOS code-signing..."
+
+    # 6a. Re-sign the just-built native binary (belt-and-suspenders — build.zig
+    #     already signs it, but cp/scp can strip the ad-hoc signature).
+    echo "  Re-signing zig-out/bin/utmm..."
+    codesign --force --sign - zig-out/bin/utmm
+
+    # 6b. If /opt/utmm/utmm exists (host is installed locally), update it and
+    #     re-sign so the local host picks up the new version immediately.
+    if [ -f /opt/utmm/utmm ]; then
+        echo "  Updating /opt/utmm/utmm (local host binary)..."
+        sudo cp zig-out/bin/utmm /opt/utmm/utmm
+        sudo codesign --force --sign - /opt/utmm/utmm
+        echo "  /opt/utmm/utmm updated and re-signed"
+    fi
+
+    # 6c. Re-sign cross-compiled macOS binaries in release/ so they survive
+    #     scp-to-VM + cp-to-canonical-path without getting SIGKILL'd.
+    for f in release/utmm-*-macos-*; do
+        if [ -f "$f" ]; then
+            codesign --force --sign - "$f" 2>/dev/null || true
+            echo "  Re-signed: $(basename "$f")"
+        fi
+    done
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Done
 # ═══════════════════════════════════════════════════════════════════════════════
 
