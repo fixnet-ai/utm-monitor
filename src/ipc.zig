@@ -842,7 +842,10 @@ fn handleUpload(
         return;
     };
 
-    // Send raw file bytes (unframed — guest reads raw bytes after upload_cmd)
+    // Send raw file bytes (unframed — guest reads raw bytes after upload_cmd).
+    // Use a separate write loop that checks sockWrite return value and handles
+    // short writes — on Windows (ws2_send) can return fewer bytes than requested
+    // even on a blocking socket when the send buffer is temporarily full.
     var file_buf: [65536]u8 = undefined;
     var total_sent: u32 = 0;
     while (total_sent < file_size) {
@@ -853,7 +856,22 @@ fn handleUpload(
         };
         if (n == 0) break;
 
-        _ = tcp_mod.sockWrite(tcp_conn.fd, file_buf[0..n].ptr, n);
+        // Write n bytes to TCP socket with retry on short writes.
+        var written: usize = 0;
+        while (written < n) {
+            const w = tcp_mod.sockWrite(tcp_conn.fd, file_buf[written..n].ptr, n - written);
+            if (w < 0) {
+                std.log.err("[ipc-upload] sockWrite failed: error={d}", .{w});
+                sendError(ipc_conn, "WriteFailed");
+                return;
+            }
+            if (w == 0) {
+                std.log.err("[ipc-upload] sockWrite returned 0 (connection closed)", .{});
+                sendError(ipc_conn, "WriteFailed");
+                return;
+            }
+            written += @intCast(w);
+        }
         total_sent += @intCast(n);
     }
 

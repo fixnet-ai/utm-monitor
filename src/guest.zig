@@ -711,20 +711,27 @@ test "zigTarget - valid format" {
 /// Runs every 30 seconds to keep the hosts file current even if
 /// the Host IP changes (unlikely but possible in UTM networks).
 fn guestHostsSync(
-    io: std.Io,
+    zio_io_unused: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
     shutdown: ?*std.atomic.Value(bool),
 ) void {
+    _ = zio_io_unused;
+    // Use a separate blocking IO for getDefaultGateway (which calls
+    // std.process.run) and for sleep. zio's IOCP-based IO on Windows
+    // does not support blocking std.process.run or std.Io.sleep.
+    var block_threaded = std.Io.Threaded.init(allocator, .{});
+    const block_io = block_threaded.io();
+
     while (true) {
         // Sleep first — no rush on initial startup
-        std.Io.sleep(io, std.Io.Duration.fromSeconds(30), .awake) catch break;
+        std.Io.sleep(block_io, std.Io.Duration.fromSeconds(30), .awake) catch break;
         if (shutdown) |s| {
             if (s.load(.acquire)) break;
         }
 
         // Resolve gateway IP (Host IP in UTM network)
-        const gateway_ip = getDefaultGateway(io, allocator) catch |err| {
+        const gateway_ip = getDefaultGateway(block_io, allocator) catch |err| {
             std.log.warn("[guest] hostsSync: getDefaultGateway failed: {}", .{err});
             continue;
         };
@@ -745,7 +752,7 @@ fn guestHostsSync(
             "C:\\Windows\\System32\\drivers\\etc\\hosts"
         else
             "/etc/hosts";
-        lsa.updateHosts(io, allocator, hosts_path, entries.items) catch |err| {
+        lsa.updateHosts(block_io, allocator, hosts_path, entries.items) catch |err| {
             std.log.warn("[guest] hostsSync: updateHosts {s}: {}", .{ hosts_path, err });
         };
     }
@@ -787,7 +794,7 @@ pub fn guestTcpLoop(
     var mesh_opt: ?lsa.Mesh = null;
     var mesh_thread: ?std.Thread = null;
     var mesh_socket_opt: ?std.Io.net.Socket = null;
-    var hosts_sync_handle: ?zio.JoinHandle(void) = null;
+    var hosts_sync_handle: ?std.Thread = null;
 
     start_mesh: {
         var broadcast_addrs = getSubnetBroadcasts(allocator) catch |err| {
@@ -863,7 +870,7 @@ pub fn guestTcpLoop(
         if (hosts_sync_handle) |*h| {
             // Signal shutdown to break the sleep loop, then join
             if (shutdown) |s| s.store(true, .release);
-            _ = h.join();
+            h.join();
         }
         if (mesh_thread) |t| {
             if (mesh_opt) |*m| m.signalShutdown();
@@ -882,11 +889,11 @@ pub fn guestTcpLoop(
     }
 
     // ── Periodic /etc/hosts sync ──
-    if (zio.spawnBlocking(guestHostsSync, .{ io, allocator, info, shutdown })) |handle| {
-        hosts_sync_handle = handle;
-    } else |_| {
-        std.log.warn("[guest] hostsSync spawnBlocking failed", .{});
-    }
+    // Use std.Thread.spawn instead of zio.spawnBlocking because guestHostsSync
+    // calls std.Io.sleep() which requires the zio event loop. On Windows (IOCP),
+    // spawnBlocking tasks cannot use event-loop-dependent IO operations.
+    // TODO: switch to zio.spawnBlocking once zio supports async ops in blocking tasks.
+    hosts_sync_handle = std.Thread.spawn(.{}, guestHostsSync, .{ io, allocator, info, shutdown }) catch null;
 
     // ── TCP accept 循环 ──
     var listener = tcp.TcpListener.init(io, mesh_port) catch |err| {
@@ -1139,8 +1146,14 @@ pub fn handleUpload(
 
     std.log.info("[guest] upload: cmd_id={s} path={s} size={d}", .{ cmd.cmd_id, cmd.path, cmd.file_size });
 
+    // 使用独立的 blocking I/O 进行文件操作。在 Windows 上，zio 的 IOCP
+    // I/O 不兼容文件 I/O（createFile/writeStreamingAll/rename 会报
+    // error.Unexpected）。与 guestHostsSync 使用 std.Io.Threaded 的原因相同。
+    var file_threaded = std.Io.Threaded.init(allocator, .{});
+    const file_io = file_threaded.io();
+
     // 创建目标管道（写入 temp 文件，验证 SHA256，atomic rename）
-    const file_pipe = dpipe_file.writeFile(allocator, io, cmd.path, cmd.file_hash) catch |err| {
+    const file_pipe = dpipe_file.writeFile(allocator, file_io, cmd.path, cmd.file_hash) catch |err| {
         std.log.err("[guest] writeFile failed: {}", .{err});
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
@@ -1208,6 +1221,11 @@ pub fn handleUpgradeCmd(
         return;
     }
 
+    // 使用独立的 blocking I/O 进行文件操作，避免 Windows zio IOCP 不兼容
+    // 文件 I/O（createFile/writeStreamingAll/deleteFile/rename 会报 error.Unexpected）。
+    var file_threaded = std.Io.Threaded.init(allocator, .{});
+    const file_io = file_threaded.io();
+
     // 并发保护：如果已有待处理升级（.sha256 标记存在，utmmd 还未消费），
     // 拒绝本次推送，防止两次升级并发导致二进制文件损坏。
     {
@@ -1217,7 +1235,7 @@ pub fn handleUpgradeCmd(
             try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256", .{svc.canonicalDir()});
         defer allocator.free(pending_marker);
 
-        if (std.Io.Dir.cwd().statFile(io, pending_marker, .{})) |_| {
+        if (std.Io.Dir.cwd().statFile(file_io, pending_marker, .{})) |_| {
             std.log.info("[guest] upgrade: pending upgrade exists, rejecting", .{});
             const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
             defer allocator.free(resp);
@@ -1236,9 +1254,9 @@ pub fn handleUpgradeCmd(
     // 创建升级文件（覆盖旧残留）
     var write_buf: [65536]u8 = undefined;
     const up_file = if (builtin.os.tag != .windows)
-        std.Io.Dir.cwd().createFile(io, upgrade_path, .{ .truncate = true, .permissions = @enumFromInt(0o755) })
+        std.Io.Dir.cwd().createFile(file_io, upgrade_path, .{ .truncate = true, .permissions = @enumFromInt(0o755) })
     else
-        std.Io.Dir.cwd().createFile(io, upgrade_path, .{ .truncate = true });
+        std.Io.Dir.cwd().createFile(file_io, upgrade_path, .{ .truncate = true });
     const file = up_file catch |err| {
         std.log.err("[guest] upgrade: create upgrade file {s}: {}", .{ upgrade_path, err });
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
@@ -1264,17 +1282,17 @@ pub fn handleUpgradeCmd(
         }
         const slice = write_buf[0..@intCast(nr)];
         hasher.update(slice);
-        _ = file.writeStreamingAll(io, slice) catch |err| {
+        _ = file.writeStreamingAll(file_io, slice) catch |err| {
             std.log.err("[guest] upgrade: write upgrade file: {}", .{err});
             break;
         };
         remaining -= @intCast(nr);
     }
 
-    file.close(io);
+    file.close(file_io);
 
     if (remaining != 0) {
-        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
         _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
@@ -1293,7 +1311,7 @@ pub fn handleUpgradeCmd(
     }
     if (!std.mem.eql(u8, cmd.sha256_hex, &hex_buf)) {
         std.log.err("[guest] upgrade: SHA256 mismatch", .{});
-        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, -1) catch return;
         defer allocator.free(resp);
         _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
@@ -1322,35 +1340,35 @@ pub fn handleUpgradeCmd(
         try std.fmt.allocPrint(allocator, "{s}/utmm-upgrade.sha256.tmp", .{svc.canonicalDir()});
     defer allocator.free(sha_tmp);
 
-    const sha_file = std.Io.Dir.cwd().createFile(io, sha_tmp, .{ .truncate = true }) catch |err| {
+    const sha_file = std.Io.Dir.cwd().createFile(file_io, sha_tmp, .{ .truncate = true }) catch |err| {
         std.log.err("[guest] upgrade: create sha256 tmp file: {}", .{err});
-        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
         return;
     };
 
     var sha_wb: [128]u8 = undefined;
-    var sw = sha_file.writer(io, &sha_wb);
+    var sw = sha_file.writer(file_io, &sha_wb);
     sw.interface.writeAll(&hex_buf) catch |err| {
         std.log.err("[guest] upgrade: write sha256: {}", .{err});
-        sha_file.close(io);
-        std.Io.Dir.cwd().deleteFile(io, sha_tmp) catch {};
-        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        sha_file.close(file_io);
+        std.Io.Dir.cwd().deleteFile(file_io, sha_tmp) catch {};
+        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
         return;
     };
     sw.interface.flush() catch |err| {
         std.log.err("[guest] upgrade: flush sha256: {}", .{err});
-        sha_file.close(io);
-        std.Io.Dir.cwd().deleteFile(io, sha_tmp) catch {};
-        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        sha_file.close(file_io);
+        std.Io.Dir.cwd().deleteFile(file_io, sha_tmp) catch {};
+        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
         return;
     };
-    sha_file.close(io);
+    sha_file.close(file_io);
 
     // 原子 rename：tmp → 最终路径，utmmd 看到 marker 时内容已完整
-    std.Io.Dir.cwd().rename(sha_tmp, std.Io.Dir.cwd(), sha_path, io) catch |err| {
+    std.Io.Dir.cwd().rename(sha_tmp, std.Io.Dir.cwd(), sha_path, file_io) catch |err| {
         std.log.err("[guest] upgrade: rename sha256: {}", .{err});
-        std.Io.Dir.cwd().deleteFile(io, sha_tmp) catch {};
-        std.Io.Dir.cwd().deleteFile(io, upgrade_path) catch {};
+        std.Io.Dir.cwd().deleteFile(file_io, sha_tmp) catch {};
+        std.Io.Dir.cwd().deleteFile(file_io, upgrade_path) catch {};
         return;
     };
     std.log.info("[guest] upgrade: marker written, utmmd will pick up", .{});
@@ -1371,8 +1389,12 @@ pub fn handleDownload(
 
     std.log.info("[guest] download: cmd_id={s} path={s}", .{ cmd.cmd_id, cmd.path });
 
+    // 使用独立的 blocking I/O（Windows zio IOCP 不兼容文件 I/O）
+    var file_threaded = std.Io.Threaded.init(allocator, .{});
+    const file_io = file_threaded.io();
+
     // 创建读取管道
-    const file_pipe = dpipe_file.readFile(allocator, io, cmd.path) catch |err| {
+    const file_pipe = dpipe_file.readFile(allocator, file_io, cmd.path) catch |err| {
         std.log.err("[guest] readFile failed: {}", .{err});
         // 发送空文件（0字节）作为错误信号
         return;
@@ -1406,13 +1428,17 @@ pub fn handleDownload(
 
 /// Guest mode entry point (from std.process.Init)
 pub fn guestRun(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
-    return guestRunWithIo(init.io, init.gpa, cli, null);
+    // Collect system info using blocking init.io BEFORE creating zio Runtime.
+    // zio's IOCP-based IO is incompatible with std.process.run on Windows.
+    const sysinfo = try getSystemInfo(init.io, init.gpa);
+    return guestRunWithIo(init.io, init.gpa, cli, null, null, sysinfo);
 }
 
 /// Guest mode entry point (called from Windows service or direct process start).
 /// shutdown is an optional atomic flag — when set (Windows service stop), the
 /// mesh session loop exits cleanly so the SCM receives STOPPED instead of a
 /// broken pipe error.
+/// pre_sysinfo: pre-collected SystemInfo (must be collected with BLOCKING io).
 /// 启动时清理残留的临时文件（升级/上传失败遗留）。
 /// 扫描 canonicalDir 和 tempDir，删除 `.utmm-*` 和 `.utmm-upgrade-*` 前缀的文件。
 fn cleanupStaleTempFiles(io: std.Io, alloc: std.mem.Allocator) void {
@@ -1443,12 +1469,12 @@ fn cleanupStaleTempFiles(io: std.Io, alloc: std.mem.Allocator) void {
     }
 }
 
-pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool), shm_handle: ?*volatile shm.ShmLayout) !void {
+pub fn guestRunWithIo(io: std.Io, gpa: std.mem.Allocator, cli: @import("main.zig").CliArgs, shutdown: ?*std.atomic.Value(bool), shm_handle: ?*volatile shm.ShmLayout, pre_sysinfo: SystemInfo) !void {
     // 启动时清理残留 temp 文件（升级失败/Crash 遗留）
     cleanupStaleTempFiles(io, gpa);
-
-    // Collect system information (sync, uses blocking Io for process.run etc.)
-    var sysinfo = try getSystemInfo(io, gpa);
+    // Use pre-collected system info (gathered with blocking IO to avoid
+    // zio IOCP incompatibility with std.process.run on Windows).
+    var sysinfo = pre_sysinfo;
     defer {
         gpa.free(sysinfo.hostname);
         gpa.free(sysinfo.ip);

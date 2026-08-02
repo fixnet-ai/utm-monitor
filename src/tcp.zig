@@ -32,11 +32,17 @@ pub const socket_t = std.posix.socket_t;
 
 /// Write data to a socket. POSIX: write(), Windows: send().
 /// Returns number of bytes written, or -1 on fatal error.
-/// Retries on EAGAIN (non-blocking socket, buffer full) and
+/// Retries on EAGAIN/WSAEWOULDBLOCK (non-blocking socket, buffer full) and
 /// EINTR (interrupted by signal).
 pub inline fn sockWrite(fd: socket_t, buf: [*]const u8, len: usize) isize {
     if (builtin.os.tag == .windows) {
-        return ws2_send(fd, buf, @intCast(len), 0);
+        while (true) {
+            const n = ws2_send(fd, buf, @intCast(len), 0);
+            if (n >= 0) return n;
+            const err = ws2_getLastError();
+            if (err == WSAEWOULDBLOCK) continue;
+            return n;
+        }
     }
     while (true) {
         const n = system.write(fd, buf, len);
@@ -49,11 +55,17 @@ pub inline fn sockWrite(fd: socket_t, buf: [*]const u8, len: usize) isize {
 
 /// Read data from a socket. POSIX: read(), Windows: recv().
 /// Returns number of bytes read, 0 on EOF, or -1 on fatal error.
-/// Retries on EAGAIN (non-blocking socket, no data yet) and
+/// Retries on EAGAIN/WSAEWOULDBLOCK (non-blocking socket, no data yet) and
 /// EINTR (interrupted by signal).
 pub inline fn sockRead(fd: socket_t, buf: [*]u8, len: usize) isize {
     if (builtin.os.tag == .windows) {
-        return ws2_recv(fd, buf, @intCast(len), 0);
+        while (true) {
+            const n = ws2_recv(fd, buf, @intCast(len), 0);
+            if (n >= 0) return n;
+            const err = ws2_getLastError();
+            if (err == WSAEWOULDBLOCK) continue;
+            return n;
+        }
     }
     while (true) {
         const n = system.read(fd, buf, len);
@@ -150,6 +162,8 @@ extern "ws2_32" fn sendto(s: std.posix.socket_t, buf: [*]const u8, len: c_int, f
 const ws2_sendto = sendto;
 extern "ws2_32" fn recvfrom(s: std.posix.socket_t, buf: [*]u8, len: c_int, flags: c_int, from: *anyopaque, fromlen: *c_int) callconv(.winapi) c_int;
 const ws2_recvfrom = recvfrom;
+
+const WSAEWOULDBLOCK: c_int = 10035;
 
 var ws2_initialized = false;
 fn ensureWinsock2() void {
@@ -440,7 +454,7 @@ fn connectTcpWindows(addr: *const std.Io.net.IpAddress, timeout_ms: u32) !std.Io
         .in6 => |*v6| ws2_connect(fd, @ptrCast(v6), @sizeOf(std.posix.sockaddr.in6)),
     };
     if (cr != 0) {
-        if (ws2_getLastError() != 10035) { // WSAEWOULDBLOCK
+        if (ws2_getLastError() != WSAEWOULDBLOCK) {
             return error.ConnectFailed;
         }
     }

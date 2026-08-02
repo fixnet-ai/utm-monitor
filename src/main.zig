@@ -432,6 +432,21 @@ pub fn main(init: std.process.Init) !void {
         // 这样 utmmd 能检测到阻塞的 utmm 进程：如果 accept 循环卡住，
         // 心跳停止更新 → utmmd 10s 超时触发重启。
 
+        // Collect system info with BLOCKING init.io BEFORE creating zio Runtime.
+        // zio's IOCP-based IO is incompatible with std.process.run on Windows
+        // (route print, getmac, powershell hang when using IOCP IO).
+        const sysinfo = guest.getSystemInfo(init.io, init.gpa) catch blk2: {
+            std.log.err("[main] getSystemInfo failed — using fallback", .{});
+            break :blk2 guest.SystemInfo{
+                .hostname = try init.gpa.dupe(u8, "unknown"),
+                .ip = try init.gpa.dupe(u8, "0.0.0.0"),
+                .mac = try init.gpa.dupe(u8, "00:00:00:00:00:00"),
+                .target = try init.gpa.dupe(u8, @tagName(builtin.cpu.arch)),
+                .iface_name = try init.gpa.dupe(u8, "unknown"),
+                .shell = try init.gpa.dupe(u8, "cmd.exe"),
+            };
+        };
+
         // Create zio async Runtime — replaces blocking init.io with coroutine-based I/O.
         // The Runtime owns the event loop and worker threads; rt.io() provides a
         // std.Io backed by async I/O (io_uring/epoll/kqueue/iocp) under the hood.
@@ -445,7 +460,7 @@ pub fn main(init: std.process.Init) !void {
         if (cli.is_host) {
             try host_mod.runWithIo(rt, rt_io, init.gpa, cli, null, shm_handle);
         } else {
-            try guest.guestRunWithIo(rt_io, init.gpa, cli, null, shm_handle);
+            try guest.guestRunWithIo(rt_io, init.gpa, cli, null, shm_handle, sysinfo);
         }
         if (shm_handle) |h| {
             h.utmm_state = @intFromEnum(shm.UtmmState.stopping);
