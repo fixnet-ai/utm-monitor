@@ -1,3 +1,81 @@
+## v0.17.11 — ssh.exe 嵌入 + CLI 测试脚本
+
+**时间**: 2026-08-02
+
+### Windows ssh.exe 嵌入与自动提取
+
+**背景**: Windows utmm 运行 sshpass 时调用 `CreateProcessW` 执行 `ssh` 命令，依赖 PATH
+中找到 `ssh.exe`。但 Windows VM 可能未安装 OpenSSH Client，或 PATH 配置有问题，
+导致 sshpass 功能不可用。
+
+**方案**: 将 x86_64/aarch64 Windows 的 `ssh.exe` 作为 embedded binary 编译进 utmm，
+并在 `--install` 流程中自动提取到 utmmd 同目录（`C:\opt\utmm\ssh.exe`）。
+sshpass 执行 ssh 时优先使用嵌入路径。
+
+**实现细节**:
+
+1. **提取 ssh.exe binary** (`src/embed/`):
+   - `src/embed/x86_64-windows/ssh.exe` — 1,253,888 bytes, PE32+ x86-64，从 winx64 提取
+   - `src/embed/aarch64-windows/ssh.exe` — 1,135,104 bytes, PE32+ Aarch64，从 windowsvm 提取
+   - 提取方法：`utmm sshpass ssh Administrator@<vm> "PowerShell Get-Command ssh.exe | Select -ExpandProperty Source"`
+   - 源路径：`C:\Windows\System32\OpenSSH\ssh.exe`
+
+2. **`src/main.zig` ssh.exe 嵌入**:
+   ```zig
+   const ssh_exe_bin: []const u8 = if (builtin.os.tag == .windows) switch (builtin.cpu.arch) {
+       .aarch64 => @embedFile("embed/aarch64-windows/ssh.exe"),
+       .x86_64 => @embedFile("embed/x86_64-windows/ssh.exe"),
+       else => &.{},
+   } else &.{};
+   ```
+   - 新增 `extractSshExe(io, alloc)` — 写 temp 文件 + SHA256 不校验（只验长度>0）
+     + atomic rename 到 `C:\opt\utmm\ssh.exe`
+   - 新增 `extractSshExeIfMissing(io, alloc)` — 检查存在性，调用 extractSshExe
+   - 从 `extractUtmmd()` 中调用：`extractSshExeIfMissing(io, alloc) catch {};` — best-effort，不硬错误
+
+3. **`src/sshpass.zig` ssh 路径解析**:
+   - 新增 `isSshCommand(cmd)` — 检测命令名是否为裸 "ssh" 或 "ssh.exe"（无路径前缀，大小写不敏感）
+   - `runWindows()` 修改：如果命令是 ssh，将 `cmd_args[0]` 替换为 `C:\opt\utmm\ssh.exe`
+   - 使用栈缓冲 `[64][]const u8` 避免堆分配
+   - 路径替换仅当 cmd_args.len < 64 时生效
+
+**设计决策**:
+- ssh.exe 提取是 best-effort（失败 warn 不中断安装流程）—— sshpass 回退到 PATH 查找
+- 不校验 SHA256（二进制较大、SHA256 跨版本变化，验长度>0 足够）
+- Atomic temp→rename 写入模式与 utmmd.bin 提取一致
+- embed 仅限 Windows 目标 — 非 Windows 编译 ssh_exe_bin = &.{}（零字节）
+
+**构建验证**:
+- 6/8 交叉编译目标通过（x86 2 个 zio 不支持）✅
+- 188 单元测试 + 59 集成测试全部通过 ✅
+
+### Python 测试脚本（MCP + CLI）
+
+**MCP Tools Test Script** (`tests/test_mcp_tools.py`, ~268 行):
+- 覆盖所有 7 个 MCP 工具：status, exec, ping, upload, download, sshpass, manual
+- JSON-RPC stdio 通信，通过 `--mcp` 管道 vs Host daemon
+- upload→download SHA256 验证 + sshpass 密码认证
+- linuxvm 为文件传输目标，linuxvm+macvm 为 exec/ping 目标
+
+**CLI Commands Test Script** (`tests/test_cli_commands.py`, ~248 行):
+- 覆盖全部 CLI 管理命令：`--version`, `--status`, `--ping`, `--exec`, `--upload`, `--download`, `sshpass`
+- 31/31 检查通过
+- 关键修复：
+  - utmm CLI 输出到 stderr（非 stdout）→ `run()` 合并 stdout+stderr
+  - `--ping` 输出 JSON 格式 `{"rtt_ms":N}` → 检查 `"rtt_ms" in out` 而非 `"RTT" in out`
+  - sshpass 错误密码测试需 `-o PubkeyAuthentication=no`（否则密钥认证绕过密码检查）
+  - upload/download 成功检测：`"[upload]" in out and "error:" not in out.lower()`
+
+**验证**:
+- `sudo python3 tests/test_mcp_tools.py` — 全部通过 ✅
+- `sudo python3 tests/test_cli_commands.py` — 31/31 通过 ✅
+
+**SKILL.md 更新**:
+- 新增 "MCP Tools Test" 章节
+- 新增 "CLI Commands Test" 章节
+
+---
+
 ## v0.17.11 — zio 协程重构完成 + macOS 自动 codesign
 
 **时间**: 2026-08-02

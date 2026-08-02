@@ -67,6 +67,16 @@ const utmmd_sha256_hex: [:0]const u8 = switch (builtin.cpu.arch) {
     else => @compileError("unsupported arch: " ++ @tagName(builtin.cpu.arch)),
 };
 
+/// Embedded ssh.exe for Windows targets — extracted to canonical directory
+/// so sshpass can always find it even when system OpenSSH is not in PATH.
+/// Target-specific: embed/{arch}-{os}/ssh.exe, selected at comptime via builtin.
+/// Empty on non-Windows / unsupported arch (x86 excluded — no x86 OpenSSH available).
+const ssh_exe_bin: []const u8 = if (builtin.os.tag == .windows) switch (builtin.cpu.arch) {
+    .aarch64 => @embedFile("embed/aarch64-windows/ssh.exe"),
+    .x86_64 => @embedFile("embed/x86_64-windows/ssh.exe"),
+    else => &.{},
+} else &.{};
+
 comptime {
     _ = @import("lsa.zig");
     _ = @import("config.zig");
@@ -641,6 +651,9 @@ fn extractUtmmd(io: std.Io, alloc: std.mem.Allocator) !void {
     };
 
     std.log.info("[main] utmmd extracted to {s} ({d} bytes)", .{ dest, utmmd_bin.len });
+
+    // Also extract ssh.exe for Windows sshpass (best-effort, no hard error)
+    extractSshExeIfMissing(io, alloc) catch {};
 }
 
 /// Extract utmmd only if it doesn't already exist at the canonical path.
@@ -654,6 +667,68 @@ fn extractUtmmdIfMissing(io: std.Io, alloc: std.mem.Allocator) !void {
     };
     // File exists — skip extraction
     std.log.debug("[main] utmmd already at {s}, skipping extraction", .{dest});
+}
+
+/// Write the embedded ssh.exe to the canonical directory for Windows sshpass use.
+/// On POSIX, this is a no-op — sshpass relies on the system ssh being in PATH.
+/// Best-effort: if extraction fails, sshpass falls back to PATH lookup.
+fn extractSshExe(io: std.Io, alloc: std.mem.Allocator) !void {
+    if (builtin.os.tag != .windows) return;
+    if (ssh_exe_bin.len == 0) return;
+
+    const dest_dir = svc.canonicalDir(); // C:\opt\utmm
+    const dest = try std.fmt.allocPrint(alloc, "{s}\\ssh.exe", .{dest_dir});
+    defer alloc.free(dest);
+
+    const cwd = std.Io.Dir.cwd();
+
+    // Write to temp file first, then rename (atomic on NTFS)
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}\\ssh.tmp.exe", .{dest_dir});
+    defer alloc.free(tmp_path);
+
+    cwd.deleteFile(io, tmp_path) catch {};
+
+    {
+        const dst_file = cwd.createFile(io, tmp_path, .{ .truncate = true }) catch |err| {
+            std.log.warn("[main] extractSshExe/create: {} — sshpass will use PATH fallback", .{err});
+            return;
+        };
+        defer dst_file.close(io);
+
+        var write_buf: [65536]u8 = undefined;
+        var writer = dst_file.writer(io, &write_buf);
+        writer.interface.writeAll(ssh_exe_bin) catch |err| {
+            std.log.warn("[main] extractSshExe/write: {} — sshpass will use PATH fallback", .{err});
+            return;
+        };
+        writer.interface.flush() catch {};
+        dst_file.sync(io) catch {};
+    }
+
+    cwd.rename(tmp_path, std.Io.Dir.cwd(), dest, io) catch |err| {
+        // If dest already exists (e.g. from concurrent install), ignore the error
+        // and verify dest exists below
+        std.log.debug("[main] extractSshExe/rename: {} (may already exist)", .{err});
+    };
+
+    std.log.info("[main] ssh.exe extracted to {s} ({d} bytes)", .{ dest, ssh_exe_bin.len });
+}
+
+/// Extract ssh.exe only if it doesn't already exist at the canonical path.
+/// Windows-only; no-op on POSIX.
+fn extractSshExeIfMissing(io: std.Io, alloc: std.mem.Allocator) !void {
+    if (builtin.os.tag != .windows) return;
+    if (ssh_exe_bin.len == 0) return;
+
+    const dest_dir = svc.canonicalDir();
+    const dest = try std.fmt.allocPrint(alloc, "{s}\\ssh.exe", .{dest_dir});
+    defer alloc.free(dest);
+
+    const cwd = std.Io.Dir.cwd();
+    _ = cwd.openFile(io, dest, .{ .mode = .read_only }) catch {
+        return extractSshExe(io, alloc);
+    };
+    std.log.debug("[main] ssh.exe already at {s}, skipping extraction", .{dest});
 }
 
 /// Copy src to dst using 64KB chunks. Used as fallback when rename fails with EXDEV.

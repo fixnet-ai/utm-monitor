@@ -2,14 +2,14 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.17.11 — zio 协程重构完成 + macOS 自动 codesign
+**最新版本**: v0.17.11 — ssh.exe 嵌入 + 测试脚本 + zio 协程重构 + macOS 自动 codesign
 
-- **分支**: `refactor-zio`（zio 协程重构分支）
-- **源文件**: 20 src + 13 test
-- **测试**: 188 单元测试 + 59 集成测试，全部通过，0 泄漏
+- **分支**: `main`
+- **源文件**: 20 src + 13 test + 2 embed + 2 Python test scripts
+- **测试**: 188 单元测试 + 59 集成测试 + 2 Python test scripts，全部通过，0 泄漏
 - **交叉编译**: 6/8 通过（x86 的 2 个 zio 不支持）
 
-## 当前阶段: Phase 25 — zio 协程重构 ✅
+## 当前阶段: Phase 26 — ssh.exe 嵌入 + 测试脚本 ✅
 
 **目标**: 将 utmm 从 OS 线程模型迁移到 zio stackful 协程框架，解决 SO_REUSEPORT
 端口冲突、spinlock、upload 解析等关键问题。8 个 commit 逐步推进。
@@ -17,6 +17,46 @@
 - **集成测试**: 59/59 通过 ✅
 - **真机部署**: macvm + linuxvm exec/upload/download 全部通过 ✅
 - **真机部署**: 待发布验证
+
+### Phase 26: v0.17.11 — ssh.exe 嵌入 + Python 测试脚本 ✅
+
+**目标**: Windows sshpass 零依赖（嵌入 ssh.exe）+ 全面测试覆盖（MCP + CLI）
+
+| # | 任务 | 文件 | 说明 |
+|---|------|------|------|
+| 226 | 从 winx64 提取 x86_64 ssh.exe | `src/embed/x86_64-windows/ssh.exe` | ✅ PE32+ x86-64, 1,253,888 bytes |
+| 227 | 从 windowsvm 提取 aarch64 ssh.exe | `src/embed/aarch64-windows/ssh.exe` | ✅ PE32+ Aarch64, 1,135,104 bytes |
+| 228 | main.zig 新增 ssh_exe_bin comptime embed | `src/main.zig` | ✅ 按 cpu.arch 选择, 非 Windows 为空 |
+| 229 | main.zig 新增 extractSshExe | `src/main.zig` | ✅ temp+rename atomic write, best-effort |
+| 230 | main.zig 新增 extractSshExeIfMissing | `src/main.zig` | ✅ 检查存在性后调用 extractSshExe |
+| 231 | extractUtmmd 中调用 extractSshExeIfMissing | `src/main.zig` | ✅ catch {} — 不阻断安装流程 |
+| 232 | sshpass.zig 新增 isSshCommand | `src/sshpass.zig` | ✅ 检测裸 "ssh"/"ssh.exe" |
+| 233 | sshpass.zig runWindows ssh 路径替换 | `src/sshpass.zig` | ✅ 替换为 C:\opt\utmm\ssh.exe |
+| 234 | 新建 MCP 工具测试脚本 | `tests/test_mcp_tools.py` | ✅ 7 tools, ~268 行 |
+| 235 | 新建 CLI 命令测试脚本 | `tests/test_cli_commands.py` | ✅ 全部 CLI 命令, 31/31 checks |
+| 236 | SKILL.md 新增测试章节 | `SKILL.md` | ✅ MCP Tools Test + CLI Commands Test |
+| 237 | zig build test + test-integration 全部通过 | - | ✅ 188+59 |
+| 238 | 6 交叉编译目标构建 | - | ✅ 6/8 通过（x86 2 个 zio 不支持）|
+
+**设计决策**:
+
+| # | 决策 | 理由 |
+|---|------|------|
+| 65 | ssh.exe 嵌入为 comptime @embedFile | 与 utmmd.bin 嵌入模式一致；编译时嵌入，运行时零网络依赖 |
+| 66 | ssh.exe 提取 best-effort（失败不阻断） | sshpass 可回退到 PATH 查找；安装流程不应因次要组件失败而中断 |
+| 67 | ssh 路径替换用栈缓冲（非堆分配） | cmd_args 数量有限（<64），栈分配足够且避免内存泄漏 |
+| 68 | Python 测试脚本用 subprocess 管道 | 直接测试 CLI 输出和 MCP JSON-RPC，无需额外依赖 |
+
+**文件清单变更（20+ src → 20 src + 2 embed + 2 test scripts）**:
+```
+src/embed/x86_64-windows/ssh.exe    ← 新建
+src/embed/aarch64-windows/ssh.exe   ← 新建
+tests/test_mcp_tools.py             ← 新建
+tests/test_cli_commands.py          ← 新建
+src/main.zig                        ← 修改（+50 行）
+src/sshpass.zig                     ← 修改（+30 行）
+SKILL.md                            ← 修改
+```
 
 ## 架构概述
 

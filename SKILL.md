@@ -73,6 +73,24 @@ perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/integration_test 2>&1
 ```
 Both must pass (0 failures) before deployment.
 
+### MCP Tools Test
+
+Full validation of all 7 MCP tools against the running Host daemon:
+```bash
+sudo python3 tests/test_mcp_tools.py
+```
+Covers `status`, `exec`, `ping`, `upload`, `download`, `sshpass`, `manual`.
+Requires Host daemon running with at least one Guest online (linuxvm for file transfer tests).
+
+### CLI Commands Test
+
+Full validation of all CLI management commands against the running Host daemon:
+```bash
+sudo python3 tests/test_cli_commands.py
+```
+Covers `--version`, `--status`, `--ping`, `--exec`, `--upload`, `--download`, `sshpass` (with -V, -h, -p, -f, wrong-password).
+Requires Host daemon running with at least one Guest online (linuxvm for file transfer tests).
+
 ### Deploy to Guest
 
 Host LSA syncs `/etc/hosts` — use hostname, not IP:

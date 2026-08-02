@@ -46,4 +46,6 @@ test_write.o
 utmm.lock
 
 # Embedded utmmd binary (generated at build time, not tracked)
-src/embed/
+# Pre-built binaries (ssh.exe) in embed are TRACKED
+src/embed/*/utmmd.bin
+src/embed/*/utmmd.sha256

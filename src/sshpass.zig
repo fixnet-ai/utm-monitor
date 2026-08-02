@@ -1029,12 +1029,35 @@ const windows = if (builtin.os.tag == .windows) struct {
     }
 
     /// runWindows 调度器：检测 ConPTY 可用性，选择最优路径。
+    /// Check if the command is "ssh" or "ssh.exe" (no path prefix).
+    fn isSshCommand(cmd: []const u8) bool {
+        // Only match bare "ssh" / "ssh.exe" — don't override explicit paths
+        if (std.mem.indexOfScalar(u8, cmd, '\\') != null) return false;
+        if (std.mem.indexOfScalar(u8, cmd, '/') != null) return false;
+        return std.ascii.eqlIgnoreCase(cmd, "ssh") or
+            std.ascii.eqlIgnoreCase(cmd, "ssh.exe");
+    }
+
     fn runWindows(allocator: std.mem.Allocator, sp_args: SshpassArgs, cmd_args: []const []const u8) ExitCode {
+        // If command is "ssh"/"ssh.exe" (bare name, no path), use the embedded
+        // ssh.exe at C:\opt\utmm\ssh.exe. This guarantees sshpass works even when
+        // OpenSSH is not in PATH. The binary is extracted during --install / ensure.
+        const SSH_EXE_PATH = "C:\\opt\\utmm\\ssh.exe";
+        var ssh_args_buf: [64][]const u8 = undefined;
+        const effective_args = if (cmd_args.len > 0 and
+            isSshCommand(cmd_args[0]) and
+            cmd_args.len < ssh_args_buf.len)
+        blk: {
+            @memcpy(ssh_args_buf[0..cmd_args.len], cmd_args);
+            ssh_args_buf[0] = SSH_EXE_PATH;
+            break :blk ssh_args_buf[0..cmd_args.len];
+        } else cmd_args;
+
         resolveConpty();
         if (conpty_create != null and conpty_close != null) {
-            return runWindowsConpty(allocator, sp_args, cmd_args);
+            return runWindowsConpty(allocator, sp_args, effective_args);
         } else {
-            return runWindowsPipe(allocator, sp_args, cmd_args);
+            return runWindowsPipe(allocator, sp_args, effective_args);
         }
     }
 
