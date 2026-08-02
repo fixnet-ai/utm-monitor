@@ -18,9 +18,11 @@ See `SKILL.md` at project root for the current VM table. Quick reference:
 | Linux | linuxvm | aarch64-linux-musl | 192.168.64.6 | root |
 | macOS | macvm | aarch64-macos | 192.168.65.4 | root |
 | Windows ARM | windowsvm | aarch64-windows | 192.168.64.3 | Administrator |
-| Windows x64 | modasiaipc | x86_64-windows | 192.168.3.108 | Administrator |
+| Windows x64 | winx64 | x86_64-windows | 192.168.3.108 | Administrator |
 
 Password for all VMs: `111`.
+
+> **deploy.json**: VM credentials can also be loaded from `/opt/utmm/deploy.json` (see MANUAL.md).
 
 ## Build
 
@@ -30,14 +32,10 @@ zig build -Doptimize=ReleaseSafe    # native (Host)
 zig build cross -Doptimize=ReleaseSafe  # all 8 targets in parallel
 ```
 
-> **Zig 0.16.0**: `zig build test` may hang on macOS (`--listen=-` bug).
-> Run binaries directly: `perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/test`
-> and same for `integration_test`. Both must pass (0 failures) before deploy.
-
 Cross-compile targets: `aarch64-linux-musl`, `x86_64-linux-musl`, `x86-linux-musl`,
 `aarch64-macos`, `x86_64-macos`, `aarch64-windows`, `x86_64-windows`, `x86-windows-gnu`.
 
-Output: `zig-out/bin/utmm-<target>` (cross build) or `zig-out/bin/utmm` (native build).
+Output: `zig-out/bin/utmm-<target>-<version>` (cross build) or `zig-out/bin/utmm` (native build).
 
 ## Deploy
 
@@ -48,26 +46,30 @@ sudo zig-out/bin/utmm --host --install
 sudo utmm --status
 ```
 
-### Guest (scp + --install)
+### Guest (manual scp + --install, using built-in utmm sshpass)
 
 ```bash
 # POSIX:
-scp zig-out/bin/utmm-<target> <user>@<hostname>:/opt/utmm/utmm-new
-ssh <user>@<hostname> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
+utmm sshpass -p 111 scp /opt/utmm/utmm-<target>-<version> <user>@<hostname>:/opt/utmm/utmm-new
+utmm sshpass -p 111 ssh <user>@<hostname> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
 
-# Windows — kill utmmd first (locks exe → AccessDenied):
-ssh Administrator@<hostname> 'taskkill /F /IM utmmd.exe 2>nul'
-scp zig-out/bin/utmm-<target>.exe Administrator@<hostname>:C:/opt/utmm/utmm-new.exe
-ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
+# Windows — use utmm sshpass, kill utmmd first (locks exe → AccessDenied):
+utmm sshpass -p 111 ssh Administrator@<hostname> 'taskkill /F /IM utmmd.exe 2>nul'
+utmm sshpass -p 111 scp /opt/utmm/utmm-<target>-<version>.exe Administrator@<hostname>:C:/opt/utmm/utmm-new.exe
+utmm sshpass -p 111 ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
 ```
+
+> **No external sshpass needed** — `utmm sshpass` is built-in. Only `ssh`/`scp` binaries required.
 
 ### Quick Deploy (all VMs via Host push)
 
 ```bash
-utmm --deploy           # zig build cross + copy to serve-dir + scp all guests
+utmm --deploy           # build + copy to serve-dir + scp all guests (cached on re-runs)
 utmm --deploy linuxvm   # single guest
-utmm --upgrade linuxvm  # push upgrade to already-deployed guest
+utmm --upgrade linuxvm  # push upgrade via SOCKS5 mesh (no SSH, zero-downtime)
 ```
+
+`--deploy` auto-detects cached binaries in serve-dir and skips recompilation.
 
 ## Daily Ops
 

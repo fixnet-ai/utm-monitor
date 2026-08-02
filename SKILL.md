@@ -93,30 +93,41 @@ Requires Host daemon running with at least one Guest online (linuxvm for file tr
 
 ### Deploy to Guest
 
-Host LSA syncs `/etc/hosts` — use hostname, not IP:
+**Automated (recommended):** `utmm --deploy` reads `deploy.json`, cross-compiles (cached),
+and pushes to all VMs using built-in `utmm sshpass`. See MANUAL.md for deploy.json format.
+
+```bash
+utmm --deploy              # all VMs
+utmm --deploy linuxvm      # single VM
+utmm --upgrade linuxvm     # push via SOCKS5 mesh (no SSH, zero-downtime)
+```
+
+**Manual deploy** using built-in `utmm sshpass` (no external sshpass needed):
 
 ```bash
 # POSIX (Linux/macOS):
-scp zig-out/bin/utmm-<target>-<ver> <user>@<hostname>:/opt/utmm/utmm-new
-ssh <user>@<hostname> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
+utmm sshpass -p <pass> scp /opt/utmm/utmm-<target>-<ver> <user>@<hostname>:/opt/utmm/utmm-new
+utmm sshpass -p <pass> ssh <user>@<hostname> 'chmod +x /opt/utmm/utmm-new && /opt/utmm/utmm-new --install --hostname <hostname>'
 
-# Windows:
-scp zig-out/bin/utmm-<target>-<ver>.exe Administrator@<hostname>:C:/opt/utmm/utmm-new.exe
-ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
+# Windows — kill utmmd first (locks exe → AccessDenied):
+utmm sshpass -p <pass> ssh Administrator@<hostname> 'taskkill /F /IM utmmd.exe 2>nul'
+utmm sshpass -p <pass> scp /opt/utmm/utmm-<target>-<ver>.exe Administrator@<hostname>:C:/opt/utmm/utmm-new.exe
+utmm sshpass -p <pass> ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --install --hostname <hostname>'
 ```
 
 ## Key Notes
 
 - **sudo required** for all commands except `sshpass` and `--version`
+- **No external sshpass** — `utmm sshpass` is built-in for all password-auth operations
+- **deploy.json** at `/opt/utmm/deploy.json` configures VM credentials for `--deploy`
+- **Serve-dir cache**: `--deploy` skips recompilation when binaries exist in serve-dir
 - **Per-command pty**: each exec opens a fresh shell. No `cd`/`export` persistence across commands
-- **ConPTY**: `--status` shows `conpty:yes/no`. Windows < 10.0.17763 falls back to pipe mode for sshpass. POSIX always `yes`
+- **ConPTY**: `--status` shows `conpty:yes/no`. Windows < 10.0.17763 falls back to pipe mode. POSIX always `yes`
 - **macOS launchctl** may throttle bootstrap — if `--install` fails, kill processes first then retry
-- **Windows SSH** does NOT handle `;` command chaining — use separate SSH calls
-- **Windows OpenSSH** must be enabled (`Add-WindowsCapability -Online -Name OpenSSH.Server`)
+- **Windows SSH** does NOT handle `;` command chaining — use `&&` or separate calls
 - **LSA sync** takes ~10-15s after guest restart before it appears in `--status`
-- **Hostname resolution**: Host LSA syncs `/etc/hosts` — use `linuxvm`/`macvm`/`windowsvm`/`winx64` instead of IPs in all commands. Note: `winx64` is on 192.168.3.x subnet and may not resolve via LSA sync — fall back to IP `192.168.3.108` if needed
-- **Build output naming**: cross-compiled binaries include version suffix (e.g. `utmm-aarch64-linux-0.17.16`)
-- **`utmm sshpass scp`** works for file copy to Guests — same password args as `utmm sshpass ssh`
+- **Build output naming**: cross-compiled binaries include version suffix (e.g. `utmm-aarch64-linux-0.17.22`)
+- **`utmm --upgrade` errors** include actionable guidance (e.g. "run --deploy first")
 
 ## Skills for Specific Workflows
 
