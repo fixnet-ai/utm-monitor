@@ -1676,3 +1676,61 @@ sc failure <name> reset=30 actions=restart/5000/restart/5000/restart/5000/none/5
 **测试验证**:
 - 188 单元测试全通过 ✅
 - 59 集成测试全通过，无内存泄漏 ✅
+
+---
+
+## v0.17.15: Windows --upgrade 推送失败修复
+
+**时间**: 2026-08-02
+
+### 根因分析
+
+`pushUpgrade` 对比已验证的 `handleUpload`，发现三个关键缺陷：
+
+| 问题 | pushUpgrade（旧） | handleUpload（正确） |
+|------|-------------------|---------------------|
+| 大文件写 | 单次 `sockWrite` 4MB，丢弃返回值 | 分块 64KB 写，循环处理短写 |
+| 响应确认 | fire-and-forget，不读响应 | 读 upload_result，验证 exit_code |
+| 连接关闭 | 写后立即 close() | 确认响应后再 close() |
+
+**故障链路推断**:
+1. macOS Host 端 `system.write(fd, buf, 4_000_000)` 对大缓冲可能短写
+2. 旧代码 `_ = tcp.sockWrite(...)` 丢弃返回值 → 短写无法检测
+3. `defer tcp_conn.deinit()` 立即 `shutdown(SHUT_RDWR)` + `close()`
+4. macOS `close()` 无 SO_LINGER 时可能丢弃内核发送缓冲中的未发送数据
+5. Guest 端 `conn.recv` 读到 0（EOF）→ `handleOneCommand` 静默返回
+6. Guest 无任何 upgrade 日志 → 升级完全未生效
+
+POSIX VM（macvm 2MB、linuxvm 14MB）成功而 Windows（4MB）失败的原因
+可能是网络时序差异：Windows 4MB 在 close() 前未能全部排入发送缓冲，
+或 send buffer 耗尽触发短写。
+
+### 修复 (src/host.zig)
+
+1. **分块写循环** — 替代单次 `sockWrite`:
+```zig
+var written: usize = 0;
+while (written < file_size) {
+    const w = tcp.sockWrite(tcp_conn.fd, file_data.ptr + written, file_size - written);
+    if (w < 0) return "WriteFailed";
+    if (w == 0) return "WriteFailed";
+    written += @intCast(w);
+}
+```
+
+2. **读 Guest 响应** — 发送后等待 upload_result:
+```zig
+const nr = tcp_conn.recv(&rbuf) catch |err| { return "ResponseReadFailed"; };
+if (nr > 0 and rbuf[0] == @intFromEnum(protocol.MsgType.upload_result)) {
+    const result = protocol.parseUploadResult(rbuf[1..nr]) orelse { ... };
+    if (result.exit_code != 0) return "UpgradeRejected";
+}
+```
+
+3. **错误传播** — 每步失败返回具体错误字符串，不再 `catch` 后吞掉
+
+**测试**: 188 单元测试全通过 ✅
+
+### 待验证
+- 下一轮部署中验证 Windows `--upgrade` 是否真正生效
+- 若问题持续，需在 Guest 端 `handleOneCommand` 入口添加更多诊断日志
