@@ -239,6 +239,10 @@ pub fn build(b: *std.Build) void {
     for (cross_targets) |query| {
         const tgt = b.resolveTargetQuery(query);
 
+        // Skip x86 targets — zio stackful coroutine framework does not support
+        // 32-bit x86 architecture (unimplemented arch in coro/coroutines.zig).
+        if (tgt.result.cpu.arch == .x86) continue;
+
         // Build utmmd for this target
         const cross_utmmd = b.addExecutable(.{
             .name = "utmmd",
