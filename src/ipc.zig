@@ -816,6 +816,7 @@ fn handleUpload(
     const ptcl = @import("protocol.zig");
 
     // Per-command TCP connection (with ARP recovery)
+    std.log.info("[ipc-upload] connecting to vm='{s}' path='{s}'", .{ vm, dest_path });
     var tcp_conn = host_mod.connectGuest(io, gpa, state, vm) catch |err| {
         std.log.err("[ipc-upload] TCP connect to {s} failed: {}", .{ vm, err });
         sendError(ipc_conn, if (err == error.GuestNotFound) "GuestNotFound" else "GuestNotConnected");

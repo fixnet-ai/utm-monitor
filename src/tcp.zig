@@ -801,11 +801,6 @@ pub const TcpListener = struct {
     port: u16 = 0,
 
     pub fn init(io: std.Io, port: u16) !TcpListener {
-        const addr = std.Io.net.IpAddress.parse("0.0.0.0", port) catch |err| {
-            std.log.err("[tcp] bind addr parse failed: {}", .{err});
-            return error.BindFailed;
-        };
-
         if (builtin.os.tag == .windows) {
             ensureWinsock2();
             const s = ws2_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -847,20 +842,50 @@ pub const TcpListener = struct {
             return TcpListener{ .server = null, .io = io, .listener_fd = s, .use_raw_accept = true, .port = actual_port };
         }
 
-        const server = addr.listen(io, .{
-            .reuse_address = true,
-            .kernel_backlog = 128,
-            .mode = .stream,
-        }) catch |err| {
-            std.log.err("[tcp] TCP listen :{d} failed: {}", .{ port, err });
+        // POSIX: raw socket — only SO_REUSEADDR, intentionally NO SO_REUSEPORT.
+        // zio's addr.listen() sets SO_REUSEPORT which causes TCP load-balancing
+        // between Host and Guest listeners on the same port, routing connections
+        // unpredictably. Use raw sockets so only one process can bind :2121.
+        const sock = system.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock < 0) {
+            std.log.err("[tcp] socket() failed: errno={d}", .{@intFromEnum(std.posix.errno(sock))});
             return error.BindFailed;
+        }
+        errdefer _ = system.close(sock);
+
+        const reuse: c_int = 1;
+        _ = system.setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, @ptrCast(&reuse), @sizeOf(c_int));
+
+        var bind_addr = sockaddr_in{
+            .family = AF_INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = 0, // INADDR_ANY
         };
+        const br = system.bind(sock, @ptrCast(&bind_addr), @sizeOf(sockaddr_in));
+        if (br < 0) {
+            std.log.err("[tcp] bind :{d} failed: errno={d}", .{ port, @intFromEnum(std.posix.errno(br)) });
+            return error.BindFailed;
+        }
 
-        const sfd = server.socket.handle;
-        const flags = std.c.fcntl(sfd, @intCast(std.posix.F.GETFD), @as(c_int, 0));
-        _ = std.c.fcntl(sfd, @intCast(std.posix.F.SETFD), @as(c_int, flags | std.posix.FD_CLOEXEC));
+        var actual_port = port;
+        if (port == 0) {
+            var name_len: std.posix.socklen_t = @sizeOf(sockaddr_in);
+            _ = system.getsockname(sock, @ptrCast(&bind_addr), &name_len);
+            actual_port = std.mem.bigToNative(u16, bind_addr.port);
+        }
 
-        return TcpListener{ .server = server, .io = io, .listener_fd = sfd, .use_raw_accept = false, .port = server.socket.address.getPort() };
+        const lr = system.listen(sock, 128);
+        if (lr < 0) {
+            std.log.err("[tcp] listen :{d} failed: errno={d}", .{ port, @intFromEnum(std.posix.errno(lr)) });
+            return error.BindFailed;
+        }
+
+        // Set non-blocking mode
+        const fcntl_flags = system.fcntl(sock, F_GETFL, @as(c_int, 0));
+        _ = system.fcntl(sock, F_SETFL, fcntl_flags | O_NONBLOCK);
+
+        std.log.info("[tcp] TCP listener bound :{d}", .{actual_port});
+        return TcpListener{ .server = null, .io = io, .listener_fd = sock, .use_raw_accept = true, .port = actual_port };
     }
 
     pub fn deinit(self: *TcpListener) void {

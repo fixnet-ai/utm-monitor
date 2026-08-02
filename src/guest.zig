@@ -1002,7 +1002,7 @@ pub fn guestTcpLoop(
 
 /// 处理一条命令（单个 TCP 连接）。
 /// 每条连接处理一条命令，命令结束即关闭。
-fn handleOneCommand(
+pub fn handleOneCommand(
     io: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
@@ -1046,7 +1046,7 @@ fn handleOneCommand(
 }
 
 /// 处理 exec 命令：dpipe_shell 创建 shell → 写入命令 → 流式读取输出 → 发送 exec_done。
-fn handleExecCmd(
+pub fn handleExecCmd(
     io: std.Io,
     allocator: std.mem.Allocator,
     info: SystemInfo,
@@ -1125,7 +1125,7 @@ fn handleExecCmd(
 }
 
 /// 处理 upload：upload_cmd 帧后的原始字节 → dpipe_file.writeFile → upload_result。
-fn handleUpload(
+pub fn handleUpload(
     io: std.Io,
     allocator: std.mem.Allocator,
     conn: *protocol.Connection,
@@ -1185,7 +1185,7 @@ fn handleUpload(
 ///
 /// 二进制写入 {canonicalDir}/utmm-upgrade（与 utmm 同目录），SHA256 hex 写入同名 .sha256 文件。
 /// utmmd 轮询发现 .sha256 文件后全权执行杀进程→替换→重启流程，Guest 不参与后续步骤。
-fn handleUpgradeCmd(
+pub fn handleUpgradeCmd(
     io: std.Io,
     allocator: std.mem.Allocator,
     conn: *protocol.Connection,
@@ -1357,7 +1357,7 @@ fn handleUpgradeCmd(
 }
 
 /// 处理 download：dpipe_file.readFile → 原始字节流发送到 TCP。
-fn handleDownload(
+pub fn handleDownload(
     io: std.Io,
     allocator: std.mem.Allocator,
     conn: *protocol.Connection,

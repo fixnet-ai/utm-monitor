@@ -436,8 +436,15 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
     _ = port; // IPC handler — port reserved for future use
     const ipc_mod = @import("ipc.zig");
 
+    // Parse "vm:path" format — extract vm hostname before the colon.
+    // target format: "macvm:/tmp/file.txt" or just "macvm" (remote_dir default).
+    const vm = if (std.mem.indexOfScalar(u8, target, ':')) |idx|
+        target[0..idx]
+    else
+        target;
+
     const basename = std.fs.path.basename(local_file);
-    const remote_dir = vmRemoteDir(target) orelse "/opt/utmm";
+    const remote_dir = vmRemoteDir(vm) orelse "/opt/utmm";
     // Always use forward slash — Windows accepts both / and \ in file paths,
     // and the Host may not be running on Windows even when the Guest is.
     const dest = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ remote_dir, basename });
@@ -445,8 +452,8 @@ fn cmdUpload(block_io: std.Io, gpa: std.mem.Allocator, port: u16, target: []cons
 
     std.debug.print("[upload] Uploading {s} -> {s} ({s})...\n", .{ local_file, target, dest });
 
-    // IPC handler
-    try ipc_mod.ipcUpload(block_io, gpa, target, local_file, dest);
+    // IPC handler — send vm to Host daemon, dest to Guest
+    try ipc_mod.ipcUpload(block_io, gpa, vm, local_file, dest);
     std.debug.print("[upload] OK\n", .{});
 }
 
@@ -707,6 +714,24 @@ fn hostTcpListen(
     shutdown: ?*std.atomic.Value(bool),
     shm_handle: ?*volatile shm.ShmLayout,
 ) !void {
+    // Get Host's own system info for self-exec (Host acts as its own Guest).
+    var host_info = guest.getSystemInfo(io, allocator) catch |err| {
+        std.log.err("[host] getSystemInfo for self-exec failed: {}", .{err});
+        return error.SystemInfoFailed;
+    };
+    defer {
+        allocator.free(host_info.hostname);
+        allocator.free(host_info.ip);
+        allocator.free(host_info.mac);
+        allocator.free(host_info.iface_name);
+        allocator.free(host_info.shell);
+    }
+    // Override hostname if passed from caller (matches startHost behavior).
+    if (!std.mem.eql(u8, host_info.hostname, hostname)) {
+        allocator.free(host_info.hostname);
+        host_info.hostname = try allocator.dupe(u8, hostname);
+    }
+
     var listener = tcp.TcpListener.init(io, mesh_port) catch |err| {
         std.log.err("[host] TCP listen :{d} failed: {}", .{ mesh_port, err });
         return error.TcpBindFailed;
@@ -777,10 +802,14 @@ fn hostTcpListen(
         if (std.mem.eql(u8, req.hostname, hostname)) {
             // 目标是本机
             if (req.port == mesh_port) {
-                // self:2121 — no utmm handler on Host side, just close
+                // self:2121 — Host acts as its own Guest, handle utmm command directly.
+                // No separate Guest process needed on the Host machine.
                 socks5.replyOk(fd);
-                tcp.sockClose(fd);
-                std.log.debug("[host] self:2121 (no handler)", .{});
+                var conn = protocol.Connection{ .fd = fd, .alive = true };
+                guest.handleOneCommand(io, allocator, host_info, &conn, shutdown, shm_handle) catch |err| {
+                    std.log.err("[host] self:2121 command failed: {}", .{err});
+                };
+                conn.deinit();
             } else {
                 // 本机 localhost relay — 连接限制计数
                 if (!conn_limit.tryAcquire()) {
@@ -1217,6 +1246,18 @@ pub const GuestTable = struct {
         self.guests.deinit(self.allocator);
     }
 
+    /// Spin-lock the table using tryLock — avoids std.Io.Mutex.lock(io) which
+    /// uses io.futexWait() requiring zio executor context (unavailable on thread pool).
+    fn lockTable(self: *GuestTable) void {
+        while (!self.mutex.tryLock()) {
+            @prefetch(@as(*const anyopaque, @ptrFromInt(0xDEAD)), .{});
+        }
+    }
+
+    fn unlockTable(self: *GuestTable) void {
+        self.mutex.unlock(self.io);
+    }
+
     fn indexOf(self: *GuestTable, hostname: []const u8) ?usize {
         for (self.guests.items, 0..) |entry, i| {
             if (std.mem.eql(u8, entry.hostname, hostname)) return i;
@@ -1227,8 +1268,8 @@ pub const GuestTable = struct {
     /// Returns a copy of the guest entry with all strings owned (duped).
     /// Caller must call freeEntry() to release the returned entry's memory.
     pub fn findByHostname(self: *GuestTable, hostname: []const u8) ?GuestEntry {
-        self.mutex.lock(self.io) catch return null;
-        defer self.mutex.unlock(self.io);
+        self.lockTable();
+        defer self.unlockTable();
         const idx = self.indexOf(hostname) orelse return null;
         const src = self.guests.items[idx];
         return GuestEntry{
@@ -1272,8 +1313,8 @@ pub const GuestTable = struct {
         role: []const u8,
         last_seen: i64,
     ) bool {
-        self.mutex.lock(self.io) catch return false;
-        defer self.mutex.unlock(self.io);
+        self.lockTable();
+        defer self.unlockTable();
         if (self.indexOf(hostname)) |idx| {
             var changed = false;
             const existing = &self.guests.items[idx];
@@ -1348,8 +1389,8 @@ pub const GuestTable = struct {
     }
 
     pub fn remove(self: *GuestTable, hostname: []const u8) void {
-        self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
+        self.lockTable();
+        defer self.unlockTable();
         const idx = self.indexOf(hostname) orelse return;
         const entry = self.guests.swapRemove(idx);
         self.allocator.free(entry.hostname);
@@ -1364,8 +1405,8 @@ pub const GuestTable = struct {
     }
 
     pub fn setMeshMac(self: *GuestTable, hostname: []const u8, mac_bytes: [6]u8) void {
-        self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
+        self.lockTable();
+        defer self.unlockTable();
         const idx = self.indexOf(hostname) orelse return;
         self.guests.items[idx].mesh_mac = mac_bytes;
     }
@@ -1373,8 +1414,8 @@ pub const GuestTable = struct {
     /// 更新 Guest IP（用于 ARP 重发现后更新）。
     /// 返回 true 表示 IP 已变更，false 表示未变更或未找到。
     pub fn updateIp(self: *GuestTable, hostname: []const u8, new_ip: []const u8) bool {
-        self.mutex.lock(self.io) catch return false;
-        defer self.mutex.unlock(self.io);
+        self.lockTable();
+        defer self.unlockTable();
         const idx = self.indexOf(hostname) orelse return false;
         const existing = &self.guests.items[idx];
         if (std.mem.eql(u8, existing.ip, new_ip)) return false;
@@ -1402,8 +1443,8 @@ fn syncHosts(
     }
 
     // Lock and collect all guest entries (skip Host itself — already added as gateway above)
-    state.mutex.lock(io) catch return;
-    defer state.mutex.unlock(io);
+    state.lockTable();
+    defer state.unlockTable();
     for (state.guests.items) |g| {
         if (g.ip.len > 0 and g.hostname.len > 0) {
             // Skip Host's own entry added at line 594 to avoid duplicate with gateway entry
