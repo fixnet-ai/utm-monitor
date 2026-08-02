@@ -7,8 +7,8 @@
 //!
 //! /etc/hosts marker block:
 //!   # UTM-MONITOR-BEGIN
-//!   192.168.64.5  macvm
-//!   192.168.64.8  linuxvm
+//!   192.168.65.4  macvm
+//!   192.168.64.6  linuxvm
 //!   # UTM-MONITOR-END
 
 const std = @import("std");
@@ -1241,8 +1241,8 @@ pub const NodeInfo = struct {
 //
 // Maintain a block wrapped by marker comments in the hosts file:
 //   # UTM-MONITOR-BEGIN
-//   192.168.64.5  macvm
-//   192.168.64.8  linuxvm
+//   192.168.65.4  macvm
+//   192.168.64.6  linuxvm
 //   # UTM-MONITOR-END
 //
 // Update logic: read file → replace marker block → write back (write to temp file then rename)

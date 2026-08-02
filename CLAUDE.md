@@ -34,7 +34,8 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
   accept + utmm frame protocol. Host is the central SOCKS5 proxy; Guests route
   through the Host via `gateway:2121` (auto-synced to every Guest's `/etc/hosts`).
   CLI and MCP use local IPC socket. MCP uses stdio — see `mcp.json.example`.
-- **8 cross-compilation targets**: aarch64/x86_64/x86 × linux-musl/macos/windows.
+- **6 cross-compilation targets**: aarch64/x86_64 × linux-musl/macos/windows.
+  (32-bit x86 targets skipped — zio does not support 32-bit x86.)
 - **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
 
 Current configuration — four VM targets tracked:
@@ -43,7 +44,7 @@ Current configuration — four VM targets tracked:
 | macOS | macvm | aarch64-macos | 192.168.65.4 | root / 111 | /opt/utmm/ |
 | Linux | linuxvm | aarch64-linux-musl | 192.168.64.6 | root / 111 | /opt/utmm/ |
 | Windows | windowsvm | aarch64-windows | 192.168.64.3 | Administrator / 111 | C:\opt\utmm\ |
-| Windows | winx64 | x86_64-windows | 192.168.3.x | Administrator / 111 | C:\opt\utmm\ |
+| Windows | winx64 | x86_64-windows | 192.168.3.108 | Administrator / 111 | C:\opt\utmm\ |
 
 ## Architecture
 
@@ -62,8 +63,9 @@ Current configuration — four VM targets tracked:
 │  arp.zig             ARP MAC→IP reverse discovery                 │
 │  lsa.zig             LSA broadcast + node table + /etc/hosts      │
 ├──────────────────────────────────────────────────────────────────┤
-│  Transport Layer                                                  │
-│  tcp.zig             Frame protocol + SOCKS5 + forwarding + conn  │
+│  Transport / Protocol Layer                                       │
+│  tcp.zig             TCP socket I/O + connection primitives       │
+│  socks5.zig          SOCKS5 protocol (RFC 1928, full)             │
 ├──────────────────────────────────────────────────────────────────┤
 │  Data Pipe Layer                                                  │
 │  dpipe.zig           DuplexPipe interface + relay engine          │
@@ -91,7 +93,7 @@ Current configuration — four VM targets tracked:
 
 ```
                ┌─────────────┐
-               │ protocol.zig │  ← zero dependencies
+               │ protocol.zig │  ← imports tcp.zig for socket_t
                └──────┬──────┘
       ┌───────────────┼───────────────┐
       ↓               ↓               ↓
@@ -248,7 +250,7 @@ Threads exit when either side closes the connection.
 
 ### Wire Protocol (protocol.zig)
 
-TCP frames: 4-byte BE length prefix (tcp.zig sendFrame/recvFrame),
+TCP frames: 4-byte BE length prefix (protocol.zig sendFrame/recvFrame),
 then inner payload = 1-byte MsgType + type-specific payload.
 Strings null-terminated, blobs 4-byte BE length prefix, integers 4-byte BE.
 File transfers use raw TCP streaming (no chunking — TCP provides reliable delivery).
@@ -287,13 +289,13 @@ pub const DuplexPipe = struct {
 };
 
 /// Bidirectional relay: a→b + b→a, dual-threaded, exits when either side closes.
-pub fn relay(io: std.Io, a: DuplexPipe, b: DuplexPipe) !void;
+pub fn relay(a: DuplexPipe, b: DuplexPipe) !void;
 ```
 
 Implementations:
 - `dpipe_shell.zig`: pty master ↔ DuplexPipe (posix_openpt/fork/execve or CreatePipe/CreateProcessW)
 - `dpipe_file.zig`: file read/write ↔ DuplexPipe with incremental SHA256
-- `tcp.Connection.duplex()`: TCP connection ↔ DuplexPipe (adapter)
+- `tcp.duplexPipe(fd, allocator)`: TCP connection ↔ DuplexPipe (adapter)
 
 ### Self-Copy Install Model
 
@@ -350,7 +352,7 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
   state.zig + cmdchan.zig deleted (~1750 lines removed).
 - **DuplexPipe vtable abstraction** (v0.13.0) — dpipe.zig defines a common interface for
   bidirectional byte streams. Implementations: dpipe_shell (pty), dpipe_file (file I/O),
-  tcp.Connection (network). dpipe.relay() bridges any two DuplexPipes — dual-threaded
+  tcp.duplexPipe (network). dpipe.relay() bridges any two DuplexPipes — dual-threaded
   bidirectional forwarding. Zig-idiomatic, extensible, testable.
 - **lsa.zig self-contained** (v0.13.0) — LSA broadcast + node table + /etc/hosts sync
   merged into one module. mesh.zig + hosts_file.zig → lsa.zig. Internal auto-sync:
@@ -396,20 +398,16 @@ zig build                    # Native build → zig-out/bin/utmm
 ```bash
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl    # → zig-out/bin/utmm-aarch64-linux
 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl     # → zig-out/bin/utmm-x86_64-linux
-zig build -Doptimize=ReleaseSafe -Dtarget=x86-linux-musl        # → zig-out/bin/utmm-x86-linux
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos         # → zig-out/bin/utmm-aarch64-macos
 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-macos          # → zig-out/bin/utmm-x86_64-macos
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows       # → zig-out/bin/utmm-aarch64-windows.exe
 zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-windows        # → zig-out/bin/utmm-x86_64-windows.exe
-zig build -Doptimize=ReleaseSafe -Dtarget=x86-windows-gnu       # → zig-out/bin/utmm-x86-windows.exe
 ```
 
 > **重要**：Debug 构建仅用于开发调试。部署、发布、CI 必须使用 `-Doptimize=ReleaseSafe`。
 > x86_64-linux-musl Debug 模式 `.data.rel.ro` 段膨胀至 20MB+，整体 80MB+；ReleaseSafe 后降至 11MB。
 >
-> 32-bit x86-linux-musl builds and passes tests. 32-bit x86-windows uses
-> `x86-windows-gnu` to avoid MinGW `_system@4` linker warning that Zig
-> promotes to error.
+> 32-bit x86 (x86-linux-musl, x86-windows-gnu) 不支持 — zio 不支持 32-bit x86。
 
 ### Tests
 ```bash
@@ -469,12 +467,12 @@ utmm --version                       # Print version and exit
 
 ### Step 1: Determine version
 Read `src/ver.txt` for the current version. Ask the user what the next version
-should be (suggest patch bump, e.g. `0.11.10` → `0.11.11`).
+should be (suggest patch bump, e.g. `0.17.16` → `0.17.17`).
 If already bumped and not yet tagged, use that.
 
 ### Step 2: Bump version (if needed)
 Update one file:
-- `src/ver.txt`: change version number (e.g. `0.11.18` → `0.11.19`)
+- `src/ver.txt`: change version number (e.g. `0.17.16` → `0.17.17`)
 
 `build.zig.zon` version is permanently `0.0.0` (never changes). Runtime version
 comes from `src/ver.txt` via `@embedFile` at compile time — single source of truth.
@@ -492,7 +490,7 @@ git push origin main --tags
 ```bash
 ./release.sh vX.Y.Z "Release notes (markdown)"
 ```
-This runs tests, cross-compiles 8 targets, creates `utmm.zip`, and calls
+This runs tests, cross-compiles 6 targets, creates `utmm.zip`, and calls
 `gh release create` to publish the GitHub release — all in one shot.
 
 Cross-compilation targets:
@@ -501,15 +499,13 @@ Cross-compilation targets:
 |---|--------|---------------|
 | 1 | `x86_64-windows` | `utmm-x86_64-windows.exe` |
 | 2 | `aarch64-windows` | `utmm-aarch64-windows.exe` |
-| 3 | `x86-windows-gnu` | `utmm-x86-windows.exe` |
-| 4 | `x86_64-macos` | `utmm-x86_64-macos` |
-| 5 | `aarch64-macos` | `utmm-aarch64-macos` |
-| 6 | `x86-linux-musl` | `utmm-x86-linux` |
-| 7 | `x86_64-linux-musl` | `utmm-x86_64-linux` |
-| 8 | `aarch64-linux-musl` | `utmm-aarch64-linux` |
+| 3 | `x86_64-macos` | `utmm-x86_64-macos` |
+| 4 | `aarch64-macos` | `utmm-aarch64-macos` |
+| 5 | `x86_64-linux-musl` | `utmm-x86_64-linux` |
+| 6 | `aarch64-linux-musl` | `utmm-aarch64-linux` |
 
-> `x86-windows` (32-bit) uses `x86-windows-gnu` target triple to work around
-> a MinGW linker warning (`_system@4`) that Zig promotes to an error.
+> 32-bit x86 targets (x86-linux-musl, x86-windows-gnu) skipped — zio does not
+> support 32-bit x86 architecture.
 
 ### Step 5: Verify
 Open the release URL printed by the script and confirm:
@@ -522,17 +518,18 @@ After release, use `utmm --deploy` to compile and copy new binaries to the
 serve-dir (`/opt/utmm/`). Then use `utmm --upgrade <vm>` to push upgrades
 to individual Guest VMs via the Host-initiated push model.
 
-## Project File Structure (19 src files + 13 test files)
+## Project File Structure (20 src files + 13 test files + 2 test scripts)
 
 ```
 src/
 ├── main.zig           Entry point, CLI parsing, mode dispatch
-├── protocol.zig       All protocol definitions (types, serialization, VERSION, buildCmdWithMarker)
+├── protocol.zig       All protocol definitions (types, frame serialization, VERSION)
 ├── fail.zig           Fast-fail helpers (err, msg — noreturn)
 ├── config.zig         Service config + file logger
 ├── arp.zig            ARP MAC→IP reverse discovery (Linux/macOS/Windows)
 ├── lsa.zig            LSA broadcast + node table + /etc/hosts + hostname→IP lookup
-├── tcp.zig            Frame protocol + SOCKS5 (accept/connect/forward/relay)
+├── tcp.zig            TCP socket I/O + connection primitives
+├── socks5.zig         SOCKS5 protocol (RFC 1928: CONNECT + BIND + UDP ASSOCIATE)
 ├── dpipe.zig          DuplexPipe interface + relay engine
 ├── dpipe_shell.zig    pty ↔ DuplexPipe (posix_openpt/CreatePipe)
 ├── dpipe_file.zig     file ↔ DuplexPipe + SHA256 verification
@@ -559,13 +556,16 @@ tests/
 ├── test_upgrade_e2e.zig    Upgrade 端到端集成测试 (pub fn test_upgrade_e2e)
 ├── test_arp.zig            ARP MAC→IP 集成测试 (pub fn test_arp)
 ├── test_hosts.zig          /etc/hosts 同步集成测试 (pub fn test_hosts)
-└── test_ipc_e2e.zig        IPC 端到端集成测试 (pub fn test_ipc_e2e)
+├── test_ipc_e2e.zig        IPC 端到端集成测试 (pub fn test_ipc_e2e)
+├── test_mcp_tools.py       MCP 工具测试脚本 (7 tools)
+└── test_cli_commands.py    CLI 命令测试脚本 (31 checks)
 ```
 
-> v0.13.0: 20 → 19 files (10 deleted, 3 added in later phases: arp.zig, sshpass.zig, testlib.zig). Deleted: state.zig, broadcast.zig, mesh.zig, hosts_file.zig,
+> v0.13.0: 20 → 19 files (10 deleted, 4 added later: arp.zig, sshpass.zig, socks5.zig, testlib.zig).
+> Deleted: state.zig, broadcast.zig, mesh.zig, hosts_file.zig,
 > tunproto.zig, tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig.
-> v0.13.2: Integration tests restructured from 8 separate executables to single binary with flat `pub fn test_xxx()` modules.
-> Run via `zig build test-integration`.
+> v0.13.2: Integration tests restructured from 8 separate executables to single binary.
+> v0.17.11: Python test scripts added for MCP + CLI coverage.
 
 ## Code of Conduct / Guidelines
 
@@ -607,15 +607,15 @@ No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
 ### TCP Frame Protocol Patterns
 
 - **Frame format**: 1-byte type + 4-byte BE length + payload. Length = payload bytes only.
-  `tcp.zig` handles frame serialization via `sendFrame`/`recvFrame`.
-- **SOCKS5**: Extracted to socks5.zig. Host accepts SOCKS5 on TCP :2121 and
-  dispatches by target hostname: self+2121 → utmm frame protocol, self+other →
-  localhost relay, other → chained SOCKS5 forward via node table. Guests accept
-  SOCKS5 from Host only (self+2121 → frame protocol, self+other → localhost relay).
-  `socks5CheckAndReply` (accept side), `socks5Connect` (connect side),
-  `socks5Forward` (chain-forward), `socks5LocalRelay` (localhost forward),
-  `socks5Relay` (bidirectional relay). Host connects to Guests via SOCKS5
-  proxy. Guest→Guest goes through Host via `gateway:2121`.
+  `protocol.zig` handles frame serialization via `sendFrame`/`recvFrame`.
+- **SOCKS5**: In `socks5.zig` (extracted from tcp.zig at v0.16.0). Host accepts SOCKS5 on
+  TCP :2121 and dispatches by target hostname: self+2121 → utmm frame protocol,
+  self+other → localhost relay, other → chained SOCKS5 forward via node table.
+  Guests accept SOCKS5 from Host only (self+2121 → frame protocol, self+other →
+  localhost relay). Key API: `socks5.checkAndReply` (accept side), `socks5.connect`
+  (connect side), `socks5.forward` (chain-forward), `socks5.localRelay` (localhost
+  forward), `socks5.relay` (bidirectional relay), `socks5.hostConnect` (Host→Guest
+  via SOCKS5 proxy). Guest→Guest goes through Host via `gateway:2121`.
 - **Windows socket handle compatibility**: On Windows, Zig 0.16.0's `IpAddress.connect()`
   returns AFD kernel handles which are NOT compatible with Winsock2 `recv`/`send`.
   `sockAccept` returns raw Winsock2 SOCKET handles. These two handle types cannot
@@ -639,8 +639,9 @@ No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
 
 - **Vtable not generics**: `DuplexPipe` uses a vtable pointer — no comptime generics,
   fast compilation. Each implementation (shell, file, tcp) has its own vtable instance.
-- **relay() threading**: `dpipe.relay()` spawns two threads (a→b and b→a). Either side
-  closing triggers the other to close. Uses `std.Io.Event` for coordination.
+- **relay() threading**: `dpipe.relay()` spawns two zio `spawnBlocking` tasks (a→b and
+  b→a). Either side closing sets a shared `std.atomic.Value(bool)` done flag to
+  trigger the other side to close.
 - **guest.zig uses individual read/write, not relay()**: The guest command handler uses
   manual read/write loops with `scanForMarker` for protocol-aware processing — the
   relay() engine is used by higher-level orchestration.

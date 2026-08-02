@@ -161,7 +161,7 @@ newline-delimited. Log traffic goes to stderr, JSON-RPC to stdout.
 
 ```
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05",...}}
-← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.14.7"},"capabilities":{"tools":{}}}}
+← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.17.16"},"capabilities":{"tools":{}}}}
 
 → {"jsonrpc":"2.0","method":"notifications/initialized"}
 ← (empty response — notification, no id)
@@ -199,7 +199,7 @@ See [sshpass Subcommand](#sshpass-subcommand) for the full CLI reference.
 **status** — list all nodes:
 ```
 → {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}
-← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"**Connected Machines:**\n- **linuxvm** (guest) — aarch64-linux-musl | IP: 192.168.64.6 | MAC: 16:a0:6c:... | v0.14.7 | shell: bash | status: online\n..."}]}}
+← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"**Connected Machines:**\n- **linuxvm** (guest) — aarch64-linux-musl | IP: 192.168.64.6 | MAC: 16:a0:6c:... | v0.17.16 | shell: bash | status: online\n..."}]}}
 ```
 
 **exec** — execute a command:

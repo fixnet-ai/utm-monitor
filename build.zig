@@ -2,7 +2,7 @@ const std = @import("std");
 
 /// Map build target to versioned deployment filename.
 /// Reads ver.txt via @embedFile at build time and appends '-VERSION' suffix.
-/// Windows: version is inserted before .exe (utmm-x86_64-windows-0.11.19.exe).
+/// Windows: version is inserted before .exe (utmm-x86_64-windows-0.17.16.exe).
 /// See utm-vm/MANUAL.md §6.x for the full compatibility matrix.
 ///
 /// 32-bit x86 Windows uses x86-windows-gnu target triple (not x86-windows).

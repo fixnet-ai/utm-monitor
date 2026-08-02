@@ -134,7 +134,7 @@ zig build test-integration         # Integration tests
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
-# ... plus x86_64 and x86 variants for all three platforms (8 targets total)
+# ... plus x86_64 variants for all three platforms (6 targets total; 32-bit x86 skipped — zio limitation)
 ```
 
 **Requirements**: Zig 0.16.0, macOS build host (other hosts may work, untested).
