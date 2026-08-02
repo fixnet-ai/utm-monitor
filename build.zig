@@ -132,6 +132,15 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&target_install.step);
     }
 
+    // macOS: ad-hoc re-sign after install — cross-compiled or scp-transferred
+    // binaries get tainted signatures, and Apple Silicon kills them with SIGKILL.
+    if (target.result.os.tag == .macos) {
+        const sign_exe = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-" });
+        sign_exe.addFileArg(exe.getEmittedBin());
+        sign_exe.step.dependOn(&exe.step);
+        b.getInstallStep().dependOn(&sign_exe.step);
+    }
+
     // Run command
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -289,6 +298,14 @@ pub fn build(b: *std.Build) void {
         const cross_filename = deploymentFilename(b, tgt.result);
         const cross_install = b.addInstallBinFile(cross_exe.getEmittedBin(), cross_filename);
         cross_install.step.dependOn(&cross_exe.step);
+
+        // macOS: ad-hoc re-sign cross-compiled binary (see note above)
+        if (tgt.result.os.tag == .macos) {
+            const cross_sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-" });
+            cross_sign.addFileArg(cross_exe.getEmittedBin());
+            cross_sign.step.dependOn(&cross_exe.step);
+            cross_install.step.dependOn(&cross_sign.step);
+        }
 
         cross_step.dependOn(&cross_install.step);
     }
