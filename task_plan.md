@@ -1054,6 +1054,40 @@ windowsvm 事件日志中多次出现：
 
 ---
 
+### v0.17.16: utmmd Windows 文件 I/O 修复 🔧
+
+**根因**: utmmd.zig 中 `checkPendingUpgrade` 等文件操作函数直接使用 zio event loop I/O，
+Windows IOCP 不支持文件 I/O（stat、open、read、rename、delete），导致 utmmd 永远检测不到
+升级标记文件 `.sha256`，升级二进制无法被消费，VM 永远停留在旧版本。
+
+**修复方案**: `monitorLoop` 中创建条件 `std.Io.Threaded`（仅 Windows），传递 `file_io` 给所有文件 I/O 函数。
+
+**修改函数签名**:
+```zig
+fn checkPendingUpgrade(file_io: std.Io) bool
+fn computeSha256Hex(alloc: std.mem.Allocator, file_io: std.Io, path: []const u8) ![]const u8
+fn readFileAlloc(alloc: std.mem.Allocator, file_io: std.Io, path: []const u8) ![]const u8
+fn applyUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator, proc: ?ProcessRef) !RestartReason
+fn copyFileUpgradeFallback(file_io: std.Io, src: []const u8, dst: []const u8) !void
+fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmLayout, proc: ProcessRef) RestartReason
+```
+
+**并发升级保护导致的拒绝服务**:
+- Guest `handleUpgradeCmd` 检查 `.sha256` 标记文件是否存在，若存在则拒绝新推送
+- 当 utmmd 无法消费升级时（IOCP bug），标记文件永久残留，阻止所有后续升级
+- EPIPE 错误链：Host 发送 upgrade_cmd → Guest 检测残留标记 → 发送 upload_result(-1) → 关闭连接 → Host 写 raw binary 收到 EPIPE
+
+**windowsvm 恢复**:
+- 早期 `ren` 命令部分执行导致 utmm.exe 被重命名、服务崩溃
+- UTM-MonitorD 服务停止（WIN32_EXIT_CODE 1067）
+- 通过 SSH (`utmm sshpass`) 直接执行 `sc start UTM-MonitorD` 恢复
+- windowsvm 已成功升级到 v0.17.16，exec/upload/download 全部正常
+
+**状态**: ✅ v0.17.16 发布（188 单测+59 集成测试通过，6 交叉编译目标），5 节点全部 v0.17.16 serving。
+
+**已知遗留**:
+- **[P2]** Guest `handleUpgradeCmd` 并发保护逻辑应处理残留 .sha256 marker：当仅有标记文件（upgrade 二进制不存在）时应清理标记而非拒绝。utmmd.zig `checkPendingUpgrade` 已有此逻辑，guest.zig 需同步。
+
 ### v0.17.15: Windows --upgrade 推送失败修复 🔧
 
 **根因**: `pushUpgrade` fire-and-forget 模式三个缺陷导致 Windows VM 升级推送静默失败：

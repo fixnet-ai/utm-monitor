@@ -2,6 +2,49 @@
 
 **时间**: 2026-08-02
 
+### v0.17.16: utmmd Windows 文件 I/O 修复 + 全量部署验证
+
+**背景**: v0.17.14/15 部署后 Windows VM 升级推送成功写入文件但 utmmd 无法检测，
+根因是 utmmd.zig 中文件操作使用 zio IOCP event loop，Windows IOCP 不支持文件 I/O。
+与 v0.17.13 在 guest.zig 中修复的同类 bug。
+
+**修复** (`src/utmmd.zig`):
+- `monitorLoop` 中创建条件 `std.Io.Threaded`（仅 Windows），传递 `file_io` 给所有文件 I/O 函数
+- 修改函数：checkPendingUpgrade、computeSha256Hex、readFileAlloc、applyUpgrade、copyFileUpgradeFallback、monitorUtmm
+- 清理 `host.zig` 中临时 debug 日志
+
+**发布**: v0.17.16 — 188 单测 + 59 集成测试通过，6/8 交叉编译目标（x86 跳过，zio 限制）
+
+**部署验证**:
+
+| VM | 升级方式 | 结果 |
+|----|---------|------|
+| Host (macOS) | 本地构建 | ✅ v0.17.16 serving |
+| linuxvm | --upgrade 推送 | ✅ v0.17.16 serving |
+| macvm | --upgrade 推送 | ✅ v0.17.16 serving |
+| winx64 | 批处理脚本手动升级 | ✅ v0.17.16 serving |
+| windowsvm | SSH sc start 恢复服务 | ✅ v0.17.16 serving |
+
+**功能验证（windowsvm 恢复后）**:
+
+| 功能 | 结果 |
+|------|------|
+| exec | ✅ |
+| upload | ✅ |
+| download | ✅ 49 bytes SHA256 一致 |
+| ping | ✅ rtt_ms=0 |
+
+**windowsvm 恢复详情**:
+- 早期 ren 命令部分执行导致 utmm 服务崩溃，UTM-MonitorD 停止（WIN32_EXIT_CODE 1067）
+- 通过 utmm sshpass SSH 直接执行 sc start UTM-MonitorD 恢复
+- 服务启动后 utmmd spawn utmm，LSA 广播恢复，TCP handler 正常
+
+**发现的并发保护问题**:
+- Guest handleUpgradeCmd 检查 .sha256 标记文件是否存在，若存在则拒绝新推送
+- 当 utmmd 无法消费升级时（IOCP bug），标记文件永久残留，阻止所有后续升级
+- 修复 utmmd IOCP bug 后此问题不再触发，但 handleUpgradeCmd 应处理残留 marker 情况
+- [P2] 待修复：仅 .sha256 marker 残留（upgrade 二进制不存在）时应清理标记而非拒绝
+
 ### 修复: installLinux() 缺少 systemd Restart 指令
 
 **根因**: `svc.zig` 中 `installLinux()` 和 `genInit(.linux)` 生成的 systemd service 配置不一致：
