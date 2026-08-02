@@ -2,12 +2,12 @@
 
 ## 状态：持续迭代中 🔄
 
-**最新版本**: v0.17.19 — 升级文件机制重构 + 文件传输统一 + Gatekeeper 隔离清除
+**最新版本**: v0.17.20 — 8 CPU 架构 + zio 网络错误映射修复
 
 - **分支**: `main`
 - **源文件**: 20 src + 13 test + 2 embed + 2 Python test scripts
 - **测试**: 188 单元测试 + 59 集成测试 + 2 Python test scripts，全部通过，0 泄漏
-- **交叉编译**: 6/8 通过（x86 的 2 个 zio 不支持）
+- **交叉编译**: 8/8 通过 🎉（x86 32-bit 已补全）
 
 ## 当前阶段: Phase 28 — 升级文件机制重构 + 文件传输统一 🟢
 
@@ -1101,3 +1101,98 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
 **修复**: 对齐 `handleUpload` 的已验证模式 — 分块写+短写处理+读响应确认。
 
 **状态**: ✅ 修复已提交 (1f983b1)，待真机部署验证。
+
+---
+
+## Phase 29: v0.17.20 — 8 CPU 架构 + zio 网络错误映射修复
+
+**时间**: 2026-08-03
+
+### 背景
+
+两个独立但相关的改进合并到一个版本：
+1. zio 在网络 IP 变化、网卡拔出、网络不可用情况下返回 `error.Unexpected` 而非正确的类型化错误
+2. utm-monitor 交叉编译仅 6/8 目标通过，x86 32-bit（x86-linux-musl、x86-windows-gnu）因 zio 不支持而跳过
+
+### zio 网络错误映射修复
+
+**根因**: `zio/src/os/net.zig` 中 5 个 errno 映射函数缺少 7 个网络相关 errno 值的映射：
+
+| 函数 | 缺失的 errno | 修复 |
+|------|-------------|------|
+| `errnoToConnectError` POSIX | `NETDOWN` | → `error.NetworkUnreachable` |
+| `errnoToRecvError` POSIX | `HOSTUNREACH`, `HOSTDOWN`, `NETUNREACH` | → `error.NetworkUnreachable` |
+| `errnoToRecvError` Windows | `EHOSTUNREACH`, `ENETUNREACH` | → `error.NetworkUnreachable` |
+| `errnoToSendError` POSIX | `NETUNREACH`, `CONNABORTED`, `OPNOTSUPP` | → `error.NetworkUnreachable` / `error.ConnectionResetByPeer` / `error.AccessDenied` |
+| `errnoToSendError` Windows | `ENETUNREACH` | → `error.NetworkUnreachable` |
+| `RecvError` 错误集 | `NetworkUnreachable` | 新增错误变体 |
+
+**超时类 errno 检查结果**: `ETIMEDOUT`/`TIMEDOUT` 已在全部 4 个映射函数中覆盖，无需修改。
+
+**zio IO 层修复** (`src/io.zig`):
+- `recvErrToReadErr`: 新增 `error.NetworkUnreachable => error.Unexpected`（兼容 Zig 标准库 `Reader.Error`）
+- `recvMsgErrToReceiveErr`: 同上
+
+**影响**: 当网络电缆拔出或 IP 变更时，应用程序现在能收到正确的类型化错误（`NetworkUnreachable`、`ConnectionResetByPeer`），而非模糊的 `error.Unexpected`。
+
+**测试**: zio 595/595 单元测试全通过 ✅
+
+### zio x86 32-bit 协程支持
+
+**修改文件**:
+1. `zio/src/coro/coroutines.zig` — 4 个 switch 分支添加 `.x86`:
+   - `Context`: IA-32 cdecl 寄存器上下文（esp/ebp/eip），16 字节栈对齐
+   - `setupContext`: 初始化协程栈帧
+   - `switchContext`: AT&T 汇编上下文切换（leal/movl/jmpl）
+   - `coroEntry`: cdecl 调用约定入口跳板（栈传参）
+2. `zio/src/ev/backends/iocp.zig` — `InflightInt` 按架构选择：`.x86 => u32`（兼容 32 位原子操作）
+
+**代码量**: ~90 行新增，单文件聚焦。
+
+**关键设计决策**:
+- 初版仅支持 Linux musl（`x86-linux-musl`），Windows 需额外 TIB 支持
+- Windows 使用 `x86-windows-gnu` ABI（非 msvc），避免 MinGW `_system@4` 链接警告
+- 16 字节栈对齐（System V ABI），与 x86_64 相同
+
+**测试**: zio 595/595 单元测试全通过 ✅（含 x86 协程切换测试）
+
+### utm-monitor 交叉编译 8/8
+
+**修改文件**:
+1. `build.zig` — 删除 x86 arch skip 逻辑，`cross_targets` 数组新增 `.x86-windows-gnu` 和 `.x86-linux-musl`
+2. `release.sh` — `6` → `8`（预期二进制数量），更新提示信息
+3. `build.zig.zon` — zio 依赖改为本地路径（开发阶段）
+
+**8 个编译目标**:
+
+| # | Target | 输出二进制 | 状态 |
+|---|--------|-----------|------|
+| 1 | `x86_64-windows` | `utmm-x86_64-windows.exe` | ✅ |
+| 2 | `aarch64-windows` | `utmm-aarch64-windows.exe` | ✅ |
+| 3 | `x86-windows-gnu` | `utmm-x86-windows.exe` | ✅ 新增 |
+| 4 | `x86_64-macos` | `utmm-x86_64-macos` | ✅ |
+| 5 | `aarch64-macos` | `utmm-aarch64-macos` | ✅ |
+| 6 | `x86-linux-musl` | `utmm-x86-linux` | ✅ 新增 |
+| 7 | `x86_64-linux-musl` | `utmm-x86_64-linux` | ✅ |
+| 8 | `aarch64-linux-musl` | `utmm-aarch64-linux` | ✅ |
+
+**测试**: 188 单元测试 + 59 集成测试全通过 ✅
+
+### 已发布
+
+- **zio**: `feat/x86-32` 分支已推送至 `git@github.com:fixnet-ai/zio.git`
+- **utm-monitor**: v0.17.20 tag + GitHub release（含 8 平台二进制 + ver.txt）
+- **依赖**: utm-monitor `build.zig.zon` 暂用本地路径指向 zio，待 zio 上游合并后更新为 URL+hash
+
+### 决策记录
+
+1. **超时类 errno 检查**: 确认 `ETIMEDOUT`/`TIMEDOUT` 已在全部 4 个映射函数中覆盖，无需修改。超时场景不会产生 `error.Unexpected`。
+2. **x86 Windows ABI 选择**: 使用 `x86-windows-gnu` 而非默认 `x86-windows`（msvc）。MinGW 在 32 位模式下表现更好，避免 Zig 0.16.0 将 `_system@4` 链接警告提升为错误。
+3. **x86 协程初版范围**: 仅 Linux musl。Windows 32 位需额外的 TIB (Thread Information Block) 支持，留待后续。
+4. **依赖管理**: zio 尚未合并上游，uttm-monitor 临时使用本地路径依赖。待 zio PR 合并后切换为 URL+hash。
+
+### 已知遗留
+
+- **[P3]** zio x86 32-bit Windows 协程需 TIB 支持（`src/coro/coroutines.zig` `coroEntry` 中 `switchContext` 需保存/恢复 `%fs` 段寄存器指向的 TIB）
+- **[P3]** zio 上游 PR 待提交（`feat/x86-32` 分支在 fixnet-ai fork）
+- **[P3]** build.zig.zon zio 依赖从本地路径切回 URL+hash

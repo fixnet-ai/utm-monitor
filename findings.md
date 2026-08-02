@@ -904,3 +904,92 @@ SSE (xmm0-7)、mxcsr、eflags、fpsr、fpcr。
 - QEMU 测试/调试：4-8 小时（汇编 bug 难以定位）
 - 提 PR + 审查迭代：取决于上游响应速度
 - **总时间：1-3 天**
+
+**实施结果** (2026-08-03): ✅ 方案 A 完成。修改 2 个文件（`coro/coroutines.zig` + `ev/backends/iocp.zig`），
+~90 行新增。`feat/x86-32` 分支已推送 fixnet-ai/zio。595/595 测试通过。
+x86-linux-musl 和 x86-windows-gnu 交叉编译验证通过。
+
+---
+
+## 2026-08-03 — zio 网络错误映射修复 + v0.17.20 发布
+
+### Finding 209: zio 网络 errno 映射缺失导致 error.Unexpected
+
+**背景**: 网络 IP 变化、网线拔出、网络不可用时，zio 返回 `error.Unexpected` 而非正确的类型化错误，
+导致调用方无法区分"预期的网络故障"和"真正的 bug"。
+
+**根因**: `zio/src/os/net.zig` 中 5 个 errno 映射函数缺少 7 个网络 errno 值：
+
+| 函数 | 平台 | 缺失值 | 修复映射 |
+|------|------|--------|---------|
+| `errnoToConnectError` | POSIX | `NETDOWN` | `error.NetworkUnreachable` |
+| `errnoToRecvError` | POSIX | `HOSTUNREACH`, `HOSTDOWN`, `NETUNREACH` | `error.NetworkUnreachable` |
+| `errnoToRecvError` | Windows | `EHOSTUNREACH`, `ENETUNREACH` | `error.NetworkUnreachable` |
+| `errnoToSendError` | POSIX | `NETUNREACH`, `CONNABORTED`, `OPNOTSUPP` | `error.NetworkUnreachable` / `ConnectionResetByPeer` / `AccessDenied` |
+| `errnoToSendError` | Windows | `ENETUNREACH` | `error.NetworkUnreachable` |
+
+**关键发现**: 缺失的 errno 不会导致编译错误，因为所有错误集都包含 `Unexpected` 作为合法成员。
+这些 errno 走到 `unexpectedError()`（`os/base.zig`）返回 `error.Unexpected`——语义上正确（不是 panic），
+但对调用方而言信息丢失严重。
+
+**修复文件**:
+- `zio/src/os/net.zig`: +8 行，5 个映射函数
+- `zio/src/io.zig`: +2 行，`recvErrToReadErr` + `recvMsgErrToReceiveErr`（`NetworkUnreachable` → `Unexpected`，因 Zig 标准库 `Reader.Error` 不含此错误）
+
+### Finding 210: zio 超时类 errno 已全覆盖
+
+**检查范围**: `errnoToConnectError`、`errnoToAcceptError`、`errnoToRecvError`、`errnoToSendError` 全部 4 个映射函数。
+
+**结论**: `ETIMEDOUT`（POSIX）/ `TIMEDOUT`（Windows）已在所有 4 个函数中映射到 `error.ConnectionTimedOut`。
+超时场景不会产生 `error.Unexpected`。无需修改。
+
+### Finding 211: zio IO 层 NetworkUnreachable 传播路径
+
+**根因**: `RecvError` 新增 `NetworkUnreachable` 后，`src/io.zig` 中两个错误转换函数触发了
+Zig 编译器的"switch must handle all possibilities"错误：
+
+- `recvErrToReadErr` (line 2305): 将 `RecvError` → `Io.net.Stream.Reader.Error`
+- `recvMsgErrToReceiveErr` (line 2329): 将 `RecvError` → `Io.net.Socket.ReceiveError`
+
+Zig 标准库的 `Reader.Error` 和 `ReceiveError` 不包含 `NetworkUnreachable`，因此必须映射到 `error.Unexpected`。
+
+**修复**:
+```zig
+// recvErrToReadErr + recvMsgErrToReceiveErr:
+error.NetworkUnreachable => error.Unexpected,  // 新增
+```
+
+**影响范围**: 仅在调用 `Io.net.Stream.Reader.read()` 或 `Io.net.Socket.receive()` 时可能触发，
+而 utm-monitor 使用 tcp.zig 的 sockRead/sockWrite（直接系统调用），不受此影响。
+
+### Finding 212: x86 32-bit 协程实现完成 — zio 8/8 架构支持
+
+**实施**: 修改 `zio/src/coro/coroutines.zig` 4 个 switch 分支 + `ev/backends/iocp.zig` 1 个 switch 分支。
+
+**Context 结构**:
+```zig
+.x86 => extern struct {
+    esp: u32,  ebp: u32,  eip: u32,
+    stack_info: StackInfo,
+    tsan_fiber: tsan.Fiber = tsan.none,
+    pub const stack_alignment = 16,
+},
+```
+
+**switchContext 汇编** (AT&T):
+```asm
+leal 0f, %edx
+movl %esp, 0(%eax)    // save sp
+movl %ebp, 4(%eax)    // save bp
+movl %edx, 8(%eax)    // save pc
+movl 0(%ecx), %esp    // restore sp
+movl 4(%ecx), %ebp    // restore bp
+jmpl *8(%ecx)         // jump to pc
+0:
+```
+
+**IOCP 兼容**: `InflightInt` 按架构选择 — `.x86 => u32`（32 位原子操作），其余 `u64`。
+
+**测试**: 595/595 通过 ✅。`feat/x86-32` 分支已推送 fixnet-ai/zio。
+
+**遗留**: Windows x86 32-bit 协程需 TIB 支持（`%fs` 段寄存器），初版仅 Linux musl。

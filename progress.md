@@ -1,3 +1,85 @@
+## v0.17.20 — 8 CPU 架构 + zio 网络错误映射修复
+
+**时间**: 2026-08-03
+
+### Part 1: zio 网络错误映射修复
+
+**问题**: 网络 IP 变化、网卡拔出、网络不可用时，zio 的 errno 映射函数将
+`ENETUNREACH`、`EHOSTUNREACH`、`EHOSTDOWN` 等落入 `unexpectedError()`，
+返回 `error.Unexpected` 而非 `error.NetworkUnreachable`。
+
+**调查过程**:
+1. 检查 `zio/src/os/net.zig` 全部 5 个 errno 映射函数
+2. 逐函数核对 POSIX 和 Windows 分支覆盖的 errno 值
+3. 确认超时类 errno（`ETIMEDOUT`/`TIMEDOUT`）已在全部 4 个映射函数中覆盖 ✅
+
+**修复** (`zio/src/os/net.zig`):
+- `errnoToConnectError` POSIX: 新增 `NETDOWN` → `NetworkUnreachable`
+- `errnoToRecvError` POSIX: 新增 `HOSTUNREACH, HOSTDOWN, NETUNREACH` → `NetworkUnreachable`
+- `errnoToRecvError` Windows: 新增 `EHOSTUNREACH, ENETUNREACH` → `NetworkUnreachable`
+- `errnoToSendError` POSIX: 新增 `NETUNREACH` + `CONNABORTED` + `OPNOTSUPP`
+- `errnoToSendError` Windows: 新增 `ENETUNREACH` → `NetworkUnreachable`
+
+**IO 层修复** (`zio/src/io.zig`):
+- `recvErrToReadErr`: 新增 `NetworkUnreachable => Unexpected`
+- `recvMsgErrToReceiveErr`: 同上
+- 原因: `Io.net.Stream.Reader.Error` 不含 `NetworkUnreachable`，需映射到 `Unexpected`
+
+**测试**: zio 595/595 ✅
+
+### Part 2: zio x86 32-bit 协程支持
+
+**背景**: utm-monitor 交叉编译仅 6/8 目标通过，缺失 x86 32-bit 两个目标。
+根因是 zio `coro/coroutines.zig` 未实现 `.x86` 架构的协程上下文切换。
+
+**实施**:
+- `coro/coroutines.zig`: 4 个 switch 分支添加 `.x86`（Context、setupContext、switchContext、coroEntry）
+- `ev/backends/iocp.zig`: `InflightInt` 添加 `.x86 => u32`
+- `feat/x86-32` 分支推送 fixnet-ai/zio
+
+**设计要点**:
+- IA-32 cdecl 调用约定，16 字节栈对齐（System V ABI）
+- AT&T 汇编语法（leal/movl/jmpl）
+- IOCP 32 位原子兼容（u32 替代 u64）
+- 初版仅 Linux musl，Windows 需额外 TIB 支持
+
+**测试**: zio 595/595 ✅
+
+### Part 3: utm-monitor 交叉编译 8/8
+
+**修改**:
+- `build.zig`: 删除 x86 arch skip 逻辑，新增 x86-windows-gnu 和 x86-linux-musl
+- `release.sh`: 预期二进制数 6→8
+- `build.zig.zon`: zio 依赖改为本地路径
+
+**8 目标编译验证**: ✅
+```
+x86_64-windows       ✅  15MB
+aarch64-windows      ✅  14MB
+x86-windows-gnu      ✅  13MB  (新增)
+x86_64-macos         ✅  13MB
+aarch64-macos        ✅  13MB
+x86-linux-musl       ✅  11MB  (新增)
+x86_64-linux-musl    ✅  11MB
+aarch64-linux-musl   ✅  11MB
+```
+
+### Part 4: 发布
+
+- **版本**: v0.17.20
+- **Tag**: `git tag -a v0.17.20`
+- **Release**: GitHub release 含 utmm.zip（8 二进制 + ver.txt）
+- **测试**: 188 单元测试 + 59 集成测试 ✅
+
+### 决策
+
+1. 超时类 errno 无需修改 — 已全覆盖
+2. x86 Windows 使用 gnu ABI（非 msvc）— 避免 `_system@4` 链接警告
+3. zio 依赖暂用本地路径 — 待上游合并后切换
+4. 两个独立改进合并一个版本发布 — 减少发布次数
+
+---
+
 ## v0.17.19 — 升级文件机制重构：SHA256 嵌入文件名 + 文件锁替代 .sha256 标记
 
 **时间**: 2026-08-02

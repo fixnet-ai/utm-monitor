@@ -70,10 +70,11 @@ const utmmd_sha256_hex: [:0]const u8 = switch (builtin.cpu.arch) {
 /// Embedded ssh.exe for Windows targets — extracted to canonical directory
 /// so sshpass can always find it even when system OpenSSH is not in PATH.
 /// Target-specific: embed/{arch}-{os}/ssh.exe, selected at comptime via builtin.
-/// Empty on non-Windows / unsupported arch (x86 excluded — no x86 OpenSSH available).
+/// Empty on non-Windows. x86 (32-bit) reuses the x86_64 binary — CreateProcessW
+/// handles cross-architecture launch, and 32-bit-only Windows is essentially extinct.
 const ssh_exe_bin: []const u8 = if (builtin.os.tag == .windows) switch (builtin.cpu.arch) {
     .aarch64 => @embedFile("embed/aarch64-windows/ssh.exe"),
-    .x86_64 => @embedFile("embed/x86_64-windows/ssh.exe"),
+    .x86_64, .x86 => @embedFile("embed/x86_64-windows/ssh.exe"),
     else => &.{},
 } else &.{};
 
