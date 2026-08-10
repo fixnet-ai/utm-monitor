@@ -92,7 +92,19 @@ Host TCP :2121 accept → peek first byte:
 
 - **zio PR #646**: 等待 lalinsky re-review 后合并
 
----
+### 8 交叉编译目标
+
+v0.18.0 实测确认 zio feat/x86-32 分支已支持 32-bit x86。8 目标全部编译通过：
+- aarch64-linux-musl ✅ (~14MB)
+- aarch64-macos ✅ (~2.1MB)
+- aarch64-windows ✅ (~3.6MB)
+- x86-linux-musl ✅ (~12MB)
+- x86-windows ✅ (~4.2MB)
+- x86_64-linux-musl ✅ (~14MB)
+- x86_64-macos ✅ (~2.3MB)
+- x86_64-windows ✅ (~4.1MB)
+
+### 待跟进
 
 ## v0.17.21 — x86 ssh.exe 嵌入 + zio review 修复 + 全量部署
 

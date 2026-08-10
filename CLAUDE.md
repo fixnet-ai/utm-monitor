@@ -55,8 +55,8 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
   central SOCKS5 proxy; Guests route through the Host via `gateway:2121`
   (auto-synced to every Guest's `/etc/hosts`). CLI management commands use
   local IPC socket. MCP uses HTTP POST to :2121 — see `mcp.json.example`.
-- **6 cross-compilation targets**: aarch64/x86_64 × linux-musl/macos/windows.
-  (32-bit x86 targets skipped — zio does not support 32-bit x86.)
+- **8 cross-compilation targets**: aarch64/x86_64/x86 × linux-musl/macos/windows
+  (x86 32-bit Linux + Windows — macOS dropped 32-bit).
 - **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
 
 Current configuration — four VM targets tracked:
@@ -560,13 +560,15 @@ Cross-compilation targets:
 |---|--------|---------------|
 | 1 | `x86_64-windows` | `utmm-x86_64-windows.exe` |
 | 2 | `aarch64-windows` | `utmm-aarch64-windows.exe` |
-| 3 | `x86_64-macos` | `utmm-x86_64-macos` |
-| 4 | `aarch64-macos` | `utmm-aarch64-macos` |
-| 5 | `x86_64-linux-musl` | `utmm-x86_64-linux` |
-| 6 | `aarch64-linux-musl` | `utmm-aarch64-linux` |
+| 3 | `x86-windows` | `utmm-x86-windows.exe` |
+| 4 | `x86_64-macos` | `utmm-x86_64-macos` |
+| 5 | `aarch64-macos` | `utmm-aarch64-macos` |
+| 6 | `x86_64-linux-musl` | `utmm-x86_64-linux` |
+| 7 | `aarch64-linux-musl` | `utmm-aarch64-linux` |
+| 8 | `x86-linux-musl` | `utmm-x86-linux` |
 
-> 32-bit x86 targets (x86-linux-musl, x86-windows-gnu) skipped — zio does not
-> support 32-bit x86 architecture.
+> 8 targets total. x86 32-bit macOS excluded (macOS dropped 32-bit support).
+> x86 32-bit Linux + Windows added in v0.18.0 (zio feat/x86-32 branch).
 
 ### Step 5: Verify
 Open the release URL printed by the script and confirm:
