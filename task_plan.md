@@ -5,7 +5,7 @@
 ## 当前状态
 
 - **源文件**: 22 src + 13 test + 2 embed + 2 Python test scripts
-- **测试**: 210+ 单元 + 59 集成 + 2 Python (CLI 31/31 + MCP 14/14)，0 泄漏
+- **测试**: 216 单元 + 59 集成 + 2 Python (CLI 31/31 + MCP 14/14)，0 泄漏
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
 - **真机部署**: 5 节点全部 v0.18.0 serving
 - **GitHub Release**: v0.18.0 published
@@ -40,6 +40,26 @@
 - `zig build` — 编译通过 ✅
 - `zig build test` — 210+ 通过 ✅
 - `zig build test-integration` — 59 通过，0 泄漏 ✅
+
+## 已完成: Phase 32 — MCP 双格式响应 (structuredContent)
+
+参考 zigtester 的 MCP 双格式模式，为全部 6 个 MCP 工具响应添加 `structuredContent` 字段。
+
+| 任务 | 状态 |
+|------|------|
+| formatStatusMCP — guests[] + counts{total,serving,offline} | ✅ |
+| formatExecMCP — {vm, command, exit_code} | ✅ |
+| formatPingMCP — {vm, reachable, mac, rtt_ms} | ✅ |
+| handleVmUpload — {vm, local_path, remote_path, success} | ✅ |
+| handleVmDownload — {vm, remote_path, local_path, bytes, success} | ✅ |
+| handleVmSshpass — {host, user, exit_code} | ✅ |
+| 6 测试新增（status×2, exec×2, ping×2）| ✅ |
+
+**收益**:
+- AI agent 可程序化解析 `structuredContent` 做决策，无需从 markdown 提取
+- 保持人类可读 markdown 在 `content[0].text` 中展示
+- ~50 行增量，集中在 `src/mcp.zig` 的 `format*` / `handle*` 函数
+- 所有 216 单元测试通过
 
 ## 下一阶段: Phase 30 — 部署体验改进
 

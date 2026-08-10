@@ -377,7 +377,8 @@ fn handleVmStatus(ctx: McpContext) ![]const u8 {
     return formatStatusMCP(ctx.gpa, json);
 }
 
-/// Format a JSON guest list string into MCP content markdown.
+/// Format a JSON guest list string into MCP content markdown + structuredContent.
+/// Returns the full result JSON: {"content":[...], "structuredContent":{...}}
 fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_str, .{ .allocate = .alloc_always }) catch |err| {
         std.log.err("[mcp] status JSON parse: {}", .{err});
@@ -388,19 +389,25 @@ fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
     const guests = switch (parsed.value) {
         .array => |arr| arr,
         else => {
-            const text = try gpa.dupe(u8, "{\"text\":\"No VMs currently online.\"}");
-            return std.fmt.allocPrint(gpa, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{text});
+            return std.fmt.allocPrint(gpa,
+                "{{\"content\":[{{\"type\":\"text\",\"text\":\"No VMs currently online.\"}}],\"structuredContent\":{{\"guests\":[],\"counts\":{{\"total\":0,\"serving\":0,\"offline\":0}}}}}}",
+                .{});
         },
     };
 
     if (guests.items.len == 0) {
-        return try gpa.dupe(u8, "{\"content\":[{\"type\":\"text\",\"text\":\"No VMs currently online.\"}]}");
+        return std.fmt.allocPrint(gpa,
+            "{{\"content\":[{{\"type\":\"text\",\"text\":\"No VMs currently online.\"}}],\"structuredContent\":{{\"guests\":[],\"counts\":{{\"total\":0,\"serving\":0,\"offline\":0}}}}}}",
+            .{});
     }
 
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
 
     try text.appendSlice(gpa, "**Connected Machines:**\\n");
+
+    var serving: usize = 0;
+    var offline: usize = 0;
 
     for (guests.items) |guest_val| {
         const g = switch (guest_val) {
@@ -415,6 +422,13 @@ fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
         const version = jsonGetString(g, "version") orelse "?";
         const shell = jsonGetString(g, "shell") orelse "?";
         const status = jsonGetString(g, "status") orelse "?";
+
+        if (std.mem.eql(u8, status, "serving")) {
+            serving += 1;
+        } else {
+            offline += 1;
+        }
+
         try text.print(gpa,
             "- **{s}** ({s}) — {s} | IP: {s} | MAC: {s} | v{s} | shell: {s} | status: {s}\\n",
             .{ hostname, role, target, ip, mac, version, if (shell.len > 0) shell else "unknown", if (status.len > 0) status else "?" },
@@ -424,7 +438,11 @@ fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
     const text_json = try jsonEscape(gpa, text.items);
     defer gpa.free(text_json);
 
-    return std.fmt.allocPrint(gpa, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{text_json});
+    // json_str is already valid JSON array from getGuestListJson — embed directly.
+    return std.fmt.allocPrint(gpa,
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"structuredContent\":{{\"guests\":{s},\"counts\":{{\"total\":{d},\"serving\":{d},\"offline\":{d}}}}}}}",
+        .{ text_json, json_str, guests.items.len, serving, offline },
+    );
 }
 
 /// Handle exec — direct mcp_handler call (no IPC).
@@ -435,7 +453,7 @@ fn handleVmExec(ctx: McpContext, vm: []const u8, command: []const u8) ![]const u
     return formatExecMCP(ctx.gpa, vm, command, result.output, result.exit_code);
 }
 
-/// Format exec output into MCP content markdown.
+/// Format exec output into MCP content markdown + structuredContent.
 fn formatExecMCP(gpa: std.mem.Allocator, vm: []const u8, command: []const u8, output: []const u8, exit_code: i32) ![]const u8 {
     const trimmed = std.mem.trim(u8, output, " \n\r");
     const esc_vm = try jsonEscape(gpa, vm);
@@ -445,16 +463,22 @@ fn formatExecMCP(gpa: std.mem.Allocator, vm: []const u8, command: []const u8, ou
     const esc_out = try jsonEscape(gpa, trimmed);
     defer gpa.free(esc_out);
 
+    // Build structuredContent: metadata only (output is in content text).
+    const esc_sc_vm = try jsonEscape(gpa, vm);
+    defer gpa.free(esc_sc_vm);
+    const esc_sc_cmd = try jsonEscape(gpa, command);
+    defer gpa.free(esc_sc_cmd);
+
     if (exit_code != 0) {
         return std.fmt.allocPrint(gpa,
-            "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** `$ {s}` (exit {d}):\\n```\\n{s}\\n```\"}}]}}",
-            .{ esc_vm, esc_cmd, exit_code, esc_out },
+            "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** `$ {s}` (exit {d}):\\n```\\n{s}\\n```\"}}],\"structuredContent\":{{\"vm\":\"{s}\",\"command\":\"{s}\",\"exit_code\":{d}}}}}",
+            .{ esc_vm, esc_cmd, exit_code, esc_out, esc_sc_vm, esc_sc_cmd, exit_code },
         );
     }
 
     return std.fmt.allocPrint(gpa,
-        "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** `$ {s}`:\\n```\\n{s}\\n```\"}}]}}",
-        .{ esc_vm, esc_cmd, esc_out },
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** `$ {s}`:\\n```\\n{s}\\n```\"}}],\"structuredContent\":{{\"vm\":\"{s}\",\"command\":\"{s}\",\"exit_code\":0}}}}",
+        .{ esc_vm, esc_cmd, esc_out, esc_sc_vm, esc_sc_cmd },
     );
 }
 
@@ -467,7 +491,7 @@ fn handleVmPing(ctx: McpContext, vm: []const u8) ![]const u8 {
     return formatPingMCP(ctx.gpa, vm, json);
 }
 
-/// Format ping JSON result into MCP content markdown.
+/// Format ping JSON result into MCP content markdown + structuredContent.
 fn formatPingMCP(gpa: std.mem.Allocator, vm: []const u8, json_str: []const u8) ![]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_str, .{ .allocate = .alloc_always }) catch |err| {
         std.log.err("[mcp] ping JSON parse: {}", .{err});
@@ -485,13 +509,17 @@ fn formatPingMCP(gpa: std.mem.Allocator, vm: []const u8, json_str: []const u8) !
         .integer => |n| n,
         else => @as(i64, 0),
     } else @as(i64, 0);
+    const reachable = rtt > 0;
 
     const esc_vm = try jsonEscape(gpa, vm);
     defer gpa.free(esc_vm);
 
+    const esc_sc_vm = try jsonEscape(gpa, vm);
+    defer gpa.free(esc_sc_vm);
+
     return std.fmt.allocPrint(gpa,
-        "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** ping: MAC={s}, RTT={d}ms\"}}]}}",
-        .{ esc_vm, mac, rtt },
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"**{s}** ping: MAC={s}, RTT={d}ms\"}}],\"structuredContent\":{{\"vm\":\"{s}\",\"reachable\":{s},\"mac\":\"{s}\",\"rtt_ms\":{d}}}}}",
+        .{ esc_vm, mac, rtt, esc_sc_vm, if (reachable) "true" else "false", mac, rtt },
     );
 }
 
@@ -507,9 +535,16 @@ fn handleVmUpload(ctx: McpContext, vm: []const u8, local_path: []const u8, remot
     const esc_remote = try jsonEscape(ctx.gpa, remote_path);
     defer ctx.gpa.free(esc_remote);
 
+    const esc_sc_vm = try jsonEscape(ctx.gpa, vm);
+    defer ctx.gpa.free(esc_sc_vm);
+    const esc_sc_local = try jsonEscape(ctx.gpa, local_path);
+    defer ctx.gpa.free(esc_sc_local);
+    const esc_sc_remote = try jsonEscape(ctx.gpa, remote_path);
+    defer ctx.gpa.free(esc_sc_remote);
+
     return std.fmt.allocPrint(ctx.gpa,
-        "{{\"content\":[{{\"type\":\"text\",\"text\":\"Uploaded `{s}` → **{s}**:`{s}`\"}}]}}",
-        .{ esc_local, esc_vm, esc_remote },
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"Uploaded `{s}` → **{s}**:`{s}`\"}}],\"structuredContent\":{{\"vm\":\"{s}\",\"local_path\":\"{s}\",\"remote_path\":\"{s}\",\"success\":true}}}}",
+        .{ esc_local, esc_vm, esc_remote, esc_sc_vm, esc_sc_local, esc_sc_remote },
     );
 }
 
@@ -535,9 +570,16 @@ fn handleVmDownload(ctx: McpContext, vm: []const u8, remote_path: []const u8, lo
     const esc_local = try jsonEscape(ctx.gpa, local_path);
     defer ctx.gpa.free(esc_local);
 
+    const esc_sc_vm = try jsonEscape(ctx.gpa, vm);
+    defer ctx.gpa.free(esc_sc_vm);
+    const esc_sc_remote = try jsonEscape(ctx.gpa, remote_path);
+    defer ctx.gpa.free(esc_sc_remote);
+    const esc_sc_local = try jsonEscape(ctx.gpa, local_path);
+    defer ctx.gpa.free(esc_sc_local);
+
     return std.fmt.allocPrint(ctx.gpa,
-        "{{\"content\":[{{\"type\":\"text\",\"text\":\"Downloaded **{s}**:`{s}` → `{s}` ({d} bytes)\"}}]}}",
-        .{ esc_vm, esc_remote, esc_local, total_bytes },
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"Downloaded **{s}**:`{s}` → `{s}` ({d} bytes)\"}}],\"structuredContent\":{{\"vm\":\"{s}\",\"remote_path\":\"{s}\",\"local_path\":\"{s}\",\"bytes\":{d},\"success\":true}}}}",
+        .{ esc_vm, esc_remote, esc_local, total_bytes, esc_sc_vm, esc_sc_remote, esc_sc_local, total_bytes },
     );
 }
 
@@ -627,18 +669,24 @@ fn handleVmSshpass(ctx: McpContext, host: []const u8, user: []const u8, password
     const esc_stdout = try jsonEscape(gpa, result.stdout);
     defer gpa.free(esc_stdout);
 
+    // Build structuredContent fields (escaped for JSON)
+    const esc_sc_host = try jsonEscape(gpa, host);
+    defer gpa.free(esc_sc_host);
+    const esc_sc_user = try jsonEscape(gpa, user);
+    defer gpa.free(esc_sc_user);
+
     if (exit_code == 0) {
         return std.fmt.allocPrint(gpa,
-            "{{\"content\":[{{\"type\":\"text\",\"text\":\"**ssh {s}@{s}** `{s}`\\nexit: {d}\\n```\\n{s}\\n```\"}}]}}",
-            .{ esc_user, esc_host, esc_command, exit_code, esc_stdout },
+            "{{\"content\":[{{\"type\":\"text\",\"text\":\"**ssh {s}@{s}** `{s}`\\nexit: {d}\\n```\\n{s}\\n```\"}}],\"structuredContent\":{{\"host\":\"{s}\",\"user\":\"{s}\",\"exit_code\":{d}}}}}",
+            .{ esc_user, esc_host, esc_command, exit_code, esc_stdout, esc_sc_host, esc_sc_user, exit_code },
         );
     }
 
     const esc_stderr = try jsonEscape(gpa, result.stderr);
     defer gpa.free(esc_stderr);
     return std.fmt.allocPrint(gpa,
-        "{{\"content\":[{{\"type\":\"text\",\"text\":\"**ssh {s}@{s}** `{s}`\\nexit: {d}\\n```\\n{s}\\n```\\nstderr:\\n```\\n{s}\\n```\"}}]}}",
-        .{ esc_user, esc_host, esc_command, exit_code, esc_stdout, esc_stderr },
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"**ssh {s}@{s}** `{s}`\\nexit: {d}\\n```\\n{s}\\n```\\nstderr:\\n```\\n{s}\\n```\"}}],\"structuredContent\":{{\"host\":\"{s}\",\"user\":\"{s}\",\"exit_code\":{d}}}}}",
+        .{ esc_user, esc_host, esc_command, exit_code, esc_stdout, esc_stderr, esc_sc_host, esc_sc_user, exit_code },
     );
 }
 
@@ -1246,6 +1294,110 @@ test "formatPingMCP: missing mac field" {
 
     // Missing mac should show "?"
     try std.testing.expect(std.mem.indexOf(u8, result, "MAC=?") != null);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// structuredContent tests — verify dual-format (markdown + JSON data)
+// ═══════════════════════════════════════════════════════════════════════════
+
+test "formatStatusMCP: structuredContent has guests and counts" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatStatusMCP(alloc,
+        \\[{"hostname":"linuxvm","role":"guest","target":"aarch64-linux-musl","ip":"192.168.64.6","mac":"aa:bb:cc:dd:ee:ff","version":"0.18.0","shell":"bash","conpty":"yes","status":"serving","last_seen":1754912498},{"hostname":"winx64","role":"guest","target":"x86_64-windows","ip":"192.168.3.108","mac":"00:ff:4d:91:87:0b","version":"0.17.22","shell":"cmd.exe","conpty":"yes","status":"offline","last_seen":1754912400}]
+    );
+    defer alloc.free(result);
+
+    // Must contain structuredContent key
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"structuredContent\"") != null);
+    // Must contain guests array
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"guests\":[") != null);
+    // Must contain counts
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"counts\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"total\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"serving\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"offline\":1") != null);
+    // Guest data should be present in structuredContent
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"hostname\":\"linuxvm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"hostname\":\"winx64\"") != null);
+    // Must also still have the human-readable content
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"content\"") != null);
+}
+
+test "formatStatusMCP: structuredContent empty list" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatStatusMCP(alloc, "[]");
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"structuredContent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"guests\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"total\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"serving\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"offline\":0") != null);
+}
+
+test "formatExecMCP: structuredContent has metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatExecMCP(alloc, "linuxvm", "uname -a", "Linux linuxvm 6.1.0", 0);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"structuredContent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"vm\":\"linuxvm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"command\":\"uname -a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"exit_code\":0") != null);
+}
+
+test "formatExecMCP: structuredContent has non-zero exit code" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try formatExecMCP(alloc, "linuxvm", "cat /nonexistent", "No such file", 1);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"structuredContent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"exit_code\":1") != null);
+}
+
+test "formatPingMCP: structuredContent has reachable and rtt" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ping_json =
+        \\{"mac":"11:22:33:44:55:66","rtt_ms":3}
+    ;
+    const result = try formatPingMCP(alloc, "linuxvm", ping_json);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"structuredContent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"vm\":\"linuxvm\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"reachable\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"mac\":\"11:22:33:44:55:66\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"rtt_ms\":3") != null);
+}
+
+test "formatPingMCP: structuredContent has reachable=false when rtt=0" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const ping_json =
+        \\{"mac":"?","rtt_ms":0}
+    ;
+    const result = try formatPingMCP(alloc, "offlinevm", ping_json);
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"reachable\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"rtt_ms\":0") != null);
 }
 
 test "guestDefaultDir: linux returns posix path" {

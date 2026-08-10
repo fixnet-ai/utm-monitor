@@ -104,6 +104,25 @@ v0.18.0 实测确认 zio feat/x86-32 分支已支持 32-bit x86。8 目标全部
 - x86_64-macos ✅ (~2.3MB)
 - x86_64-windows ✅ (~4.1MB)
 
+### MCP 双格式响应 (structuredContent)
+
+参考 zigtester MCP 服务器的双格式模式，为所有 MCP 工具响应添加 `structuredContent` 字段，
+使 AI agent 可以程序化读取结构化数据做决策，同时保持人类可读 markdown 供展示。
+
+**Before**: `{"content":[{"type":"text","text":"**linuxvm** ping: MAC=..., RTT=3ms"}]}`
+**After**: 上述 content + `"structuredContent":{"vm":"linuxvm","reachable":true,"mac":"...","rtt_ms":3}`
+
+| 工具 | structuredContent 字段 |
+|------|----------------------|
+| `status` | `guests[]`, `counts{total,serving,offline}` |
+| `exec` | `vm`, `command`, `exit_code` |
+| `ping` | `vm`, `reachable`, `mac`, `rtt_ms` |
+| `upload` | `vm`, `local_path`, `remote_path`, `success` |
+| `download` | `vm`, `remote_path`, `local_path`, `bytes`, `success` |
+| `sshpass` | `host`, `user`, `exit_code` |
+
+修改集中在 `src/mcp.zig` 的 `format*` / `handle*` 函数，~50 行增量 + 6 新测试。所有 216 单元测试通过。
+
 ### 待跟进
 
 ## v0.17.21 — x86 ssh.exe 嵌入 + zio review 修复 + 全量部署
