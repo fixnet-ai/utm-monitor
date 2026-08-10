@@ -1,49 +1,58 @@
 #!/usr/bin/env python3
 """
-MCP 工具全量测试脚本 — utmm --mcp JSON-RPC 工具验证
+MCP 工具全量测试脚本 — utmm HTTP MCP JSON-RPC 工具验证
 
 用法:
-    sudo python3 tests/test_mcp_tools.py [--bin ./zig-out/bin/utmm]
+    sudo python3 tests/test_mcp_tools.py [--bin ./zig-out/bin/utmm] [--port 2121]
 
 覆盖所有 7 个 MCP 工具:
     status, exec, ping, upload, download, sshpass, manual
 
 要求:
-    - Host utmm daemon 运行中（sudo utmm --status 可见节点）
+    - Host utmm daemon 运行中（脚本自动触发 --mcp ensure）
     - Python 3.6+
 
 输出: 每个工具的测试结果 + 最终 pass/fail 汇总。
 """
 
-import subprocess, json, sys, os
+import subprocess, json, sys, os, urllib.request, urllib.error
 
 
-def run_tests(bin_path="zig-out/bin/utmm"):
+def run_tests(bin_path="zig-out/bin/utmm", port=2121):
     """运行全部 MCP 工具测试，返回 (passed, failed) 计数。"""
 
-    proc = subprocess.Popen(
-        ["sudo", bin_path, "--mcp"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    # 1. Ensure Host daemon is running via --mcp (auto-starts if needed)
+    print(f"  Ensuring Host daemon via: sudo {bin_path} --mcp ...")
+    subprocess.run(["sudo", bin_path, "--mcp"], capture_output=True, text=True)
 
-    def send_request(method, params=None, rid=0):
-        req = {"jsonrpc": "2.0", "id": rid, "method": method}
-        if params is not None:
-            req["params"] = params
-        proc.stdin.write(json.dumps(req) + "\n")
-        proc.stdin.flush()
-        line = proc.stdout.readline()
-        return json.loads(line) if line else None
+    mcp_url = f"http://127.0.0.1:{port}/"
 
-    def send_notification(method, params=None):
-        n = {"jsonrpc": "2.0", "method": method}
+    def send_request(method, params=None, rid=0, timeout=120):
+        """Send a JSON-RPC request via HTTP POST. Returns parsed JSON response."""
+        req_body = {"jsonrpc": "2.0", "id": rid, "method": method}
         if params is not None:
-            n["params"] = params
-        proc.stdin.write(json.dumps(n) + "\n")
-        proc.stdin.flush()
+            req_body["params"] = params
+        data = json.dumps(req_body).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                mcp_url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8")
+                return json.loads(body) if body else None
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8") if e.fp else ""
+            print(f"       HTTP {e.code}: {body[:200]}")
+            return None
+        except urllib.error.URLError as e:
+            print(f"       URL Error: {e.reason}")
+            return None
+        except Exception as e:
+            print(f"       Request error: {e}")
+            return None
 
     passed = 0
     failed = 0
@@ -74,7 +83,21 @@ def run_tests(bin_path="zig-out/bin/utmm"):
             info = resp["result"].get("serverInfo", {})
             print(f"       Server: {info.get('name', '?')} v{info.get('version', '?')}")
 
-        send_notification("notifications/initialized")
+        # notifications/initialized — no response expected
+        send_notification_body = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }).encode("utf-8")
+        try:
+            req = urllib.request.Request(
+                mcp_url,
+                data=send_notification_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass  # notifications may not return a response
 
         # ── 2. tools/list ──
         resp = send_request("tools/list", {}, 2)
@@ -92,7 +115,6 @@ def run_tests(bin_path="zig-out/bin/utmm"):
         check(ok, "status")
         if ok:
             text = resp["result"]["content"][0]["text"]
-            # 验证至少包含 Host 自身
             check(len(text) > 50, "status returns data", f"{len(text)} chars")
 
         # ── 4. ping (linuxvm + macvm) ──
@@ -206,6 +228,7 @@ def run_tests(bin_path="zig-out/bin/utmm"):
                 },
             },
             8,
+            timeout=120,
         )
         ok = resp is not None and "result" in resp
         text = (
@@ -241,25 +264,19 @@ def run_tests(bin_path="zig-out/bin/utmm"):
         traceback.print_exc()
         failed += 1
 
-    finally:
-        proc.stdin.close()
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
-
     return passed, failed
 
 
 if __name__ == "__main__":
     bin_path = sys.argv[1] if len(sys.argv) > 1 else "zig-out/bin/utmm"
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 2121
 
-    print(f"=== MCP Tool Test Suite ===")
+    print(f"=== MCP Tool Test Suite (HTTP) ===")
     print(f"Binary: {bin_path}")
+    print(f"Port:   {port}")
     print(f"")
 
-    passed, failed = run_tests(bin_path)
+    passed, failed = run_tests(bin_path, port)
 
     total = passed + failed
     print(f"")

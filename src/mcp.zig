@@ -1,66 +1,40 @@
-//! MCP stdio server — AI agent interface via stdin/stdout JSON-RPC 2.0.
+//! MCP JSON-RPC server — AI agent interface.
 //!
-//! The utmm --mcp command starts a stdio MCP server. Tool calls (status,
-//! exec, ping, upload, download, sshpass, manual) are translated to IPC
-//! commands against the local Host service via /var/run/utmm.sock, benefiting
-//! from auto-ensure — auto-starts Host if not running. sshpass spawns utmm as
-//! direct SSH access to machines without utmm installed.
+//! Two transport modes:
+//! - HTTP (primary): Host daemon serves MCP on 127.0.0.1:2121 via first-byte
+//!   dispatch. Handlers call mcp_handler.zig functions directly (no IPC).
+//! - stdio (legacy): `utmm --mcp-stdio` for backward compat and testing.
+//!   Uses runWithPipe for newline-delimited JSON-RPC.
+//!
+//! Protocol: JSON-RPC 2.0. Logging goes to stderr; responses go to stdout
+//! (stdio) or HTTP response body (HTTP).
 //!
 //! The `manual` tool returns the full reference manual (MANUAL.md embedded at
 //! compile time) so AI agents can self-educate on utmm usage, architecture,
 //! and platform details.
-//!
-//! Protocol: newline-delimited JSON, one JSON-RPC object per line.
-//! Logging goes to stderr; JSON-RPC traffic goes to stdout.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
-const ipc_mod = @import("ipc.zig");
+const host_mod = @import("host.zig");
+const mcp_handler = @import("mcp_handler.zig");
+const lsa = @import("lsa.zig");
 const sshpass = @import("sshpass.zig");
 
 /// Full reference manual embedded at compile time — served by the `manual` MCP tool.
 const MANUAL_TEXT: []const u8 = @embedFile("MANUAL.md");
 
-/// 60-second bidirectional idle timeout: if neither stdin nor stdout has
-/// activity for this duration, the MCP session auto-closes. Implemented via
-/// SIGALRM + alarm() — alarm is set before blocking stdin read, cancelled
-/// after each successful read. During request processing (exec etc.), alarm
-/// is NOT active, so long-running operations are never interrupted.
-/// On Windows, no idle timeout (blocking read, managed by client lifecycle).
-const IDLE_TIMEOUT_SEC: c_uint = 60;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// POSIX signal/alarm externs — same pattern as utmmd.zig (Zig 0.16.0
-// std.c.Sigaction types differ cross-platform, so we declare directly)
-// ═══════════════════════════════════════════════════════════════════════════
-
-const SIGALRM: c_int = 14;
-
-extern "c" fn alarm(seconds: c_uint) c_uint;
-extern "c" fn _exit(status: c_int) noreturn;
-extern "c" fn sigaction(sig: c_int, noalias act: ?*const c_sigaction, noalias oact: ?*c_sigaction) c_int;
-
-const c_sigaction = extern struct {
-    handler: extern union {
-        handler: *const fn (c_int) callconv(.c) void,
-    },
-    mask: c_uint,
-    flags: c_int,
+/// Context passed to processRequest — contains everything needed to handle
+/// tool calls. state and mesh_ptr are null for stdio-only operations (tests,
+/// sshpass, manual). For HTTP MCP, set by mcp_http.handleHttpMcp.
+pub const McpContext = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    port: u16,
+    state: ?*host_mod.GuestTable,
+    mesh_ptr: ?*anyopaque,
+    hostname: []const u8,
 };
-
-/// SIGALRM handler — 60s bidirectional idle timeout. Uses _exit() (POSIX
-/// async-signal-safe) to terminate immediately without running atexit handlers.
-fn onIdleTimeout(sig: c_int) callconv(.c) void {
-    _ = sig;
-    _exit(0);
-}
-
-/// Guest default upload directory — platform-aware default for remote_path.
-fn guestDefaultDir(vm: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, vm, "win") != null) return "C:\\opt\\utmm";
-    return "/opt/utmm";
-}
 
 /// Maximum JSON-RPC request size (64KB).
 const MAX_REQUEST_SIZE = 65536;
@@ -71,113 +45,18 @@ const SERVER_INFO = "{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\
 /// MCP tool definitions (JSON). Single-line for MCP stdio transport.
 const TOOLS_JSON = "[{\"name\":\"status\",\"description\":\"Get status of all connected machines. Returns hostname, IP, OS/arch, MAC, version, and shell (bash, zsh, or cmd.exe) for each Guest — whether VM or physical machine.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}},{\"name\":\"exec\",\"description\":\"Execute a shell command on a remote machine. The command runs in the machine's native shell. Check status first to see each machine's shell type, then write compatible commands.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target machine hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command (use POSIX sh for Linux/macOS, cmd.exe syntax for Windows)\"}},\"required\":[\"vm\",\"command\"]}},{\"name\":\"ping\",\"description\":\"Ping a machine over the mesh network to test connectivity and measure RTT. Returns JSON with hostname, MAC address, and rtt_ms.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target machine hostname (e.g. 'linuxvm', 'macvm', 'windowsvm')\"}},\"required\":[\"vm\"]}},{\"name\":\"upload\",\"description\":\"Upload a file from the Host to a Guest machine. Transferred through TCP/SOCKS5 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target machine hostname\"},\"local_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Host filesystem\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Destination path on the Guest (e.g. /opt/utmm/file.txt). Defaults to /opt/utmm/<basename> (POSIX) or C:\\\\opt\\\\utmm\\\\<basename> (Windows) if omitted.\"}},\"required\":[\"vm\",\"local_path\"]}},{\"name\":\"download\",\"description\":\"Download a file from a Guest machine to the Host. Transferred through TCP/SOCKS5 connection with SHA256 verification.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"vm\":{\"type\":\"string\",\"description\":\"Target machine hostname\"},\"remote_path\":{\"type\":\"string\",\"description\":\"Path to the file on the Guest (e.g. /opt/utmm/core.dump)\"},\"local_path\":{\"type\":\"string\",\"description\":\"Local path on the Host to save the file. Defaults to ./<basename> if omitted.\"}},\"required\":[\"vm\",\"remote_path\"]}},{\"name\":\"sshpass\",\"description\":\"Execute a shell command on any machine via non-interactive SSH password authentication. Works on Linux, macOS, and Windows (ConPTY dynamic loading). Use this for direct SSH access to machines that may not have utmm installed — bootstrap, recovery, and pre-install scenarios. For machines already running utmm Guest daemon, prefer the exec tool for mesh-based command execution.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"host\":{\"type\":\"string\",\"description\":\"Target hostname or IP address (e.g. 'linuxvm', '192.168.64.6')\"},\"user\":{\"type\":\"string\",\"description\":\"SSH username (e.g. 'root', 'Administrator')\"},\"password\":{\"type\":\"string\",\"description\":\"SSH password\"},\"command\":{\"type\":\"string\",\"description\":\"Shell command to execute on the remote machine\"}},\"required\":[\"host\",\"user\",\"password\",\"command\"]}},{\"name\":\"manual\",\"description\":\"Get the full utmm reference manual — CLI usage, MCP protocol, architecture, platform differences, deployment, and troubleshooting. Use this to understand how utmm works and how to use its tools correctly.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}]";
 
-/// MCP server entry point. Reads JSON-RPC from stdin, writes responses to stdout.
-/// On POSIX: uses alarm() + SIGALRM for 60s bidirectional idle timeout.
-/// On Windows: falls back to runWithPipe (blocking read, no idle timeout).
+/// Simplified entry point — runs stdio MCP without SIGALRM idle timeout.
+/// Used for testing (runWithPipe) and legacy `--mcp-stdio` mode.
 pub fn run(io: std.Io, gpa: std.mem.Allocator, port: u16) !void {
     var stdin_buf: [4096]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buf);
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
-
-    if (builtin.os.tag == .windows) {
-        return runWithPipe(io, gpa, port, &stdin_reader.interface, &stdout_writer.interface);
-    }
-
-    // Install SIGALRM handler for idle timeout
-    var sa: c_sigaction = undefined;
-    sa.handler = .{ .handler = onIdleTimeout };
-    sa.mask = 0;
-    sa.flags = 0; // No SA_RESTART — alarm() interrupts blocking read()
-    _ = sigaction(SIGALRM, &sa, null);
-
-    return runWithIdleTimeout(io, gpa, port, &stdin_reader.interface, &stdout_writer.interface);
-}
-
-/// Main loop with 60s bidirectional idle timeout via alarm().
-///
-/// Alarm lifecycle:
-///   alarm(60)  → set before blocking stdin read
-///   alarm(0)   → cancel after successful read (idle timer reset)
-///
-/// During request processing (including long exec), alarm is NOT active,
-/// so active operations are never interrupted. The alarm only fires when
-/// the server is truly idle — blocked on stdin waiting for the next
-/// JSON-RPC request, with no output activity.
-///
-/// If SIGALRM fires, the handler calls _exit(0) — a clean, signal-safe
-/// termination. The kernel closes all open fds automatically.
-fn runWithIdleTimeout(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    port: u16,
-    reader: *std.Io.Reader,
-    writer: *std.Io.Writer,
-) !void {
-    var req_buf: std.ArrayList(u8) = .empty;
-    defer req_buf.deinit(gpa);
-
-    while (true) {
-        req_buf.clearRetainingCapacity();
-
-        // ppid check: if parent died we're orphaned — exit gracefully
-        if (std.posix.system.getppid() == 1) {
-            std.log.info("[mcp] orphaned (ppid=1), exiting", .{});
-            break;
-        }
-
-        // Set 60s alarm before blocking on stdin. If no new request arrives
-        // within 60s, SIGALRM fires → onIdleTimeout → _exit(0).
-        _ = alarm(IDLE_TIMEOUT_SEC);
-
-        const line = reader.takeDelimiter('\n') catch |err| {
-            // SIGALRM → _exit(0) in handler, so we never reach here on timeout.
-            // Other errors (EOF, broken pipe) fall through.
-            std.log.err("[mcp] read error: {}", .{err});
-            break;
-        };
-
-        // Cancel alarm — data received, idle timer reset
-        _ = alarm(0);
-
-        if (line == null) break; // EOF
-
-        const json_str = line.?;
-
-        // Process the request. No alarm active here — long-running exec
-        // or upload operations complete without interruption. Output
-        // flowing to stdout is implicit activity that resets the idle
-        // timer conceptually (next alarm is fresh after the response).
-        const response = processRequest(gpa, io, port, json_str) catch |err| {
-            std.log.err("[mcp] processRequest error: {}", .{err});
-            const err_resp = jsonBuildError(gpa, .{ .null = {} }, -32603, @errorName(err)) catch continue;
-            defer gpa.free(err_resp);
-            _ = writer.print("{s}\n", .{err_resp}) catch break;
-            _ = writer.flush() catch |err_flush| {
-                std.log.err("[mcp] flush error: {}", .{err_flush});
-                break;
-            };
-            continue;
-        };
-        defer gpa.free(response);
-
-        // Write response (skip empty responses for notifications).
-        // Stdout activity is bidirectional activity — the next alarm(60)
-        // is set fresh at the top of the loop.
-        if (response.len > 0) {
-            _ = writer.print("{s}\n", .{response}) catch break;
-            _ = writer.flush() catch |err_flush| {
-                std.log.err("[mcp] flush error: {}", .{err_flush});
-                break;
-            };
-        }
-    }
+    return runWithPipe(io, gpa, port, &stdin_reader.interface, &stdout_writer.interface);
 }
 
 /// Core MCP loop — reads JSON-RPC from `reader`, writes responses to `writer`.
 /// Testable with Reader.fixed / Writer.fixed for protocol verification.
-/// Used by tests directly; used by `run()` on Windows only (no SIGALRM).
-/// On POSIX, `run()` uses `runWithIdleTimeout` for 60s idle detection instead.
 pub fn runWithPipe(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -185,6 +64,16 @@ pub fn runWithPipe(
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
 ) !void {
+    // Build context with null state/mesh — stdio mode has no Host daemon state.
+    const ctx = McpContext{
+        .io = io,
+        .gpa = gpa,
+        .port = port,
+        .state = null,
+        .mesh_ptr = null,
+        .hostname = "",
+    };
+
     // Read JSON-RPC requests line by line until EOF.
     var req_buf: std.ArrayList(u8) = .empty;
     defer req_buf.deinit(gpa);
@@ -202,9 +91,8 @@ pub fn runWithPipe(
         const json_str = line.?;
 
         // Process the request
-        const response = processRequest(gpa, io, port, json_str) catch |err| {
+        const response = processRequest(ctx, json_str) catch |err| {
             std.log.err("[mcp] processRequest error: {}", .{err});
-            // Try to send an error response
             const err_resp = jsonBuildError(gpa, .{ .null = {} }, -32603, @errorName(err)) catch continue;
             defer gpa.free(err_resp);
             _ = writer.print("{s}\n", .{err_resp}) catch break;
@@ -228,8 +116,9 @@ pub fn runWithPipe(
 }
 
 /// Process a single JSON-RPC request string, return the response JSON string.
-/// Caller owns the returned buffer.
-fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []const u8) ![]const u8 {
+/// Caller owns the returned buffer. ctx must be valid for the lifetime of this call.
+pub fn processRequest(ctx: McpContext, json_str: []const u8) ![]const u8 {
+    const gpa = ctx.gpa;
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, json_str, .{ .allocate = .alloc_always }) catch |err| {
         return jsonBuildError(gpa, .{ .null = {} }, -32700, @errorName(err));
     };
@@ -304,7 +193,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
         const args = jsonGetNestedObject(params, "arguments");
 
         if (std.mem.eql(u8, tool_name, "status")) {
-            const result = handleVmStatus(gpa, io, port) catch |err| {
+            const result = handleVmStatus(ctx) catch |err| {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32603, @errorName(err));
             };
@@ -330,7 +219,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing argument: command");
             };
-            const result = handleVmExec(gpa, io, port, vm, command) catch |err| {
+            const result = handleVmExec(ctx, vm, command) catch |err| {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32603, @errorName(err));
             };
@@ -352,7 +241,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
                 return jsonBuildError(gpa, id_val, -32602, "Out of memory");
             };
             defer gpa.free(vm);
-            const result = handleVmPing(gpa, io, port, vm) catch |err| {
+            const result = handleVmPing(ctx, vm) catch |err| {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32603, @errorName(err));
             };
@@ -386,7 +275,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
                     local_path;
                 break :blk try std.fmt.allocPrint(gpa, "{s}/{s}", .{ guestDefaultDir(vm), basename });
             };
-            const result = handleVmUpload(gpa, io, port, vm, local_path, remote_path) catch |err| {
+            const result = handleVmUpload(ctx, vm, local_path, remote_path) catch |err| {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32603, @errorName(err));
             };
@@ -420,7 +309,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
                     remote_path;
                 break :blk try std.fmt.allocPrint(gpa, "./{s}", .{basename});
             };
-            const result = handleVmDownload(gpa, io, port, vm, remote_path, local_path) catch |err| {
+            const result = handleVmDownload(ctx, vm, remote_path, local_path) catch |err| {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32603, @errorName(err));
             };
@@ -449,7 +338,7 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32602, "Missing argument: command");
             };
-            const result = handleVmSshpass(gpa, io, host_raw, user, password, command) catch |err| {
+            const result = handleVmSshpass(ctx, host_raw, user, password, command) catch |err| {
                 if (is_notification) return gpa.dupe(u8, "");
                 return jsonBuildError(gpa, id_val, -32603, @errorName(err));
             };
@@ -474,12 +363,18 @@ fn processRequest(gpa: std.mem.Allocator, io: std.Io, port: u16, json_str: []con
     return jsonBuildError(gpa, id_val, -32601, "Method not found");
 }
 
-/// Handle status via IPC.
-fn handleVmStatus(gpa: std.mem.Allocator, io: std.Io, port: u16) ![]const u8 {
-    _ = port; // IPC handler — port reserved for future use
-    const json = try ipc_mod.ipcStatus(io, gpa);
-    defer gpa.free(json);
-    return formatStatusMCP(gpa, json);
+/// Guest default upload directory — platform-aware default for remote_path.
+fn guestDefaultDir(vm: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, vm, "win") != null) return "C:\\opt\\utmm";
+    return "/opt/utmm";
+}
+
+/// Handle status — direct GuestTable access (no IPC).
+fn handleVmStatus(ctx: McpContext) ![]const u8 {
+    const state = ctx.state orelse return error.NoHostState;
+    const json = try mcp_handler.getGuestListJson(ctx.gpa, state);
+    defer ctx.gpa.free(json);
+    return formatStatusMCP(ctx.gpa, json);
 }
 
 /// Format a JSON guest list string into MCP content markdown.
@@ -532,14 +427,12 @@ fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{text_json});
 }
 
-/// Handle exec via IPC.
-fn handleVmExec(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, command: []const u8) ![]const u8 {
-    _ = port; // IPC handler — port reserved for future use
-    // Captures output in a fixed buffer
-    var output_buf: [65536]u8 = undefined;
-    var output_writer: std.Io.Writer = .fixed(&output_buf);
-    const exit_code = try ipc_mod.ipcExec(io, gpa, vm, command, &output_writer);
-    return formatExecMCP(gpa, vm, command, output_writer.buffered(), exit_code);
+/// Handle exec — direct mcp_handler call (no IPC).
+fn handleVmExec(ctx: McpContext, vm: []const u8, command: []const u8) ![]const u8 {
+    const state = ctx.state orelse return error.NoHostState;
+    var result = try mcp_handler.execOnGuest(ctx.io, ctx.gpa, state, vm, command);
+    defer result.deinit(ctx.gpa);
+    return formatExecMCP(ctx.gpa, vm, command, result.output, result.exit_code);
 }
 
 /// Format exec output into MCP content markdown.
@@ -565,12 +458,13 @@ fn formatExecMCP(gpa: std.mem.Allocator, vm: []const u8, command: []const u8, ou
     );
 }
 
-/// Handle ping via IPC.
-fn handleVmPing(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8) ![]const u8 {
-    _ = port;
-    const json = try ipc_mod.ipcPing(io, gpa, vm);
-    defer gpa.free(json);
-    return formatPingMCP(gpa, vm, json);
+/// Handle ping — direct mcp_handler call (no IPC).
+fn handleVmPing(ctx: McpContext, vm: []const u8) ![]const u8 {
+    const state = ctx.state orelse return error.NoHostState;
+    const mesh_ptr = ctx.mesh_ptr orelse return error.NoMeshState;
+    const json = try mcp_handler.pingGuest(ctx.gpa, state, mesh_ptr, vm);
+    defer ctx.gpa.free(json);
+    return formatPingMCP(ctx.gpa, vm, json);
 }
 
 /// Format ping JSON result into MCP content markdown.
@@ -601,60 +495,90 @@ fn formatPingMCP(gpa: std.mem.Allocator, vm: []const u8, json_str: []const u8) !
     );
 }
 
-/// Handle upload via IPC.
-fn handleVmUpload(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, local_path: []const u8, remote_path: []const u8) ![]const u8 {
-    _ = port;
-    try ipc_mod.ipcUpload(io, gpa, vm, local_path, remote_path);
+/// Handle upload — direct mcp_handler call (no IPC).
+fn handleVmUpload(ctx: McpContext, vm: []const u8, local_path: []const u8, remote_path: []const u8) ![]const u8 {
+    const state = ctx.state orelse return error.NoHostState;
+    try mcp_handler.uploadToGuest(ctx.io, ctx.gpa, state, vm, local_path, remote_path);
 
-    const esc_vm = try jsonEscape(gpa, vm);
-    defer gpa.free(esc_vm);
-    const esc_local = try jsonEscape(gpa, local_path);
-    defer gpa.free(esc_local);
-    const esc_remote = try jsonEscape(gpa, remote_path);
-    defer gpa.free(esc_remote);
+    const esc_vm = try jsonEscape(ctx.gpa, vm);
+    defer ctx.gpa.free(esc_vm);
+    const esc_local = try jsonEscape(ctx.gpa, local_path);
+    defer ctx.gpa.free(esc_local);
+    const esc_remote = try jsonEscape(ctx.gpa, remote_path);
+    defer ctx.gpa.free(esc_remote);
 
-    return std.fmt.allocPrint(gpa,
+    return std.fmt.allocPrint(ctx.gpa,
         "{{\"content\":[{{\"type\":\"text\",\"text\":\"Uploaded `{s}` → **{s}**:`{s}`\"}}]}}",
         .{ esc_local, esc_vm, esc_remote },
     );
 }
 
-/// Handle download via IPC.
-fn handleVmDownload(gpa: std.mem.Allocator, io: std.Io, port: u16, vm: []const u8, remote_path: []const u8, local_path: []const u8) ![]const u8 {
-    _ = port;
+/// Handle download — direct mcp_handler call (no IPC).
+fn handleVmDownload(ctx: McpContext, vm: []const u8, remote_path: []const u8, local_path: []const u8) ![]const u8 {
+    const state = ctx.state orelse return error.NoHostState;
 
-    // Create local file for writing (createFile = open or create, truncate)
-    const file = std.Io.Dir.cwd().createFile(io, local_path, .{}) catch |err| {
+    // Create local file for writing
+    const file = std.Io.Dir.cwd().createFile(ctx.io, local_path, .{}) catch |err| {
         std.log.err("[mcp] Cannot create {s} for write: {}", .{ local_path, err });
         return error.DownloadFailed;
     };
-    defer file.close(io);
+    defer file.close(ctx.io);
 
     var fbuf: [65536]u8 = undefined;
-    var fw = file.writer(io, &fbuf);
-    const total_bytes = try ipc_mod.ipcDownload(io, gpa, vm, remote_path, &fw.interface);
+    var fw = file.writer(ctx.io, &fbuf);
+    const total_bytes = try mcp_handler.downloadFromGuest(ctx.io, ctx.gpa, state, vm, remote_path, &fw.interface);
 
-    const esc_vm = try jsonEscape(gpa, vm);
-    defer gpa.free(esc_vm);
-    const esc_remote = try jsonEscape(gpa, remote_path);
-    defer gpa.free(esc_remote);
-    const esc_local = try jsonEscape(gpa, local_path);
-    defer gpa.free(esc_local);
+    const esc_vm = try jsonEscape(ctx.gpa, vm);
+    defer ctx.gpa.free(esc_vm);
+    const esc_remote = try jsonEscape(ctx.gpa, remote_path);
+    defer ctx.gpa.free(esc_remote);
+    const esc_local = try jsonEscape(ctx.gpa, local_path);
+    defer ctx.gpa.free(esc_local);
 
-    return std.fmt.allocPrint(gpa,
+    return std.fmt.allocPrint(ctx.gpa,
         "{{\"content\":[{{\"type\":\"text\",\"text\":\"Downloaded **{s}**:`{s}` → `{s}` ({d} bytes)\"}}]}}",
         .{ esc_vm, esc_remote, esc_local, total_bytes },
     );
 }
 
-/// Handle sshpass via child process — spawns `utmm sshpass -p <pass> ssh <user>@<host> <command>`.
-fn handleVmSshpass(gpa: std.mem.Allocator, io: std.Io, host: []const u8, user: []const u8, password: []const u8, command: []const u8) ![]const u8 {
+/// Handle sshpass via child process — spawns `utmm sshpass -f <pwfile> ssh <user>@<host> <command>`.
+/// Uses -f (password file) instead of -p (inline password) because sshpass's -p mode
+/// stores a pointer to the argv string, and the subsequent memset-overwrite of the
+/// password in argv corrupts the actual password. -f mode dups the filename via gpa.dupe.
+/// Also uses a dedicated Threaded I/O for std.process.run — ctx.io from HTTP MCP
+/// is zio async I/O which is incompatible with pipe I/O in std.process.run.
+fn handleVmSshpass(ctx: McpContext, host: []const u8, user: []const u8, password: []const u8, command: []const u8) ![]const u8 {
+    const gpa = ctx.gpa;
+
+    // Use threaded.blocking I/O for child process — ctx.io from HTTP MCP
+    // is zio async I/O which is incompatible with std.process.run (pipe I/O
+    // needs a Threaded IO that can block on pipe reads).
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    const block_io = threaded.io();
+
+    // Write password to temp file for sshpass -f (avoids -p memset corruption).
+    // sshpass stores a pointer to the -p argv string, but then overwrites it with
+    // memset(..., 'z') to hide the password from ps output — corrupting the password.
+    // Using -f mode: sshpass dups the filename via gpa.dupe, then reads the actual
+    // password from the file, so the memset only affects the filename (already duped).
+    const pw_path = "/tmp/utmm-sshpass-pw";
+    const cwd = std.Io.Dir.cwd();
+    {
+        const pw_file = try cwd.createFile(block_io, pw_path, .{ .truncate = true, .permissions = @enumFromInt(0o600) });
+        var write_buf: [256]u8 = undefined;
+        var writer = pw_file.writer(block_io, &write_buf);
+        try writer.interface.writeAll(password);
+        try writer.interface.writeAll("\n");
+        writer.interface.flush() catch {};
+        pw_file.close(block_io);
+    }
+
     // Build destination string: user@host
     const dest = try std.fmt.allocPrint(gpa, "{s}@{s}", .{ user, host });
     defer gpa.free(dest);
 
     // Get path to current executable
-    const exe_path = try std.process.executablePathAlloc(io, gpa);
+    const exe_path = try std.process.executablePathAlloc(block_io, gpa);
     defer gpa.free(exe_path);
 
     // Build SSH command-line args (ssh <dest> <command>), ensure StrictHostKeyChecking
@@ -668,21 +592,23 @@ fn handleVmSshpass(gpa: std.mem.Allocator, io: std.Io, host: []const u8, user: [
     }
     try sshpass.ensureStrictHostKeyChecking(gpa, &ssh_args);
 
-    // Build argv: utmm sshpass -p <password> <ssh_args...>
+    // Build argv: utmm sshpass -f <pwfile> <ssh_args...>
     var argv = try std.ArrayList([]const u8).initCapacity(gpa, 0);
     defer argv.deinit(gpa);
     try argv.append(gpa, exe_path);
     try argv.append(gpa, "sshpass");
-    try argv.append(gpa, "-p");
-    try argv.append(gpa, password);
+    try argv.append(gpa, "-f");
+    try argv.append(gpa, pw_path);
     try argv.appendSlice(gpa, ssh_args.items);
 
     // Spawn child process, collect output, wait
-    const result = try std.process.run(gpa, io, .{
+    const result = try std.process.run(gpa, block_io, .{
         .argv = argv.items,
     });
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
+    // Clean up temp password file after subprocess completes
+    defer cwd.deleteFile(block_io, pw_path) catch {};
 
     const exit_code: i32 = switch (result.term) {
         .exited => |code| @as(i32, code),
@@ -979,7 +905,7 @@ test "processRequest: initialize" {
     const alloc = arena.allocator();
     var threaded: std.Io.Threaded = .init_single_threaded;
 
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"initialize"}
     );
     defer alloc.free(result);
@@ -1000,7 +926,7 @@ test "processRequest: ping" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"ping"}
     );
     defer alloc.free(result);
@@ -1017,7 +943,7 @@ test "processRequest: tools/list" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
     defer alloc.free(result);
@@ -1039,7 +965,7 @@ test "processRequest: notifications/initialized (notification, no id)" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","method":"notifications/initialized"}
     );
     defer alloc.free(result);
@@ -1054,7 +980,7 @@ test "processRequest: notifications/initialized with id" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":2,"method":"notifications/initialized"}
     );
     defer alloc.free(result);
@@ -1069,7 +995,7 @@ test "processRequest: unknown method" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"nonexistent"}
     );
     defer alloc.free(result);
@@ -1085,7 +1011,7 @@ test "processRequest: invalid JSON" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121, "not json at all");
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" }, "not json at all");
     defer alloc.free(result);
 
     // Should be a parse error -32700
@@ -1099,7 +1025,7 @@ test "processRequest: missing method" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1}
     );
     defer alloc.free(result);
@@ -1115,7 +1041,7 @@ test "processRequest: non-object root (array)" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121, "[1,2,3]");
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" }, "[1,2,3]");
     defer alloc.free(result);
 
     // Array instead of object should be Invalid Request -32600
@@ -1129,7 +1055,7 @@ test "processRequest: string id preserved" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":"req-abc","method":"ping"}
     );
     defer alloc.free(result);
@@ -1145,7 +1071,7 @@ test "processRequest: bool id preserved" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":true,"method":"ping"}
     );
     defer alloc.free(result);
@@ -1160,7 +1086,7 @@ test "processRequest: tools/call unknown tool" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}
     );
     defer alloc.free(result);
@@ -1176,7 +1102,7 @@ test "processRequest: tools/call without params" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call"}
     );
     defer alloc.free(result);
@@ -1501,7 +1427,7 @@ test "tools/list response: each tool has required MCP fields" {
 
     // Get tools/list response via processRequest
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
     defer alloc.free(result);
@@ -1548,7 +1474,7 @@ test "tools/list: exec requires vm and command" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
     defer alloc.free(result);
@@ -1580,7 +1506,7 @@ test "tools/list: upload requires vm and local_path" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
     defer alloc.free(result);
@@ -1608,7 +1534,7 @@ test "tools/list: download requires vm and remote_path" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
     defer alloc.free(result);
@@ -1636,7 +1562,7 @@ test "tools/list: ping requires vm only" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
     defer alloc.free(result);
@@ -1663,7 +1589,7 @@ test "tools/list: status requires no arguments" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
     defer alloc.free(result);
@@ -1689,7 +1615,7 @@ test "tools/list: manual requires no arguments" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
     defer alloc.free(result);
@@ -1715,7 +1641,7 @@ test "processRequest: tools/call manual returns embedded manual" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"manual","arguments":{}}}
     );
     defer alloc.free(result);
@@ -1733,7 +1659,7 @@ test "tools/list: each tool inputSchema has type=object" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
     defer alloc.free(result);
@@ -1756,7 +1682,7 @@ test "tools/list: each tool has a non-empty description" {
     const alloc = arena.allocator();
 
     var threaded: std.Io.Threaded = .init_single_threaded;
-    const result = try processRequest(alloc, threaded.io(), 2121,
+    const result = try processRequest(McpContext{ .io = threaded.io(), .gpa = alloc, .port = 2121, .state = null, .mesh_ptr = null, .hostname = "" },
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     );
     defer alloc.free(result);

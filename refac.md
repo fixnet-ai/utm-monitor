@@ -1,6 +1,6 @@
 # UTM Monitor 重构设计文档 v2
 
-## 状态：已完成 ✅（历史文档 — 当前 codebase 19 src + 13 test 文件）
+## 状态：已完成 ✅（历史文档 — 当时 codebase 19 src + 13 test 文件，当前 22 src）
 
 **分支**: `refac/layered-arch` | **文件**: 20 → 19 | **测试**: 172 单元 + 59 集成，全部通过
 

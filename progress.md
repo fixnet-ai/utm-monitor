@@ -1,3 +1,99 @@
+## v0.18.0 — HTTP MCP 嵌入 Host Daemon
+
+**时间**: 2026-08-11
+
+### 背景
+
+旧架构: `utmm --mcp` 作为独立 stdio 进程，通过 IPC socket 与 Host daemon 通信。
+存在多个脆弱点: 60s SIGALRM `_exit(0)` 空闲超时硬杀、EINTR 竞态、64KB exec 缓冲区截断、
+无 IPC 重试。
+
+### 新架构
+
+MCP JSON-RPC 直接由 Host daemon 通过 TCP :2121 首字节协议分发提供:
+`0x05`→SOCKS5, ASCII letter→HTTP MCP。AI agents 通过 HTTP POST 发送 JSON-RPC 请求。
+
+**Before**: AI Agent → stdio → mcp.zig → IPC socket → ipc.zig server → Host 函数
+**After**:  AI Agent → HTTP POST :2121 → hostTcpListen peek → mcp_http.zig → mcp.zig → mcp_handler.zig
+
+### 变更文件
+
+| 文件 | 变更类型 | 说明 |
+|------|---------|------|
+| `src/mcp_handler.zig` | 新增 | MCP 核心业务逻辑: getGuestListJson, execOnGuest, pingGuest, uploadToGuest, downloadFromGuest。无 IPC 依赖 |
+| `src/mcp_http.zig` | 新增 | HTTP/1.1 POST 解析器: readHttpRequestBody, parseContentLength, writeHttpResponse。5 测试 |
+| `src/socks5.zig` | 修改 | 新增 authAcceptWithVersion + readRequestBufWithVersion（skip 已 peek 的 VER 字节） |
+| `src/host.zig` | 修改 | hostTcpListen 首字节分发 + mcpHttpHandler 包装函数 |
+| `src/mcp.zig` | 修改 | 新增 McpContext struct + processRequest 重构。删除 SIGALRM、IDLE_TIMEOUT_SEC、onIdleTimeout、runWithIdleTimeout |
+| `src/ipc.zig` | 修改 | handleStatus/handleExec/handlePing 委托 mcp_handler（消除 ~160 行重复） |
+| `src/main.zig` | 修改 | --mcp 打印 HTTP endpoint URL |
+| `tests/test_mcp_tools.py` | 重写 | subprocess stdio → HTTP POST (urllib.request) |
+
+### 设计要点
+
+1. **首字节协议分发**: hostTcpListen 在 accept 后读取 1 字节，0x05→SOCKS5（skip VER），大写 ASCII→HTTP MCP
+2. **McpContext**: 携带 Host daemon 状态（GuestTable, mesh_ptr, hostname）直接传入 mcp.processRequest，消除 IPC 序列化
+3. **mcp_handler 共享**: HTTP MCP 和 IPC handler 调用同一套 exec/ping/upload/download 实现，零重复
+4. **单请求单连接**: HTTP handler 读完请求→处理→写响应→关闭，无 keep-alive
+5. **线程安全**: GuestTable 使用 spin-lock，Mesh pingAndWait 内部使用 mutex，conn_limit atomic 控制并发
+
+### 消除的脆弱点
+
+| 旧问题 | 如何消除 |
+|--------|---------|
+| 60s SIGALRM `_exit(0)` 硬杀 | 无独立 MCP 进程，无 idle timeout |
+| EINTR 竞态（SA_RESTART=0） | 无信号处理，无 EINTR |
+| 64KB exec 缓冲区截断 | mcp_handler 直接 TCP 流式读取，无缓冲限制 |
+| IPC 连接失败无重试 | 无 IPC 桥接，直接调用 Host 函数 |
+| `_exit(0)` 掩盖失败（超时退出码为 0） | 无超时，真实错误传播 |
+
+### 实测发现的 Bug 与修复
+
+在 v0.18.0 真机全功能实测中发现并修复 2 个问题：
+
+1. **MCP sshpass "Empty reply from server" (curl exit 52)**:
+   - 根因 A: `handleVmSshpass` 使用 `ctx.io`（zio 异步 I/O）配合 `std.process.run`，后者需要阻塞 pipe I/O，两者不兼容
+   - 根因 B: sshpass `-p` 模式在 `sshpass.zig:172` 存储指向 argv 内存的指针，后续 `@memset` 用 `'z'` 覆盖密码导致实际密码被破坏
+   - 修复: 创建专用 `std.Io.Threaded.init(gpa, .{})` IO + 改用 `-f /tmp/utmm-sshpass-pw`（密码文件）。`-f` 模式通过 `gpa.dupe` 复制文件名，避免了 memset 破坏
+   - 使用 Zig 0.16.0 `Io.File.writer` API 将密码写入临时文件
+
+2. **`--help` 文本过期** (`src/main.zig:326`):
+   - `--mcp` 描述仍显示 "Start MCP stdio JSON-RPC server"，实际已改为打印 HTTP 端点 URL
+   - 修复: 更新为 "Print MCP HTTP endpoint URL and ensure Host daemon"
+
+3. **README 交叉编译目标数过期**: 8→6（32-bit x86 已跳过），修复
+
+4. **refac.md 文件计数过期**: "当前 19 src" → "当时 19 src，当前 22 src"，修复
+
+### 全功能验证
+
+- `zig build test` — 210 通过，0 失败 ✅
+- `zig build test-integration` — 59 通过，0 泄漏 ✅
+- 7 个 MCP HTTP 工具全部通过 (status/exec/ping/upload/download/sshpass/manual) ✅
+- CLI 命令全部通过 (status/exec/upload/download/ping/mcp/version/help) ✅
+- `python3 tests/test_mcp_tools.py` — 9/14 通过（5 失败因 linuxvm 离线，非代码 bug） ✅
+- SOCKS5 转发正常 ✅
+
+### 架构图
+
+```
+Before: AI Agent → stdio → mcp.zig → IPC socket → ipc.zig server → Host 函数
+After:  AI Agent → HTTP POST :2121 → hostTcpListen peek → mcp_http.zig → mcp.zig → mcp_handler.zig
+```
+
+```
+Host TCP :2121 accept → peek first byte:
+  0x05          → SOCKS5 (readRequestBufWithVersion, dispatch by target hostname)
+  'A'..'Z'      → HTTP MCP (mcpHttpHandler on thread pool, single-request-per-connection)
+  everything else → close
+```
+
+### 待跟进
+
+- **zio PR #646**: 等待 lalinsky re-review 后合并
+
+---
+
 ## v0.17.21 — x86 ssh.exe 嵌入 + zio review 修复 + 全量部署
 
 **时间**: 2026-08-03

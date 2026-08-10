@@ -75,11 +75,12 @@ Both must pass (0 failures) before deployment.
 
 ### MCP Tools Test
 
-Full validation of all 7 MCP tools against the running Host daemon:
+Full validation of all 7 MCP tools via HTTP POST against the running Host daemon:
 ```bash
 sudo python3 tests/test_mcp_tools.py
 ```
 Covers `status`, `exec`, `ping`, `upload`, `download`, `sshpass`, `manual`.
+Sends JSON-RPC requests via HTTP POST to `http://127.0.0.1:2121/`.
 Requires Host daemon running with at least one Guest online (linuxvm for file transfer tests).
 
 ### CLI Commands Test
@@ -126,7 +127,7 @@ utmm sshpass -p <pass> ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --
 - **macOS launchctl** may throttle bootstrap — if `--install` fails, kill processes first then retry
 - **Windows SSH** does NOT handle `;` command chaining — use `&&` or separate calls
 - **LSA sync** takes ~10-15s after guest restart before it appears in `--status`
-- **Build output naming**: cross-compiled binaries include version suffix (e.g. `utmm-aarch64-linux-0.17.22`)
+- **Build output naming**: cross-compiled binaries include version suffix (e.g. `utmm-aarch64-linux-0.18.0`)
 - **`utmm --upgrade` errors** include actionable guidance (e.g. "run --deploy first")
 
 ## Skills for Specific Workflows

@@ -16,6 +16,7 @@ const svc = @import("svc.zig");
 const arp = @import("arp.zig");
 const sshpass = @import("sshpass.zig");
 const shm = @import("shm.zig");
+const mcp_http = @import("mcp_http.zig");
 const zio = @import("zio");
 
 pub fn run(init: std.process.Init, cli: @import("main.zig").CliArgs) !void {
@@ -915,10 +916,37 @@ fn startHost(
     // Run TCP accept loop on main executor fiber.
     // Uses blockInPlace(acceptTcp) to yield to coroutines during accept.
     // Uses group.spawnBlocking() for per-connection handlers.
-    try hostTcpListen(&group, block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown, shm_handle);
+    // Pass mesh as opaque pointer for HTTP MCP ping support.
+    const mesh_opaque: ?*anyopaque = if (mesh_opt) |*m| @as(*anyopaque, @ptrCast(m)) else null;
+    try hostTcpListen(&group, block_io, gpa, &state, host_hostname_copy, mesh_port, shutdown, shm_handle, mesh_opaque);
 }
 
-/// Host TCP listener — SOCKS5 accept + three-way dispatch.
+/// HTTP MCP handler wrapper — runs on thread pool, manages conn_limit + shutdown.
+/// Called from hostTcpListen when the first byte is an ASCII uppercase letter.
+fn mcpHttpHandler(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    fd: tcp.socket_t,
+    first_byte: u8,
+    state: *GuestTable,
+    mesh_opaque: ?*anyopaque,
+    hostname: []const u8,
+    limit: *tcp.ConnLimit,
+    shutdown: ?*std.atomic.Value(bool),
+    shm_handle: ?*volatile shm.ShmLayout,
+) void {
+    defer limit.release();
+
+    // 更新心跳（tcpRead 可能长时间阻塞）
+    if (shm_handle) |h| {
+        h.utmm_heartbeat = shm.nowMs(io);
+    }
+    _ = shutdown;
+
+    mcp_http.handleHttpMcp(io, gpa, fd, first_byte, state, mesh_opaque, hostname);
+}
+
+/// Host TCP listener — SOCKS5 accept + three-way dispatch + HTTP MCP.
 /// Uses GuestTable.findByHostname for hostname→IP lookup (vs guest's lsa.Mesh).
 /// Call acceptRaw() directly — zio's server.accept() parks coroutine via kqueue.
 fn hostTcpListen(
@@ -930,6 +958,7 @@ fn hostTcpListen(
     mesh_port: u16,
     shutdown: ?*std.atomic.Value(bool),
     shm_handle: ?*volatile shm.ShmLayout,
+    mesh_opaque: ?*anyopaque,
 ) !void {
     // Get Host's own system info for self-exec (Host acts as its own Guest).
     var host_info = guest.getSystemInfo(io, allocator) catch |err| {
@@ -980,9 +1009,38 @@ fn hostTcpListen(
             continue;
         };
 
-        // 读取 SOCKS5 请求
+        // 首字节协议分发：0x05=SOCKS5，大写 ASCII 字母=HTTP MCP
+        var first_byte_buf: [1]u8 = undefined;
+        const fb_n = tcp.sockRead(fd, &first_byte_buf, 1);
+        if (fb_n <= 0) {
+            tcp.sockClose(fd);
+            continue;
+        }
+        const first_byte = first_byte_buf[0];
+
+        // HTTP MCP 分发：首字节为大写 ASCII 字母（POST/GET/PUT/DELETE…）
+        if (first_byte >= 'A' and first_byte <= 'Z') {
+            if (!conn_limit.tryAcquire()) {
+                tcp.sockClose(fd);
+                continue;
+            }
+            group.spawnBlocking(mcpHttpHandler, .{ io, allocator, fd, first_byte, state, mesh_opaque, hostname, &conn_limit, shutdown, shm_handle }) catch {
+                conn_limit.release();
+                tcp.sockClose(fd);
+                continue;
+            };
+            continue;
+        }
+
+        // SOCKS5 分发
+        if (first_byte != socks5.SOCKS_VER) {
+            std.log.debug("[host] unknown first byte 0x{x}", .{first_byte});
+            tcp.sockClose(fd);
+            continue;
+        }
+
         var req_buf: [tcp.MAX_HOSTNAME + 1]u8 = undefined;
-        const req = socks5.readRequestBuf(fd, req_buf[0..]) catch |err| {
+        const req = socks5.readRequestBufWithVersion(fd, req_buf[0..], first_byte) catch |err| {
             std.log.err("[host] SOCKS5 read failed: {}", .{err});
             tcp.sockClose(fd);
             continue;

@@ -91,6 +91,49 @@ fn authAccept(fd: tcp.socket_t) !void {
     if (n != resp.len) return error.Socks5AuthFailed;
 }
 
+/// SOCKS5 auth negotiation variant: VER byte already consumed by caller (peek).
+/// Skips VER read — only reads NMETHODS + method list, sends NO AUTH reply.
+fn authAcceptWithVersion(fd: tcp.socket_t, version_byte: u8) !void {
+    _ = version_byte; // caller must ensure version_byte == SOCKS_VER (0x05)
+
+    // Read NMETHODS(1) — VER was already consumed by the caller's peek
+    var nmethods_byte: u8 = undefined;
+    var off: usize = 0;
+    while (off < 1) {
+        const n = tcp.sockRead(fd, @as([*]u8, @ptrCast(&nmethods_byte)), 1);
+        if (tcp.sockIsError(n) or n == 0) return error.Socks5AuthFailed;
+        off += @intCast(n);
+    }
+    const nmethods = nmethods_byte;
+
+    // Read method list
+    var methods: [256]u8 = undefined;
+    if (nmethods > 0) {
+        off = 0;
+        while (off < nmethods) {
+            const n = tcp.sockRead(fd, methods[off..].ptr, nmethods - off);
+            if (tcp.sockIsError(n) or n == 0) return error.Socks5AuthFailed;
+            off += @intCast(n);
+        }
+    }
+
+    // Check if NO AUTH is offered
+    const found_noauth = for (methods[0..nmethods]) |m| {
+        if (m == SOCKS_AUTH_NOAUTH) break true;
+    } else false;
+
+    if (!found_noauth) {
+        const resp = [_]u8{ SOCKS_VER, SOCKS_AUTH_NONE_ACCEPTABLE };
+        _ = tcp.sockWrite(fd, &resp, resp.len);
+        return error.Socks5AuthNoMethod;
+    }
+
+    // Accept NO AUTH
+    const resp = [_]u8{ SOCKS_VER, SOCKS_AUTH_NOAUTH };
+    const n = tcp.sockWrite(fd, &resp, resp.len);
+    if (n != resp.len) return error.Socks5AuthFailed;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Request Parsing
 // ═══════════════════════════════════════════════════════════════════════════
@@ -120,6 +163,80 @@ pub fn readRequestBuf(fd: tcp.socket_t, buf: []u8) !Socks5RequestBuf {
     }
 
     const atyp = hdr[3];
+    var hostname: []const u8 = undefined;
+
+    switch (atyp) {
+        SOCKS_ATYP_IPV4 => {
+            // Read 4-byte IPv4 address
+            var ip: [4]u8 = undefined;
+            off = 0;
+            while (off < 4) {
+                const n = tcp.sockRead(fd, ip[off..].ptr, ip.len - off);
+                if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+                off += @intCast(n);
+            }
+            // Format as dotted decimal into buf
+            hostname = try std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
+        },
+        SOCKS_ATYP_DOMAIN => {
+            // Phase 3: Read hostname length (1 byte) + hostname
+            var len_byte: u8 = undefined;
+            off = 0;
+            while (off < 1) {
+                const n = tcp.sockRead(fd, @as([*]u8, @ptrCast(&len_byte)), 1);
+                if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+                off += @intCast(n);
+            }
+            if (len_byte == 0 or len_byte > tcp.MAX_HOSTNAME) return error.Socks5BadHostname;
+
+            off = 0;
+            while (off < len_byte) {
+                const n = tcp.sockRead(fd, buf[off..].ptr, len_byte - off);
+                if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+                off += @intCast(n);
+            }
+            hostname = buf[0..len_byte];
+        },
+        SOCKS_ATYP_IPV6 => return error.Socks5AddressTypeNotSupported,
+        else => return error.Socks5AddressTypeNotSupported,
+    }
+
+    // Phase 4: Read port (2 bytes BE)
+    var port_buf: [2]u8 = undefined;
+    off = 0;
+    while (off < 2) {
+        const n = tcp.sockRead(fd, port_buf[off..].ptr, port_buf.len - off);
+        if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+        off += @intCast(n);
+    }
+    const dst_port = std.mem.readInt(u16, &port_buf, .big);
+
+    return Socks5RequestBuf{ .cmd = cmd, .atyp = atyp, .hostname = hostname, .port = dst_port };
+}
+
+/// Read SOCKS5 request into caller-provided buffer, skipping VER byte.
+/// `version_byte` is the already-peeked first byte (must be SOCKS_VER).
+/// Completes auth negotiation (without re-reading VER) + request parsing.
+pub fn readRequestBufWithVersion(fd: tcp.socket_t, buf: []u8, version_byte: u8) !Socks5RequestBuf {
+    // Phase 1: SOCKS5 auth negotiation — VER byte already consumed by caller's peek
+    try authAcceptWithVersion(fd, version_byte);
+
+    // Phase 2: Read remaining header: CMD(1) RSV(1) ATYP(1) = 3 bytes (VER already consumed)
+    var hdr: [3]u8 = undefined;
+    var off: usize = 0;
+    while (off < 3) {
+        const n = tcp.sockRead(fd, hdr[off..].ptr, hdr.len - off);
+        if (tcp.sockIsError(n) or n == 0) return error.Socks5HeaderTooShort;
+        off += @intCast(n);
+    }
+
+    const cmd = hdr[0];
+    switch (cmd) {
+        SOCKS_CMD_CONNECT, SOCKS_CMD_BIND, SOCKS_CMD_UDP_ASSOCIATE => {},
+        else => return error.Socks5BadCommand,
+    }
+
+    const atyp = hdr[2];
     var hostname: []const u8 = undefined;
 
     switch (atyp) {

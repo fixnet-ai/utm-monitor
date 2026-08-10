@@ -22,6 +22,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
+const mcp_handler = @import("mcp_handler.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Windows API externs (removed from std.os.windows in Zig 0.16.0)
@@ -567,28 +568,18 @@ fn handleStatus(io: std.Io, gpa: std.mem.Allocator, state_ptr: *anyopaque, conn:
     _ = io;
     const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
 
-    // Build JSON from GuestTable (no mutex — per-command TCP model
-    // has no concurrent writers during read)
-    var json: std.ArrayList(u8) = .empty;
-    defer json.deinit(gpa);
-
-    json.appendSlice(gpa, "[") catch return;
-    var first = true;
-    for (state.guests.items) |g| {
-        if (!first) json.appendSlice(gpa, ",") catch return;
-        first = false;
-        json.print(gpa, "{{\"hostname\":\"{s}\",\"role\":\"{s}\",\"target\":\"{s}\",\"ip\":\"{s}\",\"mac\":\"{s}\",\"version\":\"{s}\",\"shell\":\"{s}\",\"conpty\":\"{s}\",\"status\":\"{s}\",\"last_seen\":{d}}}", .{
-            g.hostname, g.role, g.target, g.ip, g.mac, g.version, g.shell, g.conpty, g.status, g.last_seen,
-        }) catch return;
-    }
-    json.appendSlice(gpa, "]") catch return;
+    const json = mcp_handler.getGuestListJson(gpa, state) catch {
+        sendError(conn, "AllocFailed");
+        return;
+    };
+    defer gpa.free(json);
 
     // Send response: [0x10][4-byte BE len][JSON]
     var response_buf: [4096]u8 = undefined;
     var w = std.ArrayList(u8).fromOwnedSlice(&response_buf);
     w.items.len = 0;
     w.appendAssumeCapacity(@intFromEnum(Response.status));
-    writeBlob(&w, json.items) catch return;
+    writeBlob(&w, json) catch return;
     conn.writeAll(w.items) catch {};
 }
 
@@ -600,7 +591,6 @@ fn handlePing(
     conn: Connection,
     payload: []const u8,
 ) void {
-    _ = gpa;
     var pos: usize = 0;
     const target = readString(payload, &pos) orelse {
         sendError(conn, "InvalidRequest: missing vm");
@@ -608,45 +598,26 @@ fn handlePing(
     };
 
     const state = @as(*@import("host.zig").GuestTable, @ptrCast(@alignCast(state_ptr)));
-    const mesh = @as(*@import("lsa.zig").Mesh, @ptrCast(@alignCast(mesh_ptr)));
 
-    // Find guest mesh_mac
-    const node_id: ?[6]u8 = blk: {
-        for (state.guests.items) |g| {
-            if (std.mem.eql(u8, g.hostname, target)) {
-                break :blk g.mesh_mac;
-            }
-        }
-        break :blk null;
-    };
-
-    const nid = node_id orelse {
-        var buf: [256]u8 = undefined;
-        var w2 = std.ArrayList(u8).fromOwnedSlice(&buf);
-        w2.items.len = 0;
-        w2.appendAssumeCapacity(@intFromEnum(Response.ping));
-        var err_buf: [128]u8 = undefined;
-        const err_json = std.fmt.bufPrint(&err_buf, "{{\"error\":\"GuestNotFound\",\"hostname\":\"{s}\"}}", .{target}) catch {
-            sendError(conn, "ResponseTooLarge");
+    const json = mcp_handler.pingGuest(gpa, state, mesh_ptr, target) catch |err| {
+        if (err == error.GuestNotFound) {
+            var buf: [256]u8 = undefined;
+            var w2 = std.ArrayList(u8).fromOwnedSlice(&buf);
+            w2.items.len = 0;
+            w2.appendAssumeCapacity(@intFromEnum(Response.ping));
+            var err_buf: [128]u8 = undefined;
+            const err_json = std.fmt.bufPrint(&err_buf, "{{\"error\":\"GuestNotFound\",\"hostname\":\"{s}\"}}", .{target}) catch {
+                sendError(conn, "ResponseTooLarge");
+                return;
+            };
+            writeBlob(&w2, err_json) catch return;
+            conn.writeAll(w2.items) catch {};
             return;
-        };
-        writeBlob(&w2, err_json) catch return;
-        conn.writeAll(w2.items) catch {};
+        }
+        sendError(conn, "PingFailed");
         return;
     };
-
-    // Ping via mesh
-    const rtt = mesh.pingAndWait(nid);
-    const rtt_ms = rtt orelse 0;
-
-    const lsa_mod = @import("lsa.zig");
-    var mac_buf: [18]u8 = undefined;
-    const mac_str = lsa_mod.formatNodeIdBuf(nid, &mac_buf);
-    var json_buf: [256]u8 = undefined;
-    const json = std.fmt.bufPrint(&json_buf, "{{\"hostname\":\"{s}\",\"mac\":\"{s}\",\"rtt_ms\":{d}}}", .{ target, mac_str, rtt_ms }) catch {
-        sendError(conn, "ResponseTooLarge");
-        return;
-    };
+    defer gpa.free(json);
 
     var response_buf: [512]u8 = undefined;
     var w = std.ArrayList(u8).fromOwnedSlice(&response_buf);
@@ -675,104 +646,48 @@ fn handleExec(
 
     const host_mod = @import("host.zig");
     const state = @as(*host_mod.GuestTable, @ptrCast(@alignCast(state_ptr)));
-    const ptcl = @import("protocol.zig");
 
-    // Per-command TCP connection (with ARP recovery)
-    var tcp_conn = host_mod.connectGuest(io, gpa, state, vm) catch |err| {
-        std.log.err("[ipc-exec] TCP connect to {s} failed: {}", .{ vm, err });
-        sendError(conn, if (err == error.GuestNotFound) "GuestNotFound: VM not in mesh" else "GuestNotConnected: TCP connect failed");
+    // Delegate all TCP + protocol logic to mcp_handler
+    var result = mcp_handler.execOnGuest(io, gpa, state, vm, command) catch |err| {
+        std.log.err("[ipc-exec] exec on {s} failed: {}", .{ vm, err });
+        sendError(conn, if (err == error.GuestNotFound) "GuestNotFound: VM not in mesh" else "ExecFailed");
         return;
     };
-    defer tcp_conn.deinit();
+    defer result.deinit(gpa);
 
-    // Look up guest for shell (needed for buildCmdWithMarker)
-    const guest = state.findByHostname(vm) orelse {
-        sendError(conn, "GuestNotFound");
-        return;
-    };
-    defer state.freeEntry(guest);
-
-    // Generate cmd_id
-    const cmd_id = std.fmt.allocPrint(gpa, "exec_{d}", .{std.Io.Timestamp.now(io, .real).nanoseconds}) catch {
+    // Encode output as single exec_data IPC frame (dynamic buf, output may be large)
+    const blob_header: usize = 5; // type(1) + len(4)
+    const output_len: u32 = @intCast(result.output.len);
+    var response = std.ArrayList(u8).initCapacity(gpa, blob_header + result.output.len + 5) catch {
         sendError(conn, "AllocFailed");
         return;
     };
-    defer gpa.free(cmd_id);
+    defer response.deinit(gpa);
 
-    // Build command with marker
-    const cmd_with_marker = ptcl.buildCmdWithMarker(gpa, guest.shell, command) catch {
+    // exec_data: [type][4B BE len][data]
+    response.appendAssumeCapacity(@intFromEnum(Response.exec_data));
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_buf, output_len, .big);
+    response.appendSlice(gpa, &len_buf) catch {
         sendError(conn, "AllocFailed");
         return;
     };
-    defer gpa.free(cmd_with_marker);
-
-    // Build and send pty_exec_input frame
-    const frame = ptcl.buildPtyExecInput(gpa, cmd_id, cmd_with_marker) catch {
+    response.appendSlice(gpa, result.output) catch {
         sendError(conn, "AllocFailed");
         return;
     };
-    defer gpa.free(frame);
-    tcp_conn.sendAndFlush(frame, 0) catch {
-        sendError(conn, "SendFailed");
+
+    // exec_done: [type][4B BE exit_code]
+    response.appendAssumeCapacity(@intFromEnum(Response.exec_done));
+    var int_buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &int_buf, result.exit_code, .big);
+    response.appendSlice(gpa, &int_buf) catch {
+        sendError(conn, "AllocFailed");
         return;
     };
 
-    std.log.info("[ipc-exec] sent {s} to {s}", .{ cmd_id, vm });
-
-    // Receive loop: pty_exec_output → stream to IPC, pty_exec_done → exit
-    var rbuf: [65536]u8 = undefined;
-    while (true) {
-        const nr = tcp_conn.recv(&rbuf) catch |err| {
-            if (err == error.ConnectionClosed) break;
-            std.log.err("[ipc-exec] recv error: {}", .{err});
-            break;
-        };
-        if (nr == 0) break;
-
-        const msg_type: ptcl.MsgType = @enumFromInt(rbuf[0]);
-
-        switch (msg_type) {
-            .pty_exec_output => {
-                // Parse: type + cmd_id(null-term) + data_blob(4-byte BE len)
-                var mpos: usize = 1;
-                _ = readString(rbuf[0..nr], &mpos); // skip cmd_id
-                const data = readBlob(rbuf[0..nr], &mpos) orelse continue;
-                if (data.len > 0) {
-                    var wbuf: [8192]u8 = undefined;
-                    var w = std.ArrayList(u8).fromOwnedSlice(&wbuf);
-                    w.items.len = 0;
-                    w.appendAssumeCapacity(@intFromEnum(Response.exec_data));
-                    writeBlob(&w, data) catch break;
-                    conn.writeAll(w.items) catch break;
-                }
-            },
-            .pty_exec_done => {
-                var mpos: usize = 1;
-                _ = readString(rbuf[0..nr], &mpos); // skip cmd_id
-                const exit_code = readI32(rbuf[0..nr], &mpos) orelse @as(i32, -1);
-
-                var wbuf: [16]u8 = undefined;
-                var w = std.ArrayList(u8).fromOwnedSlice(&wbuf);
-                w.items.len = 0;
-                w.appendAssumeCapacity(@intFromEnum(Response.exec_done));
-                writeI32(&w, exit_code) catch {};
-                conn.writeAll(w.items) catch {};
-                std.log.info("[ipc-exec] done {s} exit={d}", .{ cmd_id, exit_code });
-                return;
-            },
-            else => continue,
-        }
-    }
-
-    // Connection closed without pty_exec_done
-    {
-        var wbuf: [16]u8 = undefined;
-        var w = std.ArrayList(u8).fromOwnedSlice(&wbuf);
-        w.items.len = 0;
-        w.appendAssumeCapacity(@intFromEnum(Response.exec_done));
-        writeI32(&w, -1) catch {};
-        conn.writeAll(w.items) catch {};
-    }
+    conn.writeAll(response.items) catch {};
+    std.log.info("[ipc-exec] done {s} exit={d}", .{ vm, result.exit_code });
 }
 
 fn handleVersion(conn: Connection) void {

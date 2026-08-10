@@ -323,7 +323,7 @@ pub fn printHelp() void {
         \\  --host              Ensure Host service is running (auto-installs if needed)
         \\  (no args)           Ensure Guest service is running (auto-installs if needed)
         \\  --svc               Internal: run as daemon (set by service manager)
-        \\  --mcp               Start MCP stdio JSON-RPC server (auto-starts Host)
+        \\  --mcp               Print MCP HTTP endpoint URL and ensure Host daemon
         \\
         \\Guest options:
         \\  --hostname NAME     Local hostname (auto-detect by default)
@@ -544,9 +544,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // ── 10. --mcp: stdio MCP server (Host service already ensured above) ──
+    // ── 10. --mcp: print MCP HTTP endpoint (Host service already ensured above) ──
     if (cli.is_mcp) {
-        try mcp.run(init.io, init.gpa, cli.port);
+        std.debug.print("MCP endpoint: http://127.0.0.1:{d}/\n", .{cli.port});
         return;
     }
 

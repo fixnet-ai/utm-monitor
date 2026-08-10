@@ -1,3 +1,21 @@
+# Zig 0.16.0 Development Rules
+
+## Tech Stack & Environment
+- **Language**: Zig 0.16.0 (Strictly enforce 0.16.0 syntax, DO NOT use 0.15.x or older deprecated patterns)
+- **Tooling**: ZLS (Zig Language Server)
+
+## Critical Code Style & Idioms for 0.16.0
+1. **Async & Concurrency**: Zig 0.16.0 has removed the `async`/`await` keywords from the language, but has enhanced async IO through the `std.Io` interface (Future / Completion / event-driven non-blocking IO). Use `std.Io` abstractions; do not spawn raw OS threads unless explicitly required.
+2. **Build System (`build.zig`)**: Always use the 0.16.0 `std.Build` API. Many older build functions have been consolidated or renamed. Never use `b.addBuildTask` or older 0.11-0.13 paradigms.
+3. **Allocator Handling**: Always pass `allocator: std.mem.Allocator` as the first or last parameter to functions requiring allocation. Do not use global state for allocation.
+4. **Error Handling**: Use `try`, `catch`, and `errdefer` for explicit resource tracking immediately after allocation or initialization.
+5. **Memory Safety**: Prefer slices over raw pointers. Ensure `defer` and `errdefer` are used to prevent leaks.
+
+## Verification Workflow
+- BEFORE generating or refactoring any code, ALWAYS use the `zig-docs` MCP tool to query the Zig 0.16.0 standard library definition.
+- DO NOT hallucinate standard library functions. Use `@memcpy` for regular memory copies; `std.mem.copyForwards` / `std.mem.copyBackwards` only for overlapping memory.
+
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -22,18 +40,21 @@ Single Zig binary, dual mode (Guest default, Host with `--host`). Key capabiliti
   sshpass. POSIX uses PTY, Windows uses ConPTY (dynamic load) with pipe fallback
   for older Windows builds (< 17763). ConPTY support is reported in `--status`
   output — critical for MCP SSH operations.
-- **MCP stdio**: AI agents control machines via `utmm --mcp` (stdio JSON-RPC).
-  `status` / `exec` / `ping` / `upload` / `download` tools. Benefits from
-  auto-ensure — if Host service is down, `--mcp` auto-starts it, so the recovery
-  flow is never broken.
+- **MCP HTTP**: AI agents control machines via HTTP POST to Host's TCP :2121
+  (JSON-RPC over HTTP). `status` / `exec` / `ping` / `upload` / `download` /
+  `sshpass` / `manual` tools. First-byte protocol dispatch: 0x05→SOCKS5,
+  ASCII letter→HTTP MCP — single port for all protocols. `utmm --mcp` prints
+  the HTTP endpoint URL and auto-ensures Host — no separate MCP process, no
+  IPC bridge, no idle timeout, no 64KB buffer truncation.
 - **utmmd supervisor**: Lightweight supervisor daemon manages utmm lifecycle
   via shared memory (heartbeat, crash recovery with exponential backoff).
   System service managers just keep utmmd alive; all restart/upgrade logic
   lives in utmmd.
 - **Single port 2121** (TCP+UDP) — UDP for LSA mesh networking, TCP for SOCKS5
-  accept + utmm frame protocol. Host is the central SOCKS5 proxy; Guests route
-  through the Host via `gateway:2121` (auto-synced to every Guest's `/etc/hosts`).
-  CLI and MCP use local IPC socket. MCP uses stdio — see `mcp.json.example`.
+  accept + utmm frame protocol + HTTP MCP (first-byte dispatch). Host is the
+  central SOCKS5 proxy; Guests route through the Host via `gateway:2121`
+  (auto-synced to every Guest's `/etc/hosts`). CLI management commands use
+  local IPC socket. MCP uses HTTP POST to :2121 — see `mcp.json.example`.
 - **6 cross-compilation targets**: aarch64/x86_64 × linux-musl/macos/windows.
   (32-bit x86 targets skipped — zio does not support 32-bit x86.)
 - **Zero dependencies**: no Node.js, Python, SSH, curl at runtime.
@@ -55,8 +76,12 @@ Current configuration — four VM targets tracked:
 │  Application Layer                                                │
 │  guest.zig           Guest daemon: TCP listen + SOCKS5 dispatch  │
 │  host.zig            Host daemon: LSA + IPC + TCP listen + SOCKS5│
-│  ipc.zig             IPC socket server (CLI/MCP entry)            │
-│  mcp.zig             MCP stdio JSON-RPC                           │
+│                      + first-byte dispatch (SOCKS5 / HTTP MCP)   │
+│  ipc.zig             IPC socket server (CLI entry)                │
+│  mcp.zig             MCP JSON-RPC processor                      │
+│  mcp_handler.zig     MCP core business logic (shared by          │
+│                       HTTP MCP + IPC handlers)                    │
+│  mcp_http.zig        HTTP/1.1 POST parser + transport            │
 │  sshpass.zig         Built-in SSH password auth (PTY/ConPTY)      │
 ├──────────────────────────────────────────────────────────────────┤
 │  Topology Layer                                                   │
@@ -95,12 +120,12 @@ Current configuration — four VM targets tracked:
                ┌─────────────┐
                │ protocol.zig │  ← imports tcp.zig for socket_t
                └──────┬──────┘
-      ┌───────────────┼───────────────┐
-      ↓               ↓               ↓
- ┌─────────┐    ┌─────────┐    ┌──────────┐    ┌─────────┐
- │ fail.zig │    │ tcp.zig │    │ lsa.zig  │    │ arp.zig │
- └─────────┘    └────┬─────┘    └──────────┘    └────┬────┘
-                     ↓                               │
+       ┌──────────────┼───────────────┐
+       ↓              ↓               ↓
+  ┌─────────┐   ┌─────────┐   ┌──────────┐   ┌─────────┐
+  │ fail.zig │   │ tcp.zig │   │ lsa.zig  │   │ arp.zig │
+  └─────────┘   └────┬─────┘   └──────────┘   └────┬────┘
+                     ↓                              │
                 ┌─────────┐                          │
                 │ dpipe   │ ← dpipe_shell/dpipe_file │
                 └────┬────┘                          │
@@ -109,6 +134,12 @@ Current configuration — four VM targets tracked:
   ┌────────┐   ┌────────┐   ┌────────┐              │
   │ guest  │   │ host   │───│  ipc   │──────────────┘
   └────────┘   └───┬────┘   └───┬────┘  (ARP lookup)
+                   │             │
+         ┌─────────┼──────┐      │
+         ↓         ↓      ↓      ↓
+    ┌─────────┐ ┌──────┐ ┌──────────────┐
+    │ mcp_http│→│ mcp  │→│ mcp_handler  │
+    └─────────┘ └──────┘ └──────────────┘
                    │             │
                    └──────┬──────┘
                           ↓
@@ -132,9 +163,20 @@ accept → recv first frame → switch type:
   exec     → dpipe.relay(conn, dpipe_shell.create())
   upload   → dpipe.relay(conn, dpipe_file.writeFile())
   download → dpipe.relay(conn, dpipe_file.readFile())
+
+HTTP MCP side (Host only):
+accept → peek first byte → ASCII letter → mcp_http.handleHttpMcp:
+  read HTTP request → mcp.processRequest → mcp_handler (direct Host fn calls)
+  → write HTTP response → close
 ```
 
 Per-command independent connection = no cross-thread shared state = no state.zig needed.
+
+### TCP Port 2121 First-Byte Dispatch (v0.18.0+)
+
+- `0x05` — SOCKS5 protocol (existing Guest-Host communication)
+- `'A'..'Z'` — HTTP MCP JSON-RPC (HTTP method starts with uppercase ASCII)
+- Any other byte — close connection
 
 ### UDP Port 2121 First-Byte Dispatch
 
@@ -158,26 +200,29 @@ Per-command independent connection = no cross-thread shared state = no state.zig
   to other Guests — Host is the only relay node), and IPC socket for CLI/MCP
   communication. Host-initiated binary upgrade via `--upgrade <vm>` (push model).
   All on one port.
-- **MCP mode (`--mcp`)**: stdio JSON-RPC server for AI agents. Talks to Host
-  daemon via IPC socket (`/var/run/utmm.sock`); auto-ensures Host on first use.
+- **MCP mode (`--mcp`)**: Prints HTTP endpoint URL (`http://127.0.0.1:{port}/`)
+  and ensures Host daemon is running. MCP is served directly by the Host daemon
+  via TCP :2121 first-byte dispatch — no separate MCP process, no IPC bridge.
 
 ### Complete Data Flow
 
 ```
-                         ┌── MCP stdio ← AI Agent (utmm --mcp → auto-ensure → IPC socket)
+                         ┌── HTTP MCP ← AI Agent (POST to :2121)
 Guest (macvm)    ──TCP──┐
-Guest (linuxvm)  ──TCP──┤──→ Host TCP :2121 ──┼── CLI/MCP (IPC socket)
-Guest (windows)  ──TCP──┘   (SOCKS5 accept +    │   /etc/hosts sync
-                         │    forwarding)        │
-                         │                       │
+Guest (linuxvm)  ──TCP──┤──→ Host TCP :2121 ──┼── CLI (IPC socket)
+Guest (windows)  ──TCP──┘   (SOCKS5 + HTTP MCP │   /etc/hosts sync
+                         │    via first-byte)   │
+                         │                      │
 Guest ←── LSA broadcast (UDP) ──┘  (topology discovery)
 
 Every node TCP :2121 = SOCKS5 endpoint. Guest forwards to Host; Host forwards
 to Guest. Third-party tools use any node as SOCKS5 proxy to reach any other node.
+AI agents use HTTP POST to Host :2121 for MCP JSON-RPC.
 ```
 
 ### How a Command Flows
 
+**CLI management commands** (via IPC socket):
 ```
 1. CLI: utmm --exec linuxvm "ls -la"
 2. Host IPC /exec → tcp.connect(linuxvm) → sends pty_exec_input frame
@@ -187,6 +232,15 @@ to Guest. Third-party tools use any node as SOCKS5 proxy to reach any other node
 5. Host: stream recv pty_exec_output → forward to CLI via IPC binary frames
    (exec_data → exec_done with exit_code)
 6. When MDELIM:N\n found: strip marker, set exit_code=N, send exec_done frame
+```
+
+**HTTP MCP commands** (directly in Host daemon, no IPC):
+```
+1. AI Agent: HTTP POST :2121 → Host peek first byte ('P' for POST)
+2. mcp_http.readHttpRequestBody → extract JSON-RPC body
+3. mcp.processRequest(McpContext, json) → dispatch to mcp_handler
+4. mcp_handler.execOnGuest: tcp.connect(vm) → send command frame → stream recv → return result
+5. mcp_http.writeHttpResponse(fd, 200, response_json) → close
 ```
 
 ### How Upload/Download Flows
@@ -384,6 +438,13 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
   SOCKS5 forward. Guests route through Host via `gateway:2121` (auto-synced
   to every Guest's `/etc/hosts`). Third-party tools reach any Guest from the Host
   without SSH tunnels or port mapping.
+- **HTTP MCP embedding** (v0.18.0) — MCP JSON-RPC served directly by Host daemon
+  via TCP :2121 first-byte dispatch (0x05→SOCKS5, ASCII→HTTP). Eliminates the
+  stdio MCP process and IPC bridge: no SIGALRM idle timeout, no EINTR races,
+  no 64KB exec buffer truncation, no IPC serialization overhead. Core business
+  logic extracted to `mcp_handler.zig` — shared by HTTP MCP and IPC handlers
+  with zero duplication. `utmm --mcp` prints the HTTP endpoint and auto-ensures
+  Host daemon.
 
 ## Build & Run
 
@@ -518,7 +579,7 @@ After release, use `utmm --deploy` to compile and copy new binaries to the
 serve-dir (`/opt/utmm/`). Then use `utmm --upgrade <vm>` to push upgrades
 to individual Guest VMs via the Host-initiated push model.
 
-## Project File Structure (20 src files + 13 test files + 2 test scripts)
+## Project File Structure (22 src files + 13 test files + 2 test scripts)
 
 ```
 src/
@@ -534,9 +595,11 @@ src/
 ├── dpipe_shell.zig    pty ↔ DuplexPipe (posix_openpt/CreatePipe)
 ├── dpipe_file.zig     file ↔ DuplexPipe + SHA256 verification
 ├── guest.zig          Guest daemon: TCP :2121 SOCKS5 dispatch + dpipe relay
-├── host.zig           Host daemon: LSA + IPC + TCP :2121 SOCKS5 + command dispatch
-├── ipc.zig            IPC socket server: CLI/MCP request handling
-├── mcp.zig            MCP stdio server: JSON-RPC stdin/stdout, IPC client to Host
+├── host.zig           Host daemon: LSA + IPC + TCP :2121 SOCKS5 + first-byte dispatch (HTTP MCP)
+├── ipc.zig            IPC socket server: CLI request handling (delegates to mcp_handler)
+├── mcp.zig            MCP JSON-RPC processor (McpContext, tools/call dispatch)
+├── mcp_handler.zig    MCP core business logic: exec/ping/upload/download on Guest (shared by HTTP MCP + IPC)
+├── mcp_http.zig       HTTP/1.1 POST parser + transport (single-request-per-connection)
 ├── sshpass.zig        Built-in SSH password auth (PTY/ConPTY, 100% CLI compatible)
 ├── svc.zig            Service management (install/uninstall/forceInstall/ensure + Platform/genInit + InstallLock)
 ├── utmmd.zig          Supervisor daemon: utmm lifecycle, crash recovery, shared memory IPC
@@ -557,7 +620,7 @@ tests/
 ├── test_arp.zig            ARP MAC→IP 集成测试 (pub fn test_arp)
 ├── test_hosts.zig          /etc/hosts 同步集成测试 (pub fn test_hosts)
 ├── test_ipc_e2e.zig        IPC 端到端集成测试 (pub fn test_ipc_e2e)
-├── test_mcp_tools.py       MCP 工具测试脚本 (7 tools)
+├── test_mcp_tools.py       MCP 工具测试脚本 (HTTP POST, 7 tools)
 └── test_cli_commands.py    CLI 命令测试脚本 (31 checks)
 ```
 
@@ -566,6 +629,7 @@ tests/
 > tunproto.zig, tcpf.zig, socks4.zig, netconn.zig, cmdchan.zig, lock.zig.
 > v0.13.2: Integration tests restructured from 8 separate executables to single binary.
 > v0.17.11: Python test scripts added for MCP + CLI coverage.
+> v0.18.0: Added mcp_handler.zig (core logic) + mcp_http.zig (HTTP transport). MCP stdio → HTTP.
 
 ## Code of Conduct / Guidelines
 
@@ -600,14 +664,29 @@ Before starting any work, read (if they exist): `./CLAUDE.md`, `./README.md`.
 - `Io.Timeout` union: `{ none, duration: Clock.Duration, deadline: Clock.Timestamp }`
   Use `.awake` clock: `.{ .duration = .{ .raw = Io.Duration.fromSeconds(30), .clock = .awake } }`
 
-### HTTP Client Patterns (not currently used)
+### HTTP MCP Server Patterns (v0.18.0+)
 
-No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
+- **First-byte dispatch**: `hostTcpListen` reads 1 byte on accept: `0x05`→SOCKS5,
+  uppercase ASCII→HTTP MCP. Single-threaded peek, dispatched to thread pool.
+- **HTTP/1.1 POST only**: `mcp_http.zig` handles one request per connection (no
+  keep-alive). Reads request line → headers (Content-Length) → body → dispatches
+  to `mcp.processRequest()` → writes HTTP response → closes socket.
+- **Max body 64KB**: matches old stdio buffer size. Content-Length required.
+  Non-POST returns 405, missing Content-Length returns 411, oversized returns 413.
+- **Thread pool execution**: `spawnBlocking(mcpHttpHandler, ...)` runs HTTP handler
+  on zio thread pool. ConnLimit prevents overload. Heartbeat updated before spawnBlocking.
+- **McpContext struct**: `{ io, gpa, port, state: ?*GuestTable, mesh_ptr: ?*anyopaque, hostname }`
+  — carries Host daemon state into MCP processor. Eliminates IPC serialization.
 
 ### TCP Frame Protocol Patterns
 
 - **Frame format**: 1-byte type + 4-byte BE length + payload. Length = payload bytes only.
   `protocol.zig` handles frame serialization via `sendFrame`/`recvFrame`.
+- **First-byte protocol dispatch** (v0.18.0): `hostTcpListen` reads 1 byte on accept
+  before any further processing. `0x05` → SOCKS5 (skip VER byte, use
+  `socks5.readRequestBufWithVersion`). Uppercase ASCII → HTTP MCP
+  (`mcpHttpHandler` on thread pool). Everything else → close. This enables
+  SOCKS5, utmm frame protocol, and HTTP MCP on a single TCP port.
 - **SOCKS5**: In `socks5.zig` (extracted from tcp.zig at v0.16.0). Host accepts SOCKS5 on
   TCP :2121 and dispatches by target hostname: self+2121 → utmm frame protocol,
   self+other → localhost relay, other → chained SOCKS5 forward via node table.
@@ -616,6 +695,8 @@ No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
   (connect side), `socks5.forward` (chain-forward), `socks5.localRelay` (localhost
   forward), `socks5.relay` (bidirectional relay), `socks5.hostConnect` (Host→Guest
   via SOCKS5 proxy). Guest→Guest goes through Host via `gateway:2121`.
+  `socks5.authAcceptWithVersion` / `socks5.readRequestBufWithVersion` accept
+  pre-peeked VER byte for first-byte dispatch compatibility.
 - **Windows socket handle compatibility**: On Windows, Zig 0.16.0's `IpAddress.connect()`
   returns AFD kernel handles which are NOT compatible with Winsock2 `recv`/`send`.
   `sockAccept` returns raw Winsock2 SOCKET handles. These two handle types cannot
@@ -625,6 +706,7 @@ No HTTP client code currently — checkGitHubVersion was removed in v0.14.0.
   connect that will be relayed with an accept-fd — use raw Winsock2 on Windows.
 - **Per-command connections**: Every exec/upload/download opens `tcp.connect()`,
   completes one operation, and closes. No connection pooling or keep-alive.
+  HTTP MCP connections are also single-request-per-connection.
 
 ### LSA Patterns
 

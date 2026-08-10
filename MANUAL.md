@@ -3,8 +3,8 @@
 utmm is a remote machine management tool — single binary, dual mode (Host +
 Guest). It provides command execution, file transfer, mesh networking, and
 SOCKS5 forwarding to any machine (VM, cloud instance, or bare metal) running
-the Guest daemon. AI agents interact with utmm via the MCP stdio JSON-RPC
-interface (`utmm --mcp`).
+the Guest daemon. AI agents interact with utmm via HTTP MCP JSON-RPC
+on the Host's TCP :2121 port (`utmm --mcp` prints the endpoint URL).
 
 ## For AI Agents — Quick Start
 
@@ -60,7 +60,7 @@ need to know:
 | `utmm` (no args) | Ensure Guest service is running (auto-installs if needed) |
 | `utmm --host` | Ensure Host service is running |
 | `utmm --svc` | Internal: run as daemon (set by service manager) |
-| `utmm --mcp` | Start MCP stdio JSON-RPC server (auto-ensures Host on first use) |
+| `utmm --mcp` | Print MCP HTTP endpoint URL and ensure Host daemon is running |
 
 ### Guest Options
 
@@ -154,20 +154,30 @@ mode. Check `--status` for `conpty:yes/no` on each node.
 
 ## MCP Protocol
 
-`utmm --mcp` implements a stdio JSON-RPC 2.0 server. One JSON object per line,
-newline-delimited. Log traffic goes to stderr, JSON-RPC to stdout.
+MCP is served directly by the Host daemon via HTTP POST on TCP :2121 (first-byte
+protocol dispatch: `0x05`→SOCKS5, ASCII→HTTP MCP). No separate MCP process,
+no IPC bridge.
+
+`utmm --mcp` prints the HTTP endpoint URL (`http://127.0.0.1:{port}/`) and
+ensures the Host daemon is running. AI agents then send JSON-RPC 2.0 requests
+as HTTP POST with `Content-Type: application/json`. Each request opens a fresh
+TCP connection — single-request-per-connection model (no keep-alive).
 
 ### Initialization
 
 ```
-→ {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05",...}}
-← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.17.16"},"capabilities":{"tools":{}}}}
+→ POST http://127.0.0.1:2121/  Content-Type: application/json
+  {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05",...}}
+← HTTP/1.1 200 OK  Content-Type: application/json
+  {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.18.0"},"capabilities":{"tools":{}}}}
 
-→ {"jsonrpc":"2.0","method":"notifications/initialized"}
-← (empty response — notification, no id)
+→ POST (notification — no response expected for "notifications/initialized")
+  {"jsonrpc":"2.0","method":"notifications/initialized"}
 
-→ {"jsonrpc":"2.0","id":2,"method":"tools/list"}
-← {"jsonrpc":"2.0","id":2,"result":{"tools":[{...tool1...},{...tool2...}]}}
+→ POST
+  {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+← HTTP/1.1 200 OK  Content-Type: application/json
+  {"jsonrpc":"2.0","id":2,"result":{"tools":[{...tool1...},{...tool2...}]}}
 ```
 
 ### tools/list Response
@@ -199,7 +209,7 @@ See [sshpass Subcommand](#sshpass-subcommand) for the full CLI reference.
 **status** — list all nodes:
 ```
 → {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}
-← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"**Connected Machines:**\n- **linuxvm** (guest) — aarch64-linux-musl | IP: 192.168.64.6 | MAC: 16:a0:6c:... | v0.17.16 | shell: bash | status: online\n..."}]}}
+← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"**Connected Machines:**\n- **linuxvm** (guest) — aarch64-linux-musl | IP: 192.168.64.6 | MAC: 16:a0:6c:... | v0.18.0 | shell: bash | status: online\n..."}]}}
 ```
 
 **exec** — execute a command:
@@ -268,12 +278,14 @@ accepts SOCKS5 connections from Guests and chain-forwards them to other Guests,
 and serves CLI/MCP requests via a local IPC socket. Only one Host per mesh.
 The Host is the only node that relays SOCKS5 between Guests.
 
-**MCP mode** (`--mcp`): stdio JSON-RPC server for AI agents. Auto-ensures the Host
-service on first use — no daemon awareness needed. All management commands go through
-the Host via IPC.
+**MCP mode** (`--mcp`): Prints the HTTP endpoint URL and ensures the Host daemon
+is running. MCP JSON-RPC is served directly by the Host daemon via TCP :2121
+first-byte dispatch — no separate MCP process, no IPC bridge. AI agents POST
+JSON-RPC requests to `http://127.0.0.1:2121/`.
 
 ### How a Command Flows
 
+**CLI management commands** (via IPC socket):
 ```
 1. User runs: utmm --exec linuxvm "ls -la"
 2. CLI connects to Host daemon via local IPC socket
@@ -283,8 +295,17 @@ the Host via IPC.
 6. Host forwards output to CLI, detects exit-code marker, reports exit code
 ```
 
+**MCP commands** (via HTTP POST, handled directly by Host daemon):
+```
+1. AI Agent: HTTP POST :2121 {"method":"tools/call","params":{"name":"exec",...}}
+2. Host first-byte dispatch: ASCII 'P' → mcp_http → mcp.processRequest
+3. mcp_handler.execOnGuest → SOCKS5 connect → send command → stream recv → return result
+4. Host: write HTTP 200 response with JSON-RPC result
+```
+
 Each exec/upload/download opens a fresh TCP connection, completes one operation,
-and closes — no persistent tunnels between commands.
+and closes — no persistent tunnels between commands. Each MCP HTTP request is
+also one connection.
 
 ### SOCKS5 Forwarding (Hub-Spoke)
 
@@ -295,14 +316,18 @@ Guest, target the Host with `gateway:2121`.
 **Dispatch model (Host TCP :2121):**
 
 ```
-SOCKS5 request arrives at Host:
-  target_hostname == self ?
-    ├─ target_port == 2121 → utmm internal frame protocol (exec/upload/download)
-    └─ target_port != 2121 → connect 127.0.0.1:target_port, relay
-  target_hostname != self ?
-    └─ lookup hostname→IP in node table
-        ├─ found → chain-forward SOCKS5 to target_ip:2121, relay
-        └─ not found → REJECT
+TCP connection arrives at Host :2121:
+  peek 1 byte:
+    'A'..'Z' → HTTP MCP JSON-RPC (read HTTP request, process, respond, close)
+    0x05      → SOCKS5 dispatch:
+      target_hostname == self ?
+        ├─ target_port == 2121 → utmm internal frame protocol (exec/upload/download)
+        └─ target_port != 2121 → connect 127.0.0.1:target_port, relay
+      target_hostname != self ?
+        └─ lookup hostname→IP in node table
+            ├─ found → chain-forward SOCKS5 to target_ip:2121, relay
+            └─ not found → REJECT
+    other → close (unknown protocol)
 ```
 
 **Guest SOCKS5 accept (TCP :2121):**
@@ -477,7 +502,7 @@ supervisor. Error messages include actionable guidance for common failures.
 utmm sshpass -p <pass> ssh root@newvm 'mkdir -p /opt/utmm'
 
 # 2. Copy the binary (from Host serve-dir or zig-out/bin)
-utmm sshpass -p <pass> scp /opt/utmm/utmm-aarch64-linux-0.17.22 root@newvm:/opt/utmm/utmm-new
+utmm sshpass -p <pass> scp /opt/utmm/utmm-aarch64-linux-0.18.0 root@newvm:/opt/utmm/utmm-new
 
 # 3. Install as a system service
 utmm sshpass -p <pass> ssh root@newvm '/opt/utmm/utmm-new --install --hostname newvm'
@@ -488,7 +513,7 @@ sleep 15 && utmm --status
 
 For Windows VMs, use the `.exe` binary and Windows paths:
 ```bash
-utmm sshpass -p <pass> scp /opt/utmm/utmm-x86_64-windows-0.17.22.exe Administrator@winvm:"C:\\opt\\utmm\\utmm-new.exe"
+utmm sshpass -p <pass> scp /opt/utmm/utmm-x86_64-windows-0.18.0.exe Administrator@winvm:"C:\\opt\\utmm\\utmm-new.exe"
 utmm sshpass -p <pass> ssh Administrator@winvm "C:\\opt\\utmm\\utmm-new.exe --install --hostname winvm"
 ```
 

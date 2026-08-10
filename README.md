@@ -6,11 +6,12 @@
 
 Single Zig binary, dual mode (Guest agent + Host controller). Check processes,
 read logs, transfer files on any machine — Linux, macOS, Windows. No SSH daemon
-required at runtime. AI agents get the same capabilities through MCP stdio.
+required at runtime. AI agents get the same capabilities through HTTP MCP.
 
 ## MCP Integration
 
-`utmm --mcp` provides seven tools over stdio JSON-RPC 2.0 for AI coding agents.
+`utmm --mcp` prints the HTTP endpoint URL and ensures the Host daemon is running.
+Seven tools available via HTTP POST to `http://127.0.0.1:2121/` (JSON-RPC 2.0):
 
 | Tool | Description |
 |------|-------------|
@@ -46,20 +47,23 @@ See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
   fallback on older Windows).
 - **LSA mesh zero-config** — Guests auto-discover Host over the local network,
   `/etc/hosts` kept in sync automatically.
-- **MCP stdio** — AI agents get seven tools (`status`, `exec`, `ping`, `upload`,
-  `download`, `sshpass`, `manual`) via `utmm --mcp`. Auto-ensures Host on first use.
+- **MCP HTTP** — AI agents get seven tools (`status`, `exec`, `ping`, `upload`,
+  `download`, `sshpass`, `manual`) via HTTP POST to Host's TCP :2121. First-byte
+  protocol dispatch: 0x05→SOCKS5, ASCII→HTTP MCP. `utmm --mcp` prints the endpoint
+  URL and auto-ensures Host — no separate process, no IPC bridge, no idle timeout.
 
 ## Architecture
 
 ```
-                         ┌── MCP stdio ← AI Agent
+                         ┌── HTTP MCP ← AI Agent (POST to :2121)
 Guest (macvm)    ──TCP──┐
-Guest (linuxvm)  ──TCP──┤──→ Host TCP :2121  ──┼── CLI (IPC)
-Guest (windows)  ──TCP──┘   (SOCKS5 endpoint)
-                         │
+Guest (linuxvm)  ──TCP──┤──→ Host TCP :2121 ──┼── CLI (IPC)
+Guest (windows)  ──TCP──┘   (SOCKS5 + HTTP MCP
+                         │    via first-byte)
 Guest ←── LSA broadcast (UDP :2121) ──┘  (auto-discovery + topology)
 
-Host TCP :2121 = SOCKS5 proxy to every Guest. Reach services on any node from the Host.
+Host TCP :2121 = SOCKS5 proxy + HTTP MCP on a single port. Reach any Guest's
+services from the Host. AI agents use HTTP POST for MCP JSON-RPC.
 ```
 
 ## CLI Quick Start
@@ -134,7 +138,7 @@ zig build test-integration         # Integration tests
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-macos
 zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
-# ... plus x86_64 and x86 variants for all three platforms (8 targets total)
+# ... plus x86_64 variants for all three platforms (6 targets total)
 ```
 
 **Requirements**: Zig 0.16.0, macOS build host (other hosts may work, untested).
