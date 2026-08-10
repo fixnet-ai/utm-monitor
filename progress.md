@@ -1,3 +1,23 @@
+## v0.18.1 — MCP 双格式响应 (structuredContent)
+
+**时间**: 2026-08-11
+
+参考 zigtester MCP 服务器的双格式模式，为全部 6 个 MCP 工具响应添加 `structuredContent` 字段，
+同时保留 `content[0].text` 人类可读 markdown。AI agent 可程序化解析 `structuredContent` 做决策，
+无需从 markdown 提取数据。
+
+| 工具 | structuredContent 字段 |
+|------|----------------------|
+| `status` | `guests[]`, `counts{total,serving,offline}` |
+| `exec` | `vm`, `command`, `exit_code` |
+| `ping` | `vm`, `reachable`, `mac`, `rtt_ms` |
+| `upload` | `vm`, `local_path`, `remote_path`, `success` |
+| `download` | `vm`, `remote_path`, `local_path`, `bytes`, `success` |
+| `sshpass` | `host`, `user`, `exit_code` |
+
+修改集中在 `src/mcp.zig` 的 `format*` / `handle*` 函数，~50 行增量 + 6 新测试。216 单元测试通过。
+文档更新：README.md、CLAUDE.md、MANUAL.md、progress.md、task_plan.md。
+
 ## v0.18.0 — HTTP MCP 嵌入 Host Daemon
 
 **时间**: 2026-08-11

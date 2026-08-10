@@ -1,14 +1,14 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.0 | **分支**: `main` | **更新**: 2026-08-11
+**版本**: v0.18.1 | **分支**: `main` | **更新**: 2026-08-11
 
 ## 当前状态
 
 - **源文件**: 22 src + 13 test + 2 embed + 2 Python test scripts
 - **测试**: 216 单元 + 59 集成 + 2 Python (CLI 31/31 + MCP 14/14)，0 泄漏
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
-- **真机部署**: 5 节点全部 v0.18.0 serving
-- **GitHub Release**: v0.18.0 published
+- **真机部署**: 5 节点全部 v0.18.1 serving
+- **GitHub Release**: v0.18.1 published
 
 ## 已完成: Phase 31 — HTTP MCP 嵌入 Host Daemon
 

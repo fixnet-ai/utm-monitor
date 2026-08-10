@@ -445,6 +445,13 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
   logic extracted to `mcp_handler.zig` — shared by HTTP MCP and IPC handlers
   with zero duplication. `utmm --mcp` prints the HTTP endpoint and auto-ensures
   Host daemon.
+- **MCP dual-format responses** (v0.18.1) — Every tool result includes both
+  `content[0].text` (human-readable markdown) and `structuredContent`
+  (machine-readable JSON). AI agents parse `structuredContent` for programmatic
+  decisions without regex/markdown extraction. Fields: status→guests[]+counts,
+  exec→{vm,command,exit_code}, ping→{vm,reachable,mac,rtt_ms}, upload→{vm,
+  local_path,remote_path,success}, download→{vm,remote_path,local_path,bytes,
+  success}, sshpass→{host,user,exit_code}. All format helpers in `src/mcp.zig`.
 
 ## Build & Run
 

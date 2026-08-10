@@ -163,13 +163,27 @@ ensures the Host daemon is running. AI agents then send JSON-RPC 2.0 requests
 as HTTP POST with `Content-Type: application/json`. Each request opens a fresh
 TCP connection — single-request-per-connection model (no keep-alive).
 
+**Dual-format responses** (v0.18.1+): Every tool result includes both
+`content[0].text` (human-readable markdown for display) and `structuredContent`
+(machine-readable JSON for programmatic use). AI agents should parse
+`structuredContent` instead of extracting data from markdown text.
+
+| Tool | structuredContent fields |
+|------|-------------------------|
+| `status` | `guests[]`, `counts{total,serving,offline}` |
+| `exec` | `vm`, `command`, `exit_code` |
+| `ping` | `vm`, `reachable`, `mac`, `rtt_ms` |
+| `upload` | `vm`, `local_path`, `remote_path`, `success` |
+| `download` | `vm`, `remote_path`, `local_path`, `bytes`, `success` |
+| `sshpass` | `host`, `user`, `exit_code` |
+
 ### Initialization
 
 ```
 → POST http://127.0.0.1:2121/  Content-Type: application/json
   {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05",...}}
 ← HTTP/1.1 200 OK  Content-Type: application/json
-  {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.18.0"},"capabilities":{"tools":{}}}}
+  {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"utmm","version":"0.18.1"},"capabilities":{"tools":{}}}}
 
 → POST (notification — no response expected for "notifications/initialized")
   {"jsonrpc":"2.0","method":"notifications/initialized"}
@@ -206,40 +220,40 @@ See [sshpass Subcommand](#sshpass-subcommand) for the full CLI reference.
 
 ### tools/call Examples
 
-**status** — list all nodes:
+**status** — list all nodes (v0.18.1+ includes structuredContent):
 ```
 → {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}
-← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"**Connected Machines:**\n- **linuxvm** (guest) — aarch64-linux-musl | IP: 192.168.64.6 | MAC: 16:a0:6c:... | v0.18.0 | shell: bash | status: online\n..."}]}}
+← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"**Connected Machines:**\n- **linuxvm** (guest) — aarch64-linux-musl | IP: 192.168.64.6 | MAC: 16:a0:6c:... | v0.18.1 | shell: bash | status: serving\n..."}],"structuredContent":{"guests":[{...}],"counts":{"total":1,"serving":1,"offline":0}}}}
 ```
 
 **exec** — execute a command:
 ```
 → {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"exec","arguments":{"vm":"linuxvm","command":"uname -a"}}}
-← {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"Linux linuxvm 6.1.0-... aarch64 GNU/Linux\n"}]}}
+← {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"**linuxvm** `$ uname -a`:\n```\nLinux linuxvm 6.1.0-... aarch64 GNU/Linux\n```"}],"structuredContent":{"vm":"linuxvm","command":"uname -a","exit_code":0}}}
 ```
 
 **ping** — mesh connectivity test:
 ```
 → {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ping","arguments":{"vm":"linuxvm"}}}
-← {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"{\"hostname\":\"linuxvm\",\"mac\":\"16:a0:6c:...\",\"rtt_ms\":3}"}]}}
+← {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"**linuxvm** ping: MAC=16:a0:6c:..., RTT=3ms"}],"structuredContent":{"vm":"linuxvm","reachable":true,"mac":"16:a0:6c:...","rtt_ms":3}}}
 ```
 
 **upload** — file transfer to Guest:
 ```
 → {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"upload","arguments":{"vm":"linuxvm","local_path":"/tmp/test.txt","remote_path":"/opt/utmm/test.txt"}}}
-← {"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"Upload OK: /opt/utmm/test.txt (1048576 bytes, SHA256: abc123...)"}]}}
+← {"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"Upload OK: /opt/utmm/test.txt (1048576 bytes, SHA256: abc123...)"}],"structuredContent":{"vm":"linuxvm","local_path":"/tmp/test.txt","remote_path":"/opt/utmm/test.txt","success":true}}}
 ```
 
 **download** — file transfer from Guest:
 ```
 → {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"download","arguments":{"vm":"linuxvm","remote_path":"/var/log/app.log","local_path":"./app.log"}}}
-← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"Download OK: ./app.log (4096 bytes)"}]}}
+← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"Download OK: ./app.log (4096 bytes)"}],"structuredContent":{"vm":"linuxvm","remote_path":"/var/log/app.log","local_path":"./app.log","bytes":4096,"success":true}}}
 ```
 
 **sshpass** — direct SSH to any machine:
 ```
 → {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"sshpass","arguments":{"host":"linuxvm","user":"root","password":"111","command":"uname -a"}}}
-← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"**ssh root@linuxvm** `uname -a`\\nexit: 0\\n```\\nLinux linuxvm 6.1.0-... aarch64 GNU/Linux\\n```"}]}}
+← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"**ssh root@linuxvm** `uname -a`\\nexit: 0\\n```\\nLinux linuxvm 6.1.0-... aarch64 GNU/Linux\\n```"}],"structuredContent":{"host":"linuxvm","user":"root","exit_code":0}}}
 ```
 
 **manual** — get the full reference manual (this document):
@@ -502,7 +516,7 @@ supervisor. Error messages include actionable guidance for common failures.
 utmm sshpass -p <pass> ssh root@newvm 'mkdir -p /opt/utmm'
 
 # 2. Copy the binary (from Host serve-dir or zig-out/bin)
-utmm sshpass -p <pass> scp /opt/utmm/utmm-aarch64-linux-0.18.0 root@newvm:/opt/utmm/utmm-new
+utmm sshpass -p <pass> scp /opt/utmm/utmm-aarch64-linux-0.18.1 root@newvm:/opt/utmm/utmm-new
 
 # 3. Install as a system service
 utmm sshpass -p <pass> ssh root@newvm '/opt/utmm/utmm-new --install --hostname newvm'
@@ -513,7 +527,7 @@ sleep 15 && utmm --status
 
 For Windows VMs, use the `.exe` binary and Windows paths:
 ```bash
-utmm sshpass -p <pass> scp /opt/utmm/utmm-x86_64-windows-0.18.0.exe Administrator@winvm:"C:\\opt\\utmm\\utmm-new.exe"
+utmm sshpass -p <pass> scp /opt/utmm/utmm-x86_64-windows-0.18.1.exe Administrator@winvm:"C:\\opt\\utmm\\utmm-new.exe"
 utmm sshpass -p <pass> ssh Administrator@winvm "C:\\opt\\utmm\\utmm-new.exe --install --hostname winvm"
 ```
 

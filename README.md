@@ -11,17 +11,20 @@ required at runtime. AI agents get the same capabilities through HTTP MCP.
 ## MCP Integration
 
 `utmm --mcp` prints the HTTP endpoint URL and ensures the Host daemon is running.
-Seven tools available via HTTP POST to `http://127.0.0.1:2121/` (JSON-RPC 2.0):
+Seven tools available via HTTP POST to `http://127.0.0.1:2121/` (JSON-RPC 2.0).
+All responses include both human-readable `content[0].text` (markdown) and
+machine-readable `structuredContent` (JSON) — AI agents parse `structuredContent`
+for decisions without extracting data from markdown.
 
-| Tool | Description |
-|------|-------------|
-| `status` | List all nodes: hostname, role, IP, OS/arch, MAC, version, status, shell, ConPTY |
-| `exec` | Execute a shell command on any Guest via per-command pty |
-| `ping` | Ping a Guest over the mesh network and measure RTT |
-| `upload` | Upload file from Host to Guest (TCP/SOCKS5, SHA256 verified) |
-| `download` | Download file from Guest to Host (TCP/SOCKS5, SHA256 verified) |
-| `sshpass` | Non-interactive SSH password auth — direct shell access to any machine |
-| `manual` | Return the full reference manual (this document embedded at compile time) |
+| Tool | Description | structuredContent |
+|------|-------------|-------------------|
+| `status` | List all nodes: hostname, role, IP, OS/arch, MAC, version, status, shell, ConPTY | `guests[]`, `counts{total,serving,offline}` |
+| `exec` | Execute a shell command on any Guest via per-command pty | `vm`, `command`, `exit_code` |
+| `ping` | Ping a Guest over the mesh network and measure RTT | `vm`, `reachable`, `mac`, `rtt_ms` |
+| `upload` | Upload file from Host to Guest (TCP/SOCKS5, SHA256 verified) | `vm`, `local_path`, `remote_path`, `success` |
+| `download` | Download file from Guest to Host (TCP/SOCKS5, SHA256 verified) | `vm`, `remote_path`, `local_path`, `bytes`, `success` |
+| `sshpass` | Non-interactive SSH password auth — direct shell access to any machine | `host`, `user`, `exit_code` |
+| `manual` | Return the full reference manual (this document embedded at compile time) | — |
 
 Example prompts your AI agent can handle:
 - "Push the new build to linuxvm and run the test suite — show me the failures"
