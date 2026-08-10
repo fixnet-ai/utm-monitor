@@ -44,7 +44,7 @@ v0.13.0 完整重构历程：
 │  guest.zig           Host daemon: LSA + IPC + command dispatch    │
 │  host.zig            Guest daemon: TCP listen + dpipe relay       │
 │  ipc.zig             IPC socket server (CLI/MCP entry)            │
-│  mcp.zig             MCP stdio JSON-RPC                           │
+│  mcp.zig             MCP JSON-RPC 处理 / HTTP 传输                    │
 ├──────────────────────────────────────────────────────────────────┤
 │  拓扑层                                                           │
 │  lsa.zig             LSA 广播 + 节点表 + /etc/hosts（自洽闭环）    │
@@ -389,7 +389,9 @@ src/
 ├── guest.zig         Guest daemon
 ├── host.zig          Host daemon
 ├── ipc.zig           IPC socket
-├── mcp.zig           MCP stdio
+├── mcp_handler.zig   MCP public 逻辑
+├── mcp_http.zig       HTTP/1.1 POST transport
+├── mcp.zig            MCP processor
 ├── svc.zig           服务管理（install/uninstall/forceInstall/ensure + Platform/genInit + InstallLock）
 ├── utmmd.zig         监督进程
 └── shm.zig           共享内存（utmmd↔utmm）

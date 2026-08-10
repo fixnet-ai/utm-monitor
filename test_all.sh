@@ -4,7 +4,7 @@
 # =============================================================================
 # Covers: build (8 targets), unit tests, --status, --exec,
 #         --upload/--download, HTTP API, Host/serve-dir, /etc/hosts,
-#         --install/--uninstall (SSH), --gen-init, MCP stdio, musl verify.
+#         --install/--uninstall (SSH), --gen-init, MCP HTTP, musl verify.
 # =============================================================================
 set -euo pipefail
 
@@ -375,17 +375,25 @@ done
 report ""
 
 # =============================================================================
-# PHASE 11: MCP JSON-RPC (stdio — utmm --mcp)
+# PHASE 11: MCP JSON-RPC (HTTP POST — Host daemon TCP :2121)
 # =============================================================================
-report "━━━ PHASE 11: MCP JSON-RPC (stdio) ━━━"
+report "━━━ PHASE 11: MCP JSON-RPC (HTTP) ━━━"
 report ""
 
-# MCP is served via utmm --mcp stdio (newline-delimited JSON-RPC over stdin/stdout).
-# Test requires the utmm binary to be runnable with sudo -n.
+# v0.18.0+: MCP is served via HTTP POST to Host daemon TCP :2121.
+# utmm --mcp prints the endpoint URL and ensures the Host daemon.
+# Test requires curl and the Host daemon running.
+MCP_URL="http://127.0.0.1:2121/"
+
+# Ensure Host daemon is running
 if [ -x "$HOST_BIN" ] && sudo -n "$HOST_BIN" --version >/dev/null 2>&1; then
+    sudo -n "$HOST_BIN" --host >/dev/null 2>&1 || true
+fi
+
+if command -v curl >/dev/null 2>&1; then
     # Initialize
     INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}'
-    MCP_RESP=$(echo "$INIT_REQ" | sudo -n "$HOST_BIN" --mcp 2>/dev/null || echo "MCP_FAILED")
+    MCP_RESP=$(curl -s -X POST "$MCP_URL" -H 'Content-Type: application/json' -d "$INIT_REQ" 2>/dev/null || echo "MCP_FAILED")
 
     if echo "$MCP_RESP" | grep -q "serverInfo"; then
         pass "MCP initialize response"
@@ -394,27 +402,20 @@ if [ -x "$HOST_BIN" ] && sudo -n "$HOST_BIN" --version >/dev/null 2>&1; then
         else
             fail "MCP version" "version not in response"
         fi
-        # Verify single-line output (required for MCP stdio transport)
-        LINE_COUNT=$(echo "$MCP_RESP" | wc -l | tr -d ' ')
-        if [ "$LINE_COUNT" -eq 1 ]; then
-            pass "MCP single-line response (stdio transport)"
-        else
-            fail "MCP single-line response" "got $LINE_COUNT lines"
-        fi
     else
         fail "MCP initialize" "no serverInfo in response"
     fi
 
     # tools/list
     TL_REQ='{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-    TL_RESP=$(echo "$TL_REQ" | sudo -n "$HOST_BIN" --mcp 2>/dev/null || echo "MCP_FAILED")
-    if echo "$TL_RESP" | grep -q "vm_status"; then
-        pass "MCP tools/list (has vm_status)"
+    TL_RESP=$(curl -s -X POST "$MCP_URL" -H 'Content-Type: application/json' -d "$TL_REQ" 2>/dev/null || echo "MCP_FAILED")
+    if echo "$TL_RESP" | grep -q '"status"'; then
+        pass "MCP tools/list (has status)"
     else
-        fail "MCP tools/list" "vm_status not found"
+        fail "MCP tools/list" "status tool not found"
     fi
 else
-    skip "MCP tests" "utmm binary not available or sudo -n fails (need passwordless sudo)"
+    skip "MCP tests" "curl not available"
 fi
 report ""
 
