@@ -1,74 +1,64 @@
 # MCP Server Configuration for utmm
 # =============================================================================
-# This file lets Claude Code (or any MCP client) control UTM VMs via the utmm
-# stdio MCP interface.  utmm --mcp handles auto-ensure (starts Host service if
-# not running), so no separate daemon management is needed.
+# v0.18.0+: MCP is served directly by the Host daemon via HTTP POST on TCP :2121.
+# No separate MCP process, no IPC bridge, no idle timeout, no buffer truncation.
 #
 # PREREQUISITES
 # -----------------------------------------------------------------------------
-# 1. utmm binary must be installed and executable:
-#       which utmm   # should print /opt/utmm/utmm (or C:\opt\utmm\utmm.exe)
+# 1. utmm Host daemon must be installed and running:
+#       sudo utmm --host --install   # one-time setup, survives reboots
+#       sudo utmm --status           # verify Host is "serving"
 #
-# 2. Passwordless sudo for the utmm binary:
-#       sudo -n /opt/utmm/utmm --version   # must succeed without password prompt
+# 2. utmm --mcp can be used to print the endpoint URL and ensure the Host:
+#       utmm --mcp                   # prints: MCP endpoint: http://127.0.0.1:{port}/
 #
 # QUICK INSTALL (Claude Code)
 # -----------------------------------------------------------------------------
-# Option A — claude CLI (recommended, available across all projects):
-#   claude mcp add --scope user utmm -- sudo -n /opt/utmm/utmm --mcp
+# HTTP transport (v0.18.0+, recommended):
+#   claude mcp add --transport http --scope user utmm http://127.0.0.1:2121/
 #
-#   --scope user registers the server at user level in ~/.claude.json, so it's
-#   available in ALL projects. Default --scope local is project-only.
-#   Use `claude mcp list` to verify.
-#
-#   To update an existing registration:
+#   To update an existing stdio registration (pre-v0.18.0):
 #     claude mcp remove utmm
-#     claude mcp add --scope user utmm -- sudo -n /opt/utmm/utmm --mcp
+#     claude mcp add --transport http --scope user utmm http://127.0.0.1:2121/
 #
-# Option B — manual JSON config:
-#   Copy the JSON below into your MCP config. Note: project-level registrations
-#   (--scope local/project) in ~/.claude.json take precedence over this file.
-#
-#   Config locations:
-#     Claude Code:     ~/.claude/mcp.json  (user)  or  .mcp.json (project)
-#     Claude Desktop:  ~/Library/Application Support/Claude/claude_desktop_config.json
+# CONFIG FILES
+# -----------------------------------------------------------------------------
+#   Claude Code:     ~/.claude/mcp.json  (user)  or  .mcp.json (project)
+#   Claude Desktop:  ~/Library/Application Support/Claude/claude_desktop_config.json
 #
 # VERIFY
 # -----------------------------------------------------------------------------
 # After installation, verify the connection:
-#   claude mcp list                    # should show "utmm: ... - Connected"
+#   claude mcp list                    # should show "utmm: http://127.0.0.1:2121/ (HTTP) - Connected"
 #
 # Or test manually:
-#   echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | sudo -n /opt/utmm/utmm --mcp
+#   curl -X POST http://127.0.0.1:2121/ -H 'Content-Type: application/json' \
+#     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
 #
-# HOW IT WORKS
+# HOW IT WORKS (v0.18.0+)
 # -----------------------------------------------------------------------------
-# utmm --mcp starts a stdio MCP server. On first use:
-#   1. Checks if Host service is running → if not, auto-installs + auto-starts
-#   2. Reads JSON-RPC from stdin, writes responses to stdout (newline-delimited)
-#   3. Tool calls talk to the Host daemon via local IPC socket (/var/run/utmm.sock)
+# The Host daemon listens on TCP :2121 for both SOCKS5 and HTTP MCP (first-byte
+# dispatch: 0x05→SOCKS5, ASCII→HTTP MCP). Each HTTP request is a single
+# JSON-RPC call — one request, one response, then close. No keep-alive.
+# The Host daemon auto-starts on boot (launchd/systemd/sc.exe), so the MCP
+# endpoint is always available without any separate process.
 #
 # TROUBLESHOOTING
 # -----------------------------------------------------------------------------
 # | Symptom                              | Fix                                |
 # |--------------------------------------|------------------------------------|
-# | "No VMs online"                      | Boot the VMs, start utmm inside each |
-# | "Failed to reconnect: -32000"        | Check `claude mcp list` — may have  |
-# |                                      | stale registration. Remove & re-add:|
-# |                                      | `claude mcp remove utmm`            |
-# |                                      | `claude mcp add --scope user ...`   |
+# | MCP not connecting                   | sudo utmm --host --install         |
+# |                                      | (Host daemon not running)          |
+# | "No VMs online"                      | Boot the VMs, start utmm inside each|
 # | MCP tools not showing in Claude      | Restart Claude Code after config    |
 # |                                      | change; verify with `claude mcp list`|
-# | utmm --mcp hangs                     | Ensure stdin is not a TTY (piped)   |
-# | "Root privileges required"           | Must run via sudo; add -n flag for  |
-# |                                      | non-interactive (passwordless) mode |
 # =============================================================================
 
 {
   "mcpServers": {
     "utmm": {
-      "command": "sudo",
-      "args": ["-n", "/opt/utmm/utmm", "--mcp"]
+      "type": "http",
+      "url": "http://127.0.0.1:2121/"
     }
   }
 }
