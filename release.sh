@@ -110,10 +110,10 @@ zig build test-integration 2>&1
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Phase 2: Cross-compile all 8 targets (parallel via zig build cross)
+# Phase 2: Cross-compile all 6 targets (parallel via zig build cross)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-echo "==> Phase 2: Building all 8 targets (ReleaseSafe, parallel)..."
+echo "==> Phase 2: Building all 6 targets (ReleaseSafe, parallel)..."
 rm -rf release && mkdir -p release
 
 # Clean old deployment binaries so only current-version files are collected.
@@ -137,13 +137,13 @@ for f in zig-out/bin/utmm-*; do
     fi
 done
 
-if [ "$BINARY_COUNT" -ne 8 ]; then
+if [ "$BINARY_COUNT" -ne 6 ]; then
     echo ""
-    echo "ERROR: Expected 8 binaries, found $BINARY_COUNT. Build may have failed."
+    echo "ERROR: Expected 6 binaries, found $BINARY_COUNT. Build may have failed."
     echo "Check zig build cross output above for errors."
     exit 1
 fi
-echo "[OK] All 8 targets collected"
+echo "[OK] All 6 targets collected"
 
 echo ""
 echo "==> Adding ver.txt..."
