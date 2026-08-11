@@ -10,76 +10,24 @@
 - **真机部署**: 5 节点全部 v0.18.1 serving
 - **GitHub Release**: v0.18.1 published
 
-## 已完成: Phase 31 — HTTP MCP 嵌入 Host Daemon
+## 进行中: Phase 33 — Windows --upgrade 二进制替换崩溃修复
 
-将 MCP 从独立 stdio 进程嵌入 Host daemon，消除 IPC 桥接。
+**状态**: 代码修改完成，测试通过，待 Windows 真机验证
 
-| 任务 | 状态 |
-|------|------|
-| mcp_handler.zig — 提取核心业务逻辑（无 IPC 依赖） | ✅ |
-| mcp_http.zig — HTTP/1.1 POST 解析器 + 传输层 | ✅ |
-| socks5.zig — 新增 peek 变体（authAcceptWithVersion / readRequestBufWithVersion） | ✅ |
-| host.zig — 首字节协议分发（0x05→SOCKS5, ASCII→HTTP MCP） | ✅ |
-| mcp.zig — McpContext 结构体 + processRequest 重构 | ✅ |
-| ipc.zig — handler 委托 mcp_handler（消除 ~160 行重复） | ✅ |
-| main.zig — --mcp 打印 HTTP 端点 URL | ✅ |
-| test_mcp_tools.py — stdio → HTTP POST | ✅ |
-| mcp.zig 删除 SIGALRM / idle timeout / _exit(0) | ✅ |
-| mcp.zig handleVmSshpass — 修复 zio IO + sshpass memset bug | ✅ |
-| main.zig --help — 修复过期 --mcp 描述 | ✅ |
-| README/refac.md — 修复过期数字 | ✅ |
+### 修复任务
 
-**收益**:
-- 消除 IPC 序列化开销（JSON 不走 socket）
-- 消除 SIGALRM 空闲超时（`_exit(0)` 硬杀）
-- 消除 EINTR 竞态（`SA_RESTART=0` 读中断即退出）
-- 消除 64KB exec 缓冲区截断
-- 单端口 2121 承载 SOCKS5 + HTTP MCP（首字节分发）
-
-**验证**:
-- `zig build` — 编译通过 ✅
-- `zig build test` — 210+ 通过 ✅
-- `zig build test-integration` — 59 通过，0 泄漏 ✅
-
-## 已完成: Phase 32 — MCP 双格式响应 (structuredContent)
-
-参考 zigtester 的 MCP 双格式模式，为全部 6 个 MCP 工具响应添加 `structuredContent` 字段。
-
-| 任务 | 状态 |
-|------|------|
-| formatStatusMCP — guests[] + counts{total,serving,offline} | ✅ |
-| formatExecMCP — {vm, command, exit_code} | ✅ |
-| formatPingMCP — {vm, reachable, mac, rtt_ms} | ✅ |
-| handleVmUpload — {vm, local_path, remote_path, success} | ✅ |
-| handleVmDownload — {vm, remote_path, local_path, bytes, success} | ✅ |
-| handleVmSshpass — {host, user, exit_code} | ✅ |
-| 6 测试新增（status×2, exec×2, ping×2）| ✅ |
-
-**收益**:
-- AI agent 可程序化解析 `structuredContent` 做决策，无需从 markdown 提取
-- 保持人类可读 markdown 在 `content[0].text` 中展示
-- ~50 行增量，集中在 `src/mcp.zig` 的 `format*` / `handle*` 函数
-- 所有 216 单元测试通过
-
-## 下一阶段: Phase 30 — 部署体验改进
-
-审计 `docs/deploy-ux-audit.md` 发现 8 个障碍，已完成 7/8：
-
-| 障碍 | 优先级 | 状态 |
-|------|--------|------|
-| VM 凭据硬编码 → deploy.json | P0 | ✅ |
-| Windows --deploy 空操作 → 自动化 | P0 | ✅ |
-| zio 依赖不可解析 → README + 注释 | P1 | ✅ |
-| deploy 要求 Zig 工具链 → serve-dir 缓存 | P1 | ✅ |
-| --upgrade 错误信息差 → 可操作指引 | P3 | ✅ |
-| Guest bootstrap（从零部署到裸 VM） | P2 | 待讨论 |
-| zip 无文档 + 版本号不一致 | P2/P3 | 不做 |
-| MANUAL.md 更新 deploy.json/serve-dir/sshpass | P2 | ✅ |
-| cmdDeploy 用 utmm sshpass 去外部依赖 | P2 | ✅ |
+| # | 任务 | 状态 |
+|---|------|------|
+| 1 | Windows: 重命名旧 exe + 放置新 exe（MoveFileExW 替代 deleteFile+rename） | ✅ |
+| 2 | 修复进程句柄管理：defer closeProcessHandle 统一清理 | ✅ |
+| 3 | handleUpgradeCmd 通过 shm 通知 utmmd | ✅ |
+| 4 | macOS codesign 修正（rename 后统一执行） | ✅ |
+| 5 | 测试 | ✅ 216 unit + 59 integration passed |
+| 6 | Windows 真机验证 | ⏳ 待部署 |
 
 ### 待跟进
 
-- **zio PR #646**: 等待 lalinsky re-review 后合并，之后 build.zig.zon 切回 URL
+- **Windows 真机**: 部署到 windowsvm + winx64 验证 --upgrade 推送全流程
 
 ## 关键设计决策（持续有效）
 

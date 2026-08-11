@@ -1,3 +1,51 @@
+## Phase 33 — Windows --upgrade 二进制替换崩溃修复
+
+**时间**: 2026-08-11
+
+### 问题
+
+在 Windows 上 `--upgrade` 推送二进制后，utmmd 在尝试替换运行中 utmm.exe 时崩溃
+（SCM exit 1067），导致升级静默失败（`[upgrade] OK` 只完成了传输，没完成替换和重启）。
+
+### 根因
+
+详见 [findings.md](findings.md) 2026-08-11 条目。两个协同故障：
+1. `deleteFile+rename` 在 Windows 上失败（文件锁定）
+2. `killProcess` 关闭进程句柄导致 isProcessAlive 误判 → crash-loop
+
+### 修复内容
+
+| 文件 | 变更 | 说明 |
+|------|------|------|
+| `src/utmmd.zig` | `killProcess` | 移除 `CloseHandle` — 句柄由调用者通过 `closeProcessHandle` 管理 |
+| `src/utmmd.zig` | `closeProcessHandle` | 新增函数 — 平台适配的进程句柄关闭 |
+| `src/utmmd.zig` | `tryApplyPendingUpgrade` | Windows 路径用 `renameWindowsOldFirst`（MoveFileExW 先 rename 旧→.old，再 rename 新→目标），代替 deleteFile+rename 循环 |
+| `src/utmmd.zig` | `renameWindowsOldFirst` | 新增函数 — 使用 MoveFileExW API 安全替换运行中 exe，含 20 次重试（250ms 间隔） |
+| `src/utmmd.zig` | `monitorUtmm` | 新增 `defer closeProcessHandle(proc)` 确保句柄在返回时被关闭 |
+| `src/utmmd.zig` | macOS codesign | codesign 移到 rename 成功后统一执行（原来只在 CrossDevice 回退路径执行） |
+| `src/guest.zig` | `handleUpgradeCmd` | 接收完成后通过 shm 设置 `.restart` 通知 utmmd 立即处理升级 |
+
+### 设计要点
+
+1. **Windows 重命名策略**: 利用 Windows 允许对已打开文件执行 rename 的特性（文件数据仍在内存中，但目录条目可修改），先将旧 exe 重命名为 .old，再将新 .tmp 重命名为目标名
+2. **MoveFileExW API**: 使用 `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` flag，确保原子性和同步写入
+3. **句柄管理生命周期**: killProcess 只负责杀进程+等待终止，句柄关闭推迟到 monitorUtmm 退出时统一处理，避免 isProcessAlive 误判
+4. **shm 提前触发**: handleUpgradeCmd 成功后设置 shm restart 命令，utmmd 在下次 poll 迭代中立即处理（无需等待文件扫描周期）
+5. **POSIX 路径不变**: macOS/Linux 仍使用 rename 原子替换，behavior 不变
+
+### 测试
+
+- `zig build test` — 216/217 passed, 0 failed ✅
+- `zig build test-integration` — 59/59 passed, 0 leaks ✅
+
+### 待验证
+
+- [ ] Windows 真机 `--upgrade` 推送验证（windowsvm + winx64）
+- [ ] 验证 utmmd 不再 exit 1067
+- [ ] 验证 .old 文件清理正常
+
+---
+
 ## v0.18.1 — MCP 双格式响应 (structuredContent)
 
 **时间**: 2026-08-11

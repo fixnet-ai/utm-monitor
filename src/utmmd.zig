@@ -152,17 +152,24 @@ fn killUtmmByPid(pid: u32) void {
 /// 强杀 utmm 进程并等待终止完成。
 /// Windows: TerminateProcess 是异步的，必须 WaitForSingleObject 确保进程完全退出，
 /// 释放所有文件句柄后再进行后续操作（如 rename 覆盖可执行文件）。
+/// 注意：不关闭进程句柄——调用者负责管理句柄生命周期。
 fn killProcess(proc: ProcessRef) void {
     if (builtin.os.tag == .windows) {
         _ = TerminateProcess(proc.handle, 1);
         // 等待进程完全退出——TerminateProcess 异步返回，文件锁可能尚未释放
         _ = WaitForSingleObject(proc.handle, 5000); // 最多等待 5 秒
-        _ = std.os.windows.CloseHandle(proc.handle);
         std.log.info("[utmmd] utmm killed, pid={d}", .{proc.pid});
     } else {
         if (proc == 0) return;
         std.posix.kill(@intCast(proc), std.posix.SIG.KILL) catch {};
         std.log.info("[utmmd] utmm killed, pid={d}", .{proc});
+    }
+}
+
+/// 关闭进程句柄（清理不再使用的 ProcessRef）。
+fn closeProcessHandle(proc: ProcessRef) void {
+    if (builtin.os.tag == .windows) {
+        _ = std.os.windows.CloseHandle(proc.handle);
     }
 }
 
@@ -486,53 +493,65 @@ fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator,
 
     // 7. 替换二进制。
     // POSIX: rename 原子替换目标文件。
-    // Windows: rename 不覆盖已有文件，需先删后重命名。
-    var retry: u32 = 0;
-    while (true) {
+    // Windows: 运行中 exe 无法删除或覆盖（文件锁）。先 rename 旧 exe → .old
+    //   （Windows 允许 rename 打开的文件），再将新 .tmp rename → 目标。
+    //   旧 .old 文件在下次升级或重启时清理。
+    if (builtin.os.tag == .windows) {
+        const old_path_buf = try alloc.alloc(u8, dest.len + 4);
+        defer alloc.free(old_path_buf);
+        @memcpy(old_path_buf[0..dest.len], dest);
+        @memcpy(old_path_buf[dest.len..], ".old");
+        const old_path = old_path_buf[0 .. dest.len + 4];
+
+        // 7a. 删除上次升级的 .old 残留（如果有），忽略错误
+        std.Io.Dir.cwd().deleteFile(file_io, old_path) catch {};
+
+        // 7b. 将当前 utmm.exe rename 为 utmm.exe.old
+        //     即使 exe 仍在运行（文件锁定）Windows 也允许此操作。
+        renameWindowsOldFirst(file_io, dest, old_path, tmp_path) catch |err| {
+            std.log.err("[utmmd] upgrade replace failed: {}", .{err});
+            lock.release();
+            return null;
+        };
+
+        // 7c. 清理 .old 文件（best-effort，失败也无妨——下次升级会覆盖）
+        std.Io.Dir.cwd().deleteFile(file_io, old_path) catch {};
+
+        std.log.info("[utmmd] upgrade replace done: {s}", .{tmp_path});
+    } else {
+        // POSIX: rename 原子替换（覆盖已有文件）
         std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), dest, file_io) catch |err| {
             if (err == error.CrossDevice) {
-                // 跨文件系统回退：copy + delete
                 copyFileUpgradeFallback(file_io, tmp_path, dest) catch |e| {
                     std.log.err("[utmmd] copyFileUpgradeFallback failed: {}", .{e});
                     lock.release();
                     std.Io.Dir.cwd().deleteFile(file_io, tmp_path) catch {};
                     return null;
                 };
-                if (builtin.os.tag == .macos) {
-                    if (!runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest })) {
-                        std.log.warn("[utmmd] codesign failed — checking if binary is executable...", .{});
-                        if (!runCmd(alloc, io, &.{ dest, "--version" })) {
-                            std.log.err("[utmmd] codesign failed AND binary not executable — manual recovery needed (upgrade at {s})", .{tmp_path});
-                            lock.release();
-                            return null;
-                        }
-                        std.log.info("[utmmd] codesign failed but binary runs — continuing", .{});
-                    }
-                }
                 std.Io.Dir.cwd().deleteFile(file_io, tmp_path) catch {};
-                break;
+            } else {
+                std.log.err("[utmmd] upgrade rename failed: {}", .{err});
+                lock.release();
+                return null;
             }
-            if (builtin.os.tag == .windows and retry < 10) {
-                // Windows: 首次失败先删目标再试（rename 不覆盖已有文件）
-                if (retry == 0) {
-                    std.Io.Dir.cwd().deleteFile(file_io, dest) catch {};
-                }
-                retry += 1;
-                std.log.warn("[utmmd] upgrade rename retry {d}/10: {}", .{ retry, err });
-                sleepMs(io, 500);
-                continue;
-            }
-            // 永久失败：保留 .tmp 文件供手动恢复
-            std.log.err("[utmmd] upgrade rename failed: {}", .{err});
-            lock.release();
-            return null;
         };
-        break;
+        if (builtin.os.tag == .macos) {
+            if (!runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest })) {
+                std.log.warn("[utmmd] codesign failed — checking if binary is executable...", .{});
+                if (!runCmd(alloc, io, &.{ dest, "--version" })) {
+                    std.log.err("[utmmd] codesign failed AND binary not executable — manual recovery needed (upgrade at {s})", .{tmp_path});
+                    lock.release();
+                    return null;
+                }
+                std.log.info("[utmmd] codesign failed but binary runs — continuing", .{});
+            }
+        }
+        std.log.info("[utmmd] upgrade rename done: → {s}", .{dest});
     }
 
     // 8. 释放锁
     lock.release();
-    std.log.info("[utmmd] upgrade complete: → {s}", .{dest});
+    std.log.info("[utmmd] upgrade complete", .{});
     return .restart;
 }
 
@@ -557,6 +576,83 @@ fn copyFileUpgradeFallback(file_io: std.Io, src: []const u8, dst: []const u8) !v
     w.interface.flush() catch {};
     df.sync(file_io) catch {};
 }
+
+/// Windows: 安全替换正在运行的可执行文件。
+///
+/// Windows 上无法直接覆盖或删除运行中的 exe（文件锁定）。但 Windows 允许
+/// 对已打开的文件进行重命名操作。利用此特性：
+///   1. 将旧 exe 重命名为 .old（释放目标路径名）
+///   2. 将新 .tmp 重命名为目标路径名
+///
+/// 这与 Windows 安装程序的原子替换策略（MoveFileEx + MOVEFILE_REPLACE_EXISTING
+/// 回退到 MOVEFILE_DELAY_UNTIL_REBOOT）原理相同，但无需重启。
+/// file_io: 文件 I/O 用 Io（Windows 上需为 Threaded，IOCP 不支持文件操作）。
+fn renameWindowsOldFirst(file_io: std.Io, dest: []const u8, old_path: []const u8, tmp_path: []const u8) !void {
+    // 使用原始 Windows MoveFileExW API：
+    // MOVEFILE_REPLACE_EXISTING=1 — 替换已有文件
+    // MOVEFILE_WRITE_THROUGH=8  — 等待写入完成
+    // 不使用 MOVEFILE_DELAY_UNTIL_REBOOT — 不需要重启
+    const windows = std.os.windows;
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+
+    // 需要 UTF-16 路径
+    var dest_utf16: [512]u16 = [_]u16{0} ** 512;
+    var old_utf16: [512]u16 = [_]u16{0} ** 512;
+    var tmp_utf16: [512]u16 = [_]u16{0} ** 512;
+
+    const dest_len = std.unicode.utf8ToUtf16Le(&dest_utf16, dest) catch return error.NameTooLong;
+    if (dest_len >= dest_utf16.len) return error.NameTooLong;
+    dest_utf16[dest_len] = 0;
+
+    const old_len = std.unicode.utf8ToUtf16Le(&old_utf16, old_path) catch return error.NameTooLong;
+    if (old_len >= old_utf16.len) return error.NameTooLong;
+    old_utf16[old_len] = 0;
+
+    const tmp_len = std.unicode.utf8ToUtf16Le(&tmp_utf16, tmp_path) catch return error.NameTooLong;
+    if (tmp_len >= tmp_utf16.len) return error.NameTooLong;
+    tmp_utf16[tmp_len] = 0;
+
+    // 重试循环：进程刚被杀后文件锁定可能短暂残留
+    var retry: u32 = 0;
+    while (true) {
+        // Step 1: 如果目标 exe 存在，将其重命名为 .old
+        //         此操作在 exe 仍在运行时也允许
+        if (MoveFileExW(@ptrCast(&dest_utf16), @ptrCast(&old_utf16), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+            std.log.info("[utmmd] renameWindowsOldFirst: renamed dest → .old", .{});
+        } else {
+            const err = windows.GetLastError();
+            if (@intFromEnum(err) == 2) { // ERROR_FILE_NOT_FOUND
+                // dest 不存在（首次安装？）— 继续
+                std.log.info("[utmmd] renameWindowsOldFirst: dest not found, placing new binary directly", .{});
+            } else {
+                std.log.err("[utmmd] renameWindowsOldFirst: rename dest → .old failed (err={d})", .{@intFromEnum(err)});
+                return error.ReplaceFailed;
+            }
+        }
+
+        // Step 2: 将新 .tmp 重命名为目标 exe
+        if (MoveFileExW(@ptrCast(&tmp_utf16), @ptrCast(&dest_utf16), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+            return;
+        }
+        const err2 = windows.GetLastError();
+        if (retry < 20) {
+            retry += 1;
+            std.log.warn("[utmmd] renameWindowsOldFirst: rename tmp → dest retry {d}/20 (err={d})", .{ retry, @intFromEnum(err2) });
+            // 等待 250ms 后重试（文件锁正在释放）
+            std.Io.sleep(file_io, std.Io.Duration.fromMilliseconds(250), .awake) catch {};
+            continue;
+        }
+        std.log.err("[utmmd] renameWindowsOldFirst: rename tmp → dest failed after 20 retries (err={d})", .{@intFromEnum(err2)});
+        return error.ReplaceFailed;
+    }
+}
+
+extern "kernel32" fn MoveFileExW(
+    lpExistingFileName: [*:0]const u16,
+    lpNewFileName: ?[*:0]const u16,
+    dwFlags: u32,
+) callconv(.winapi) i32;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 信号处理 — POSIX（直接用 C extern + 原生 sigaction）
@@ -751,6 +847,9 @@ fn stabilityCheck(io: std.Io, shm_ptr: *volatile shm.ShmLayout, proc: ProcessRef
 /// 运行中监控。
 /// file_io: 文件 I/O 用 Io（Windows 上需为 Threaded，IOCP 不支持文件操作）。
 fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmLayout, proc: ProcessRef) RestartReason {
+    // 确保进程句柄在返回时被关闭（Windows 上 HANDLE 不会自动回收）
+    defer if (builtin.os.tag == .windows) closeProcessHandle(proc);
+
     var last_hb = shm.nowMs(io);
 
     // IP 变更检测状态

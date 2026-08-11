@@ -1301,7 +1301,14 @@ pub fn handleUpgradeCmd(
     _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
 
     result.lock.release();
-    std.log.info("[guest] upgrade: file ready, lock released — utmmd will pick up", .{});
+    std.log.info("[guest] upgrade: file ready, lock released — signaling utmmd to apply", .{});
+
+    // 通过共享内存通知 utmmd 升级文件已就绪。
+    // utmmd 立即杀 utmm（释放 exe 文件锁）→ 替换二进制 → 重启新版 utmm。
+    if (shm_handle) |h| {
+        h.cmd = @intFromEnum(shm.Cmd.restart);
+        h.cmd_status = @intFromEnum(shm.CmdStatus.pending);
+    }
 }
 
 /// 处理 download：dpipe_file.readFile → 原始字节流发送到 TCP。

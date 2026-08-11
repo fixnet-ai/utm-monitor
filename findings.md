@@ -68,6 +68,29 @@
 
 `loadDeployConfig()` 使用 `std.json.Value` 动态解析（与 mcp.zig 一致模式），错误宽松处理：文件缺失/格式错误 → 日志警告 + 回退编译时默认值。`@intFromPtr` 区分堆分配 vs 编译时常量指针。
 
+### 2026-08-11 — Windows --upgrade 二进制替换崩溃根因
+
+**症状**: `--upgrade` 推送到 Windows Guest 后，Host 显示 `[upgrade] OK`，但 utmmd
+在尝试替换 utmm.exe 时崩溃（SCM exit 1067），升级实际未生效。
+
+**根因 1 — 文件替换策略不兼容 Windows**:
+`deleteFile(utmm.exe) + rename(.tmp, utmm.exe)` 在 Windows 上失败，因为
+TerminateProcess 后 OS 可能仍在短时间内保留 exe 文件锁定。deleteFile 静默失败
+（catch {}），rename 因目标仍存在而失败。10 次重试后升级被放弃。
+
+**根因 2 — 进程句柄关闭导致 crash-loop**:
+`killProcess` 在 `tryApplyPendingUpgrade` 中调用 `CloseHandle` 关闭进程句柄。
+返回 `monitorUtmm` 后，`isProcessAlive(proc)` 因句柄已关闭而返回 false
+→ 误判 utmm 崩溃 → 返回 .crashed → monitorLoop 启动**旧**二进制（升级未应用）
+→ .tmp 文件仍在 → 下次循环再次杀→替换失败→句柄关闭... → 无限 kill-restart 循环
+→ 超过 MAX_FAILURE_COUNT(5) → utmmd 退出 → SCM exit 1067。
+
+**修复**:
+1. Windows 上用 `MoveFileExW` 先 rename 旧 exe → .old（Windows 允许 rename 打开的文件），再 rename .tmp → 目标
+2. `killProcess` 不再关闭句柄，由 `monitorUtmm` 的 `defer closeProcessHandle(proc)` 统一清理
+3. `handleUpgradeCmd` 接收完成后通过 shm 设置 `.restart` 通知 utmmd 立即处理，消除轮询延迟
+4. macOS codesign 移到 rename 成功后统一执行（之前只在 CrossDevice 回退路径执行，覆盖不全）
+
 ### 2026-08-02 — zio 网络 errno 映射缺失
 
 `zio/src/os/net.zig` 中 5 个 errno 映射函数缺少 `NETDOWN`/`HOSTUNREACH`/`NETUNREACH` 等导致返回 `error.Unexpected`。已修复并推送 fixnet-ai/zio `feat/x86-32` 分支。PR #646 等待上游 re-review。
