@@ -1531,3 +1531,64 @@ std.debug.print("[deploy]   Windows target — manual deploy required.\n", .{});
 
 - `zig build test` — 196/196 通过 ✅
 - `zig build test-integration` — 59/59 通过，0 泄漏 ✅
+
+## Phase 33.5 — findUpgradeTmp 固化 + 端到端验证
+
+**时间**: 2026-08-12
+
+### 问题
+
+v0.18.30 部署到 windowsvm 后，`--upgrade` 传输成功但 utmmd 无法找到 `.tmp` 文件，
+升级永远不生效。Host 端 `[upgrade] OK`，Guest 端文件已写入磁盘，
+但 utmmd 的 `findUpgradeTmp` 始终返回 null。
+
+### 根因
+
+两个之前未知的 bug 叠加：
+
+1. **`WIN32_FIND_DATAW` struct 布局错误**: `FILETIME` 字段用 `u64`(align=8) 声明，
+   在 aarch64-windows 上每个 FILETIME 多出 4 字节 padding，导致 `cFileName` 偏移量
+   比 Windows ABI 预期多出 3×4=12 字节。`extractSha256` 从错误的偏移读到乱码，
+   对所有文件返回 null。
+
+2. **`std.Io.Dir.walk()` + `Threaded` Io 不兼容 Windows**: `openDirAbsolute` 能打开
+   目录，但 `walker.next()` 在 `Threaded` Io 上始终失败。这是 Zig 0.16.0 的限制。
+
+两个 bug 叠加 → `findUpgradeTmp` 在 Windows 服务上下文中完全无法工作。
+之前的诊断方向（CWD=System32）是错误的。
+
+### 修复内容
+
+| 文件 | 变更 | 说明 |
+|------|------|------|
+| `src/svc.zig` | 新增 `findUpgradeTmpWindows` | 使用 FindFirstFileW/FindNextFileW 直接扫描目录，绕过 Zig Io walker |
+| `src/svc.zig` | 新增 `findUpgradeTmpPosix` | POSIX 保持原 walker 实现不变 |
+| `src/svc.zig` | `findUpgradeTmp` 重构 | 顶层按平台分发到 Windows/POSIX 实现 |
+| `src/svc.zig` | WIN32_FIND_DATAW 声明 | 文件顶层，FILETIME 使用 u32 low/high 对（align=4）匹配 Windows ABI |
+| `src/svc.zig` | FindFirstFileW/FindNextFileW/FindClose 声明 | 文件顶层 extern "kernel32" |
+| `src/utmmd.zig` | 删除 inline findUpgradeTmp blk | ~60 行 FindFirstFileW 调试代码 + WIN32_FIND_DATAW 声明全部移除 |
+| `src/utmmd.zig` | tryApplyPendingUpgrade | 恢复为简单 `svc.findUpgradeTmp(alloc, file_io)` 调用 |
+| `src/ver.txt` | 0.18.30 → 0.18.33 | 3 次迭代 build + verify |
+
+### 验证
+
+- `zig build test` — 216/216 通过, 1 skipped ✅
+- `zig build test-integration` — 59/59 通过, 0 泄漏 ✅
+- windowsvm 端到端: `--upgrade` 推送 → 5 秒内自动升级 (v0.18.32→v0.18.33) ✅
+  - findUpgradeTmp → FindFirstFileW 发现 .tmp
+  - tryAcquire → killAllUtmmWindows → tryReplaceWindows (MoveFileExW)
+  - utmmd monitorUtmm 轮询自动触发（无需 SHM restart 信号）
+  - 5 节点全部 serving，0 offline
+
+### 经验教训
+
+1. **跨平台 struct 布局必须以参考实现为准**。WIN32_FIND_DATAW 的 FILETIME 是
+   `struct { DWORD low; DWORD high; }`（align=4），在 aarch64-windows 上
+   `u64`(align=8) 的行为与 x86_64 不同。
+
+2. **Zig Io 抽象层在 Windows 上不完整**。`Threaded` Io 的 `Dir.walk()` 在 Windows
+   上不可用 → 需要直接调用 kernel32 API。这应该是临时方案，等 Zig 0.17+ 修复后
+   可恢复使用 walker。
+
+3. **"为什么找不到文件"这类问题不要假设**。之前的诊断认为是 CWD 问题、时间窗口问题、
+   SHM 信号问题——全是错的。真正的问题需要 diff 验证（对比参考实现的 struct 布局）。

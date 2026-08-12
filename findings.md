@@ -98,3 +98,61 @@ TerminateProcess 后 OS 可能仍在短时间内保留 exe 文件锁定。delete
 ### 2026-08-02 — x86 32-bit 协程支持
 
 zio coro/coroutines.zig 新增 `.x86` 架构支持（IA-32 cdecl、AT&T 汇编、16 字节栈对齐）。初版仅 Linux musl，Windows 需额外 TIB 支持。8/8 交叉编译目标已通过。
+
+### 2026-08-12 — WIN32_FIND_DATAW struct 布局 + FindFirstFileW 替代 Zig Io walker
+
+#### WIN32_FIND_DATAW FILETIME 对齐陷阱
+
+Windows `WIN32_FIND_DATAW` 结构体中 `FILETIME` 是 `struct { DWORD low; DWORD high; }`
+（align=4），**不能用 `u64`(align=8) 替代**。在 aarch64-windows 上 `u64` 的 8 字节
+对齐要求会在每个 FILETIME 后插入 4 字节 padding，导致后续字段（`cFileName`）偏移量
+比 Windows ABI 预期多出 12 字节（3 个 FILETIME × 4 字节）。
+
+**正确声明**：
+```zig
+const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes: u32,
+    _ftCreationTimeLow: u32,
+    _ftCreationTimeHigh: u32,
+    _ftLastAccessTimeLow: u32,
+    _ftLastAccessTimeHigh: u32,
+    _ftLastWriteTimeLow: u32,
+    _ftLastWriteTimeHigh: u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+    dwReserved0: u32,
+    dwReserved1: u32,
+    cFileName: [260]u16,
+    cAlternateFileName: [14]u16,
+};
+```
+
+**关键教训**：跨语言/跨平台的 C ABI struct 声明不能凭猜测。必须对照参考实现
+（MSDN 文档 + C 头文件）逐个字段验证大小和对齐。在 x86_64-windows 上 `u64` 碰巧
+工作（因为 8 字节对齐本就存在），但在 aarch64-windows 上就会出错。
+
+#### std.Io.Dir.walk() + Threaded Io 不兼容 Windows
+
+Zig 0.16.0 的 `Threaded` Io 在 Windows 上不支持目录迭代：
+- `openDirAbsolute` — 正常工作（可以打开目录句柄）
+- `dir.walk(allocator)` — 正常工作（可以创建 walker）
+- `walker.next(io)` — **始终失败**（Threaded Io 不支持）
+
+**解决方案**：直接使用 `FindFirstFileW`/`FindNextFileW` kernel32 API 绕过 Zig Io 层。
+
+**UTF-16 文件名处理**：
+- 搜索路径：`utf8ToUtf16Le` + 手动 null-terminate
+- 读取文件名：`sliceTo` 找到 null terminator → `utf16LeToUtf8`
+- `bufPrintZ` 自动在格式化字符串末尾追加 null byte
+
+**注意**：这应该是临时方案。Zig 0.17+ 如果修复了 Threaded Io 的 Windows 目录迭代，
+应该恢复使用 walker。
+
+#### build.zig: Windows utmmd 用 Debug 优化
+
+交叉编译到 aarch64-windows 时：
+- `ReleaseSafe`: 崩溃 exit 1067（SCM 服务崩溃）
+- `ReleaseSmall`: c0000005 ACCESS VIOLATION in ucrtbase.dll
+- `Debug`: 正常工作（utmmd 仅 ~429KB，性能影响可忽略）
+
+这是 Zig 0.16.0 交叉编译器的 bug，仅影响 aarch64-windows target。
