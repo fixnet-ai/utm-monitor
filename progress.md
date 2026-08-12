@@ -1,3 +1,92 @@
+## v0.18.39 — TCP SO_REUSEADDR 跨平台修复 + FD_CLOEXEC + F_GETFD/F_SETFD 常量修复
+
+**时间**: 2026-08-12
+
+### 问题背景
+
+TCP :2121 BindFailed 崩溃循环：utmmd kill→restart 周期中，新 utmm 无法 bind TCP :2121 (errno=98/EADDRINUSE)，导致 TCP SOCKS5 不可用。UDP LSA 广播正常，但终端用户无法通过 SOCKS5 exec/upload/download。
+
+### 根因分析（三层面）
+
+#### 层面 1 — SO_REUSEADDR/SOL_SOCKET 硬编码常量跨平台错误（直接根因）
+
+`src/tcp.zig` 顶部定义：
+- `SO_REUSEADDR = 0x0004` — macOS 正确，Linux 应为 2
+- `SOL_SOCKET = 0xffff` — macOS 正确，Linux 应为 1
+
+TcpListener.init POSIX 路径使用这些常量调用 `setsockopt(SO_REUSEADDR)`，
+Linux 上传递了错误的选项值，内核静默忽略。返回值和 errno 均被丢弃（`_ =`）。
+
+**影响**：Linux 上 SO_REUSEADDR 从未生效。TIME_WAIT 状态下 bind 必然失败。
+
+#### 层面 2 — Listen Socket 缺 FD_CLOEXEC 导致子进程继承（间接根因）
+
+dpipe_shell fork/exec 创建 shell 子进程时，子进程继承父进程全部 FD（包括 listen socket）。
+utmmd kill→restart 后：
+1. 旧 utmm 被 SIGKILL，但 shell 子进程仍持有 listen socket fd
+2. 新 utmm bind :2121 → EADDRINUSE（子进程仍未退出）
+
+**影响**：即使 SO_REUSEADDR 修复，listen socket 被继承到子进程后仍导致 EADDRINUSE。
+
+#### 层面 3 — F_GETFD/F_SETFD 硬编码常量跨平台错误（新增代码引入的次生 bug）
+
+我们新增的 FD_CLOEXEC 代码使用了硬编码常量：
+- `F_GETFD = 2` — macOS 正确，Linux 应为 1
+- `F_SETFD = 3` — macOS 正确，Linux 应为 2
+
+在 Linux 上 `fcntl(sock, 2, 0)` 被内核解释为 `F_SETFD`（设置 fd flags 为 0），反而**清除了** FD_CLOEXEC！
+第二个 `fcntl(sock, 3, ...)` 被解释为 `F_GETFL`（获取文件状态标志），第三个参数被忽略。
+
+**教训**：POSIX fcntl 常量（F_GETFD/F_SETFD/F_GETFL/F_SETFL）在不同 OS 上值不同，**必须使用 `std.posix` 命名空间**提供的跨平台值。禁止硬编码。
+
+### 修复方案
+
+```zig
+// BEFORE — 硬编码 macOS 值，Linux 上静默失效
+const SO_REUSEADDR = 0x0004;
+const SOL_SOCKET = 0xffff;
+const F_GETFD = 2;
+const F_SETFD = 3;
+const reuse: c_int = 1;
+_ = system.setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, ...);
+const fd_flags = system.fcntl(sock, F_GETFD, 0);
+_ = system.fcntl(sock, F_SETFD, fd_flags | FD_CLOEXEC);
+
+// AFTER — 使用 std.posix 跨平台常量
+const reuse: c_int = 1;
+if (system.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, ...) < 0) {
+    std.log.err("[tcp] setsockopt(SO_REUSEADDR) failed: errno={d}", ...);
+}
+const fd_flags = system.fcntl(sock, std.posix.F.GETFD, 0);
+_ = system.fcntl(sock, std.posix.F.SETFD, fd_flags | std.posix.FD_CLOEXEC);
+```
+
+### 退出路径审查
+
+| 组件 | 文件/行 | 机制 | 状态 |
+|------|---------|------|------|
+| Guest TCP accept | guest.zig:903 | `defer listener.deinit()` + shutdown flag break | ✅ |
+| Host TCP accept | host.zig:982 | `defer listener.deinit()` + shutdown flag break | ✅ |
+| SIGKILL 响应 | kernel | FD_CLOEXEC 防子进程继承 + SO_REUSEADDR 允 rebind | ✅ 已修复 |
+| UDP mesh socket | tcp.zig:607 | 有 SO_REUSEADDR + SO_REUSEPORT，缺 FD_CLOEXEC | ⚠️ 低风险，非紧急 |
+| `O_NONBLOCK` 硬编码 | tcp.zig:25 | `0x0004`(macOS) vs `2048`(Linux) — pre-existing | ⚠️ 待修复 |
+
+### 已修复的回退问题
+
+- v0.18.36 中已修复的 Bug 清单：僵尸进程、findUpgradeTmp、pushUpgrade、Windows tryAcquire
+- 全部 216 单元测试 + 59 集成测试通过
+
+### 部署状态
+
+全部 5 节点已部署 v0.18.39：
+- Host (dasis-macbook-air): ✅
+- linuxvm: ✅ (TCP :2121 BindFailed 已确认修复 — strace 验证 SO_REUSEADDR 正确生效)
+- macvm: ✅
+- windowsvm: ✅
+- winx64: ✅
+
+---
+
 ## v0.18.36 — 僵尸进程收割 + findUpgradeTmp 选最新 + Windows tryAcquire 重试
 
 **时间**: 2026-08-12

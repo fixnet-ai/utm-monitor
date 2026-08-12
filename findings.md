@@ -60,6 +60,28 @@
 
 ## 最近发现
 
+### 2026-08-12 — POSIX fcntl/socket 常量跨平台不兼容：SO_REUSEADDR 硬编码导致 Linux BindFailed 崩溃循环
+
+**症状**: TCP :2121 间歇性 BindFailed (errno=98/EADDRINUSE)，UDP LSA 正常但所有 SOCKS5 连接失败。
+
+**根因**: `tcp.zig` 中三个 POSIX 常量硬编码为 macOS 值，Linux 上完全错误：
+
+| 常量 | macOS | Linux | 后果 |
+|------|-------|-------|------|
+| `SO_REUSEADDR` | `0x0004` | `2` | setsockopt 静默无效 |
+| `SOL_SOCKET` | `0xffff` | `1` | setsockopt 静默无效 |
+| `F_GETFD` | `2` | `1` | fcntl 清除而非设置 FD_CLOEXEC |
+| `F_SETFD` | `3` | `2` | fcntl 执行错误操作 |
+
+加上 `_ =` 丢弃返回值 → 全部静默失败，日志无任何警告。用了数月的代码从未在 Linux 上正确工作过。
+
+**教训 — 跨平台 POSIX 常量铁律**：
+1. **所有 `setsockopt`/`fcntl` 常量必须使用 `std.posix` 命名空间**（`std.posix.SOL.SOCKET`、`std.posix.SO.REUSEADDR`、`std.posix.F.GETFD`、`std.posix.F.SETFD`、`std.posix.FD_CLOEXEC`）
+2. **绝不禁用返回值检查** — `_ = setsockopt(...)` → 必须 `if (setsockopt(...) < 0) { log errno }`
+3. **每个新增的 OS 常量必须先验证跨平台值**，对照 Linux/macOS/Windows 三个平台的系统头文件
+
+**额外发现**：`O_NONBLOCK = 0x0004` 同样是硬编码的 macOS 值（Linux 应为 `2048=04000`），但属于历史遗留问题（pre-existing），暂未修复（需要同步修改 `setNonBlocking()` 调用处）。
+
 ### 2026-08-03 — 部署体验审计
 
 审计 `docs/deploy-ux-audit.md`，识别 8 个用户部署障碍。P0（VM 凭据硬编码 + Windows --deploy 空操作）已修复。P1（zio 依赖文档 + deploy 缓存）已修复。详见审计文档。
