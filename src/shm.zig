@@ -351,6 +351,54 @@ pub fn detach(shm: *volatile ShmLayout) void {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 跨进程同步辅助函数（原子操作 + 内存序）
+//
+// ShmLayout 字段是普通整数类型，*volatile 指针仅防止编译器重排，
+// 不插入 CPU 内存屏障。ARM64 弱内存序可能导致写入方连续 store 被
+// 读取方以乱序观察到，必须使用 @atomicStore/@atomicLoad 确保跨进程
+// Happens-Before 语义。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// utmm → utmmd: 写入命令及状态。
+/// cmd_status 先写入，cmd 后写入——utmmd 轮询 cmd 字段触发分发，
+/// cmd 的 release 存储确保 cmd_status 对 acquire 读取方可见。
+pub fn writeCmd(shm_ptr: *volatile ShmLayout, cmd_val: Cmd, status: CmdStatus) void {
+    @atomicStore(u32, &shm_ptr.cmd_status, @intFromEnum(status), .release);
+    @atomicStore(u32, &shm_ptr.cmd, @intFromEnum(cmd_val), .release);
+}
+
+/// utmm → utmmd: 清除命令（utmmd 处理完后重置）。
+pub fn clearCmd(shm_ptr: *volatile ShmLayout) void {
+    @atomicStore(u32, &shm_ptr.cmd_status, @intFromEnum(CmdStatus.pending), .release);
+    @atomicStore(u32, &shm_ptr.cmd, @intFromEnum(Cmd.none), .release);
+}
+
+/// utmmd ← utmm: 读取命令，acquire 确保 cmd_status 写入已可见。
+pub fn readCmd(shm_ptr: *volatile ShmLayout) Cmd {
+    return @enumFromInt(@atomicLoad(u32, &shm_ptr.cmd, .acquire));
+}
+
+/// utmmd ← utmm: 读取命令状态（紧接 readCmd 之后调用）。
+pub fn readCmdStatus(shm_ptr: *volatile ShmLayout) CmdStatus {
+    return @enumFromInt(@atomicLoad(u32, &shm_ptr.cmd_status, .acquire));
+}
+
+/// utmm → utmmd: 写入 utmm 心跳（release 存储确保 utmmd 看到最新值）。
+pub fn writeUtmmHeartbeat(shm_ptr: *volatile ShmLayout, io: std.Io) void {
+    @atomicStore(u64, &shm_ptr.utmm_heartbeat, nowMs(io), .release);
+}
+
+/// utmmd → utmm: 写入 utmmd 心跳。
+pub fn writeSvcHeartbeat(shm_ptr: *volatile ShmLayout, io: std.Io) void {
+    @atomicStore(u64, &shm_ptr.svc_heartbeat, nowMs(io), .release);
+}
+
+/// utmmd ← utmm: 读取 utmm 心跳（acquire 加载）。
+pub fn readUtmmHeartbeat(shm_ptr: *volatile ShmLayout) u64 {
+    return @atomicLoad(u64, &shm_ptr.utmm_heartbeat, .acquire);
+}
+
 // ========== Tests ==========
 
 test "ShmLayout size is 4096" {

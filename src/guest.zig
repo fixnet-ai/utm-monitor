@@ -917,7 +917,7 @@ pub fn guestTcpLoop(
         // 更新心跳 — utmmd 监控此字段，10s 无更新触发重启。
         // 放在 accept 循环顶部确保每次循环迭代都刷新心跳。
         if (shm_handle) |h| {
-            h.utmm_heartbeat = shm.nowMs(io);
+            shm.writeUtmmHeartbeat(h, io);
         }
 
         // Accept TCP 连接（不含 SOCKS5 握手）
@@ -1096,7 +1096,7 @@ pub fn handleExecCmd(
         // 更新心跳 — 长时间运行的命令可能在 shell.read() 阻塞。
         // 每次成功读取后刷新心跳，避免 utmmd 误判超时。
         if (shm_handle) |h| {
-            h.utmm_heartbeat = shm.nowMs(io);
+            shm.writeUtmmHeartbeat(h, io);
         }
 
         const nr = shell.read(&output_buf) catch |err| {
@@ -1175,7 +1175,7 @@ fn receiveFile(
     while (remaining > 0) {
         // 更新心跳 — 大文件传输可能超过 10s，需在循环中刷新。
         if (shm_handle) |h| {
-            h.utmm_heartbeat = shm.nowMs(io);
+            shm.writeUtmmHeartbeat(h, io);
         }
 
         const to_read = @min(buf.len, remaining);
@@ -1324,8 +1324,7 @@ pub fn handleUpgradeCmd(
     // 通过共享内存通知 utmmd 升级文件已就绪。
     // utmmd 立即杀 utmm（释放 exe 文件锁）→ 替换二进制 → 重启新版 utmm。
     if (shm_handle) |h| {
-        h.cmd = @intFromEnum(shm.Cmd.restart);
-        h.cmd_status = @intFromEnum(shm.CmdStatus.pending);
+        shm.writeCmd(h, .restart, .pending);
     }
 }
 
@@ -1361,7 +1360,7 @@ pub fn handleDownload(
     while (true) {
         // 更新心跳 — 大文件下载可能超过 10s，需在循环中刷新。
         if (shm_handle) |h| {
-            h.utmm_heartbeat = shm.nowMs(io);
+            shm.writeUtmmHeartbeat(h, io);
         }
 
         const nr = file_pipe.read(&buf) catch |err| {

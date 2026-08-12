@@ -421,6 +421,11 @@ pub const Mesh = struct {
     /// will carry the new info. Takes ownership of new_info.
     /// The per-process nonce is re-appended so dynamic field changes
     /// (status:, ip:) don't trigger spurious LSA restart detection.
+    ///
+    /// Caller must hold lsas_mutex — broadcastOwnLsa reads node_info
+    /// without internal locking, so concurrent free+realloc would race.
+    /// Currently unused (dead code); add caller + lock acquisition when
+    /// dynamic node_info updates are needed (e.g. upgrade status change).
     pub fn updateNodeInfo(self: *Mesh, new_info: []const u8) void {
         self.allocator.free(self.node_info);
         // Append nonce so LSA restart detection can distinguish genuine

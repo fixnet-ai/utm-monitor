@@ -1039,7 +1039,33 @@ try buf.append(allocator, 'x');
 try buf.appendSlice(allocator, "hello");
 ```
 
-### 跨编译目标编译注意事项
+### 跨进程共享内存同步 (v0.18.35)
+
+Zig 0.16.0 **已移除 `@fence` 内置函数**。跨进程共享内存的内存序必须通过
+`@atomicStore` / `@atomicLoad` 实现：
+
+```zig
+// ❌ WRONG — @fence 在 Zig 0.16.0 中不存在
+shm_ptr.utmm_heartbeat = nowMs(io);
+@fence(.release);  // 编译错误: invalid builtin function: '@fence'
+
+// ✅ CORRECT — 使用 @atomicStore 带 .release 内存序
+@atomicStore(u64, &shm_ptr.utmm_heartbeat, nowMs(io), .release);
+
+// ✅ CORRECT — 读取时使用 @atomicLoad 带 .acquire
+const t = @atomicLoad(u64, &shm_ptr.utmm_heartbeat, .acquire);
+```
+
+**内存序选择**：
+- `.release`：写入时用，确保之前的所有写入对此之后的 acquire 读取可见
+- `.acquire`：读取时用，确保观察到 release 写入方在此之前的所有写入
+- `.monotonic`：仅需原子性不需同步时用（如简单计数器）
+
+**为什么不用 `std.atomic.Value`**：共享内存 `extern struct` 需要可预测的
+ABI 布局，`std.atomic.Value` 的内部布局不确定。在 extern struct 中保留
+普通整数类型字段，通过 `@atomicStore`/`@atomicLoad` 包装访问。
+
+## 线程安全审计与修复 (v0.18.35)
 
 - 原生编译（如 macOS）不会检查 Windows 代码路径的类型错误
 - develepment build 成功了不代表所有目标都能编译

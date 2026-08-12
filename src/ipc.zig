@@ -547,7 +547,13 @@ fn handleConnection(
         .download => handleDownload(io, gpa, state_ptr, conn, payload.items),
         .version => handleVersion(conn),
         .upgrade => handleUpgrade(io, gpa, state_ptr, mesh_ptr, conn, payload.items),
-        .upload => unreachable, // handled above
+        .upload => {
+            // 不应到达——upload 已在上面提前处理并 return。
+            // 若到达此处说明存在控制流 bug，打日志后优雅返回，
+            // 避免 unreachable 触发 panic 导致守护进程崩溃。
+            std.log.err("[ipc] unexpected upload in dispatch (should have been handled above)", .{});
+            return;
+        },
     }
 }
 

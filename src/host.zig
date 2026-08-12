@@ -937,10 +937,7 @@ fn mcpHttpHandler(
 ) void {
     defer limit.release();
 
-    // 更新心跳（tcpRead 可能长时间阻塞）
-    if (shm_handle) |h| {
-        h.utmm_heartbeat = shm.nowMs(io);
-    }
+    _ = shm_handle;
     _ = shutdown;
 
     mcp_http.handleHttpMcp(io, gpa, fd, first_byte, state, mesh_opaque, hostname);
@@ -990,7 +987,7 @@ fn hostTcpListen(
     while (true) {
         // 更新心跳 — utmmd 10s 超时检测。
         if (shm_handle) |h| {
-            h.utmm_heartbeat = shm.nowMs(io);
+            shm.writeUtmmHeartbeat(h, io);
         }
 
         if (shutdown) |s| {
@@ -1398,6 +1395,7 @@ fn hostMainLoop(
     host_hostname: []const u8,
     shm_handle: ?*volatile shm.ShmLayout,
 ) void {
+    _ = shm_handle;
     defer allocator.free(host_ip);
     defer allocator.free(host_hostname);
     // Pre-allocated list for LSA snapshots (reused across iterations).
@@ -1416,11 +1414,6 @@ fn hostMainLoop(
     }
 
     while (true) {
-        // 更新心跳 — utmmd 10s 超时检测。
-        if (shm_handle) |h| {
-            h.utmm_heartbeat = shm.nowMs(io);
-        }
-
         // Check shutdown
         if (mesh_opt.*) |*m| {
             if (m.shutdown.load(.acquire)) break;

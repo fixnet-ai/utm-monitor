@@ -409,10 +409,9 @@ fn startUtmmPosix(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.S
     }
 
     shm_ptr.utmm_pid = @intCast(pid);
-    shm_ptr.svc_heartbeat = shm.nowMs(io);
+    shm.writeSvcHeartbeat(shm_ptr, io);
     shm_ptr.restart_count += 1;
-    shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
-    shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.pending);
+    shm.clearCmd(shm_ptr);
     std.log.info("[utmmd] utmm started, pid={d}", .{pid});
     return @intCast(pid);
 }
@@ -453,10 +452,9 @@ fn startUtmmWin(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.Shm
     _ = w.CloseHandle(pi.hThread);
 
     shm_ptr.utmm_pid = pi.dwProcessId;
-    shm_ptr.svc_heartbeat = shm.nowMs(io);
+    shm.writeSvcHeartbeat(shm_ptr, io);
     shm_ptr.restart_count += 1;
-    shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
-    shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.pending);
+    shm.clearCmd(shm_ptr);
     std.log.info("[utmmd] utmm started, pid={d}", .{pi.dwProcessId});
     return UtmmProcessWin{ .handle = pi.hProcess, .pid = pi.dwProcessId };
 }
@@ -1053,17 +1051,17 @@ fn stabilityCheck(io: std.Io, shm_ptr: *volatile shm.ShmLayout, proc: ProcessRef
 
         const now = shm.nowMs(io);
         if (now - last_hb >= 2000) {
-            shm_ptr.svc_heartbeat = now;
+            shm.writeSvcHeartbeat(shm_ptr, io);
             last_hb = now;
         }
 
-        if (@as(shm.Cmd, @enumFromInt(shm_ptr.cmd)) == .shutdown) {
+        if (shm.readCmd(shm_ptr) == .shutdown) {
             _ = killProcess(proc);
             return false;
         }
     }
 
-    shm_ptr.svc_heartbeat = shm.nowMs(io);
+    shm.writeSvcHeartbeat(shm_ptr, io);
     return true;
 }
 
@@ -1090,12 +1088,12 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
 
         const now = shm.nowMs(io);
         if (now - last_hb >= 2000) {
-            shm_ptr.svc_heartbeat = now;
+            shm.writeSvcHeartbeat(shm_ptr, io);
             last_hb = now;
         }
 
         // 心跳超时检测
-        const hb = shm_ptr.utmm_heartbeat;
+        const hb = shm.readUtmmHeartbeat(shm_ptr);
         if (hb > 0 and now - hb > HEARTBEAT_TIMEOUT_SEC * 1000) {
             std.log.warn("[utmmd] heartbeat timeout, killing utmm", .{});
             _ = killProcess(proc);
@@ -1105,10 +1103,9 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
         // 进程退出检测
         if (!isProcessAlive(proc)) {
             std.log.info("[utmmd] utmm exited", .{});
-            const cmd: shm.Cmd = @enumFromInt(shm_ptr.cmd);
+            const cmd = shm.readCmd(shm_ptr);
             if (cmd == .restart) {
-                shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.done);
-                shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
+                shm.clearCmd(shm_ptr);
                 return .restart;
             }
             if (cmd == .shutdown) return .shutdown;
@@ -1121,22 +1118,21 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
         }
 
         // 命令处理
-        const cmd: shm.Cmd = @enumFromInt(shm_ptr.cmd);
+        const cmd = shm.readCmd(shm_ptr);
         switch (cmd) {
             .restart => {
-                shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.accepted);
-                shm_ptr.cmd = @intFromEnum(shm.Cmd.none);
                 // Guest 通过 SHM 发 restart 信号前可能已写入 .tmp 文件，
                 // 先尝试应用待处理升级，确保不会启动旧二进制。
                 if (tryApplyPendingUpgrade(file_io, io, alloc, proc)) |reason| {
+                    shm.clearCmd(shm_ptr);
                     return reason;
                 }
+                shm.clearCmd(shm_ptr);
                 _ = killProcess(proc);
                 return .restart;
             },
             .shutdown => {
-                shm_ptr.cmd_status = @intFromEnum(shm.CmdStatus.accepted);
-                _ = killProcess(proc);
+                shm.clearCmd(shm_ptr);
                 return .shutdown;
             },
             .none, .upgrade => {}, // .upgrade 已迁移到文件式升级，SHM 处忽略
