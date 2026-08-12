@@ -1249,7 +1249,15 @@ pub fn pushUpgrade(
     if (!found) return "GuestNotFound: VM not in mesh — is the Guest running? Use --deploy for initial setup";
     defer state.freeEntry(guest_entry);
 
-    // 2. Determine deployment filename from target triple
+    // 2. 同版本检测：Guest 版本已在 LSA 中可见，无需推送相同版本。
+    //    避免 Guest 端同版本跳过逻辑导致 Host 写失败（Guest 返回 upload_result
+    //    但不消费后续二进制流，Host sockWrite 收到 RST）。
+    if (std.mem.eql(u8, guest_entry.version, protocol.VERSION)) {
+        std.log.info("[auto-upgrade] {s}: same version v{s}, skipping", .{ hostname, guest_entry.version });
+        return null; // 不是错误，版本已一致
+    }
+
+    // 3. Determine deployment filename from target triple
     const filename = protocol.deploymentFilename(guest_entry.target) orelse {
         std.log.err("[auto-upgrade] unknown guest target: {s}", .{guest_entry.target});
         return "UnknownTarget: unsupported architecture — check deploy.json target field";
@@ -1357,6 +1365,8 @@ pub fn pushUpgrade(
                 return "UpgradeRejected";
             }
             std.log.info("[auto-upgrade] {s} confirmed upgrade receipt (exit={d})", .{ hostname, result.exit_code });
+        } else {
+            std.log.warn("[auto-upgrade] {s}: unexpected response byte 0x{x} (nr={d}), continuing", .{ hostname, if (nr > 0) rbuf[0] else @as(u8, 0), nr });
         }
     }
 

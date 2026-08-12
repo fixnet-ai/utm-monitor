@@ -11,6 +11,37 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const fail = @import("fail.zig");
+
+// ──────────── Windows: FindFirstFileW 目录扫描（文件顶层声明）────────────
+// WIN32_FIND_DATAW — 必须精确匹配 Windows ABI 布局。
+// FILETIME 是 struct { DWORD low; DWORD high; } (align=4)，不能用 u64 (align=8)，
+// 否则在 aarch64-windows 上 cFileName 偏移量会多出 4 字节。
+const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes: u32,
+    _ftCreationTimeLow: u32,
+    _ftCreationTimeHigh: u32,
+    _ftLastAccessTimeLow: u32,
+    _ftLastAccessTimeHigh: u32,
+    _ftLastWriteTimeLow: u32,
+    _ftLastWriteTimeHigh: u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+    dwReserved0: u32,
+    dwReserved1: u32,
+    cFileName: [260]u16,
+    cAlternateFileName: [14]u16,
+};
+const INVALID_HANDLE_VALUE_FIND: isize = -1;
+extern "kernel32" fn FindFirstFileW(
+    lpFileName: [*:0]const u16,
+    lpFindFileData: *WIN32_FIND_DATAW,
+) callconv(.winapi) isize;
+extern "kernel32" fn FindNextFileW(
+    hFindFile: isize,
+    lpFindFileData: *WIN32_FIND_DATAW,
+) callconv(.winapi) i32;
+extern "kernel32" fn FindClose(hFindFile: isize) callconv(.winapi) i32;
+
 /// Install-time singleton lock to serialize install/uninstall operations.
 /// Uses OS-level advisory locks automatically released on process exit.
 const InstallLock = struct {
@@ -421,6 +452,7 @@ pub const UpgradeLock = struct {
         const GENERIC_WRITE: DWORD = 0x40000000;
         const GENERIC_READ: DWORD = 0x80000000;
         const FILE_SHARE_READ: DWORD = 0x00000001;
+        const FILE_SHARE_DELETE: DWORD = 0x00000004;
         const CREATE_ALWAYS: DWORD = 2;
         const OPEN_EXISTING: DWORD = 3;
         const FILE_ATTRIBUTE_NORMAL: DWORD = 128;
@@ -479,7 +511,7 @@ pub const UpgradeLock = struct {
         const h = windows.CreateFileW(
             @ptrCast(wpath.ptr),
             windows.GENERIC_READ,
-            windows.FILE_SHARE_READ, // Guest 用 dwShareMode=0 所以 Guest 持有文件时此调用失败
+            windows.FILE_SHARE_READ | windows.FILE_SHARE_DELETE, // Guest 用 dwShareMode=0 所以 Guest 持有文件时此调用失败
             null,
             windows.OPEN_EXISTING,
             windows.FILE_ATTRIBUTE_NORMAL,
@@ -503,6 +535,16 @@ pub const UpgradeLock = struct {
     }
 };
 
+/// 用 DeleteFileW 删除绝对路径文件（避免 std.Io.Dir.cwd().deleteFile 在
+/// Windows 服务 CWD=System32 时对绝对路径处理不一致的问题）。失败静默忽略。
+fn deleteFileAbsoluteWindows(abs_path: []const u8) void {
+    var path_utf16: [512]u16 = [_]u16{0} ** 512;
+    const len = std.unicode.utf8ToUtf16Le(&path_utf16, abs_path) catch return;
+    if (len >= path_utf16.len) return;
+    path_utf16[len] = 0;
+    _ = UpgradeLock.windows.DeleteFileW(@ptrCast(&path_utf16));
+}
+
 /// 从 .tmp 文件名提取 SHA256 hex 后验证文件内容完整性。
 /// 成功返回 true（内容匹配文件名），失败返回 false（文件损坏/不完整，已删除）。
 /// file_io: 文件 I/O 用 Io（Windows 上需为 Threaded，IOCP 不支持文件操作）。
@@ -511,15 +553,25 @@ pub fn verifyUpgradeTmpByFilename(allocator: std.mem.Allocator, file_io: std.Io,
     const actual_hex = computeSha256Hex(allocator, file_io, path) catch return false;
     defer allocator.free(actual_hex);
     if (!std.mem.eql(u8, expected_hex, actual_hex)) {
-        std.Io.Dir.cwd().deleteFile(file_io, path) catch {};
+        // 使用平台合适的绝对路径删除
+        if (builtin.os.tag == .windows) {
+            deleteFileAbsoluteWindows(path);
+        } else {
+            std.Io.Dir.cwd().deleteFile(file_io, path) catch {};
+        }
         return false;
     }
     return true;
 }
 
 /// 计算文件的 SHA256 hex 字符串（64 字符，allocator 分配）。
+/// CWD-insensitive: 使用 openDirAbsolute 解析绝对路径。
 fn computeSha256Hex(allocator: std.mem.Allocator, file_io: std.Io, path: []const u8) ![]const u8 {
-    const f = try std.Io.Dir.cwd().openFile(file_io, path, .{ .mode = .read_only });
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    const name = std.fs.path.basename(path);
+    const dir = try std.Io.Dir.openDirAbsolute(file_io, parent, .{});
+    defer dir.close(file_io);
+    const f = try dir.openFile(file_io, name, .{ .mode = .read_only });
     defer f.close(file_io);
 
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
@@ -545,20 +597,62 @@ fn computeSha256Hex(allocator: std.mem.Allocator, file_io: std.Io, path: []const
 
 /// 扫描升级临时文件：在 canonicalDir 中查找第一个 utmm-upgrade.*.tmp 文件。
 /// 成功返回完整路径名（allocator 分配，调用者释放），未找到返回 null。
+///
+/// Windows: 用 FindFirstFileW/FindNextFileW 直接扫描，绕过 Zig Io walker
+/// （Threaded Io 的 walker.next() 在 Windows 服务上下文中不支持目录迭代）。
+/// POSIX: 使用 openDirAbsolute + walk。
 pub fn findUpgradeTmp(allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
-    const dir = std.Io.Dir.cwd().openDir(io, canonicalDir(), .{}) catch return null;
+    if (builtin.os.tag == .windows) return findUpgradeTmpWindows(allocator);
+    return findUpgradeTmpPosix(allocator, io);
+}
+
+/// Windows: FindFirstFileW/FindNextFileW 直接扫描（绕过 Zig Io walker 兼容性问题）。
+fn findUpgradeTmpWindows(allocator: std.mem.Allocator) ?[]const u8 {
+    // 构造搜索路径: C:\opt\utmm\utmm-upgrade.*.tmp → UTF-16 LE
+    var search_path_buf: [512]u8 = undefined;
+    const search_path = std.fmt.bufPrintZ(&search_path_buf, "C:\\opt\\utmm\\utmm-upgrade.*.tmp", .{}) catch return null;
+    var search_wbuf: [512]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(search_wbuf[0..511], search_path) catch return null;
+    search_wbuf[wlen] = 0;
+    const search_w: [*:0]const u16 = @ptrCast(&search_wbuf);
+
+    var fdata: WIN32_FIND_DATAW = undefined;
+    const h = FindFirstFileW(search_w, &fdata);
+    if (h == INVALID_HANDLE_VALUE_FIND) return null;
+    defer _ = FindClose(h);
+
+    // 遍历匹配文件，找到第一个 extractSha256 匹配的
+    var name_buf: [300]u8 = undefined;
+    var first: bool = true;
+    while (true) {
+        if (!first) {
+            if (FindNextFileW(h, &fdata) == 0) break;
+        }
+        first = false;
+        // cFileName: null-terminated UTF-16 LE → UTF-8
+        const name_utf16 = std.mem.sliceTo(@as([*:0]const u16, @ptrCast(&fdata.cFileName)), 0);
+        const name_len = std.unicode.utf16LeToUtf8(&name_buf, name_utf16) catch continue;
+        const basename = name_buf[0..name_len];
+        if (UpgradeLock.extractSha256(basename, "utmm-upgrade")) |_| {
+            return std.fmt.allocPrint(allocator, "C:\\opt\\utmm\\{s}", .{basename}) catch return null;
+        }
+    }
+    return null;
+}
+
+/// POSIX: openDirAbsolute + walk（macOS/Linux 正常工作）。
+fn findUpgradeTmpPosix(allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
+    const dir = std.Io.Dir.openDirAbsolute(io, canonicalDir(), .{}) catch return null;
     defer dir.close(io);
 
     var walker = dir.walk(allocator) catch return null;
     defer walker.deinit();
 
-    while (walker.next(io) catch null) |entry| {
+    while (walker.next(io) catch return null) |entry| {
         if (entry.kind != .file) continue;
         if (UpgradeLock.extractSha256(entry.basename, "utmm-upgrade")) |_| {
-            if (builtin.os.tag == .windows) {
-                return std.fmt.allocPrint(allocator, "C:\\opt\\utmm\\{s}", .{entry.basename}) catch return null;
-            }
-            return std.fmt.allocPrint(allocator, "/opt/utmm/{s}", .{entry.basename}) catch return null;
+            const full = std.fmt.allocPrint(allocator, "/opt/utmm/{s}", .{entry.basename}) catch return null;
+            return full;
         }
     }
     return null;
@@ -587,10 +681,18 @@ pub fn cleanupStaleUpgradeTmp(io: std.Io, allocator: std.mem.Allocator) void {
         else
             "/opt/utmm/utmm-upgrade";
         std.Io.Dir.cwd().deleteFile(io, old_bin) catch {};
+
+        // 清理 rename 替换后遗留的旧二进制
+        const old_exe = if (builtin.os.tag == .windows)
+            "C:\\opt\\utmm\\utmm-old.exe"
+        else
+            "/opt/utmm/utmm-old";
+        std.Io.Dir.cwd().deleteFile(io, old_exe) catch {};
     }
 
     // 清理新的 .tmp 机制残留（崩溃遗留的半写文件）。
-    const dir = std.Io.Dir.cwd().openDir(io, canonicalDir(), .{}) catch return;
+    // CWD-insensitive: Windows 服务 CWD 为 System32，必须用绝对路径
+    const dir = std.Io.Dir.openDirAbsolute(io, canonicalDir(), .{}) catch return;
     defer dir.close(io);
 
     var walker = dir.walk(allocator) catch return;
@@ -598,10 +700,11 @@ pub fn cleanupStaleUpgradeTmp(io: std.Io, allocator: std.mem.Allocator) void {
 
     while (walker.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
-        // 检查 upload.*.tmp 或 utmm-upgrade.*.tmp 前缀
+        // 仅清理 upload.*.tmp（半写文件残留）。
+        // utmm-upgrade.*.tmp 由 utmmd 全权管理 — Guest 启动时不得触碰，
+        // 否则会在 utmmd 尚未处理升级文件时就将其当作"残留"删除。
         const is_upload = UpgradeLock.extractSha256(entry.basename, "upload") != null;
-        const is_upgrade = UpgradeLock.extractSha256(entry.basename, "utmm-upgrade") != null;
-        if (is_upload or is_upgrade) {
+        if (is_upload) {
             // 尝试获取排他锁 — 如果成功，说明没有人在写入，可以安全删除。
             const full_path = if (builtin.os.tag == .windows)
                 std.fmt.allocPrint(allocator, "C:\\opt\\utmm\\{s}", .{entry.basename}) catch continue

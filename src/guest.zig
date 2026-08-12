@@ -1131,6 +1131,19 @@ pub fn handleExecCmd(
     std.log.info("[guest] exec done (shell closed): cmd_id={s}", .{input.cmd_id});
 }
 
+/// 从 TCP 连接读取并丢弃指定字节数。
+/// 用于同版本升级跳过时消费 Host 已发送的二进制流。
+fn discardBytes(fd: tcp.socket_t, remaining: u32) !void {
+    var buf: [65536]u8 = undefined;
+    var left: u64 = remaining;
+    while (left > 0) {
+        const to_read: usize = @min(buf.len, @as(usize, @intCast(left)));
+        const nr = tcp.sockRead(fd, &buf, to_read);
+        if (nr <= 0) return error.ReadFailed;
+        left -= @intCast(nr);
+    }
+}
+
 /// 通用文件接收：从 TCP 连接读取二进制流，写入 {prefix}.<sha256>.tmp 临时文件。
 /// 使用 OS 排他锁（flock/dwShareMode=0），进程崩溃时自动释放。
 /// 成功返回锁（仍持有）和路径；调用者决定 release 还是 release+rename。
@@ -1276,9 +1289,14 @@ pub fn handleUpgradeCmd(
 
     std.log.info("[guest] upgrade: cmd_id={s} target={s} size={d} version={s}", .{ cmd.cmd_id, cmd.target, cmd.file_size, cmd.version });
 
-    // 同版本检测：如果推送的版本与当前运行版本相同，跳过升级
+    // 同版本检测：如果推送的版本与当前运行版本相同，跳过升级。
+    // 必须先消费 Host 已发送的二进制流再发送响应，否则 Host sockWrite 可能因
+    // TCP 接收窗口满而失败（Host 在发送 upgrade_cmd frame 后立即流式推送二进制数据）。
     if (std.mem.eql(u8, cmd.version, protocol.VERSION)) {
-        std.log.info("[guest] upgrade: same version ({s}), skipping", .{cmd.version});
+        std.log.info("[guest] upgrade: same version ({s}), discarding {d} bytes", .{ cmd.version, cmd.file_size });
+        discardBytes(conn.fd, cmd.file_size) catch |err| {
+            std.log.warn("[guest] upgrade: discard failed: {}", .{err});
+        };
         const resp = protocol.buildUploadResult(allocator, cmd.cmd_id, 0) catch return;
         defer allocator.free(resp);
         _ = conn.sendAndFlush(resp, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});

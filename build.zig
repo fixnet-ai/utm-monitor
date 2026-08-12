@@ -60,12 +60,20 @@ pub fn build(b: *std.Build) void {
     const zio_mod = zio_dep.module("zio");
 
     // ── Step 1: Build utmmd (supervisor daemon) ──
+    // ReleaseSafe on aarch64-windows produces incorrect code (crash 1067).
+    // ReleaseSmall also crashed (c0000005 ACCESS VIOLATION in ucrtbase.dll).
+    // Using Debug for Windows avoids cross-compiled optimizer bugs. utmmd is
+    // a minimal supervisor (~429KB), so Debug size is not a concern.
+    const utmmd_optimize: std.builtin.OptimizeMode = if (target.result.os.tag == .windows)
+        .Debug
+    else
+        optimize;
     const utmmd = b.addExecutable(.{
         .name = "utmmd",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/utmmd.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = utmmd_optimize,
             .link_libc = true,
         }),
     });
@@ -239,13 +247,17 @@ pub fn build(b: *std.Build) void {
     for (cross_targets) |query| {
         const tgt = b.resolveTargetQuery(query);
 
-        // Build utmmd for this target
+        // Build utmmd for this target (Debug for Windows — see note above)
+        const cross_utmmd_optimize: std.builtin.OptimizeMode = if (tgt.result.os.tag == .windows)
+            .Debug
+        else
+            optimize;
         const cross_utmmd = b.addExecutable(.{
             .name = "utmmd",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/utmmd.zig"),
                 .target = tgt,
-                .optimize = optimize,
+                .optimize = cross_utmmd_optimize,
                 .link_libc = true,
             }),
         });
