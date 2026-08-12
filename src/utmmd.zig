@@ -671,9 +671,10 @@ fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator,
         const replaced = tryReplaceWindows(tp, dest, old_path);
         debugLogWindows("tryApplyPendingUpgrade: after tryReplaceWindows");
         if (!replaced) {
-            // 所有替换方法都失败 — 清理 .tmp，返回 null（不影响 crash-loop：.tmp 已删除）
-            std.log.err("[utmmd] upgrade replace failed: all methods exhausted — removing .tmp", .{});
-            deleteFileAbsoluteWindows(tp);
+            // 替换失败 — utmm.exe 可能仍被进程或 AV 锁定。保留 .tmp，
+            // 下一轮监控循环（1s 后）会重试。killAllUtmmWindows 会再次
+            // 尝试杀残留进程，MoveFileExW 可能在锁释放后成功。
+            std.log.warn("[utmmd] upgrade replace failed — keeping .tmp for retry", .{});
             return null;
         }
 
@@ -1164,15 +1165,17 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
         const cmd = shm.readCmd(shm_ptr);
         switch (cmd) {
             .restart => {
-                // Guest 通过 SHM 发 restart 信号前可能已写入 .tmp 文件，
-                // 先尝试应用待处理升级，确保不会启动旧二进制。
+                // Guest 通过 SHM 发 restart 信号表明升级 .tmp 已就绪。
+                // 尝试立即应用升级，成功则重启到新版。
                 if (tryApplyPendingUpgrade(file_io, io, alloc, proc)) |reason| {
                     shm.clearCmd(shm_ptr);
                     return reason;
                 }
+                // 升级文件尚未就绪（锁未释放、taskkill 未完成等）。
+                // 清除命令，继续监控循环 — 主循环的 upgrade 检查（本函数
+                // 每轮先检查升级再处理命令）会在下一轮重试。不杀 utmm：
+                // 杀后重启旧二进制 = 升级丢失 + 服务中断，两败俱伤。
                 shm.clearCmd(shm_ptr);
-                _ = killProcess(proc);
-                return .restart;
             },
             .shutdown => {
                 shm.clearCmd(shm_ptr);
