@@ -1592,3 +1592,82 @@ v0.18.30 部署到 windowsvm 后，`--upgrade` 传输成功但 utmmd 无法找�
 
 3. **"为什么找不到文件"这类问题不要假设**。之前的诊断认为是 CWD 问题、时间窗口问题、
    SHM 信号问题——全是错的。真正的问题需要 diff 验证（对比参考实现的 struct 布局）。
+
+## Phase 34 — 全节点升级验证 + POSIX findUpgradeTmp 修复
+
+**时间**: 2026-08-12
+
+### 目标
+
+将全部 4 个 Guest 节点升级到 v0.18.34，验证 auto-upgrade 全流程，修复发现的问题。
+
+### 全节点升级过程
+
+**初始状态**（v0.18.34 Host 部署后）：
+- macvm: v0.18.34 ✅（上一轮已升级）
+- windowsvm: v0.18.33 — 需升级
+- winx64: v0.18.26 — 需升级
+- linuxvm: v0.18.28 — 需升级
+
+**第一轮推送**：
+- linuxvm: `GuestConnectFailed`（SOCKS5 连接失败）
+- windowsvm: `[upgrade] OK`
+- winx64: `[upgrade] OK`
+
+**问题诊断**：推送 OK 但版本未变：
+- windowsvm: `utmmd.exe` 已崩溃（不在进程列表中），仅 `utmm.exe` 存活
+- winx64: UTM-MonitorD 服务 STOPPED，WIN32_EXIT_CODE=1067，utmmd 已崩溃
+- 两个 VM 的 SCM 都未自动重启 utmmd → .tmp 文件永远不会被处理
+
+**修复**：`sc.exe start UTM-MonitorD` 手动重启服务 → utmmd 启动后立即
+`tryApplyPendingUpgrade` → 找到并应用 .tmp 文件 → 升级成功。
+
+- windowsvm: v0.18.33 → v0.18.34 ✅
+- winx64: v0.18.26 → v0.18.27（先应用旧 .tmp）→ v0.18.34 ✅
+
+**linuxvm 问题诊断**：
+- 症状：TCP 端口 2121 和 22 均返回 Connection refused，但 UDP ping 正常
+- utmm LSA 广播可达（status 显示 serving），但 TCP listener 线程崩溃
+- SSH daemon 也挂了（无法远程登录）
+- QEMU guest agent 未安装（utmctl exec 不可用）
+
+**修复**：`utmctl stop "Ubuntu Desktop"` + `utmctl start "Ubuntu Desktop"` 重启 VM
+→ TCP 服务恢复 → `utmm --upgrade linuxvm` 推送 OK → 升级至 v0.18.34 ✅
+
+**最终状态**：全部 5 节点 v0.18.34 ✅
+
+### POSIX findUpgradeTmp 静默失败 Bug
+
+**发现**：虽然通过重启 Windows 服务和 linuxvm VM 完成了升级，但深入检查发现
+linuxvm 的 utmmd 在正常运行期间**本应能**自动发现并应用 .tmp 文件，却一直
+找不到。进一步分析代码发现 `utmmd.zig:941`：
+
+```zig
+const need_threaded = builtin.os.tag == .windows;
+```
+
+POSIX 上 `file_io` 直接复用事件循环 Io（epoll/kqueue），而 `findUpgradeTmpPosix`
+调用的 `std.Io.Dir.openDirAbsolute(io, ...)` 需要文件系统操作能力，epoll-based Io
+静默失败（`catch return null`）。
+
+- macOS kqueue 碰巧兼容 → macvm 升级正常
+- Linux epoll 不兼容 → linuxvm 升级失败
+- Windows IOCP 之前已修复（独立 Threaded Io）
+
+**修复** (v0.18.35)：所有平台始终创建 Threaded Io 用于文件操作，`need_threaded` 移除。
+
+### 构建与测试
+
+- 216 单元测试通过，1 skipped
+- 59 集成测试通过，0 泄漏
+- 构建成功
+
+### 教训
+
+1. **事件循环 Io ≠ 文件 I/O**：epoll/kqueue/IOCP 是为网络设计的，文件操作必须用 Threaded Io。这不是 Windows 特有的限制。
+
+2. **静默失败是最坏的失败**：`catch return null` 掩盖了 openDirAbsolute 的真正错误原因。如果 panic 或记录错误日志，早就能定位到问题。
+
+3. **跨平台测试不能只测一个 OS**：Phase 33 只在 Windows 上验证了 upgrade 流程，macOS 碰巧工作（kqueue 兼容），导致 Linux 上的 bug 被遗漏。
+
+4. **utmmd 崩溃恢复缺口**：SCM/systemd 配置了 restart，但两个 Windows VM 的 utmmd 都停止后未自动重启。需要排查 SCM 失败恢复配置或 utmmd 崩溃根因。

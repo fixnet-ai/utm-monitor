@@ -99,6 +99,26 @@ TerminateProcess 后 OS 可能仍在短时间内保留 exe 文件锁定。delete
 
 zio coro/coroutines.zig 新增 `.x86` 架构支持（IA-32 cdecl、AT&T 汇编、16 字节栈对齐）。初版仅 Linux musl，Windows 需额外 TIB 支持。8/8 交叉编译目标已通过。
 
+### 2026-08-12 — findUpgradeTmpPosix 静默失败：事件循环 Io 不支持文件操作
+
+**症状**: linuxvm Guest 收到 `--upgrade` 推送后 utmm-upgrade.*.tmp 文件正常写入，
+但 utmmd 持续报告 "no tmp found, return null"，升级永远不生效。重启 utmmd 服务后同样失败。
+
+**根因**: `utmmd.zig` 的 `monitorLoop` 中 `need_threaded = builtin.os.tag == .windows`，
+在 POSIX 上 `file_io` 直接复用事件循环 Io（epoll/kqueue）。`findUpgradeTmpPosix` 调用
+`std.Io.Dir.openDirAbsolute(io, ...)` 时，epoll-based Io 无法执行文件系统操作，
+调用静默失败（`catch return null`），导致 .tmp 文件永远不会被发现。
+
+macOS kqueue 碰巧支持 `openDirAbsolute`（因为 kqueue 对文件描述符的兼容性更好），
+所以 macvm 升级正常。Linux epoll 不支持，导致 linuxvm 升级失败。
+
+**修复**: `utmmd.zig` — 所有平台始终创建 `std.Io.Threaded` 实例用于文件操作，
+不再复用事件循环 Io。`need_threaded` 变量移除。
+
+**教训**: 事件循环 Io（epoll/kqueue/IOCP）是为网络 I/O 设计的，文件系统操作
+（openDirAbsolute、rename、deleteFile 等）必须使用 Threaded Io。这个限制不是
+Windows 特有的 — 所有平台都需要。
+
 ### 2026-08-12 — WIN32_FIND_DATAW struct 布局 + FindFirstFileW 替代 Zig Io walker
 
 #### WIN32_FIND_DATAW FILETIME 对齐陷阱

@@ -936,16 +936,15 @@ pub fn main(init: std.process.Init) !void {
 fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmLayout, utmm_args: []const []const u8) void {
     if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: entry");
 
-    // Windows: IOCP 不支持文件 I/O（stat/open/read/rename/delete），
-    // 需使用独立的 Threaded Io 进行文件操作。POSIX 上直接复用 io。
-    const need_threaded = builtin.os.tag == .windows;
-    var file_threaded: std.Io.Threaded = undefined;
-    if (need_threaded) {
-        if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: before Threaded.init");
-        file_threaded = std.Io.Threaded.init(alloc, .{});
-        if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: after Threaded.init");
-    }
-    const file_io: std.Io = if (need_threaded) file_threaded.io() else io;
+    // 所有平台都需要独立的 Threaded Io 进行文件操作。
+    // 事件循环 Io（epoll/kqueue/IOCP）不支持文件系统操作
+    //（openDirAbsolute/rename/deleteFile 等）。POSIX 上复用 io 会导致
+    // findUpgradeTmpPosix 中的 openDirAbsolute 静默失败 → 升级 .tmp 文件
+    // 永远不会被发现（v0.18.34 linuxvm 升级失败根因）。
+    if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: before Threaded.init");
+    var file_threaded = std.Io.Threaded.init(alloc, .{});
+    if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: after Threaded.init");
+    const file_io: std.Io = file_threaded.io();
 
     var failure_count: u32 = 0;
     var backoff_sec: u32 = 1;
