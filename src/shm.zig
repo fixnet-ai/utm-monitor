@@ -411,11 +411,10 @@ pub fn writeCmdPath(shm_ptr: *volatile ShmLayout, path: []const u8) void {
 /// utmmd ← utmm: 读取 cmd_data 中的路径（若有效）。acquire 确保写入可见。
 pub fn readCmdPath(shm_ptr: *volatile ShmLayout, buf: []u8) ?[]const u8 {
     const first_byte = @atomicLoad(u8, &shm_ptr.cmd_data[0], .acquire);
-    if (first_byte == 0 or first_byte != '/') return null; // 不是路径
+    if (first_byte == 0) return null; // 空
     const max_len = @min(buf.len, shm_ptr.cmd_data.len);
     var len: usize = 0;
     while (len < max_len) : (len += 1) {
-        // 每次读取一个字节确保跨进程可见（简单路径，非性能关键路径）
         if (shm_ptr.cmd_data[len] == 0) break;
         buf[len] = shm_ptr.cmd_data[len];
     }
