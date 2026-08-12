@@ -2124,6 +2124,111 @@ pub fn shouldUpdateUtmmd(io: std.Io, alloc: std.mem.Allocator, comptime embedded
     return false;
 }
 
+/// 升级 utmmd 自身：hash 比较 → disable → stop → kill → replace → enable → start。
+/// 每步串行等待，不并行。由 CLI 进程调用（不是 utmmd 自己）。
+/// new_utmmd_path: 新 utmmd 临时文件路径（如 /opt/utmm/utmmd-new）。
+pub fn upgradeUtmmd(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8, new_utmmd_path: []const u8, comptime embedded_sha256_hex: []const u8) void {
+    const dest = canonicalSvcPath();
+
+    // 1. SHA256 比较 — 相同则跳过
+    const new_hash = fileSha256Hex(io, alloc, new_utmmd_path) orelse {
+        fail.err("upgradeUtmmd/hash-new", error.FileNotFound);
+    };
+    defer alloc.free(new_hash);
+
+    if (std.mem.eql(u8, new_hash, embedded_sha256_hex)) {
+        const current = fileSha256Hex(io, alloc, dest);
+        if (current) |h| {
+            defer alloc.free(h);
+            if (std.mem.eql(u8, h, embedded_sha256_hex)) {
+                std.log.info("[svc] utmmd unchanged (SHA256 match), skipping upgrade", .{});
+                return;
+            }
+        }
+    }
+
+    std.log.info("[svc] utmmd upgrade: {s} → {s}", .{ new_utmmd_path, dest });
+
+    // 2. Disable 服务
+    disableService(io, alloc, role);
+
+    // 3. Stop 服务
+    stop(io, alloc, role) catch |err| {
+        std.log.warn("[svc] upgradeUtmmd: stop returned {} (continuing)", .{err});
+    };
+
+    // 4. Kill utmmd 进程（确保文件不被锁定）
+    killUtmmdProcess(io, alloc);
+
+    // 5. 替换 utmmd 二进制
+    replaceFile(io, alloc, new_utmmd_path, dest);
+
+    // 6. Enable 服务
+    enableService(io, alloc, role);
+
+    // 7. Start 服务
+    start(io, alloc, role, extra_args) catch |err| {
+        fail.err("upgradeUtmmd/start", err);
+    };
+
+    std.log.info("[svc] utmmd upgrade complete", .{});
+}
+
+fn disableService(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) void {
+    _ = role;
+    const name = svcName();
+    switch (builtin.os.tag) {
+        .macos => _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "disable", "system", name }),
+        .linux => _ = runCmd(alloc, io, &[_][]const u8{ "systemctl", "disable", name }),
+        .windows => _ = runCmd(alloc, io, &[_][]const u8{ "sc", "config", name, "start=", "disabled" }),
+        else => {},
+    }
+}
+
+fn enableService(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) void {
+    _ = role;
+    const name = svcName();
+    switch (builtin.os.tag) {
+        .macos => _ = runCmd(alloc, io, &[_][]const u8{ "launchctl", "enable", "system", name }),
+        .linux => _ = runCmd(alloc, io, &[_][]const u8{ "systemctl", "enable", name }),
+        .windows => _ = runCmd(alloc, io, &[_][]const u8{ "sc", "config", name, "start=", "auto" }),
+        else => {},
+    }
+}
+
+fn killUtmmdProcess(io: std.Io, alloc: std.mem.Allocator) void {
+    switch (builtin.os.tag) {
+        .windows => {
+            _ = runCmd(alloc, io, &[_][]const u8{ "C:\\Windows\\System32\\taskkill.exe", "/f", "/im", "utmmd.exe" });
+        },
+        .macos, .linux => {
+            _ = runCmd(alloc, io, &[_][]const u8{ "killall", "-9", "utmmd" });
+        },
+        else => {},
+    }
+}
+
+fn replaceFile(io: std.Io, alloc: std.mem.Allocator, src: []const u8, dst: []const u8) void {
+    // 删旧 → rename 新
+    std.Io.Dir.cwd().deleteFile(io, dst) catch {};
+    std.Io.Dir.cwd().rename(src, std.Io.Dir.cwd(), dst, io) catch |err| {
+        if (err == error.CrossDevice) {
+            copyFile(io, alloc, src, dst, builtin.os.tag != .windows) catch |e| {
+                fail.err("upgradeUtmmd/copy-fallback", e);
+            };
+            std.Io.Dir.cwd().deleteFile(io, src) catch {};
+        } else {
+            fail.err("upgradeUtmmd/replace", err);
+        }
+    };
+    if (builtin.os.tag != .windows) {
+        _ = std.posix.system.chmod(@ptrCast(dst.ptr), 0o755);
+    }
+    if (builtin.os.tag == .macos) {
+        _ = runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dst });
+    }
+}
+
 /// No-op stub — previously persisted metadata to /opt/utmm/utmm.conf.
 /// Kept so callers in main.zig don't need to change.
 pub fn saveUtmmdMeta(

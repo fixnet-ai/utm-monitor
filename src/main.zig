@@ -508,10 +508,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
-            // 3a path: utmmd needs update — extract + full forceInstall
-            try extractUtmmd(init.io, init.gpa);
-            svc.forceInstall(init.io, init.gpa, .host, extra_args.items);
-            svc.saveUtmmdMeta(init.io, init.gpa, .host, extra_args.items, utmmd_sha256_hex);
+            // utmmd needs update — extract to temp, upgrade (disable→stop→kill→replace→enable→start)
+            const tmp_path = try extractUtmmdToTemp(init.io, init.gpa);
+            svc.upgradeUtmmd(init.io, init.gpa, .host, extra_args.items, tmp_path, utmmd_sha256_hex);
+            init.gpa.free(tmp_path);
         } else if (!was_running) {
             // 3b path: utmmd unchanged, just start the service (skip reinstall)
             std.log.info("[main] utmmd unchanged, starting service directly", .{});
@@ -560,10 +560,9 @@ pub fn main(init: std.process.Init) !void {
         }
 
         if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
-            // 3a path: utmmd needs update — extract + full forceInstall
-            try extractUtmmd(init.io, init.gpa);
-            svc.forceInstall(init.io, init.gpa, .guest, extra_args_guest.items);
-            svc.saveUtmmdMeta(init.io, init.gpa, .guest, extra_args_guest.items, utmmd_sha256_hex);
+            const tmp_path = try extractUtmmdToTemp(init.io, init.gpa);
+            svc.upgradeUtmmd(init.io, init.gpa, .guest, extra_args_guest.items, tmp_path, utmmd_sha256_hex);
+            init.gpa.free(tmp_path);
         } else if (!was_running) {
             // 3b path: utmmd unchanged, just start the service (skip reinstall)
             std.log.info("[main] utmmd unchanged, starting guest service directly", .{});
@@ -578,6 +577,39 @@ pub fn main(init: std.process.Init) !void {
 
 /// Write the embedded utmmd binary to the canonical service path.
 /// Validates the binary type before writing. Always overwrites.
+/// 提取嵌入的 utmmd 到临时文件，返回路径（调用者负责 free）。
+fn extractUtmmdToTemp(io: std.Io, alloc: std.mem.Allocator) ![]const u8 {
+    const dest_dir = svc.canonicalDir();
+    std.Io.Dir.cwd().createDirPath(io, dest_dir) catch |err| {
+        fail.err("extractUtmmdTmp/mkdir", err);
+    };
+    const tmp_path = if (builtin.os.tag == .windows)
+        try std.fmt.allocPrint(alloc, "{s}\\utmmd-new.exe", .{dest_dir})
+    else
+        try std.fmt.allocPrint(alloc, "{s}/utmmd-new", .{dest_dir});
+    errdefer alloc.free(tmp_path);
+
+    std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    const cwd = std.Io.Dir.cwd();
+    const dst = if (builtin.os.tag != .windows)
+        cwd.createFile(io, tmp_path, .{ .truncate = true, .permissions = @enumFromInt(0o755) }) catch |err| {
+            fail.err("extractUtmmdTmp/create", err);
+        }
+    else
+        cwd.createFile(io, tmp_path, .{ .truncate = true }) catch |err| {
+            fail.err("extractUtmmdTmp/create", err);
+        };
+    defer dst.close(io);
+
+    var write_buf: [65536]u8 = undefined;
+    var writer = dst.writer(io, &write_buf);
+    writer.interface.writeAll(utmmd_bin) catch |err| { fail.err("extractUtmmdTmp/write", err); };
+    writer.interface.flush() catch |err| { std.log.warn("[main] extractUtmmdTmp flush: {}", .{err}); };
+    dst.sync(io) catch |err| { std.log.warn("[main] extractUtmmdTmp sync: {}", .{err}); };
+
+    return tmp_path;
+}
+
 fn extractUtmmd(io: std.Io, alloc: std.mem.Allocator) !void {
     const dest = svc.canonicalSvcPath();
     const dest_dir = svc.canonicalDir();
