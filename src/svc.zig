@@ -843,8 +843,8 @@ fn checkIpcSocket() bool {
 /// TCP connect 比 Unix domain socket 更可靠：不依赖 sun_len 平台差异，
 /// 不依赖 io 上下文，直接验证服务功能。
 fn checkServicePort() bool {
-    // 短暂重试：t+0s 服务可能刚启动端口未就绪，1s 内通常完成 bind。
-    for (0..3) |_| {
+    // 重试：服务刚启动时端口可能未就绪（utmm 初始化 1-3s）。
+    for (0..5) |_| {
         const sock = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
         if (sock < 0) return false;
         defer _ = std.posix.system.close(sock);
@@ -859,10 +859,9 @@ fn checkServicePort() bool {
         const rc = std.posix.system.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in));
         if (rc >= 0) return true;
 
-        // ECONNREFUSED = 端口未就绪，等 200ms 再试。其他错误直接放弃。
+        // ECONNREFUSED = 端口未就绪。其他错误直接放弃。
         if (std.posix.errno(rc) != .CONNREFUSED) break;
-        // 200ms — 不依赖 std.Io.sleep（init.io 上下文可能不支持）。
-        _ = usleep(200_000);
+        _ = usleep(500_000);
     }
     return false;
 }
@@ -2055,11 +2054,11 @@ pub fn ensure(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_arg
         return;
     }
 
-    // 服务可能正在启动中（utmmd stability check 最多 10s，TCP listener
-    // 在 stability 之后才 bind）。以 2s 间隔重试最多 6 次（共 12s），
-    // 覆盖 utmm 完全初始化窗口。仅在全部失败后才执行 forceInstall。
-    for (0..6) |_| {
-        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(2000), .awake) catch break;
+    // 服务可能正在启动中，TCP listener 在 utmmd stability 之后才 bind。
+    // std.Io.sleep 在 init.io 上下文中可能不支持 → catch break 直接跳出，
+    // 用 usleep 替代确保延迟可靠执行。3×2s = 6s 覆盖启动窗口。
+    for (0..3) |_| {
+        _ = usleep(2_000_000);
         if (isRunning(io, alloc, role)) {
             std.log.info("[svc] {s} service running after wait", .{name});
             std.debug.print("utmm {s} service is running.\n", .{if (role == .host) "host" else "guest"});

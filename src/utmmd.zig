@@ -696,8 +696,9 @@ fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator,
                 };
                 std.Io.Dir.cwd().deleteFile(file_io, tp) catch {};
             } else {
-                std.log.err("[utmmd] upgrade rename failed: {}", .{err});
+                std.log.err("[utmmd] upgrade rename failed: {} — removing stale .tmp", .{err});
                 lock.release();
+                std.Io.Dir.cwd().deleteFile(file_io, tp) catch {};
                 return null;
             }
         };
