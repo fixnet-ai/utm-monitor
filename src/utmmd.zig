@@ -854,6 +854,11 @@ fn copyFileAbsoluteWindows(src: []const u8, dst: []const u8) bool {
 
 var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
+/// Windows SCM 停止事件 — svcHandler 收到 STOP/SHUTDOWN 控制时设置。
+/// monitorLoop / stabilityCheck / monitorUtmm 轮询此标志位优雅退出，
+/// 替代 svcHandler 中直接 exit(0) 的错误行为。
+var g_stop_event: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
 // 直接用 C sigaction — Zig 0.16.0 的 Sigaction/SIG 类型跨平台差异大。
 extern "c" fn sigaction(sig: c_int, noalias act: ?*const c_sigaction, noalias oact: ?*c_sigaction) c_int;
 
@@ -949,8 +954,8 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
     shm_ptr.svc_state = @intFromEnum(shm.SvcState.running);
 
     while (true) {
-        if (sigterm_received.load(.acquire)) {
-            std.log.info("[utmmd] SIGTERM, shutting down", .{});
+        if (sigterm_received.load(.acquire) or g_stop_event.load(.acquire)) {
+            std.log.info("[utmmd] stop signal received, shutting down", .{});
             shm_ptr.svc_state = @intFromEnum(shm.SvcState.stopping);
             // 杀掉 utmm 子进程防止变孤儿进程
             killUtmmByPid(shm_ptr.utmm_pid);
@@ -1041,7 +1046,7 @@ fn stabilityCheck(io: std.Io, shm_ptr: *volatile shm.ShmLayout, proc: ProcessRef
 
     while (shm.nowMs(io) - t0 < threshold_sec * 1000) {
         sleepMs(io, POLL_INTERVAL_MS);
-        if (sigterm_received.load(.acquire)) return false;
+        if (sigterm_received.load(.acquire) or g_stop_event.load(.acquire)) return false;
 
         if (!isProcessAlive(proc)) {
             shm_ptr.last_exit_code = 0; // waitpid 已获取，简化
@@ -1081,7 +1086,7 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
     while (true) {
         sleepMs(io, POLL_INTERVAL_MS);
 
-        if (sigterm_received.load(.acquire)) {
+        if (sigterm_received.load(.acquire) or g_stop_event.load(.acquire)) {
             _ = killProcess(proc);
             return .shutdown;
         }
@@ -1171,7 +1176,11 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
 const SERVICE_WIN32_OWN_PROCESS = 0x00000010;
 const SERVICE_ACCEPT_STOP = 0x00000001;
 const SERVICE_CONTROL_STOP = 0x00000001;
+const SERVICE_CONTROL_INTERROGATE = 0x00000004;
+const SERVICE_CONTROL_SHUTDOWN = 0x00000005;
 const SERVICE_RUNNING = 0x00000004;
+const SERVICE_START_PENDING = 0x00000002;
+const SERVICE_STOP_PENDING = 0x00000003;
 const SERVICE_STOPPED = 0x00000001;
 
 const SERVICE_STATUS = extern struct {
@@ -1205,15 +1214,38 @@ const SvcCtx = struct {
 };
 
 fn svcHandler(dwControl: u32, _: u32, _: ?*anyopaque, _: ?*anyopaque) callconv(.winapi) u32 {
-    if (dwControl == SERVICE_CONTROL_STOP) {
-        var s = std.mem.zeroes(SERVICE_STATUS);
-        s.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-        s.dwCurrentState = SERVICE_STOPPED;
-        s.dwControlsAccepted = 0;
-        _ = SetServiceStatus(SvcCtx.status_handle, &s);
-        std.process.exit(0);
+    switch (dwControl) {
+        SERVICE_CONTROL_STOP, SERVICE_CONTROL_SHUTDOWN => {
+            // 1. 报告 STOP_PENDING — SCM 期望 RUNNING→STOP_PENDING→STOPPED 状态转换。
+            //    dwWaitHint=10000 告知 SCM 预计 10 秒内完成停止。
+            if (SvcCtx.status_handle) |h| {
+                var s = std.mem.zeroes(SERVICE_STATUS);
+                s.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+                s.dwCurrentState = SERVICE_STOP_PENDING;
+                s.dwControlsAccepted = 0;
+                s.dwWaitHint = 10000;
+                s.dwCheckPoint = 1;
+                _ = SetServiceStatus(h, &s);
+            }
+            // 2. 通知 monitorLoop 优雅退出（设置原子标志位后立即返回，
+            //    不在 SCM Handler 线程中执行清理或 exit）。
+            g_stop_event.store(true, .release);
+            return 0;
+        },
+        SERVICE_CONTROL_INTERROGATE => {
+            // SCM 定期发送 INTERROGATE 检查服务健康状态。
+            // 必须调用 SetServiceStatus 报告当前状态，否则 SCM 可能标记服务为未响应。
+            if (SvcCtx.status_handle) |h| {
+                var s = std.mem.zeroes(SERVICE_STATUS);
+                s.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+                s.dwCurrentState = SERVICE_RUNNING;
+                s.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+                _ = SetServiceStatus(h, &s);
+            }
+            return 0;
+        },
+        else => return 0,
     }
-    return 0;
 }
 
 fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
@@ -1222,10 +1254,21 @@ fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
     debugLogWindows("svcMain: handler registered");
     SvcCtx.status_handle = h;
     if (h) |handle| {
+        // 1. 报告 SERVICE_START_PENDING — SCM 期望 START_PENDING → RUNNING 状态转换。
+        //    dwWaitHint=5000 告知 SCM 预计 5 秒内完成初始化。
         var s = std.mem.zeroes(SERVICE_STATUS);
         s.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+        s.dwCurrentState = SERVICE_START_PENDING;
+        s.dwControlsAccepted = 0;
+        s.dwWaitHint = 5000;
+        s.dwCheckPoint = 0;
+        _ = SetServiceStatus(handle, &s);
+
+        // 2. 初始化完成 → SERVICE_RUNNING
         s.dwCurrentState = SERVICE_RUNNING;
         s.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+        s.dwWaitHint = 0;
+        s.dwCheckPoint = 0;
         _ = SetServiceStatus(handle, &s);
     }
 
@@ -1233,11 +1276,14 @@ fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
         monitorLoop(SvcCtx.io, SvcCtx.gpa, shm_ptr, SvcCtx.args);
     }
 
+    // monitorLoop 正常返回（收到 STOP/SHUTDOWN 信号后优雅退出）→ 报告 SERVICE_STOPPED。
+    // 此时 utmm 子进程已被 killUtmmByPid 终止，共享内存将在 defer shm.destroy 中清理。
     if (h) |handle| {
         var s = std.mem.zeroes(SERVICE_STATUS);
         s.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
         s.dwCurrentState = SERVICE_STOPPED;
         s.dwControlsAccepted = 0;
+        s.dwWin32ExitCode = 0;
         _ = SetServiceStatus(handle, &s);
     }
 }
