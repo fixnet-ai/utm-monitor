@@ -184,14 +184,20 @@ pub fn uploadToGuest(
     local_path: []const u8,
     remote_path: []const u8,
 ) !void {
+    // 文件 I/O 必须使用独立 Threaded Io — ctx.io 是 zio 事件循环 Io，
+    // 不支持在线程池线程中执行文件系统操作（epoll 不支持，kqueue 非线程安全）。
+    // 与 handleVmSshpass 一致的模式。
+    var file_threaded = std.Io.Threaded.init(gpa, .{});
+    const file_io = file_threaded.io();
+
     // Open local file and compute SHA256
-    const local_file = std.Io.Dir.cwd().openFile(io, local_path, .{}) catch |err| {
+    const local_file = std.Io.Dir.cwd().openFile(file_io, local_path, .{}) catch |err| {
         std.log.err("[mcp-handler-upload] open {s}: {}", .{ local_path, err });
         return error.FileOpenFailed;
     };
-    defer local_file.close(io);
+    defer local_file.close(file_io);
 
-    const file_stat = local_file.stat(io) catch return error.FileStatFailed;
+    const file_stat = local_file.stat(file_io) catch return error.FileStatFailed;
     const file_size: u32 = @intCast(file_stat.size);
 
     // Compute SHA256 via positional read (doesn't change seek position)
@@ -199,7 +205,7 @@ pub fn uploadToGuest(
     var hash_buf: [32768]u8 = undefined;
     var pos: u64 = 0;
     while (true) {
-        const nr = local_file.readPositional(io, &.{&hash_buf}, pos) catch return error.FileReadFailed;
+        const nr = local_file.readPositional(file_io, &.{&hash_buf}, pos) catch return error.FileReadFailed;
         if (nr == 0) break;
         sha.update(hash_buf[0..nr]);
         pos += nr;
@@ -238,7 +244,7 @@ pub fn uploadToGuest(
     pos = 0;
     while (total_sent < file_size) {
         const to_read: usize = @min(file_rbuf.len, file_size - total_sent);
-        const n = local_file.readPositional(io, &.{file_rbuf[0..to_read]}, pos) catch {
+        const n = local_file.readPositional(file_io, &.{file_rbuf[0..to_read]}, pos) catch {
             std.log.err("[mcp-handler-upload] local read failed", .{});
             return error.FileReadFailed;
         };

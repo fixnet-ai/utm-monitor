@@ -552,15 +552,21 @@ fn handleVmUpload(ctx: McpContext, vm: []const u8, local_path: []const u8, remot
 fn handleVmDownload(ctx: McpContext, vm: []const u8, remote_path: []const u8, local_path: []const u8) ![]const u8 {
     const state = ctx.state orelse return error.NoHostState;
 
+    // 文件 I/O 必须使用独立 Threaded Io — ctx.io 是 zio 事件循环 Io，
+    // 不支持在线程池线程中执行文件系统操作。
+    // 与 handleVmSshpass 一致的模式。
+    var file_threaded = std.Io.Threaded.init(ctx.gpa, .{});
+    const file_io = file_threaded.io();
+
     // Create local file for writing
-    const file = std.Io.Dir.cwd().createFile(ctx.io, local_path, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().createFile(file_io, local_path, .{}) catch |err| {
         std.log.err("[mcp] Cannot create {s} for write: {}", .{ local_path, err });
         return error.DownloadFailed;
     };
-    defer file.close(ctx.io);
+    defer file.close(file_io);
 
     var fbuf: [65536]u8 = undefined;
-    var fw = file.writer(ctx.io, &fbuf);
+    var fw = file.writer(file_io, &fbuf);
     const total_bytes = try mcp_handler.downloadFromGuest(ctx.io, ctx.gpa, state, vm, remote_path, &fw.interface);
 
     const esc_vm = try jsonEscape(ctx.gpa, vm);
