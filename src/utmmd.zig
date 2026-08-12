@@ -167,6 +167,8 @@ fn killUtmmByPid(pid: u32) void {
 /// 强杀 utmm 进程并等待终止完成。
 /// Windows: TerminateProcess 是异步的，必须 WaitForSingleObject 确保进程完全退出，
 /// 释放所有文件句柄后再进行后续操作（如 rename 覆盖可执行文件）。
+/// POSIX: SIGKILL 后必须 waitpid 回收僵尸进程，否则在升级循环中会累积数百个
+/// defunct 进程（v0.18.36 linuxvm 僵尸进程根因）。waitpid 同时确认进程已终止。
 /// 注意：不关闭进程句柄——调用者负责管理句柄生命周期。
 /// 返回 true 表示进程已成功终止，false 表示可能未终止（TerminateProcess 失败或超时）。
 fn killProcess(proc: ProcessRef) bool {
@@ -190,8 +192,28 @@ fn killProcess(proc: ProcessRef) bool {
         return true;
     } else {
         if (proc == 0) return false;
-        std.posix.kill(@intCast(proc), std.posix.SIG.KILL) catch {};
-        std.log.info("[utmmd] utmm killed, pid={d}", .{proc});
+        // 先尝试回收已退出的僵尸（可能在 kill 之前就已崩溃）。
+        const pre_reap = std.c.waitpid(@intCast(proc), null, WNOHANG);
+        if (pre_reap > 0) {
+            // 进程已退出且已被回收 — 无需 kill
+            std.log.info("[utmmd] utmm already dead and reaped, pid={d}", .{proc});
+            return true;
+        }
+        // 发送 SIGKILL
+        std.posix.kill(@intCast(proc), std.posix.SIG.KILL) catch |err| {
+            // ESRCH: 进程不存在 — 可能已被 init 或其他机制回收
+            std.log.info("[utmmd] utmm already dead (kill→{s}), pid={d}", .{ @errorName(err), proc });
+            return true;
+        };
+        // 阻塞等待进程终止并回收僵尸（0 = 无超时，阻塞到进程退出）。
+        // WNOHANG 不够：SIGKILL 是异步的，进程可能需要几 ms 才真正退出。
+        const wait_result = std.c.waitpid(@intCast(proc), null, 0);
+        if (wait_result < 0) {
+            // ECHILD: 进程已被其他方式回收
+            std.log.info("[utmmd] utmm kill confirmed (waitpid→reaped by other), pid={d}", .{proc});
+            return true;
+        }
+        std.log.info("[utmmd] utmm killed and reaped, pid={d}", .{proc});
         return true;
     }
 }
@@ -549,12 +571,28 @@ fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator,
         return null;
     }
 
-    // 3. 尝试获取排他锁 — 成功 = 文件写入完成，失败 = Guest 仍在写入
+    // 3. 尝试获取排他锁 — 成功 = 文件写入完成，失败 = Guest 仍在写入。
+    // Windows 上 Guest 释放锁后可能存在短暂的时间窗口（CloseHandle 异步性、
+    // AV 软件扫描等），tryAcquire 可能短暂失败。添加重试逻辑避免因一次性
+    // 失败而放弃升级，导致 tmp 文件残留（v0.18.36 windowsvm/winx64 预存 bug）。
     if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: before tryAcquire");
-    var lock = svc.UpgradeLock.tryAcquire(tp) orelse {
-        if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: tryAcquire failed");
+    var lock: svc.UpgradeLock = undefined;
+    var acquired: bool = false;
+    for (0..10) |attempt| {
+        if (svc.UpgradeLock.tryAcquire(tp)) |l| {
+            lock = l;
+            acquired = true;
+            break;
+        }
+        if (attempt < 9) {
+            if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: tryAcquire retry");
+            std.Io.sleep(file_io, std.Io.Duration.fromMilliseconds(200), .awake) catch {};
+        }
+    }
+    if (!acquired) {
+        if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: tryAcquire failed after 10 retries");
         return null;
-    };
+    }
 
     std.log.info("[utmmd] upgrade tmp file found: {s}", .{tp});
 

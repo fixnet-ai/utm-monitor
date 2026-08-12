@@ -6,7 +6,7 @@
 
 | # | 限制 | 影响 | 状态 |
 |---|------|------|------|
-| 1 | Zombie 进程 | killChild 5s WNOHANG waitpid，D 状态子进程无法收割 | 已知 |
+| 1 | Zombie 进程 | killChild 5s WNOHANG waitpid，D 状态子进程无法收割 | v0.18.36 已修复 |
 | 2 | utmmd 二进制升级缺口 | push-upgrade 只替换 utmm，utmmd 需手动更新 | 已知 |
 | 3 | Windows BIND 防火墙 | Windows Firewall 阻止 BIND 动态端口入站（非代码问题） | OS 限制 |
 | 4 | zio 依赖本地路径 | build.zig.zon 用 path="../zio"，待 PR 合并后切 URL | 待 zio 上游 |

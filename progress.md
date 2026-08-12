@@ -1,3 +1,68 @@
+## v0.18.36 — 僵尸进程收割 + findUpgradeTmp 选最新 + Windows tryAcquire 重试
+
+**时间**: 2026-08-12
+
+### 修复的四项 Bug
+
+#### Bug 1 — Linux 僵尸进程 (最严重)
+
+**症状**: linuxvm 执行 `ps aux` 时出现数百个 `[utmm] <defunct>` 僵尸进程。
+
+**根因分析** (crash-loop 触发链):
+
+```
+1. 多个 utmm-upgrade.*.tmp 文件堆积（每次 auto-upgrade 推送创建 1 个）
+2. findUpgradeTmp 返回第一个匹配文件（最旧的，可能已损坏）
+3. tryApplyPendingUpgrade 用错误版本替换二进制
+4. 新 utmm 启动后崩溃或上报错误版本 → utmmd killProcess(SIGKILL)
+5. killProcess 仅 kill，从不调用 waitpid 收割僵尸
+6. proc PID 被下一个 startUtmm 覆盖，旧僵尸 PID 丢失，永远无法收割
+7. Host auto-upgrade 检测版本不匹配 → 再次推送新 tmp → 循环继续
+8. 每循环一次产生 1 个不可收割的僵尸，数小时积累数百个
+```
+
+**修复** (`src/utmmd.zig` killProcess POSIX 路径):
+- kill 前先 `waitpid(WNOHANG)` 收割已退出子进程
+- SIGKILL 后 blocking `waitpid` 等待进程终止并收割
+- `kill()→ESRCH` 表示进程已不存在 → 直接返回 true（不视为错误）
+
+#### Bug 2 — findUpgradeTmp 返回旧文件而非最新
+
+**症状**: 存在多个 .tmp 文件时，返回第一个匹配文件（按 walk 顺序，非时间顺序）。
+旧文件可能是损坏的、版本不匹配的，导致升级到错误版本。
+
+**修复** (`src/svc.zig`):
+- **findUpgradeTmpPosix**: 扫描所有匹配文件 → 通过 `statFile` 比较 mtime → 返回最新的
+- **findUpgradeTmpWindows**: 扫描所有匹配文件 → 通过 `ftLastWriteTime` 比较 → 返回最新的
+- 两个实现均在扫描过程中删除旧文件，防止堆积
+
+#### Bug 3 — pushUpgrade 静默成功
+
+**症状**: `pushUpgrade` 收到意外的响应字节后仍然返回 null（成功），`[upgrade] OK`
+日志已打印但升级实际未生效。
+
+**修复** (`src/host.zig`): 非 upload_result 类型的响应字节 → 返回 `"UnexpectedResponse"` error。
+
+#### Bug 4 — Windows tryAcquire 可能立即失败
+
+**症状**: utmmd 的 `tryApplyPendingUpgrade` 中 `UpgradeLock.tryAcquire` 调用一次
+即放弃，当另一个进程持有锁时（如 Guest 正在写入 .tmp）即错失升级窗口。
+
+**修复** (`src/utmmd.zig`): tryAcquire 失败后重试最多 10 次（200ms 间隔）。
+
+### 测试
+
+- `zig build test` — 216/216 passed ✅
+- `zig build test-integration` — 59/59 passed, 0 leaks ✅
+
+### 待验证
+
+- [ ] linuxvm 部署后确认僵尸进程不再产生
+- [ ] 多 .tmp 文件场景下确认选中最新
+- [ ] winx64 auto-upgrade 端到端验证
+
+---
+
 ## Phase 33 — Windows --upgrade 二进制替换崩溃修复
 
 **时间**: 2026-08-11

@@ -607,6 +607,7 @@ pub fn findUpgradeTmp(allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
 }
 
 /// Windows: FindFirstFileW/FindNextFileW 直接扫描（绕过 Zig Io walker 兼容性问题）。
+/// 遍历所有匹配文件，返回 ftLastWriteTime 最新的一个，同时删除旧文件。
 fn findUpgradeTmpWindows(allocator: std.mem.Allocator) ?[]const u8 {
     // 构造搜索路径: C:\opt\utmm\utmm-upgrade.*.tmp → UTF-16 LE
     var search_path_buf: [512]u8 = undefined;
@@ -621,7 +622,9 @@ fn findUpgradeTmpWindows(allocator: std.mem.Allocator) ?[]const u8 {
     if (h == INVALID_HANDLE_VALUE_FIND) return null;
     defer _ = FindClose(h);
 
-    // 遍历匹配文件，找到第一个 extractSha256 匹配的
+    var newest_path: ?[]const u8 = null;
+    var newest_time: u64 = 0; // FILETIME: 100ns intervals since 1601-01-01
+
     var name_buf: [300]u8 = undefined;
     var first: bool = true;
     while (true) {
@@ -634,13 +637,27 @@ fn findUpgradeTmpWindows(allocator: std.mem.Allocator) ?[]const u8 {
         const name_len = std.unicode.utf16LeToUtf8(&name_buf, name_utf16) catch continue;
         const basename = name_buf[0..name_len];
         if (UpgradeLock.extractSha256(basename, "utmm-upgrade")) |_| {
-            return std.fmt.allocPrint(allocator, "C:\\opt\\utmm\\{s}", .{basename}) catch return null;
+            const full = std.fmt.allocPrint(allocator, "C:\\opt\\utmm\\{s}", .{basename}) catch continue;
+            // ftLastWriteTime: FILETIME 结构体 (low + high)，100ns 单位
+            const file_time: u64 = (@as(u64, fdata._ftLastWriteTimeHigh) << 32) | fdata._ftLastWriteTimeLow;
+            if (file_time > newest_time) {
+                if (newest_path) |old| allocator.free(old);
+                newest_path = full;
+                newest_time = file_time;
+            } else {
+                // 旧文件 — 立即删除
+                deleteFileAbsoluteWindows(full);
+                std.log.info("[svc] cleanup: removed stale upgrade tmp {s}", .{basename});
+                allocator.free(full);
+            }
         }
     }
-    return null;
+    return newest_path;
 }
 
 /// POSIX: openDirAbsolute + walk（macOS/Linux 正常工作）。
+/// 遍历所有匹配的 utmm-upgrade.*.tmp 文件，返回 mtime 最新的一个。
+/// 同时清理所有其他（旧）tmp 文件，防止过期文件堆积导致逐次处理失败。
 fn findUpgradeTmpPosix(allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     const dir = std.Io.Dir.openDirAbsolute(io, canonicalDir(), .{}) catch return null;
     defer dir.close(io);
@@ -648,14 +665,35 @@ fn findUpgradeTmpPosix(allocator: std.mem.Allocator, io: std.Io) ?[]const u8 {
     var walker = dir.walk(allocator) catch return null;
     defer walker.deinit();
 
+    var newest_path: ?[]const u8 = null;
+    var newest_mtime_ns: i128 = -1; // 任何真实文件的 mtime > -1
+
     while (walker.next(io) catch return null) |entry| {
         if (entry.kind != .file) continue;
         if (UpgradeLock.extractSha256(entry.basename, "utmm-upgrade")) |_| {
-            const full = std.fmt.allocPrint(allocator, "/opt/utmm/{s}", .{entry.basename}) catch return null;
-            return full;
+            // 获取 mtime: stat 查询文件元数据
+            const full = std.fmt.allocPrint(allocator, "/opt/utmm/{s}", .{entry.basename}) catch continue;
+            const stat_result = std.Io.Dir.cwd().statFile(io, full, .{});
+            if (stat_result) |st| {
+                const mtime_ns: i128 = @intCast(st.mtime.nanoseconds);
+                if (mtime_ns > newest_mtime_ns) {
+                    // 发现更新的文件 — 清理之前认为最新的旧文件
+                    if (newest_path) |old| allocator.free(old);
+                    newest_path = full;
+                    newest_mtime_ns = mtime_ns;
+                } else {
+                    // 旧文件 — 立即删除（utmmd 启动时不会有 Guest 并发写入）
+                    std.Io.Dir.cwd().deleteFile(io, full) catch {};
+                    std.log.info("[svc] cleanup: removed stale upgrade tmp {s}", .{entry.basename});
+                    allocator.free(full);
+                }
+            } else |_| {
+                // stat 失败 — 文件可能刚被删除，跳过
+                allocator.free(full);
+            }
         }
     }
-    return null;
+    return newest_path;
 }
 
 /// 清理由崩溃 Guest 遗留的升级临时文件。

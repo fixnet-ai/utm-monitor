@@ -1363,7 +1363,10 @@ pub fn pushUpgrade(
             }
             std.log.info("[auto-upgrade] {s} confirmed upgrade receipt (exit={d})", .{ hostname, result.exit_code });
         } else {
-            std.log.warn("[auto-upgrade] {s}: unexpected response byte 0x{x} (nr={d}), continuing", .{ hostname, if (nr > 0) rbuf[0] else @as(u8, 0), nr });
+            // nr==0: Guest 关闭连接但未发送 upload_result。nr>0 但首字节不匹配:
+            // Guest 可能发送了错误消息或协议不匹配。
+            std.log.err("[auto-upgrade] {s}: unexpected response — nr={d}, first_byte=0x{x}", .{ hostname, nr, if (nr > 0) rbuf[0] else @as(u8, 0) });
+            return "UnexpectedResponse";
         }
     }
 
