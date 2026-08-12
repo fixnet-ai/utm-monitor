@@ -400,6 +400,30 @@ pub fn readUtmmHeartbeat(shm_ptr: *volatile ShmLayout) u32 {
     return @atomicLoad(u32, &shm_ptr.utmm_heartbeat, .acquire);
 }
 
+/// utmm → utmmd: 将升级文件路径写入 cmd_data（null 结尾）。
+/// utmmd 可直接使用此路径，无需扫描目录。
+pub fn writeCmdPath(shm_ptr: *volatile ShmLayout, path: []const u8) void {
+    const len = @min(path.len, shm_ptr.cmd_data.len - 1);
+    @memcpy(shm_ptr.cmd_data[0..len], path[0..len]);
+    @atomicStore(u8, &shm_ptr.cmd_data[len], 0, .release);
+}
+
+/// utmmd ← utmm: 读取 cmd_data 中的路径（若有效）。acquire 确保写入可见。
+pub fn readCmdPath(shm_ptr: *volatile ShmLayout, buf: []u8) ?[]const u8 {
+    const first_byte = @atomicLoad(u8, &shm_ptr.cmd_data[0], .acquire);
+    if (first_byte == 0 or first_byte != '/') return null; // 不是路径
+    const max_len = @min(buf.len, shm_ptr.cmd_data.len);
+    var len: usize = 0;
+    while (len < max_len) : (len += 1) {
+        // 每次读取一个字节确保跨进程可见（简单路径，非性能关键路径）
+        if (shm_ptr.cmd_data[len] == 0) break;
+        buf[len] = shm_ptr.cmd_data[len];
+    }
+    if (len == 0 or len >= max_len) return null;
+    buf[len] = 0;
+    return buf[0..len];
+}
+
 // ========== Tests ==========
 
 test "ShmLayout size is 4096" {

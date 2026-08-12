@@ -546,12 +546,16 @@ fn tryReplaceWindows(
 /// 尝试查找并应用待处理升级。
 /// 返回 RestartReason 表示升级已应用（调用者应重启 utmm），null 表示无待处理升级。
 /// file_io: 文件 I/O 用 Io（Windows 上需为 Threaded，IOCP 不支持文件操作）。
-fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator, proc: ?ProcessRef) ?RestartReason {
+fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator, proc: ?ProcessRef, shm_ptr: *volatile shm.ShmLayout) ?RestartReason {
     if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: entry");
-    // 1. 扫描 utmm-upgrade.*.tmp 文件
-    const tmp_path = svc.findUpgradeTmp(alloc, file_io);
-    const tp: []const u8 = tmp_path orelse {
-        if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: no tmp found, return null");
+
+    // 1. 从 SHM cmd_data 读 Guest 写入的升级文件全路径。
+    //    Guest 在 handleUpgradeCmd 中将 .tmp 路径写入 SHM 后才发 restart。
+    var path_buf: [512]u8 = undefined;
+    const tp: []const u8 = if (shm.readCmdPath(shm_ptr, &path_buf)) |p|
+        alloc.dupe(u8, p) catch return null
+    else {
+        if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: no path in SHM, return null");
         return null;
     };
     if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: tmp found");
@@ -1020,7 +1024,7 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
             if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: after killAllUtmmWindows#1");
         }
         if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: before tryApplyPendingUpgrade");
-        if (tryApplyPendingUpgrade(file_io, io, alloc, null)) |_| {
+        if (tryApplyPendingUpgrade(file_io, io, alloc, null, shm_ptr)) |_| {
             if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: upgrade applied, looping to start new utmm");
             // 升级已应用，继续循环启动新的（已升级的）utmm
         }
@@ -1164,7 +1168,7 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
         }
 
         // 文件式升级检查：utmmd 扫描 .tmp 文件 → 尝试锁 → 校验 → 应用升级
-        if (tryApplyPendingUpgrade(file_io, io, alloc, proc)) |reason| {
+        if (tryApplyPendingUpgrade(file_io, io, alloc, proc, shm_ptr)) |reason| {
             return reason;
         }
         // 升级未成功 — 区分「无 .tmp」和「有 .tmp 但失败」。
@@ -1189,7 +1193,7 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
             .restart => {
                 // Guest 通过 SHM 发 restart 信号表明升级 .tmp 已就绪。
                 // 尝试立即应用升级，成功则重启到新版。
-                if (tryApplyPendingUpgrade(file_io, io, alloc, proc)) |reason| {
+                if (tryApplyPendingUpgrade(file_io, io, alloc, proc, shm_ptr)) |reason| {
                     shm.clearCmd(shm_ptr);
                     return reason;
                 }

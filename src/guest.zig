@@ -1321,9 +1321,10 @@ pub fn handleUpgradeCmd(
     result.lock.release();
     std.log.info("[guest] upgrade: file ready, lock released — signaling utmmd to apply", .{});
 
-    // 通过共享内存通知 utmmd 升级文件已就绪。
-    // utmmd 立即杀 utmm（释放 exe 文件锁）→ 替换二进制 → 重启新版 utmm。
+    // 把 .tmp 全路径写入 SHM cmd_data，utmmd 直接用——无需扫描目录。
+    // 这绕过了 findUpgradeTmpPosix 在 Linux 上的 walker 兼容性问题。
     if (shm_handle) |h| {
+        shm.writeCmdPath(h, result.path);
         shm.writeCmd(h, .restart, .pending);
     }
 }
