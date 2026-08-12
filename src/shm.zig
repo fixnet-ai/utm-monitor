@@ -91,7 +91,8 @@ comptime {
 /// 获取当前单调时钟时间（毫秒）。
 pub fn nowMs(io: std.Io) u32 {
     const ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
-    return @truncate(@divTrunc(ns, std.time.ns_per_ms));
+    const ms: u64 = @intCast(@divTrunc(ns, std.time.ns_per_ms));
+    return @truncate(ms);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
