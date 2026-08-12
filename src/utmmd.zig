@@ -116,7 +116,6 @@ extern "kernel32" fn TerminateProcess(hProcess: std.os.windows.HANDLE, uExitCode
 extern "kernel32" fn WaitForSingleObject(hHandle: std.os.windows.HANDLE, dwMilliseconds: u32) callconv(.winapi) u32;
 extern "kernel32" fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) callconv(.winapi) ?std.os.windows.HANDLE;
 extern "kernel32" fn DeleteFileW(lpFileName: [*:0]const u16) callconv(.winapi) i32;
-extern "kernel32" fn CopyFileW(lpExistingFileName: [*:0]const u16, lpNewFileName: [*:0]const u16, bFailIfExists: i32) callconv(.winapi) i32;
 
 
 // Zig 0.16.0 移除了 CreateProcessW，声明 CreateProcessA（UTF-8 路径即可）
@@ -501,46 +500,40 @@ fn runCmd(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
 /// 使用 kernel32 API（MoveFileExW / DeleteFileW / CopyFileW）绕过 Zig Io.Dir 的
 /// Threaded Io 兼容性问题（Io.Dir.rename 在 Windows Threaded Io 上可能崩溃）。
 /// 返回 true 表示替换成功，false 表示所有方法都失败。
-fn tryReplaceWindows(
-    tmp_path: []const u8,
-    dest: []const u8,
-    old_path: []const u8,
-) bool {
-    // Phase E1: rename utmm.exe → utmm-old.exe（使用 MoveFileExW，支持覆盖已有目标）。
-    _ = deleteFileAbsoluteWindows(old_path);
-    const old_renamed = moveFileExReplaceWindows(dest, old_path);
+/// Windows 升级替换：杀进程 → DeleteFileW 旧 exe → MoveFileExW .tmp → utmm.exe。
+/// 失败时保留 .tmp，返回 false 供调用方重试。
+fn replaceUtmmWindows(tmp_path: []const u8, dest: []const u8) bool {
+    debugLogWindows("replaceUtmmWindows: entry");
 
-    // Phase E2: rename .tmp → utmm.exe
-    if (moveFileExReplaceWindows(tmp_path, dest)) {
-        return true;
-    }
-    const err = std.os.windows.GetLastError();
-    std.log.warn("[utmmd] MoveFileExW .tmp→utmm.exe failed (err={d}), trying recovery", .{@intFromEnum(err)});
+    // 1. 杀全部 utmm.exe（Toolhelp32 直接枚举）
+    _ = killAllUtmmWindows();
 
-    // 恢复旧二进制
-    if (old_renamed) {
-        _ = moveFileExReplaceWindows(old_path, dest);
-        std.log.info("[utmmd] old binary restored", .{});
+    // 2. 重试：AV/Defender 可能短暂持有文件句柄
+    for (0..5) |attempt| {
+        if (!deleteFileAbsoluteWindows(dest)) {
+            if (attempt < 4) {
+                _ = killAllUtmmWindows();
+                sleepMsWin(500 * (@as(u32, @intCast(attempt)) + 1));
+                continue;
+            }
+            return false;
+        }
+        if (moveFileExWindows(tmp_path, dest)) return true;
+        if (attempt < 4) sleepMsWin(500 * (@as(u32, @intCast(attempt)) + 1));
     }
-
-    // Phase E3 后备：delete + MoveFileExW
-    _ = deleteFileAbsoluteWindows(dest);
-    if (moveFileExReplaceWindows(tmp_path, dest)) {
-        std.log.info("[utmmd] upgrade replace done via delete+MoveFileExW", .{});
-        return true;
-    }
-    const err2 = std.os.windows.GetLastError();
-
-    // Phase E4 最后一招：CopyFileW + delete tmp
-    std.log.warn("[utmmd] delete+MoveFileExW failed (err={d}), trying CopyFileW", .{@intFromEnum(err2)});
-    if (copyFileAbsoluteWindows(tmp_path, dest)) {
-        _ = deleteFileAbsoluteWindows(tmp_path);
-        std.log.info("[utmmd] upgrade replace done via CopyFileW", .{});
-        return true;
-    }
-    const err3 = std.os.windows.GetLastError();
-    std.log.err("[utmmd] all replace methods exhausted (err={d}, err2={d}, err3={d})", .{ @intFromEnum(err), @intFromEnum(err2), @intFromEnum(err3) });
     return false;
+}
+
+fn moveFileExWindows(src: []const u8, dst: []const u8) bool {
+    var s: [512]u16 = [_]u16{0} ** 512;
+    var d: [512]u16 = [_]u16{0} ** 512;
+    const sl = std.unicode.utf8ToUtf16Le(&s, src) catch return false;
+    if (sl >= s.len) return false;
+    s[sl] = 0;
+    const dl = std.unicode.utf8ToUtf16Le(&d, dst) catch return false;
+    if (dl >= d.len) return false;
+    d[dl] = 0;
+    return MoveFileExW(@ptrCast(&s), @ptrCast(&d), MOVEFILE_REPLACE_EXISTING) != 0;
 }
 
 /// 尝试查找并应用待处理升级。
@@ -571,7 +564,7 @@ fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator,
 
     if (svc.UpgradeLock.extractSha256(basename, "utmm-upgrade") == null) {
         // 文件名格式不对 — 清理残留
-        if (builtin.os.tag == .windows) deleteFileAbsoluteWindows(tp)
+        if (builtin.os.tag == .windows) _ = deleteFileAbsoluteWindows(tp)
         else std.Io.Dir.cwd().deleteFile(file_io, tp) catch {};
         return null;
     }
@@ -609,7 +602,7 @@ fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator,
         const expected_hex = svc.UpgradeLock.extractSha256(basename, "utmm-upgrade");
         if (expected_hex == null) {
             std.log.err("[utmmd] upgrade: invalid filename, deleting {s}", .{tp});
-            deleteFileAbsoluteWindows(tp);
+            _ = deleteFileAbsoluteWindows(tp);
             return null;
         }
         // Windows 上跳过二次 SHA256 验证，直接信任 Guest 端已在写入时验证的文件名。
@@ -628,67 +621,28 @@ fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator,
     const dest = utmmPath();
 
     // 5. 杀 utmm 进程。
-    // Windows：必须杀掉所有 utmm.exe 进程（不仅是主守护进程，还包括 exec 产生的
-    // 子进程等），因为任何 utmm.exe 进程都会持有可执行文件句柄阻止 rename。
+    // 5. 杀 utmm 进程 + 替换二进制。
     if (builtin.os.tag == .windows) {
-        debugLogWindows("tryApplyPendingUpgrade: before killAllUtmmWindows#2");
-        killAllUtmmWindows(file_io);
-        debugLogWindows("tryApplyPendingUpgrade: after killAllUtmmWindows#2");
-    } else if (proc) |p| {
-        if (!killProcess(p)) {
-            std.log.err("[utmmd] upgrade aborted: failed to kill utmm", .{});
-            lock.release();
-            if (builtin.os.tag == .windows) deleteFileAbsoluteWindows(tp);
-            return null;
-        }
-    }
-
-    // 6. POSIX: 设置可执行权限
-    if (builtin.os.tag != .windows) {
-        _ = std.posix.system.chmod(@ptrCast(tp.ptr), 0o755);
-    }
-
-    // 7. 替换二进制。
-    // Windows 策略（与 POSIX 完全不同）：
-    //   - Phase B: 锁立即释放 — 消除 Windows 自锁问题（FILE_SHARE_DELETE 缺失）
-    //   - 两阶段 rename：旧 exe → utmm-old.exe，.tmp → utmm.exe
-    //   - NTFS rename 是目录条目操作，不碰文件数据 → AV 持有文件也能成功
-    //   - 若第二步 rename 失败 → rename 旧二进制回来恢复
-    if (builtin.os.tag == .windows) {
-        // Phase B: 锁已无意义（SHA256 已验证），立即释放以解除 Windows 共享限制。
-        debugLogWindows("tryApplyPendingUpgrade: releasing lock");
+        // 锁先释放 — 否则自己的句柄可能妨碍 MoveFileExW。
         lock.release();
 
-        // 等待 500ms 让 AV/Defender 释放残余文件句柄。
-        debugLogWindows("tryApplyPendingUpgrade: sleeping 500ms");
-        std.Io.sleep(file_io, std.Io.Duration.fromMilliseconds(500), .awake) catch {};
-
-        // 构造 old_path 用于重命名和后续清理
-        debugLogWindows("tryApplyPendingUpgrade: before allocPrint old_path");
-        const old_path = std.fmt.allocPrint(alloc, "{s}\\utmm-old.exe", .{utmmDir()}) catch {
-            deleteFileAbsoluteWindows(tp);
-            return null;
-        };
-        defer alloc.free(old_path);
-
-        // 使用 kernel32 API 进行替换（绕过 Zig Io.Dir rename，避免 Threaded Io 兼容性问题）
-        debugLogWindows("tryApplyPendingUpgrade: before tryReplaceWindows");
-        const replaced = tryReplaceWindows(tp, dest, old_path);
-        debugLogWindows("tryApplyPendingUpgrade: after tryReplaceWindows");
-        if (!replaced) {
-            // 替换失败 — utmm.exe 可能仍被进程或 AV 锁定。保留 .tmp，
-            // 下一轮监控循环（1s 后）会重试。killAllUtmmWindows 会再次
-            // 尝试杀残留进程，MoveFileExW 可能在锁释放后成功。
-            std.log.warn("[utmmd] upgrade replace failed — keeping .tmp for retry", .{});
-            return null;
+        // replaceUtmmWindows: 枚举杀全部 utmm.exe → 删旧 → MoveFileExW
+        if (replaceUtmmWindows(tp, dest)) {
+            std.log.info("[utmmd] upgrade replace done: → {s}", .{dest});
+            return .restart;
         }
-
-        // Phase F: 清理旧二进制（尽力而为，失败不阻塞下次启动）
-        deleteFileAbsoluteWindows(old_path);
-
-        std.log.info("[utmmd] upgrade replace done: → {s}", .{dest});
-        return .restart;
+        std.log.warn("[utmmd] upgrade replace failed — keeping .tmp for retry", .{});
+        return null;
     } else {
+        // POSIX: kill utmm 然后 rename 原子替换
+        if (proc) |p| {
+            if (!killProcess(p)) {
+                std.log.err("[utmmd] upgrade aborted: failed to kill utmm", .{});
+                lock.release();
+                return null;
+            }
+        }
+        _ = std.posix.system.chmod(@ptrCast(tp.ptr), 0o755);
         // POSIX: rename 原子替换（覆盖已有文件）
         std.Io.Dir.cwd().rename(tp, std.Io.Dir.cwd(), dest, file_io) catch |err| {
             if (err == error.CrossDevice) {
@@ -761,53 +715,62 @@ extern "kernel32" fn MoveFileExW(
     dwFlags: u32,
 ) callconv(.winapi) i32;
 
-/// 用 taskkill 杀掉所有 utmm.exe 进程。
-/// 在 Windows 上升级替换需要 rename utmm.exe，但正在运行的 utmm.exe
-///（--install 进程、孤儿进程等）持有文件句柄阻止 rename。
-/// 此函数确保所有 utmm.exe 已终止。
-fn killAllUtmmWindows(file_io: std.Io) void {
-    // 先尝试 killUtmmByPid（如果 SHM 中有 PID 记录），然后 500ms 等待进程退出，
-    // 再使用 taskkill 做兜底清理。
-    // 注意：file_io 参数预留给可能的 Sleep 调用，当前不需要。
-    _ = file_io;
+// ── Toolhelp32 进程枚举（替代 taskkill.exe 子进程方案）──
+const TH32CS_SNAPPROCESS: u32 = 0x00000002;
+const PROCESSENTRY32W = extern struct {
+    dwSize: u32,
+    cntUsage: u32,
+    th32ProcessID: u32,
+    th32DefaultHeapID: usize,
+    th32ModuleID: u32,
+    cntThreads: u32,
+    th32ParentProcessID: u32,
+    pcPriClassBase: i32,
+    dwFlags: u32,
+    szExeFile: [260]u16,
+};
+extern "kernel32" fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn Process32FirstW(hSnapshot: ?*anyopaque, lppe: *PROCESSENTRY32W) callconv(.winapi) i32;
+extern "kernel32" fn Process32NextW(hSnapshot: ?*anyopaque, lppe: *PROCESSENTRY32W) callconv(.winapi) i32;
 
-    debugLogWindows("killAllUtmmWindows: entry");
+/// 直接枚举所有进程，TerminateProcess 杀掉全部 utmm.exe。
+fn killAllUtmmWindows() bool {
+    debugLogWindows("killAllUtmmWindows: Toolhelp32 entry");
+    const h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) orelse {
+        debugLogWindows("killAllUtmmWindows: snapshot FAILED");
+        return false;
+    };
+    defer _ = CloseHandle(h);
 
-    // 使用 CreateProcessA 运行 taskkill.exe — 比手动枚举进程更简单可靠。
-    var si: std.os.windows.STARTUPINFOW = std.mem.zeroes(std.os.windows.STARTUPINFOW);
-    si.cb = @sizeOf(std.os.windows.STARTUPINFOW);
-    var pi: PROCESS_INFORMATION = undefined;
+    var pe: PROCESSENTRY32W = undefined;
+    pe.dwSize = @sizeOf(PROCESSENTRY32W);
+    if (Process32FirstW(h, &pe) == 0) return false;
 
-    // 使用完整路径：SYSTEM 账户的 PATH 可能不包含 System32。
-    const cmd = "C:\\Windows\\System32\\taskkill.exe /f /im utmm.exe";
-    var cmd_buf: [256]u8 = undefined;
-    @memcpy(cmd_buf[0..cmd.len], cmd);
-    cmd_buf[cmd.len] = 0;
-
-    debugLogWindows("killAllUtmmWindows: before CreateProcessA");
-    const created = CreateProcessA(
-        null,                // lpApplicationName
-        @ptrCast(&cmd_buf),  // lpCommandLine
-        null,                // lpProcessAttributes
-        null,                // lpThreadAttributes
-        0,                   // bInheritHandles
-        0x08000000,          // CREATE_NO_WINDOW
-        null,                // lpEnvironment
-        null,                // lpCurrentDirectory
-        @ptrCast(&si),       // lpStartupInfo
-        &pi,                  // lpProcessInformation
-    );
-
-    if (created != 0) {
-        debugLogWindows("killAllUtmmWindows: taskkill spawned, waiting...");
-        // 等待 taskkill 完成（最多 10 秒）
-        _ = WaitForSingleObject(pi.hProcess, 10000);
-        _ = std.os.windows.CloseHandle(pi.hProcess);
-        _ = std.os.windows.CloseHandle(pi.hThread);
-        debugLogWindows("killAllUtmmWindows: taskkill done");
-    } else {
-        debugLogWindows("killAllUtmmWindows: CreateProcessA FAILED");
+    var killed: bool = false;
+    while (true) {
+        const name = std.mem.sliceTo(@as([*:0]const u16, @ptrCast(&pe.szExeFile)), 0);
+        if (std.mem.eql(u16, name, &[_]u16{ 'u', 't', 'm', 'm', '.', 'e', 'x', 'e' })) {
+            if (pe.th32ProcessID != std.os.windows.GetCurrentProcessId()) {
+                const ph = OpenProcess(PROCESS_TERMINATE, 0, pe.th32ProcessID);
+                if (ph) |h2| {
+                    _ = TerminateProcess(h2, 0);
+                    _ = WaitForSingleObject(h2, 5000);
+                    _ = CloseHandle(h2);
+                    killed = true;
+                }
+            }
+        }
+        if (Process32NextW(h, &pe) == 0) break;
     }
+    debugLogWindows("killAllUtmmWindows: done");
+    return killed;
+}
+
+fn sleepMsWin(ms: u32) void {
+    const krnl = struct {
+        extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+    };
+    krnl.Sleep(ms);
 }
 
 /// 用原始 kernel32 WriteFile 写调试日志到 C:\opt\utmm\utmmd-debug.log。
@@ -849,49 +812,14 @@ extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) i32;
 
 /// 用 DeleteFileW 删除绝对路径文件（避免 std.Io.Dir.cwd().deleteFile 在
 /// Windows 上对绝对路径处理不一致的问题）。失败静默忽略。
-fn deleteFileAbsoluteWindows(abs_path: []const u8) void {
+fn deleteFileAbsoluteWindows(abs_path: []const u8) bool {
     var path_utf16: [512]u16 = [_]u16{0} ** 512;
-    const len = std.unicode.utf8ToUtf16Le(&path_utf16, abs_path) catch return;
-    if (len >= path_utf16.len) return;
+    const len = std.unicode.utf8ToUtf16Le(&path_utf16, abs_path) catch return false;
+    if (len >= path_utf16.len) return false;
     path_utf16[len] = 0;
-    _ = DeleteFileW(@ptrCast(&path_utf16));
+    return DeleteFileW(@ptrCast(&path_utf16)) != 0;
 }
 
-/// 用 MoveFileExW 替换目标文件（原子操作，源文件被移动到目标位置）。
-/// MOVEFILE_REPLACE_EXISTING → 覆盖已有目标。
-/// 返回 true 表示成功。
-fn moveFileExReplaceWindows(src: []const u8, dst: []const u8) bool {
-    var src_utf16: [512]u16 = [_]u16{0} ** 512;
-    var dst_utf16: [512]u16 = [_]u16{0} ** 512;
-
-    const src_len = std.unicode.utf8ToUtf16Le(&src_utf16, src) catch return false;
-    if (src_len >= src_utf16.len) return false;
-    src_utf16[src_len] = 0;
-
-    const dst_len = std.unicode.utf8ToUtf16Le(&dst_utf16, dst) catch return false;
-    if (dst_len >= dst_utf16.len) return false;
-    dst_utf16[dst_len] = 0;
-
-    return MoveFileExW(@ptrCast(&src_utf16), @ptrCast(&dst_utf16), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-}
-
-/// 用 CopyFileW 复制文件（源文件保留，目标被覆盖）。
-/// 返回 true 表示成功。
-fn copyFileAbsoluteWindows(src: []const u8, dst: []const u8) bool {
-    var src_utf16: [512]u16 = [_]u16{0} ** 512;
-    var dst_utf16: [512]u16 = [_]u16{0} ** 512;
-
-    const src_len = std.unicode.utf8ToUtf16Le(&src_utf16, src) catch return false;
-    if (src_len >= src_utf16.len) return false;
-    src_utf16[src_len] = 0;
-
-    const dst_len = std.unicode.utf8ToUtf16Le(&dst_utf16, dst) catch return false;
-    if (dst_len >= dst_utf16.len) return false;
-    dst_utf16[dst_len] = 0;
-
-    // bFailIfExists=FALSE → 覆盖已有文件
-    return CopyFileW(@ptrCast(&src_utf16), @ptrCast(&dst_utf16), 0) != 0;
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 信号处理 — POSIX（直接用 C extern + 原生 sigaction）
@@ -1009,7 +937,7 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
 
         // 清理上次升级遗留的旧二进制（rename 替换后残留的 utmm-old.exe）
         if (builtin.os.tag == .windows) {
-            deleteFileAbsoluteWindows("C:\\opt\\utmm\\utmm-old.exe");
+            _ = deleteFileAbsoluteWindows("C:\\opt\\utmm\\utmm-old.exe");
         }
 
         // 启动前检查待处理升级：utmm crash-loop 时 monitorUtmm 没机会运行，
@@ -1020,7 +948,7 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
         // 导致 rename 失败。先通过 taskkill 确保所有 utmm.exe 已终止。
         if (builtin.os.tag == .windows) {
             if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: before killAllUtmmWindows#1");
-            killAllUtmmWindows(file_io);
+            _ = killAllUtmmWindows();
             if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: after killAllUtmmWindows#1");
         }
         if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: before tryApplyPendingUpgrade");
@@ -1179,7 +1107,7 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
             upgrade_fail_streak += 1;
             if (upgrade_fail_streak >= MAX_UPGRADE_FAILURES) {
                 std.log.err("[utmmd] upgrade failed {d} consecutive times — removing stale {s}", .{ upgrade_fail_streak, tp });
-                if (builtin.os.tag == .windows) deleteFileAbsoluteWindows(tp)
+                if (builtin.os.tag == .windows) _ = deleteFileAbsoluteWindows(tp)
                 else std.Io.Dir.cwd().deleteFile(file_io, tp) catch {};
                 upgrade_fail_streak = 0;
             }
