@@ -2127,10 +2127,13 @@ pub fn shouldUpdateUtmmd(io: std.Io, alloc: std.mem.Allocator, comptime embedded
 /// 升级 utmmd 自身：hash 比较 → disable → stop → kill → replace → enable → start。
 /// 每步串行等待，不并行。由 CLI 进程调用（不是 utmmd 自己）。
 /// new_utmmd_path: 新 utmmd 临时文件路径（如 /opt/utmm/utmmd-new）。
+///
+/// 失败回滚：replaceFile 用 rename 原子替换，若失败旧二进制仍在盘上，
+/// 立即 enable+start 恢复旧 utmmd，避免服务停留在 disable+stop 状态。
 pub fn upgradeUtmmd(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args: []const []const u8, new_utmmd_path: []const u8, comptime embedded_sha256_hex: []const u8) void {
     const dest = canonicalSvcPath();
 
-    // 1. SHA256 比较 — 相同则跳过
+    // 1. SHA256 比较 — 相同则跳过（无任何破坏性操作之前）
     const new_hash = fileSha256Hex(io, alloc, new_utmmd_path) orelse {
         fail.err("upgradeUtmmd/hash-new", error.FileNotFound);
     };
@@ -2152,7 +2155,7 @@ pub fn upgradeUtmmd(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, ext
     // 2. Disable 服务
     disableService(io, alloc, role);
 
-    // 3. Stop 服务
+    // 3. Stop 服务（触发 utmmd shutdown 回调 → 杀掉服务 utmm）
     stop(io, alloc, role) catch |err| {
         std.log.warn("[svc] upgradeUtmmd: stop returned {} (continuing)", .{err});
     };
@@ -2160,15 +2163,27 @@ pub fn upgradeUtmmd(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, ext
     // 4. Kill utmmd 进程（确保文件不被锁定）
     killUtmmdProcess(io, alloc);
 
-    // 5. 替换 utmmd 二进制
-    replaceFile(io, alloc, new_utmmd_path, dest);
+    // 5. 替换 utmmd 二进制。失败则回滚：旧二进制仍在盘上，enable+start 恢复。
+    if (!replaceFileSafe(io, alloc, new_utmmd_path, dest)) {
+        std.log.err("[svc] utmmd replace failed — rolling back to old binary", .{});
+        enableService(io, alloc, role);
+        start(io, alloc, role, extra_args) catch |err| {
+            fail.err("upgradeUtmmd/rollback-start", err);
+        };
+        fail.err("upgradeUtmmd/replace", error.ReplaceFailed);
+    }
 
     // 6. Enable 服务
     enableService(io, alloc, role);
 
     // 7. Start 服务
     start(io, alloc, role, extra_args) catch |err| {
-        fail.err("upgradeUtmmd/start", err);
+        // 新二进制已替换成功，仅启动失败 — 保留新二进制，重试启动
+        std.log.err("[svc] upgradeUtmmd: start failed {} — new binary installed, retrying", .{err});
+        std.Io.sleep(io, std.Io.Duration.fromSeconds(1), .awake) catch {};
+        start(io, alloc, role, extra_args) catch |err2| {
+            fail.err("upgradeUtmmd/start-retry", err2);
+        };
     };
 
     std.log.info("[svc] utmmd upgrade complete", .{});
@@ -2208,24 +2223,26 @@ fn killUtmmdProcess(io: std.Io, alloc: std.mem.Allocator) void {
     }
 }
 
-fn replaceFile(io: std.Io, alloc: std.mem.Allocator, src: []const u8, dst: []const u8) void {
+/// 替换文件：rename 原子替换（三平台同盘符），失败返回 false。
+fn replaceFileSafe(io: std.Io, alloc: std.mem.Allocator, src: []const u8, dst: []const u8) bool {
     // 三平台统一：rename() 原子替换目标（同盘符）。
-    // POSIX: rename(2) 内核保证原子。
-    // Windows: MoveFileExW + MOVEFILE_REPLACE_EXISTING，同 NTFS 卷原子。
     std.Io.Dir.cwd().rename(src, std.Io.Dir.cwd(), dst, io) catch |err| {
         if (err == error.CrossDevice) {
             copyFile(io, alloc, src, dst, true) catch |e| {
-                fail.err("upgradeUtmmd/copy-fallback", e);
+                std.log.err("[svc] replaceFile copy-fallback failed: {}", .{e});
+                return false;
             };
             std.Io.Dir.cwd().deleteFile(io, src) catch {};
         } else {
-            fail.err("upgradeUtmmd/replace", err);
+            std.log.err("[svc] replaceFile rename failed: {}", .{err});
+            return false;
         }
     };
     // 提取的临时文件无签名，macOS 需重新签
     if (builtin.os.tag == .macos) {
         _ = runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dst });
     }
+    return true;
 }
 
 /// No-op stub — previously persisted metadata to /opt/utmm/utmm.conf.
