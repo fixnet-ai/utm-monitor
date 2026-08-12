@@ -11,6 +11,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const fail = @import("fail.zig");
+extern "c" fn usleep(usec: c_uint) c_int;
 
 // ──────────── Windows: FindFirstFileW 目录扫描（文件顶层声明）────────────
 // WIN32_FIND_DATAW — 必须精确匹配 Windows ABI 布局。
@@ -810,6 +811,62 @@ pub fn clearQuarantine(alloc: std.mem.Allocator, io: std.Io, path: []const u8) v
     runCmdQuiet(alloc, io, &[_][]const u8{ "xattr", "-d", "com.apple.quarantine", path });
 }
 
+/// 尝试连接 IPC socket（/var/run/utmm.sock）。成功 = Host 正在监听。
+/// 不依赖 std.process.run，在任意 io 上下文中均可用。
+fn checkIpcSocket() bool {
+    const sock = std.posix.system.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    if (sock < 0) return false;
+    defer _ = std.posix.system.close(sock);
+
+    var addr = std.c.sockaddr.un{
+        .family = std.posix.AF.UNIX,
+        .path = undefined,
+    };
+    @memset(std.mem.asBytes(&addr.path), 0);
+    const path = "/var/run/utmm.sock";
+    const path_len = @min(path.len, addr.path.len - 1);
+    @memcpy(addr.path[0..path_len], path[0..path_len]);
+    addr.path[path_len] = 0;
+
+    const addr_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.un);
+    const rc = std.posix.system.connect(sock, @ptrCast(&addr), addr_len);
+    if (rc >= 0) return true;
+
+    // ECONNREFUSED = socket 文件存在但无人监听（僵尸 socket）。清理。
+    if (std.posix.errno(rc) == .CONNREFUSED) {
+        _ = std.posix.system.unlink(@ptrCast(path));
+    }
+    return false;
+}
+
+/// 尝试连接 localhost:2121（Host 和 Guest 均监听此端口）。
+/// TCP connect 比 Unix domain socket 更可靠：不依赖 sun_len 平台差异，
+/// 不依赖 io 上下文，直接验证服务功能。
+fn checkServicePort() bool {
+    // 短暂重试：t+0s 服务可能刚启动端口未就绪，1s 内通常完成 bind。
+    for (0..3) |_| {
+        const sock = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+        if (sock < 0) return false;
+        defer _ = std.posix.system.close(sock);
+
+        var addr: std.c.sockaddr.in = undefined;
+        @memset(std.mem.asBytes(&addr), 0);
+        if (builtin.os.tag == .macos) addr.len = @sizeOf(std.c.sockaddr.in);
+        addr.family = std.posix.AF.INET;
+        addr.port = std.mem.nativeToBig(u16, 2121);
+        addr.addr = std.mem.nativeToBig(u32, 0x7f000001); // 127.0.0.1
+
+        const rc = std.posix.system.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in));
+        if (rc >= 0) return true;
+
+        // ECONNREFUSED = 端口未就绪，等 200ms 再试。其他错误直接放弃。
+        if (std.posix.errno(rc) != .CONNREFUSED) break;
+        // 200ms — 不依赖 std.Io.sleep（init.io 上下文可能不支持）。
+        _ = usleep(200_000);
+    }
+    return false;
+}
+
 fn runCmdQuiet(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) void {
     const result = std.process.run(alloc, io, .{ .argv = argv }) catch |err| {
         std.log.debug("[svc] cmd failed: {s} {s}: {}", .{ argv[0], argv[1], err });
@@ -842,11 +899,19 @@ fn runCmdCheckExit(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Check if the service is currently running.
-pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) bool {
-    _ = _role;
+pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) bool {
     const name = svcName();
     return switch (builtin.os.tag) {
         .macos => blk: {
+            // 首选：直连 IPC socket（仅 Host 有）。
+            // 不依赖 std.process.run —— 在 CLI 的 init.io 上下文中
+            // 可能失败，导致 isRunning 误判 → 触发不必要的 forceInstall
+            // → 杀 Host → IPC 断开 → IpcNotRunning。
+            if (role == .host) {
+                if (checkServicePort()) break :blk true;
+            }
+
+            // 次选：launchctl list 文本解析
             const result = runCmdStdout(alloc, io, &[_][]const u8{ "launchctl", "list" });
             if (result) |stdout| {
                 defer alloc.free(stdout);
@@ -861,9 +926,7 @@ pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) bool 
                     }
                 }
             }
-            // Fallback: check if utmmd process is actually running.
-            // launchctl load (legacy) may have started it without launchd
-            // tracking the PID properly. pgrep catches this case.
+            // 兜底：pgrep 检查 utmmd 进程是否存活。
             if (runCmdCheckExit(alloc, io, &[_][]const u8{
                 "pgrep", "-f", CANONICAL_SVC_PATH_POSIX,
             })) {
@@ -1901,6 +1964,22 @@ fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole,
         std.log.warn("[svc] forceInstall killAllUtmm failed: {}", .{err});
     };
 
+    // 2.5. Remove stale IPC socket from previous (crashed/killed) run.
+    // ipc.zig unlinks before bind, but if the new process crashes before
+    // reaching that code, the zombie socket persists → checkIpcSocket
+    // gets ECONNREFUSED → isRunning false → ensure triggers yet another
+    // forceInstall → infinite restart loop. Clean it here so any stale
+    // socket is gone before the new service starts.
+    if (role == .host) {
+        if (builtin.os.tag == .windows) {
+            // Windows named pipe: no filesystem cleanup needed
+        } else {
+            const sock_path = "/var/run/utmm.sock";
+            _ = std.posix.system.unlink(@ptrCast(sock_path));
+            std.log.debug("[svc] cleaned stale IPC socket", .{});
+        }
+    }
+
     // 3. Copy self to canonical path
     selfCopy(io, alloc) catch |err| {
         fail.err("forceInstall/selfCopy", err);
@@ -1975,6 +2054,19 @@ pub fn ensure(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_arg
         std.debug.print("utmm {s} service is running.\n", .{if (role == .host) "host" else "guest"});
         return;
     }
+
+    // 服务可能正在启动中（utmmd stability check 最多 10s，TCP listener
+    // 在 stability 之后才 bind）。以 2s 间隔重试最多 6 次（共 12s），
+    // 覆盖 utmm 完全初始化窗口。仅在全部失败后才执行 forceInstall。
+    for (0..6) |_| {
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(2000), .awake) catch break;
+        if (isRunning(io, alloc, role)) {
+            std.log.info("[svc] {s} service running after wait", .{name});
+            std.debug.print("utmm {s} service is running.\n", .{if (role == .host) "host" else "guest"});
+            return;
+        }
+    }
+
     std.log.info("[svc] {s} service not running — acquiring lock...", .{name});
     InstallLock.acquire() catch |err| {
         fail.err("ensure/lock", err);
