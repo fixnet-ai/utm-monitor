@@ -497,25 +497,45 @@ fn runCmd(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) bool {
 // utmmd 通过尝试获取锁来判断文件是否写入完成。
 
 /// Windows 两阶段 rename 替换：utmm.exe → utmm-old.exe，.tmp → utmm.exe。
-/// 使用 kernel32 API（MoveFileExW / DeleteFileW / CopyFileW）绕过 Zig Io.Dir 的
-/// Threaded Io 兼容性问题（Io.Dir.rename 在 Windows Threaded Io 上可能崩溃）。
-/// 返回 true 表示替换成功，false 表示所有方法都失败。
-/// Windows 升级替换：杀进程 → DeleteFileW 旧 exe → MoveFileExW .tmp → utmm.exe。
-/// 失败时保留 .tmp，返回 false 供调用方重试。
+/// 杀指定 PID 的 utmm.exe（用 SHM 记录的 PID 精准杀）。
+fn killUtmmByPidWindows(pid: u32) void {
+    if (pid == 0) return;
+    const h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+    if (h) |handle| {
+        _ = TerminateProcess(handle, 0);
+        _ = WaitForSingleObject(handle, 5000);
+        _ = CloseHandle(handle);
+        debugLogWindows("killUtmmByPidWindows: killed");
+    }
+}
+
+/// taskkill /f /im utmm.exe — 兜底清理意外残留的 utmm.exe 进程。
+/// 必须等待 taskkill 完成再返回。
+fn taskkillUtmmWindows() void {
+    debugLogWindows("taskkillUtmmWindows: entry");
+    var si: std.os.windows.STARTUPINFOW = std.mem.zeroes(std.os.windows.STARTUPINFOW);
+    si.cb = @sizeOf(std.os.windows.STARTUPINFOW);
+    var pi: PROCESS_INFORMATION = undefined;
+
+    const cmd = "C:\\Windows\\System32\\taskkill.exe /f /im utmm.exe";
+    var cmd_buf: [256]u8 = undefined;
+    @memcpy(cmd_buf[0..cmd.len], cmd);
+    cmd_buf[cmd.len] = 0;
+
+    if (CreateProcessA(null, @ptrCast(&cmd_buf), null, null, 0, 0x08000000, null, null, @ptrCast(&si), &pi) != 0) {
+        _ = WaitForSingleObject(pi.hProcess, 10000);
+        _ = CloseHandle(pi.hProcess);
+        _ = CloseHandle(pi.hThread);
+    }
+    debugLogWindows("taskkillUtmmWindows: done");
+}
+
+/// Windows 升级替换：DeleteFileW 旧 exe → MoveFileExW .tmp → utmm.exe。
 fn replaceUtmmWindows(tmp_path: []const u8, dest: []const u8) bool {
     debugLogWindows("replaceUtmmWindows: entry");
-
-    // 1. 杀全部 utmm.exe（Toolhelp32 直接枚举）
-    _ = killAllUtmmWindows();
-
-    // 2. 重试：AV/Defender 可能短暂持有文件句柄
     for (0..5) |attempt| {
         if (!deleteFileAbsoluteWindows(dest)) {
-            if (attempt < 4) {
-                _ = killAllUtmmWindows();
-                sleepMsWin(500 * (@as(u32, @intCast(attempt)) + 1));
-                continue;
-            }
+            if (attempt < 4) { sleepMsWin(500 * (@as(u32, @intCast(attempt)) + 1)); continue; }
             return false;
         }
         if (moveFileExWindows(tmp_path, dest)) return true;
@@ -528,11 +548,9 @@ fn moveFileExWindows(src: []const u8, dst: []const u8) bool {
     var s: [512]u16 = [_]u16{0} ** 512;
     var d: [512]u16 = [_]u16{0} ** 512;
     const sl = std.unicode.utf8ToUtf16Le(&s, src) catch return false;
-    if (sl >= s.len) return false;
-    s[sl] = 0;
+    if (sl >= s.len) return false; s[sl] = 0;
     const dl = std.unicode.utf8ToUtf16Le(&d, dst) catch return false;
-    if (dl >= d.len) return false;
-    d[dl] = 0;
+    if (dl >= d.len) return false; d[dl] = 0;
     return MoveFileExW(@ptrCast(&s), @ptrCast(&d), MOVEFILE_REPLACE_EXISTING) != 0;
 }
 
@@ -623,10 +641,17 @@ fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator,
     // 5. 杀 utmm 进程。
     // 5. 杀 utmm 进程 + 替换二进制。
     if (builtin.os.tag == .windows) {
-        // 锁先释放 — 否则自己的句柄可能妨碍 MoveFileExW。
         lock.release();
 
-        // replaceUtmmWindows: 枚举杀全部 utmm.exe → 删旧 → MoveFileExW
+        // 5a. SHM PID 精准杀
+        debugLogWindows("tryApplyPendingUpgrade: killByPid");
+        killUtmmByPidWindows(shm_ptr.utmm_pid);
+
+        // 5b. taskkill 兜底 — 清理意外残留的 utmm.exe，必须等待完成
+        taskkillUtmmWindows();
+
+        // 5c. 替换旧 exe → 新 .tmp
+        debugLogWindows("tryApplyPendingUpgrade: replaceUtmmWindows");
         if (replaceUtmmWindows(tp, dest)) {
             std.log.info("[utmmd] upgrade replace done: → {s}", .{dest});
             return .restart;
@@ -714,57 +739,6 @@ extern "kernel32" fn MoveFileExW(
     lpNewFileName: ?[*:0]const u16,
     dwFlags: u32,
 ) callconv(.winapi) i32;
-
-// ── Toolhelp32 进程枚举（替代 taskkill.exe 子进程方案）──
-const TH32CS_SNAPPROCESS: u32 = 0x00000002;
-const PROCESSENTRY32W = extern struct {
-    dwSize: u32,
-    cntUsage: u32,
-    th32ProcessID: u32,
-    th32DefaultHeapID: usize,
-    th32ModuleID: u32,
-    cntThreads: u32,
-    th32ParentProcessID: u32,
-    pcPriClassBase: i32,
-    dwFlags: u32,
-    szExeFile: [260]u16,
-};
-extern "kernel32" fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) callconv(.winapi) ?*anyopaque;
-extern "kernel32" fn Process32FirstW(hSnapshot: ?*anyopaque, lppe: *PROCESSENTRY32W) callconv(.winapi) i32;
-extern "kernel32" fn Process32NextW(hSnapshot: ?*anyopaque, lppe: *PROCESSENTRY32W) callconv(.winapi) i32;
-
-/// 直接枚举所有进程，TerminateProcess 杀掉全部 utmm.exe。
-fn killAllUtmmWindows() bool {
-    debugLogWindows("killAllUtmmWindows: Toolhelp32 entry");
-    const h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) orelse {
-        debugLogWindows("killAllUtmmWindows: snapshot FAILED");
-        return false;
-    };
-    defer _ = CloseHandle(h);
-
-    var pe: PROCESSENTRY32W = undefined;
-    pe.dwSize = @sizeOf(PROCESSENTRY32W);
-    if (Process32FirstW(h, &pe) == 0) return false;
-
-    var killed: bool = false;
-    while (true) {
-        const name = std.mem.sliceTo(@as([*:0]const u16, @ptrCast(&pe.szExeFile)), 0);
-        if (std.mem.eql(u16, name, &[_]u16{ 'u', 't', 'm', 'm', '.', 'e', 'x', 'e' })) {
-            if (pe.th32ProcessID != std.os.windows.GetCurrentProcessId()) {
-                const ph = OpenProcess(PROCESS_TERMINATE, 0, pe.th32ProcessID);
-                if (ph) |h2| {
-                    _ = TerminateProcess(h2, 0);
-                    _ = WaitForSingleObject(h2, 5000);
-                    _ = CloseHandle(h2);
-                    killed = true;
-                }
-            }
-        }
-        if (Process32NextW(h, &pe) == 0) break;
-    }
-    debugLogWindows("killAllUtmmWindows: done");
-    return killed;
-}
 
 fn sleepMsWin(ms: u32) void {
     const krnl = struct {
@@ -948,7 +922,7 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
         // 导致 rename 失败。先通过 taskkill 确保所有 utmm.exe 已终止。
         if (builtin.os.tag == .windows) {
             if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: before killAllUtmmWindows#1");
-            _ = killAllUtmmWindows();
+            taskkillUtmmWindows();
             if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: after killAllUtmmWindows#1");
         }
         if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: before tryApplyPendingUpgrade");
