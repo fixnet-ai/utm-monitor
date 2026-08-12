@@ -402,9 +402,12 @@ pub fn readUtmmHeartbeat(shm_ptr: *volatile ShmLayout) u32 {
 
 /// utmm → utmmd: 将升级文件路径写入 cmd_data（null 结尾）。
 /// utmmd 可直接使用此路径，无需扫描目录。
+/// 逐字节写 — @memcpy 对 *volatile 共享内存可能被优化掉，跨进程不可见。
 pub fn writeCmdPath(shm_ptr: *volatile ShmLayout, path: []const u8) void {
     const len = @min(path.len, shm_ptr.cmd_data.len - 1);
-    @memcpy(shm_ptr.cmd_data[0..len], path[0..len]);
+    for (path[0..len], 0..) |c, i| {
+        @atomicStore(u8, &shm_ptr.cmd_data[i], c, .monotonic);
+    }
     @atomicStore(u8, &shm_ptr.cmd_data[len], 0, .release);
 }
 
@@ -415,8 +418,9 @@ pub fn readCmdPath(shm_ptr: *volatile ShmLayout, buf: []u8) ?[]const u8 {
     const max_len = @min(buf.len, shm_ptr.cmd_data.len);
     var len: usize = 0;
     while (len < max_len) : (len += 1) {
-        if (shm_ptr.cmd_data[len] == 0) break;
-        buf[len] = shm_ptr.cmd_data[len];
+        const c = @atomicLoad(u8, &shm_ptr.cmd_data[len], .acquire);
+        if (c == 0) break;
+        buf[len] = c;
     }
     if (len == 0 or len >= max_len) return null;
     buf[len] = 0;
