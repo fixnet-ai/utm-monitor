@@ -17,11 +17,11 @@ const posix_getsockopt = @extern(*const fn (c_int, c_int, c_int, *anyopaque, *st
 const posix_sendto = @extern(*const fn (c_int, *const anyopaque, usize, c_int, *const anyopaque, std.posix.socklen_t) callconv(.c) isize, .{ .name = "sendto" });
 const posix_recvfrom = @extern(*const fn (c_int, *anyopaque, usize, c_int, *anyopaque, *std.posix.socklen_t) callconv(.c) isize, .{ .name = "recvfrom" });
 
-const F_GETFL = 3;
-const F_SETFL = 4;
-// F_GETFD/F_SETFD/FD_CLOEXEC removed — use std.posix.F.GETFD / std.posix.F.SETFD / std.posix.FD_CLOEXEC
-// (cross-platform: Linux=1,2 / macOS=2,3).
-const O_NONBLOCK = 0x0004;
+// fcntl 常量 — 使用 std.posix.F.GETFL/SETFL/GETFD/SETFD（跨平台兼容）。
+// O_NONBLOCK: macOS=0x0004, Linux=0x800(04000)。必须按平台区分，
+// 否则 Linux 上 fcntl(std.posix.F.SETFL, O_NONBLOCK) 静默无效 → 阻塞 socket
+// → accept 不再返回 WouldBlock → 心跳停止更新 → utmmd 误判超时杀 utmm。
+const O_NONBLOCK: c_int = if (builtin.os.tag == .linux) 0x800 else 0x0004;
 const EINPROGRESS = 36;
 const EALREADY = 37;
 const EISCONN = 56;
@@ -266,16 +266,15 @@ pub fn makePair() !struct { a: socket_t, b: socket_t } {
 }
 
 /// Set socket to non-blocking mode, for testing EAGAIN retry paths.
-/// POSIX: fcntl(F_SETFL, O_NONBLOCK). Windows: ioctlsocket(FIONBIO).
+/// POSIX: fcntl(std.posix.F.SETFL, O_NONBLOCK). Windows: ioctlsocket(FIONBIO).
 pub fn makeNonBlocking(fd: socket_t) void {
     if (builtin.os.tag == .windows) {
         ensureWinsock2();
         var mode: std.os.windows.ULONG = 1;
         _ = ws2_ioctlsocket(fd, FIONBIO, &mode);
     } else {
-        const NONBLOCK = if (builtin.os.tag == .linux) @as(c_int, 0x800) else @as(c_int, 0x4);
         const flags = std.c.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
-        _ = std.c.fcntl(fd, std.posix.F.SETFL, flags | NONBLOCK);
+        _ = std.c.fcntl(fd, std.posix.F.SETFL, flags | O_NONBLOCK);
     }
 }
 
@@ -376,9 +375,9 @@ fn connectTcpPosix(io2: std.Io, addr: *const std.Io.net.IpAddress, timeout_ms: u
     if (fd < 0) return error.ConnectFailed;
     errdefer sockClose(fd);
 
-    const old_flags = posix_fcntl(@intCast(fd), F_GETFL, 0);
+    const old_flags = posix_fcntl(@intCast(fd), std.posix.F.GETFL, 0);
     if (old_flags < 0) return error.ConnectFailed;
-    _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags | O_NONBLOCK);
+    _ = posix_fcntl(@intCast(fd), std.posix.F.SETFL, old_flags | O_NONBLOCK);
 
     const cr: isize = switch (addr.*) {
         .ip4 => |ip4| blk: {
@@ -405,7 +404,7 @@ fn connectTcpPosix(io2: std.Io, addr: *const std.Io.net.IpAddress, timeout_ms: u
     if (cr < 0) {
         const e = std.posix.errno(cr);
         if (e != .INPROGRESS and e != .ALREADY) {
-            _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+            _ = posix_fcntl(@intCast(fd), std.posix.F.SETFL, old_flags);
             return error.ConnectFailed;
         }
     }
@@ -413,26 +412,26 @@ fn connectTcpPosix(io2: std.Io, addr: *const std.Io.net.IpAddress, timeout_ms: u
     var pfd: [1]std.posix.pollfd = .{.{ .fd = @intCast(fd), .events = std.posix.POLL.OUT, .revents = 0 }};
     const poll_ret = posix_poll(&pfd, 1, @intCast(timeout_ms));
     if (poll_ret < 0) {
-        _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+        _ = posix_fcntl(@intCast(fd), std.posix.F.SETFL, old_flags);
         return error.ConnectFailed;
     }
     if (poll_ret == 0) {
-        _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+        _ = posix_fcntl(@intCast(fd), std.posix.F.SETFL, old_flags);
         return error.ConnectTimeout;
     }
 
     var so_err: c_int = 0;
     var so_err_len: std.posix.socklen_t = @sizeOf(c_int);
     if (posix_getsockopt(@intCast(fd), SOL_SOCKET, SO_ERROR, @ptrCast(&so_err), &so_err_len) < 0) {
-        _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+        _ = posix_fcntl(@intCast(fd), std.posix.F.SETFL, old_flags);
         return error.ConnectFailed;
     }
     if (so_err != 0) {
-        _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+        _ = posix_fcntl(@intCast(fd), std.posix.F.SETFL, old_flags);
         return error.ConnectFailed;
     }
 
-    _ = posix_fcntl(@intCast(fd), F_SETFL, old_flags);
+    _ = posix_fcntl(@intCast(fd), std.posix.F.SETFL, old_flags);
 
     return std.Io.net.Stream{ .socket = .{ .handle = fd, .address = addr.* } };
 }
@@ -907,8 +906,8 @@ pub const TcpListener = struct {
         }
 
         // Set non-blocking mode
-        const fcntl_flags = system.fcntl(sock, F_GETFL, @as(c_int, 0));
-        _ = system.fcntl(sock, F_SETFL, fcntl_flags | O_NONBLOCK);
+        const fcntl_flags = system.fcntl(sock, std.posix.F.GETFL, @as(c_int, 0));
+        _ = system.fcntl(sock, std.posix.F.SETFL, fcntl_flags | O_NONBLOCK);
 
         std.log.info("[tcp] TCP listener bound :{d}", .{actual_port});
         return TcpListener{ .server = null, .io = io, .listener_fd = sock, .use_raw_accept = true, .port = actual_port };
