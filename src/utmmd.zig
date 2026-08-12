@@ -29,6 +29,7 @@ const STABILITY_THRESHOLD_SEC: u64 = 10; // 稳定运行阈值
 const HEARTBEAT_TIMEOUT_SEC: u64 = 10; // 心跳超时 → 僵死
 const MAX_FAILURE_COUNT: u32 = 5; // 连续失败 > 此值 → utmmd 退出
 const MAX_BACKOFF_SEC: u32 = 60; // 最大退避延迟
+const MAX_UPGRADE_FAILURES: u32 = 5; // 连续升级失败 > 此值 → 删除 .tmp，放弃
 const POLL_INTERVAL_MS: u64 = 1000; // 监控轮询间隔
 const IP_CHECK_INTERVAL_MS: u64 = 10000; // IP 指纹检查间隔
 const IP_STABLE_CHECKS: u32 = 2; // IP 变更去抖：需连续检测到变更的次数
@@ -1122,6 +1123,11 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
     var last_ip_fingerprint: u64 = 0;
     var stable_ip_checks: u32 = 0;
 
+    // 升级连续失败计数 — 防止 .tmp 永不可应用时无限重试。
+    // 仅当 .tmp 文件确实存在但 tryApplyPendingUpgrade 失败时递增。
+    // 无 .tmp 文件时重置（正常状态，无需升级）。
+    var upgrade_fail_streak: u32 = 0;
+
     while (true) {
         sleepMs(io, POLL_INTERVAL_MS);
 
@@ -1160,6 +1166,21 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
         if (tryApplyPendingUpgrade(file_io, io, alloc, proc)) |reason| {
             return reason;
         }
+        // 升级未成功 — 区分「无 .tmp」和「有 .tmp 但失败」。
+        // 有 .tmp 但连续失败 = 升级文件无法应用（磁盘满、权限等），
+        // 必须设置上限，防止无限重试（每秒一次永不休止）。
+        if (svc.findUpgradeTmp(alloc, file_io)) |tp| {
+            defer alloc.free(tp);
+            upgrade_fail_streak += 1;
+            if (upgrade_fail_streak >= MAX_UPGRADE_FAILURES) {
+                std.log.err("[utmmd] upgrade failed {d} consecutive times — removing stale {s}", .{ upgrade_fail_streak, tp });
+                if (builtin.os.tag == .windows) deleteFileAbsoluteWindows(tp)
+                else std.Io.Dir.cwd().deleteFile(file_io, tp) catch {};
+                upgrade_fail_streak = 0;
+            }
+        } else {
+            upgrade_fail_streak = 0;
+        }
 
         // 命令处理
         const cmd = shm.readCmd(shm_ptr);
@@ -1176,6 +1197,8 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
                 // 每轮先检查升级再处理命令）会在下一轮重试。不杀 utmm：
                 // 杀后重启旧二进制 = 升级丢失 + 服务中断，两败俱伤。
                 shm.clearCmd(shm_ptr);
+                // 注意：失败计数由上面的主循环 upgrade 检查统一处理，
+                // 不在此单独计数，避免一次失败被双重计数。
             },
             .shutdown => {
                 shm.clearCmd(shm_ptr);
