@@ -19,6 +19,9 @@ const posix_recvfrom = @extern(*const fn (c_int, *anyopaque, usize, c_int, *anyo
 
 const F_GETFL = 3;
 const F_SETFL = 4;
+const F_GETFD = 2;
+const F_SETFD = 3;
+const FD_CLOEXEC = 1;
 const O_NONBLOCK = 0x0004;
 const EINPROGRESS = 36;
 const EALREADY = 37;
@@ -867,8 +870,17 @@ pub const TcpListener = struct {
         }
         errdefer _ = system.close(sock);
 
+        // SO_REUSEADDR — 允许 TIME_WAIT 状态下 rebind（utmmd kill→restart 路径必需）。
+        // 使用 std.posix.SO.REUSEADDR 而非硬编码常量，确保 Linux(2)/macOS(0x0004) 跨平台兼容。
         const reuse: c_int = 1;
-        _ = system.setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, @ptrCast(&reuse), @sizeOf(c_int));
+        if (system.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, @ptrCast(&reuse), @sizeOf(c_int)) < 0) {
+            std.log.err("[tcp] setsockopt(SO_REUSEADDR) failed: errno={d}", .{@intFromEnum(std.posix.errno(-1))});
+        }
+
+        // FD_CLOEXEC — 防止 dpipe_shell fork 出的 shell 子进程继承 listen socket。
+        // 子进程不关 listen fd 时，父进程被杀后 socket 仍被持有，bind EADDRINUSE。
+        const fd_flags = system.fcntl(sock, F_GETFD, @as(c_int, 0));
+        _ = system.fcntl(sock, F_SETFD, fd_flags | FD_CLOEXEC);
 
         var bind_addr = sockaddr_in{
             .family = AF_INET,
