@@ -65,8 +65,8 @@ pub const ShmLayout = extern struct {
     utmm_pid: u32 = 0, // utmm 进程 PID（utmmd 写入）
     svc_pid: u32 = 0, // utmmd 自身 PID（utmmd 写入）
 
-    svc_heartbeat: u64 = 0, // utmmd 心跳（单调时钟 ms）
-    utmm_heartbeat: u64 = 0, // utmm 心跳（单调时钟 ms）
+    svc_heartbeat: u32 = 0, // utmmd 心跳（单调时钟 ms）
+    utmm_heartbeat: u32 = 0, // utmm 心跳（单调时钟 ms）
 
     cmd: u32 = @intFromEnum(Cmd.none), // utmm 写入命令
     cmd_status: u32 = @intFromEnum(CmdStatus.pending), // utmmd 响应
@@ -78,7 +78,7 @@ pub const ShmLayout = extern struct {
 
     cmd_data: [1024]u8 = [_]u8{0} ** 1024, // 命令附加数据（如升级路径）
 
-    _reserved: [3008]u8 = [_]u8{0} ** 3008,
+    _reserved: [3016]u8 = [_]u8{0} ** 3016,
 };
 
 comptime {
@@ -89,9 +89,9 @@ comptime {
 }
 
 /// 获取当前单调时钟时间（毫秒）。
-pub fn nowMs(io: std.Io) u64 {
+pub fn nowMs(io: std.Io) u32 {
     const ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
-    return @intCast(@divTrunc(ns, std.time.ns_per_ms));
+    return @truncate(@divTrunc(ns, std.time.ns_per_ms));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -386,17 +386,17 @@ pub fn readCmdStatus(shm_ptr: *volatile ShmLayout) CmdStatus {
 
 /// utmm → utmmd: 写入 utmm 心跳（release 存储确保 utmmd 看到最新值）。
 pub fn writeUtmmHeartbeat(shm_ptr: *volatile ShmLayout, io: std.Io) void {
-    @atomicStore(u64, &shm_ptr.utmm_heartbeat, nowMs(io), .release);
+    @atomicStore(u32, &shm_ptr.utmm_heartbeat, nowMs(io), .release);
 }
 
 /// utmmd → utmm: 写入 utmmd 心跳。
 pub fn writeSvcHeartbeat(shm_ptr: *volatile ShmLayout, io: std.Io) void {
-    @atomicStore(u64, &shm_ptr.svc_heartbeat, nowMs(io), .release);
+    @atomicStore(u32, &shm_ptr.svc_heartbeat, nowMs(io), .release);
 }
 
 /// utmmd ← utmm: 读取 utmm 心跳（acquire 加载）。
-pub fn readUtmmHeartbeat(shm_ptr: *volatile ShmLayout) u64 {
-    return @atomicLoad(u64, &shm_ptr.utmm_heartbeat, .acquire);
+pub fn readUtmmHeartbeat(shm_ptr: *volatile ShmLayout) u32 {
+    return @atomicLoad(u32, &shm_ptr.utmm_heartbeat, .acquire);
 }
 
 // ========== Tests ==========
