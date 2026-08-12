@@ -19,9 +19,8 @@ const posix_recvfrom = @extern(*const fn (c_int, *anyopaque, usize, c_int, *anyo
 
 const F_GETFL = 3;
 const F_SETFL = 4;
-const F_GETFD = 2;
-const F_SETFD = 3;
-const FD_CLOEXEC = 1;
+// F_GETFD/F_SETFD/FD_CLOEXEC removed — use std.posix.F.GETFD / std.posix.F.SETFD / std.posix.FD_CLOEXEC
+// (cross-platform: Linux=1,2 / macOS=2,3).
 const O_NONBLOCK = 0x0004;
 const EINPROGRESS = 36;
 const EALREADY = 37;
@@ -879,8 +878,9 @@ pub const TcpListener = struct {
 
         // FD_CLOEXEC — 防止 dpipe_shell fork 出的 shell 子进程继承 listen socket。
         // 子进程不关 listen fd 时，父进程被杀后 socket 仍被持有，bind EADDRINUSE。
-        const fd_flags = system.fcntl(sock, F_GETFD, @as(c_int, 0));
-        _ = system.fcntl(sock, F_SETFD, fd_flags | FD_CLOEXEC);
+        // 使用 std.posix.F / std.posix.FD_CLOEXEC 而非硬编码常量，确保跨平台兼容。
+        const fd_flags = system.fcntl(sock, std.posix.F.GETFD, @as(c_int, 0));
+        _ = system.fcntl(sock, std.posix.F.SETFD, fd_flags | std.posix.FD_CLOEXEC);
 
         var bind_addr = sockaddr_in{
             .family = AF_INET,
