@@ -266,8 +266,10 @@ fn createWindows(io: std.Io) !*volatile ShmLayout {
         _ = windows.CloseHandle(h);
         return error.ShmMapFailed;
     };
-    // MapViewOfFile 后句柄可关闭，映射持有引用
-    _ = windows.CloseHandle(h);
+    // 不关闭句柄 h —— Windows 上关闭 CreateFileMappingW 句柄会移除命名对象的名字，
+    // 即使 MapViewOfFile 的视图还映射着。名字移除后，utmm 的 OpenFileMappingW
+    // 找不到映射（ERROR_FILE_NOT_FOUND）。句柄随 utmmd 进程退出自动释放。
+    // 泄漏一个句柄换取命名对象在整个 utmmd 生命周期内可见，代价可忽略。
 
     const shm: *volatile ShmLayout = @ptrCast(@alignCast(ptr));
     @memset(@as([*]u8, @ptrCast(@alignCast(ptr)))[0..@sizeOf(ShmLayout)], 0);
