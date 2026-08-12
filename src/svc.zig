@@ -2155,13 +2155,16 @@ pub fn upgradeUtmmd(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, ext
     // 2. Disable 服务
     disableService(io, alloc, role);
 
-    // 3. Stop 服务（触发 utmmd shutdown 回调 → 杀掉服务 utmm）
-    stop(io, alloc, role) catch |err| {
-        std.log.warn("[svc] upgradeUtmmd: stop returned {} (continuing)", .{err});
-    };
-
-    // 4. Kill utmmd 进程（确保文件不被锁定）
+    // 3. 强杀 utmmd（SIGKILL/taskkill /f）—— 不用 stop() 优雅停止，
+    //    因为 stop 会触发 utmmd shutdown 回调，回调里 killUtmmByPid 杀 utmm。
+    //    升级流程必须全程由 CLI 控制，不能依赖 utmmd 自身的清理逻辑。
     killUtmmdProcess(io, alloc);
+
+    // 4. 显式杀掉服务 utmm（utmmd 已死，utmm 变孤儿，需清理）。
+    //    killAllUtmm 跳过 self（CLI），只杀服务 utmm 和残留进程。
+    killAllUtmm(io, alloc) catch |err| {
+        std.log.warn("[svc] upgradeUtmmd: killAllUtmm {} (continuing)", .{err});
+    };
 
     // 5. 替换 utmmd 二进制。失败则回滚：旧二进制仍在盘上，enable+start 恢复。
     if (!replaceFileSafe(io, alloc, new_utmmd_path, dest)) {
