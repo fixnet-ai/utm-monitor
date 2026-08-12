@@ -2209,30 +2209,22 @@ fn killUtmmdProcess(io: std.Io, alloc: std.mem.Allocator) void {
 }
 
 fn replaceFile(io: std.Io, alloc: std.mem.Allocator, src: []const u8, dst: []const u8) void {
-    // POSIX: rename() 原子替换目标，无需先删除。
-    // Windows: MoveFileExW + MOVEFILE_REPLACE_EXISTING。
-    if (builtin.os.tag == .windows) {
-        // Windows 无原生 rename 原子替换 —— 走 MoveFileExW
-        std.Io.Dir.cwd().deleteFile(io, dst) catch {};
-        std.Io.Dir.cwd().rename(src, std.Io.Dir.cwd(), dst, io) catch |err| {
+    // 三平台统一：rename() 原子替换目标（同盘符）。
+    // POSIX: rename(2) 内核保证原子。
+    // Windows: MoveFileExW + MOVEFILE_REPLACE_EXISTING，同 NTFS 卷原子。
+    std.Io.Dir.cwd().rename(src, std.Io.Dir.cwd(), dst, io) catch |err| {
+        if (err == error.CrossDevice) {
+            copyFile(io, alloc, src, dst, true) catch |e| {
+                fail.err("upgradeUtmmd/copy-fallback", e);
+            };
+            std.Io.Dir.cwd().deleteFile(io, src) catch {};
+        } else {
             fail.err("upgradeUtmmd/replace", err);
-        };
-    } else {
-        // POSIX rename 原子替换
-        std.Io.Dir.cwd().rename(src, std.Io.Dir.cwd(), dst, io) catch |err| {
-            if (err == error.CrossDevice) {
-                copyFile(io, alloc, src, dst, true) catch |e| {
-                    fail.err("upgradeUtmmd/copy-fallback", e);
-                };
-                std.Io.Dir.cwd().deleteFile(io, src) catch {};
-            } else {
-                fail.err("upgradeUtmmd/replace", err);
-            }
-        };
-        // codesign: rename 不保留签名，macOS 需重新签
-        if (builtin.os.tag == .macos) {
-            _ = runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dst });
         }
+    };
+    // 提取的临时文件无签名，macOS 需重新签
+    if (builtin.os.tag == .macos) {
+        _ = runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dst });
     }
 }
 
