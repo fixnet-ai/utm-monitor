@@ -1,3 +1,41 @@
+## v0.18.44 → v0.18.68 — 三平台自动升级彻底打通
+
+**时间**: 2026-08-12 → 2026-08-13
+
+### 背景
+
+从 4 个预存 Bug（linuxvm 心跳超时 crash-loop、--upgrade 推送成功但不生效、deploy IP 过期、winx64 文件锁定）出发，通过多轮 bump→SSH 部署→auto-upgrade 测试，逐步挖出自动升级链路上的一串跨平台 bug。
+
+### 根因与修复链条
+
+| # | 根因 | 平台 | 修复 |
+|---|------|------|------|
+| 1 | `O_NONBLOCK=0x0004` 硬编码 macOS 值，Linux 应为 0x800 | Linux | 按平台区分常量 |
+| 2 | macOS scp 后二进制签名损坏，forceInstall 跳过 codesign | macOS | forceInstall 无条件重签 |
+| 3 | SHM restart 失败后杀 utmm → 升级丢失 + 服务中断 | 全部 | 失败不杀 utmm，保留 .tmp |
+| 4 | 升级失败无限重试（每秒一次永不休止） | 全部 | 连续失败计数器，超限删 .tmp |
+| 5 | `std.Io.sleep` 在 init.io 上下文失败，ensure retry 失效 | 全部 | 改 usleep |
+| 6 | `findUpgradeTmp` 目录扫描（Windows Threaded Io 不支持） | Linux/Windows | SHM cmd_data 传路径 |
+| 7 | `readCmdPath` 首字符 `!= '/'` 检查拒绝 Windows `C:\` | Windows | 只查非空 |
+| 8 | `@memcpy` 写 volatile 共享内存跨进程不可见 | 全部 | @atomicStore/Load |
+| 9 | `CloseHandle(CreateFileMappingW)` 移除命名对象名字 | Windows | 不关闭句柄（泄漏一个） |
+
+### 关键教训
+
+1. **Windows 命名共享内存生命周期**：`CreateFileMappingW` 的句柄关闭会移除对象名字，
+   即使 `MapViewOfFile` 的视图还映射着。要跨进程可见，句柄必须保持打开。
+2. **Windows 服务 stdout 被丢弃**：`std.log` 在 Windows 服务里不可见，调试需写文件。
+3. **测试流程要核对 ver.txt**：曾因 ver.txt 已是新版本但文件名误标旧版本，导致
+   Guest 和 Host 同版本，触发"同版本跳过"，误判为代码 bug。
+
+### 验证
+
+- 5 轮自动升级压力测试（v0.18.64 → v0.18.68），每轮 4 个 VM 最终全部追平版本。
+- 间歇性 `GuestConnectFailed`/`GuestNotFound` 均为时序问题（上一轮升级还在重启），
+  自愈于下一轮 push，非升级逻辑 bug。
+
+---
+
 ## v0.18.39 — TCP SO_REUSEADDR 跨平台修复 + FD_CLOEXEC + F_GETFD/F_SETFD 常量修复
 
 **时间**: 2026-08-12

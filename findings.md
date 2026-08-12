@@ -60,6 +60,34 @@
 
 ## 最近发现
 
+### 2026-08-13 — Windows 命名共享内存：CloseHandle(CreateFileMappingW) 移除对象名字
+
+**症状**: Guest 的 `OpenFileMappingW("Global\utmmd-shm")` 返回 ERROR_FILE_NOT_FOUND (2)，
+`shm_handle=null`，Guest 无心跳、无升级路径。Windows `--upgrade` 永远不生效。
+
+**根因**: `createWindows` 在 `MapViewOfFile` 后调用了 `CloseHandle(h)`，注释错误地认为
+"映射持有引用"。实际上 Windows 上关闭 `CreateFileMappingW` 句柄会**移除命名对象的名字**
+（即使视图还映射着），导致后续 `OpenFileMappingW` 找不到。
+
+**修复**: 不关闭句柄 `h`，让它随 utmmd 进程生命周期存活（进程退出时 OS 自动清理）。
+泄漏一个句柄，换取命名对象全程可见。
+
+**教训**: Windows 命名内核对象（section/mutex/event）的**名字**和**对象本身**生命周期不同。
+名字在对象销毁时从命名空间移除，而对象由"句柄 + 视图"共同持有引用。关闭句柄即使视图
+还活着，也可能导致名字提前失效。跨进程共享务必保持创建句柄打开。
+
+### 2026-08-13 — SHM 跨进程共享内存必须用 @atomicStore/Load
+
+`writeCmdPath` 最初用 `@memcpy` 写 `*volatile` 共享内存，`readCmdPath` 用普通读。
+volatile 只防编译器缓存，不提供跨进程内存屏障。改为逐字节 `@atomicStore(.monotonic)` +
+`.release` 终止符，读取侧 `@atomicLoad(.acquire)`，确保 Guest 写的路径对 utmmd 可见。
+
+### 2026-08-13 — O_NONBLOCK 硬编码 macOS 值（历史遗留，已修复）
+
+`tcp.zig` 的 `O_NONBLOCK = 0x0004` 是 macOS 值，Linux 应为 `0x800 (04000)`。
+导致 Linux 上 TCP listen socket 实际阻塞，`accept()` 不再返回 WouldBlock，心跳停止更新，
+utmmd 每 ~10s 误杀 utmm（crash-loop）。修复为按平台区分常量。
+
 ### 2026-08-12 — POSIX fcntl/socket 常量跨平台不兼容：SO_REUSEADDR 硬编码导致 Linux BindFailed 崩溃循环
 
 **症状**: TCP :2121 间歇性 BindFailed (errno=98/EADDRINUSE)，UDP LSA 正常但所有 SOCKS5 连接失败。
@@ -80,7 +108,7 @@
 2. **绝不禁用返回值检查** — `_ = setsockopt(...)` → 必须 `if (setsockopt(...) < 0) { log errno }`
 3. **每个新增的 OS 常量必须先验证跨平台值**，对照 Linux/macOS/Windows 三个平台的系统头文件
 
-**额外发现**：`O_NONBLOCK = 0x0004` 同样是硬编码的 macOS 值（Linux 应为 `2048=04000`），但属于历史遗留问题（pre-existing），暂未修复（需要同步修改 `setNonBlocking()` 调用处）。
+**额外发现**：`O_NONBLOCK = 0x0004` 同样是硬编码的 macOS 值（Linux 应为 `2048=04000`），**v0.18.45 已修复**（按平台区分常量 + 全部 F_GETFL/F_SETFL 改用 std.posix.F）。
 
 ### 2026-08-03 — 部署体验审计
 
