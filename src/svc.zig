@@ -1910,6 +1910,21 @@ fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole,
     clearQuarantine(alloc, io, dest_path);
     clearQuarantine(alloc, io, canonicalSvcPath());
 
+    // macOS: re-sign binaries with ad-hoc signature.
+    // selfCopy only runs codesign when it actually copies (not when the
+    // binary is already at the canonical path).  In the common SSH deploy
+    // flow (cp utmm-new → utmm, then --install), the binary arrives at
+    // the canonical path via external cp, bypassing selfCopy's codesign.
+    // We must re-sign here unconditionally so the service can start.
+    if (builtin.os.tag == .macos) {
+        if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dest_path })) {
+            std.log.warn("[svc] forceInstall: codesign failed for utmm — service may fail to start", .{});
+        }
+        if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", canonicalSvcPath() })) {
+            std.log.warn("[svc] forceInstall: codesign failed for utmmd — supervisor may fail to start", .{});
+        }
+    }
+
     // 3.1. Create/refresh symlink in system PATH so any user can
     // run `utmm` without specifying the full /opt/utmm/utmm path.
     ensurePathSymlink(io, alloc);
