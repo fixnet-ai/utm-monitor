@@ -84,9 +84,13 @@ pub const VERSION: []const u8 = if (embedded_ver.len > 0 and embedded_ver[embedd
 else
     embedded_ver[0..embedded_ver.len :0];
 
-/// When true, Host daemon auto-pushes upgrade binary to any Guest whose
-/// LSA-advertised version differs from VERSION.  Disable by setting to false.
-pub const AUTO_UPGRADE = true;
+/// Host auto-upgrade: when true, the Host daemon auto-pushes an upgrade binary
+/// to any Guest whose LSA-advertised version differs from VERSION (per-Guest
+/// 2-minute cooldown in host.zig). Default OFF — upgrades are on-demand only
+/// (`utmm --upgrade <vm>` / `utmm --deploy`). Opt in at build time to enable
+/// silent push-based upgrades; a Host with this on will replace binaries on any
+/// older Guest it discovers, which is dangerous on shared/production networks.
+pub const AUTO_UPGRADE = false;
 
 /// Parse "IP:port" string to net.IpAddress for local testing peer mesh.
 /// Returns null on any parse failure.

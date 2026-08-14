@@ -430,7 +430,9 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
   ordered delivery — application-level chunking and SHA256-per-chunk are unnecessary.
   dpipe_file handles incremental SHA256 for end-to-end integrity verification.
 - **LSA version broadcast**: Host broadcasts version in LSA every 2s for informational
-  purposes. Guest no longer takes autonomous action on version mismatch.
+  purposes. Guest no longer takes autonomous action on version mismatch. The Host's
+  opt-in auto-upgrade (build-time `protocol.AUTO_UPGRADE`, default **false**) can push
+  to mismatched Guests — off by default so upgrades stay on-demand (`--upgrade`/`--deploy`).
 - Guest auto-discovers Host via default gateway (UTM Host is the gateway)
 - **Hub-spoke SOCKS5 forwarding** (v0.15.0) — Host is the central SOCKS5 proxy.
   TCP :2121 accepts SOCKS5, dispatches by target hostname: self+2121 → utmm
@@ -720,7 +722,8 @@ Before starting any work, read (if they exist): `./CLAUDE.md`, `./README.md`.
 ### LSA Patterns
 
 - **LSA carries version**: Host node_info includes version string for informational
-  purposes (visible in `--status`). Version is no longer used for auto-upgrade triggering.
+  purposes (visible in `--status`). Auto-upgrade triggering is opt-in via
+  `protocol.AUTO_UPGRADE` (default **false**) — see the LSA scan loop in host.zig.
 - **Self-contained closed loop**: LSA rx → update node table → trigger hosts sync
   via range replacement (not splitScalar). No external state dependency.
 - **2s broadcast interval**: Host broadcasts LSA every 2 seconds. Nodes timeout
