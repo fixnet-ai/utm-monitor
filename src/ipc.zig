@@ -1550,8 +1550,8 @@ test "ExecIpcSink.onOutput encodes exec_data IPC frames" {
     }
 
     // 流式回调两次，每次一块数据 → 两个 exec_data 帧
-    var conn = Connection{ .fd = nbp.a };
-    var sink = ExecIpcSink{ .conn = &conn, .broken = false };
+    const conn = Connection{ .fd = nbp.a };
+    var sink = ExecIpcSink{ .conn = conn, .broken = false };
     ExecIpcSink.onOutput(&sink, "hello");
     ExecIpcSink.onOutput(&sink, "world");
     try std.testing.expect(!sink.broken);
