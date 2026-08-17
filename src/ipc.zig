@@ -635,7 +635,7 @@ fn handlePing(
 
 /// ipc exec 流式转发上下文：把 mcp_handler 的流式输出逐块转发为 IPC exec_data 帧。
 const ExecIpcSink = struct {
-    conn: *Connection,
+    conn: Connection,
     broken: bool,
 
     fn onOutput(ctx: *anyopaque, data: []const u8) void {
@@ -677,7 +677,7 @@ fn handleExec(
 
     // 流式转发：每收到一块 pty_exec_output 立即作为 exec_data IPC 帧发给 CLI，
     // CLI 终端实时看到输出，无需等待命令结束。
-    var sink = ExecIpcSink{ .conn = &conn, .broken = false };
+    var sink = ExecIpcSink{ .conn = conn, .broken = false };
     const exit_code = mcp_handler.execOnGuestStream(io, gpa, state, vm, command, ExecIpcSink.onOutput, &sink) catch |err| {
         std.log.err("[ipc-exec] exec on {s} failed: {}", .{ vm, err });
         sendError(conn, if (err == error.GuestNotFound) "GuestNotFound: VM not in mesh" else "ExecFailed");
@@ -1112,7 +1112,7 @@ pub fn ipcExec(io: std.Io, gpa: std.mem.Allocator, vm: []const u8, cmd: []const 
                     if (n == 0) return error.IpcProtocolError;
                     _ = stdout_writer.write(rbuf[0..n]) catch {};
                     try stdout_writer.flush();
-                    remaining -= n;
+                    remaining -= @intCast(n);
                 }
             },
             .exec_done => {
