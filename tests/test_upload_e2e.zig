@@ -47,10 +47,11 @@ fn guestUploadSimulator(
 
     var sha: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(received.items, &sha, .{});
-    const expected_hash = cmd.file_hash;
-    for (sha, 0..) |b, i| {
-        if (b != expected_hash[i]) return;
-    }
+    // 生产语义：upload_cmd 的 hash 字段是 64 字符 hex 字符串（writeString 写、readString 读）。
+    // 模拟器按同一语义比对，避免二进制哈希中的 0 字节被当作字符串终止符。
+    var sha_hex: [64]u8 = undefined;
+    _ = toHex(&sha_hex, &sha);
+    if (!std.mem.eql(u8, cmd.file_hash, &sha_hex)) return;
 
     if (!std.mem.eql(u8, expected_data, received.items)) return;
 
@@ -65,6 +66,15 @@ fn computeSha256(data: []const u8) ![32]u8 {
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &hash, .{});
     return hash;
+}
+
+/// 32 字节二进制哈希 → 64 字符小写 hex 字符串（与生产代码的 hex 语义一致）。
+fn toHex(buf: *[64]u8, hash: *const [32]u8) []const u8 {
+    for (hash, 0..) |b, i| {
+        buf[i * 2] = "0123456789abcdef"[b >> 4];
+        buf[i * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    return buf;
 }
 
 pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.TestRunner) !void {
@@ -84,6 +94,7 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
 
         const test_data = "Hello, upload protocol test!";
         const file_hash = try computeSha256(test_data);
+        var file_hash_hex: [64]u8 = undefined;
 
         const guest_thread = try std.Thread.spawn(.{}, guestUploadSimulator, .{
             io, alloc, listener.fd, test_data, 0, &guest_done, &guest_ok,
@@ -102,7 +113,7 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
         defer conn.close(io);
         const fd = conn.socket.handle;
 
-        const cmd_frame = try protocol.buildUploadCmd(alloc, "up-1", "/tmp/test.txt", @intCast(test_data.len), &file_hash);
+        const cmd_frame = try protocol.buildUploadCmd(alloc, "up-1", "/tmp/test.txt", @intCast(test_data.len), toHex(&file_hash_hex, &file_hash));
         defer alloc.free(cmd_frame);
         try protocol.sendFrame(fd, cmd_frame);
 
@@ -145,6 +156,7 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
 
         const test_data = "error case";
         const file_hash = try computeSha256(test_data);
+        var file_hash_hex: [64]u8 = undefined;
 
         const guest_thread = try std.Thread.spawn(.{}, guestUploadSimulator, .{
             io, alloc, listener.fd, test_data, 13, &guest_done, &guest_ok,
@@ -163,7 +175,7 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
         defer conn.close(io);
         const fd = conn.socket.handle;
 
-        const cmd_frame = try protocol.buildUploadCmd(alloc, "up-2", "/tmp/err.txt", @intCast(test_data.len), &file_hash);
+        const cmd_frame = try protocol.buildUploadCmd(alloc, "up-2", "/tmp/err.txt", @intCast(test_data.len), toHex(&file_hash_hex, &file_hash));
         defer alloc.free(cmd_frame);
         try protocol.sendFrame(fd, cmd_frame);
         _ = common.sockWrite(fd, test_data.ptr, test_data.len);
@@ -203,6 +215,7 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
 
         const empty_data: []const u8 = &.{};
         const file_hash = try computeSha256(empty_data);
+        var file_hash_hex: [64]u8 = undefined;
 
         const guest_thread = try std.Thread.spawn(.{}, guestUploadSimulator, .{
             io, alloc, listener.fd, empty_data, 0, &guest_done, &guest_ok,
@@ -221,7 +234,7 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
         defer conn.close(io);
         const fd = conn.socket.handle;
 
-        const cmd_frame = try protocol.buildUploadCmd(alloc, "up-3", "/tmp/empty.txt", 0, &file_hash);
+        const cmd_frame = try protocol.buildUploadCmd(alloc, "up-3", "/tmp/empty.txt", 0, toHex(&file_hash_hex, &file_hash));
         defer alloc.free(cmd_frame);
         try protocol.sendFrame(fd, cmd_frame);
 
@@ -264,6 +277,7 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
             b.* = @intCast(i);
         }
         const file_hash = try computeSha256(&binary_data);
+        var file_hash_hex: [64]u8 = undefined;
 
         const guest_thread = try std.Thread.spawn(.{}, guestUploadSimulator, .{
             io, alloc, listener.fd, &binary_data, 0, &guest_done, &guest_ok,
@@ -282,7 +296,7 @@ pub fn test_upload_e2e(io: std.Io, alloc: std.mem.Allocator, runner: *common.Tes
         defer conn.close(io);
         const fd = conn.socket.handle;
 
-        const cmd_frame = try protocol.buildUploadCmd(alloc, "up-4", "/tmp/binary.bin", 256, &file_hash);
+        const cmd_frame = try protocol.buildUploadCmd(alloc, "up-4", "/tmp/binary.bin", 256, toHex(&file_hash_hex, &file_hash));
         defer alloc.free(cmd_frame);
         try protocol.sendFrame(fd, cmd_frame);
         _ = common.sockWrite(fd, &binary_data, binary_data.len);
