@@ -316,6 +316,7 @@ File transfers use raw TCP streaming (no chunking — TCP provides reliable deli
 | pty_exec_output | 0x15 | guest→host | Shell stdout (cmd_id + data) |
 | pty_exec_done | 0x16 | guest→host | Command exit (cmd_id + exit_code) |
 | download_cmd | 0x14 | host→guest | Download request (cmd_id + path) |
+| download_result | 0x1c | guest→host | Download verify header (cmd_id + file_size + sha256_hex), sent before raw bytes |
 | upload_cmd | 0x1b | host→guest | Upload request (cmd_id + path + file_size + hash) |
 | upload_result | 0x17 | guest→host | Upload result (cmd_id + exit_code) |
 | upgrade_cmd | 0x1a | host→guest | Push upgrade binary (cmd_id + target + file_size + sha256 + version) |
@@ -454,6 +455,22 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
   exec→{vm,command,exit_code}, ping→{vm,reachable,mac,rtt_ms}, upload→{vm,
   local_path,remote_path,success}, download→{vm,remote_path,local_path,bytes,
   success}, sshpass→{host,user,exit_code}. All format helpers in `src/mcp.zig`.
+- **Exec output streaming** (v0.18.69) — Guest streams pty output as 4KB
+  chunks (only a ≤6-byte tail is held for partial MDELIM prefix detection),
+  eliminating the 64KB single-frame loss bug. Host forwards chunks in real
+  time: CLI via per-chunk `exec_data` IPC frames (terminal shows output as it
+  arrives), MCP via synchronous full response (single-call semantics — a
+  two-phase session/read model was rejected as unusable for AI agents).
+- **Download end-to-end hash verification** (v0.18.69) — `download_result`
+  frame (cmd_id + file_size + sha256_hex) precedes the raw byte stream,
+  symmetric with upload. Host reads exactly file_size bytes and verifies
+  incremental SHA256. Parse results must be copied out of the recv buffer
+  before reuse (dangling-slice bug found in live verification).
+- **macOS utmmd hash check disabled** (v0.18.72) — adhoc codesign is
+  non-deterministic and remove-signature is not byte-reversible, so the
+  installed utmmd hash can never match the embedded unsigned hash.
+  `shouldUpdateUtmmd` returns false on macOS (utmmd updates come from
+  explicit `--install`); Linux/Windows keep hash comparison.
 
 ## Build & Run
 

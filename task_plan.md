@@ -1,15 +1,35 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.68 | **分支**: `main` | **更新**: 2026-08-17
+**版本**: v0.18.72 | **分支**: `main` | **更新**: 2026-08-17
 
 ## 当前状态
 
 - **源文件**: 22 src + 13 test + 2 embed + 2 Python test scripts
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
-- **真机部署**: 5 节点全部 v0.18.68 serving
-- **Phase 36 进行中**: exec 输出可靠性 + 异步化落盘 + download 哈希校验
+- **真机部署**: 5 节点全部 v0.18.72 serving（Phase 36 + 37 修复全量部署）
+- **Phase 36/37 完成**: exec 输出可靠性 + CLI 流式 + download 校验 + 升级循环根因修复
 
-## 进行中: Phase 36 — exec 异步化落盘 + download 哈希校验 (v0.18.68 → v0.18.7x)
+## 已完成: Phase 37 — macOS utmmd 升级循环 + CLI status 缺失（根因修复）
+
+**状态**: ✅ 完成（commit 9390a50 + 7f6cced）
+
+**症状**: 每次 CLI 管理命令触发 utmmd 升级循环（utmmd/utmm 重启）；
+CLI --status 只显示 host；升级推送间歇 IpcNotRunning。
+
+**根因**: macOS 部署流程对 utmmd 做 adhoc codesign（Phase 35 引入），
+签名非确定性且 remove-signature 不可逆 → 磁盘 utmmd 哈希永远 ≠ 内嵌
+未签名哈希 → `shouldUpdateUtmmd` 永远 true → 每次 CLI 触发完整 upgrade
+循环 → mesh 抖动、status 空 guest 表。
+
+**修复**: macOS 上 `shouldUpdateUtmmd` 恒返回 false——macOS 的 utmmd
+升级由 `--install`（forceInstall 提取）显式完成。Linux/Windows 保留哈希比较。
+
+**验证**: 连续 3 次 status 零 upgrade 日志；4 台 Guest 完整显示；
+Host utmm PID 稳定；4 台 VM 升级推送全部一次成功。
+
+## 已完成: Phase 36 — exec 输出流式化 + download 哈希校验 (v0.18.68 → v0.18.69)
+
+**状态**: ✅ 完成并发布 v0.18.69
 
 **状态**: 🔄 规划完成，待确认后实施
 
@@ -171,6 +191,10 @@
 | 17 | SHM 跨进程共享内存用 @atomicStore/Load | @memcpy 对 *volatile 可能被优化掉，跨进程不可见 |
 | 18 | Windows SHM 不关闭 CreateFileMappingW 句柄 | 关闭句柄会移除命名对象名字，utmm 打开失败 |
 | 19 | utmmd 自升级用强杀（killAllUtmm 跳过 self） | 不用 stop() 优雅停止，避免触发 utmmd shutdown 回调杀 utmm |
+| 20 | exec 输出流式分块发送（Guest 4KB 块 + ≤6B 尾部保留） | 帧大小与输出总量解耦，修 >64KB 输出丢失；执行中实时可见 |
+| 21 | download 校验用头帧（download_result: file_size + sha256_hex） | 原始字节流无法可靠区分 trailer 帧头；长度先行边界精确，与 upload 对称 |
+| 22 | exec 同步响应模型（CLI 经 IPC 流式转发；MCP 同步全量） | 两段式（session_id + 轮询）让 AI agent 无所适从；实时性 = 底层流式传输 |
+| 23 | macOS shouldUpdateUtmmd 恒 false（utmmd 升级靠 --install） | adhoc codesign 非确定且不可逆，磁盘哈希永远 ≠ 内嵌哈希；比较必触发升级循环 |
 
 ## 架构（v0.18.0+）
 
