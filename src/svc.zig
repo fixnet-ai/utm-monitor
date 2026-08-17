@@ -2110,10 +2110,20 @@ fn fileSha256Hex(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ?[]cons
 pub fn shouldUpdateUtmmd(io: std.Io, alloc: std.mem.Allocator, comptime embedded_sha256_hex: []const u8) bool {
     const svc_path = canonicalSvcPath();
 
-    const installed_hash = fileSha256Hex(io, alloc, svc_path) orelse {
-        std.log.debug("[svc] utmmd binary missing at {s}, needs install", .{svc_path});
-        return true;
-    };
+    // macOS: 部署流程会对 utmmd 做 adhoc codesign（forceInstall/replaceFileSafe），
+    // 而 adhoc 签名非确定性（同内容两次签名哈希不同）。直接比较磁盘哈希会永远
+    // 不匹配 → 每次 CLI 都触发 upgrade → utmmd/utmm 重启 → mesh 抖动。
+    // 因此 macOS 上剥离签名后比较内容哈希。其它平台无签名，直接比较。
+    const installed_hash = if (builtin.os.tag == .macos)
+        fileSha256HexUnsigned(io, alloc, svc_path) orelse {
+            std.log.debug("[svc] utmmd binary missing at {s}, needs install", .{svc_path});
+            return true;
+        }
+    else
+        fileSha256Hex(io, alloc, svc_path) orelse {
+            std.log.debug("[svc] utmmd binary missing at {s}, needs install", .{svc_path});
+            return true;
+        };
     defer alloc.free(installed_hash);
 
     if (!std.mem.eql(u8, installed_hash, embedded_sha256_hex)) {
@@ -2122,6 +2132,20 @@ pub fn shouldUpdateUtmmd(io: std.Io, alloc: std.mem.Allocator, comptime embedded
     }
 
     return false;
+}
+
+/// macOS: 计算文件剥离 adhoc 签名后的 SHA256。
+/// 拷贝到临时文件 → codesign --remove-signature → 哈希（调用者负责 free）。
+fn fileSha256HexUnsigned(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    if (builtin.os.tag != .macos) return fileSha256Hex(io, alloc, path);
+
+    const tmp = std.fmt.allocPrint(alloc, "{s}/utmmd-hash-check-{d}", .{ canonicalDir(), std.Io.Timestamp.now(io, .real).nanoseconds }) catch return null;
+    defer alloc.free(tmp);
+    defer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+
+    copyFile(io, alloc, path, tmp, false) catch return null;
+    _ = runCmd(alloc, io, &[_][]const u8{ "codesign", "--remove-signature", tmp });
+    return fileSha256Hex(io, alloc, tmp);
 }
 
 /// 升级 utmmd 自身：hash 比较 → disable → stop → kill → replace → enable → start。
