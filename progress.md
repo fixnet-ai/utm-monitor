@@ -1947,3 +1947,24 @@ POSIX 上 `file_io` 直接复用事件循环 Io（epoll/kqueue），而 `findUpg
 - 100KB exec 输出 md5 与本地一致（Bug 1 真机回归通过）。
 - 观察到升级后 mesh 瞬态窗口（GuestNotFound/ConnectFailed 间歇 10-30s），
   存量行为，已记录 findings。
+
+### 连续两轮升级压力测试（2026-08-17 晚）
+
+用户要求：连续 bump 两个版本验证自动升级可靠性。
+
+| 轮次 | 版本 | 结果 |
+|------|------|------|
+| 轮 1 | v0.18.69 → v0.18.70 | 5/5 追平。macvm/windowsvm 首次推送撞 IpcNotRunning 窗口（CLI 命令触发 Host 重启的存量 bug），重试后成功；linuxvm/winx64 一次成功 |
+| 轮 2 | v0.18.70 → v0.18.71 | 4 台推送**全部一次成功**（sleep 8 间隔 + 重试策略避开窗口）；5/5 追平 |
+
+**回归验证（v0.18.71）**：
+- 4 台 exec smoke 全过
+- 100KB 大输出 md5 与本地一致（首次尝试撞瞬态窗口，重试通过）
+- upload/download 200KB 哈希一致
+
+**发现**：
+- 升级后 10-30 秒不稳定窗口（IpcNotRunning/WriteFailed/ConnectFailed 间歇）在
+  每轮升级后都存在——存量 bug（Host 端 CLI 触发重启 + LSA nonce 抖动），
+  与 Phase 36 改动无关。推送时 sleep 8 + 重试可稳定绕过。
+- ver.txt 已 bump 到 0.18.71（两个测试 commit 0633c6c/0be5241 未 tag 未 push），
+  发布与否待用户决定。
