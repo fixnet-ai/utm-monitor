@@ -60,6 +60,67 @@
 
 ## 最近发现
 
+### 2026-08-17 — MCP exec 输出丢失根因（Bug 1 + Bug 2）
+
+**症状**: 经常发生 MCP 响应 `content[0].text` 中 stdout 为空、exit_code=-1。
+
+**根因 1（主因）— 单帧 64KB 上限**: Guest 端把 pty 输出全量累积在内存 ArrayList，
+MDELIM 标记命中后才打包成**一个** `pty_exec_output` 帧发送（`guest.zig:1112-1117`）。
+Host 端 `execOnGuest` 接收缓冲只有 65536 字节（`mcp_handler.zig:91`），
+`protocol.Connection.recv` 帧长超缓冲返回 `error.BufferTooSmall`（`protocol.zig:745`），
+`execOnGuest` catch-all break（`mcp_handler.zig:96-100`）→ 返回空 output + exit -1。
+任何输出 >64KB 的命令（编译错误刷屏、cat 大文件、测试失败日志）stdout 整体消失。
+CLI（IPC）路径走同一个 `mcp_handler.execOnGuest`（`ipc.zig:657`），同样受影响。
+
+**根因 2 — shell 异常退出丢弃已累积输出**: Guest 读循环因 `shell.read` EOF/错误退出且
+MDELIM 未命中时，只发 `pty_exec_done(-1)`，`accumulated` 里的输出从不发送
+（`guest.zig:1127-1131`）。触发场景：命令含 `exit`、shell 被杀、pty read 错误。
+
+**次要发现**: Windows cmd.exe `& echo MDELIM:%errorlevel%` 的 `%errorlevel%` 在整行
+**解析时**展开，恒回显 0（`protocol.zig:603`）— 退出码永远 0，不影响 stdout 展示。
+
+**教训**: 帧缓冲大小必须与对端单帧大小解耦（流式分块发送）；catch-all break 吞掉
+`BufferTooSmall` 违反"error.Unexpected 视为致命"铁律，把数据丢失伪装成正常结束。
+
+### 2026-08-17 — ipc.zig 测试从未运行（standalone_test_modules 遗漏）
+
+`build.zig` 的 `standalone_test_modules` 列表（dpipe/dpipe_shell/dpipe_file/guest/shm/utmmd）
+没有 ipc.zig，而 ipc.zig 的 6 个测试（readFull EAGAIN、writeAll、upload header 边界等）
+也不在主测试二进制的 import 链里被收集——**这 6 个测试从写出来起就从未运行过**。
+36C 加第 7 个测试（ExecIpcSink 帧编码）时发现测试数不变才暴露。已把 ipc.zig
+加入 standalone 列表（commit 9ad72e5），7 个测试全过。
+
+**教训**: 新增测试后必须确认测试数变化；`zig build test` 的结果缓存会让
+"没跑测试"看起来像"测试通过"，用 `--summary all` 或检查测试名列表。
+
+### 2026-08-17 — 手动删 .zig-cache 产物破坏缓存清单
+
+删除 `.zig-cache/o/*/test` 二进制后，zig 报 `file_hash FileNotFound`（缓存元数据
+引用已删文件），7 个 run test 步骤全部失败。正确做法：整个删 `.zig-cache`
+目录重建，不要只删产物文件。
+
+### 2026-08-17 — test_upload_e2e 二进制 hash 传参（已修复 dfa863b）
+
+`test_upload_e2e.zig` 4 处 `buildUploadCmd` 传 32 字节二进制 SHA256，而
+`buildUploadCmd` 用 `writeString`（null-term）序列化——哈希含 0 字节会截断。
+模拟器比对也是逐字节二进制比对，与生产语义（hex 字符串）不一致。
+修复：调用点转 hex，模拟器 hex 字符串比对。生产代码（mcp_handler/ipc）传参本就正确。
+
+### 2026-08-17 — download 无端到端哈希校验（协议不对称）
+
+upload 方向有完整校验（cmd 头带 file_size+sha256 → Guest 边收边算 → 读满校验 →
+原子 rename）。download 方向无任何校验：Guest 流式发原始字节，Host 读到 EOF 即停，
+无长度、无哈希 trailer。IPC 协议 `download_done` 的 hash 字段恒为空（`ipc.zig:928`）。
+中间设备损坏/截断无法检测。
+
+### 2026-08-17 — exec 输出已合并 stdout+stderr（验证确认）
+
+- POSIX: `dup2(slave, 0/1/2)`（`dpipe_shell.zig:119-121`）— stdout+stderr 均进 pty。
+- Windows: `si.hStdError = stdout_write`（`dpipe_shell.zig:232`）— stderr 与 stdout
+  合并进同一管道。
+- sshpass 工具例外：stdout/stderr 分开收集，响应中 stderr 单独代码块（`mcp.zig:694`）。
+  保持分开（信息无损），不合并。
+
 ### 2026-08-13 — Windows 命名共享内存：CloseHandle(CreateFileMappingW) 移除对象名字
 
 **症状**: Guest 的 `OpenFileMappingW("Global\utmmd-shm")` 返回 ERROR_FILE_NOT_FOUND (2)，

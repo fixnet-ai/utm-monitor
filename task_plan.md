@@ -1,13 +1,86 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.68 | **分支**: `main` | **更新**: 2026-08-13
+**版本**: v0.18.68 | **分支**: `main` | **更新**: 2026-08-17
 
 ## 当前状态
 
 - **源文件**: 22 src + 13 test + 2 embed + 2 Python test scripts
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
-- **真机部署**: 5 节点全部 v0.18.68 serving（三平台自动升级全通）
-- **GitHub Release**: v0.18.68（本次发布）
+- **真机部署**: 5 节点全部 v0.18.68 serving
+- **Phase 36 进行中**: exec 输出可靠性 + 异步化落盘 + download 哈希校验
+
+## 进行中: Phase 36 — exec 异步化落盘 + download 哈希校验 (v0.18.68 → v0.18.7x)
+
+**状态**: 🔄 规划完成，待确认后实施
+
+### 背景
+
+三个已知缺陷（详见 findings.md 2026-08-17）：
+1. **Bug 1**: Guest 单帧发送全量输出 → Host 64KB 帧缓冲溢出 → stdout 整体丢失 + exit -1
+2. **Bug 2**: shell 异常退出（EOF 无 MDELIM）时 Guest 丢弃已累积输出
+3. download 方向无端到端哈希校验（与 upload 不对称）
+
+### 架构决策（用户已确认，2026-08-17 修订）
+
+| # | 决策 | 理由 |
+|---|------|------|
+| D1 | exec 输出 **流式分块发送**：Guest 每 4KB 读块立即发帧，仅保留 ≤7B 尾部（可能是 MDELIM: 前缀） | 帧大小与输出总量解耦，修 Bug 1；执行中输出实时可见 |
+| D2 | **同步响应模型**：CLI 和 MCP 都是一次调用拿完整输出。MCP 同步全量响应；CLI 通过 IPC **流式转发**（边收边发 exec_data 帧，收完发 exec_done） | 用户修订：两段式（session_id + 轮询）让 AI agent 无所适从（不知何时有数据）。实时性 = 底层流式传输，不是交互层异步 |
+| D3 | **不做**落盘/spool/会话表/read_output 工具/TTL | 用户修订：落盘动机只是"缓冲不够"，36B 流式分块后已无单帧 64KB 问题；Host 端 ArrayList 动态无上限（天然优于固定 128MB 上限）。同步响应下全量在内存是模型固有属性，用户拍板接受 |
+| D4 | download 哈希校验采用 **头帧**（file_size + sha256）而非 trailer | 原始字节流中任意 4 字节都可能像帧头，长度先行则数据边界精确；与 upload 对称 |
+
+### 子阶段
+
+#### Phase 36A: download 端到端哈希校验 ✅ 完成
+
+- [x] `protocol.zig`: `download_result = 0x1c` + `buildDownloadResult` + `parseDownloadResult` + `DownloadResultData`（commit 1196e1e）
+- [x] `guest.zig` handleDownload: stat → hash pre-pass → 发 download_result → 流式发原始字节（commit 18ed965，与 36B 同 commit 混入）
+- [x] `mcp_handler.downloadFromGuest` + `ipc.zig` download 路径: 收帧 → 增量 SHA256 → 读满 file_size → 比对（HashMismatch / TruncatedDownload）
+- [x] 测试: round-trip 单元测试；集成测试（正确哈希 + 篡改不匹配，download 四项全过）
+- [x] 门禁: zig build test exit 0 + 60 集成通过 0 泄漏
+
+#### Phase 36B: Guest 流式分块 + Bug 2 修复 + Host 防御（Bug 1 修复）✅ 完成
+
+- [x] `guest.zig` handleExecCmd: 流式分块（partialMarkerKeepLen 保留 ≤6B 尾部）+ EOF/错误路径补发 accumulated + done(-1)（commit 18ed965）
+- [x] `mcp_handler.execOnGuest`: BufferTooSmall 改 panic；ConnectionClosed 保持 break
+- [x] 测试: partialMarkerKeepLen 单元测试 3 个 + >64KB 大输出 e2e 场景
+- [x] 门禁: 218 单元 + 60 集成通过
+- [x] 追加修复: test_upload_e2e 二进制 hash 传参 → hex（commit dfa863b）
+
+#### Phase 36C: CLI exec 流式转发（修订版）✅ 完成
+
+- [x] `mcp_handler.zig`: 新增 `execOnGuestStream(io, gpa, state, vm, command, on_output, ctx)`——
+  每块 pty_exec_output 立即回调；execOnGuest 变薄为 OutputCollector 封装（commit 9ad72e5）
+- [x] `ipc.zig` handleExec: ExecIpcSink 回调逐块发 exec_data IPC 帧（broken 标志处理 CLI 断开），收完发 exec_done
+- [x] `ipc.zig` ipcExec 客户端: 流式解析响应帧（exec_data 边读边写 stdout + flush，不再 clientReadAll 全量缓冲）
+- [x] 测试: ExecIpcSink 帧编码单元测试
+- [x] 修复存量问题: ipc.zig 加入 build.zig standalone_test_modules（原 6 个 ipc 测试从未运行过）
+- [x] 门禁: 218 单元 + 7 ipc standalone + 60 集成通过，0 泄漏
+
+#### Phase 36D: 测试更新 + 全量验证 + 部署
+
+- [ ] 集成测试确认（36B 大输出场景已覆盖 Bug 1 回归）
+- [ ] `tests/test_mcp_tools.py` / `tests/test_cli_commands.py` 确认同步语义不变（无需大改）
+- [ ] `zig build test` + `zig build test-integration` 全绿（部署门禁）
+- [ ] 交叉编译 8 目标 + 真机部署验证（macvm/linuxvm/windowsvm/winx64）
+- [ ] 版本 bump + release
+
+#### Phase 36D: 测试更新 + 全量验证 + 部署
+
+- [ ] 集成测试: exec 异步（running → done 状态转换、offset 分段读取、结束后读全量）
+- [ ] `tests/test_mcp_tools.py` 更新: exec 改为异步流程（exec → 轮询 read_output）
+- [ ] `tests/test_cli_commands.py` 确认 CLI 同步路径不变
+- [ ] `zig build test` + `zig build test-integration` 全绿（部署门禁）
+- [ ] 交叉编译 8 目标 + 真机部署验证（macvm/linuxvm/windowsvm/winx64）
+- [ ] 版本 bump + release
+
+### 风险与已知限制
+
+| # | 风险 | 对策 |
+|---|------|------|
+| R1 | 同步响应模型下 Host 端输出全量在内存（超大输出吃内存） | 用户拍板接受：ArrayList 动态无上限，现实输出远小于该量级 |
+| R2 | IPC 流式转发下每块一帧，帧数多（4KB 块） | IPC 帧头开销小（5B/帧），CLI 读取循环已有流式协议支持 |
+| R3 | 二进制/非 UTF-8 输出在 JSON 响应中的处理 | 沿用 jsonEscape 既有行为（与现状一致） |
 
 ## 已完成: Phase 35 — 三平台自动升级彻底打通 (v0.18.44 → v0.18.68)
 

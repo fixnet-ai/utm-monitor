@@ -1,3 +1,76 @@
+## Phase 36 会话 1 — 设计修正与实施（2026-08-17）
+
+### 用户设计修正（重要）
+
+原 36C 方案（异步化 + session_id + read_output 轮询）被用户否决：
+两段式让 AI agent 无所适从（不知道何时有数据）。用户的真实意图是
+**一次调用拿完整输出、底层流式传输不丢数据**。落盘动机只是缓冲不够，
+36B 流式分块后已无单帧 64KB 问题，Host 端 ArrayList 无上限。
+修订方案：砍掉全部异步化/spool/会话表/TTL，只做 CLI 流式转发。
+
+### 实施进度
+
+| 阶段 | 状态 | commit |
+|------|------|--------|
+| 36A download 哈希校验 | ✅ | 1196e1e（+ 混入 18ed965 的 guest/mcp_handler 部分） |
+| 36B Guest 流式分块 + Bug 2 修复 | ✅ | 18ed965 |
+| upload 测试 hex 修复 | ✅ | dfa863b |
+| 36C CLI exec 流式转发 | ✅ | 9ad72e5 |
+| 36D 交叉编译 + 真机验证 + release | 🔄 | — |
+
+### 36A/36B 并行分派复盘
+
+- 两个 agent 用 worktree 隔离参数分派，但 **worktree 隔离未生效**，双双落在
+  主工作区编辑。得益于分派时的文件区域避让约束，无互相覆盖。
+- 36B 先 commit 时把 36A 已完成的 guest.zig/mcp_handler.zig 改动一并提交
+  （36A 拆在两个 commit 中）。功能无损，历史不重写，已记录。
+- 8 个历史遗留 worktree（channel/disco/sess 等旧实验文件）未清理，待用户决定。
+
+### 门禁结果
+
+- 单元测试：218 passed + ipc standalone 7 passed（修复后），1 skipped，0 failed
+- 集成测试：60 passed，0 failed，无泄漏
+- 发现并修复：ipc.zig 6 个测试从未运行（standalone_test_modules 遗漏）
+
+### 36C 实现要点
+
+- mcp_handler: execOnGuestStream 回调流式核心 + OutputCollector 薄封装
+- ipc 服务端: ExecIpcSink 逐块发 exec_data 帧（broken 标志处理断开）
+- ipc 客户端: 流式解析响应帧（exec_data 边读边写 stdout + flush）
+- 36D 交叉编译进行中
+
+### 设计阶段记录（2026-08-17 上午）
+
+### 问题调查（MCP exec stdout 丢失）
+
+用户报告：经常发生 MCP 响应 stdout 在 content[0].text 中未展示。
+
+**调查结果**（详见 findings.md 2026-08-17）：
+- Bug 1: Guest 单帧发送全量输出（`guest.zig:1112-1117`）→ Host 64KB 帧缓冲
+  `BufferTooSmall`（`mcp_handler.zig:91` + `protocol.zig:745`）→ catch-all break
+  → stdout 整体丢失 + exit -1。CLI 路径同受影响（`ipc.zig:657`）。
+- Bug 2: shell EOF 无 MDELIM 时 Guest 丢弃 accumulated（`guest.zig:1127-1131`）。
+- 次要: Windows cmd `%errorlevel%` 解析时展开恒为 0。
+
+### 设计讨论（用户确认的架构决策）
+
+- Q1 download 哈希校验 → 采用**头帧**（file_size + sha256）方案，与 upload 对称。
+- Q2 exec 输出架构 → 用户纠正了"实时消费者"假设：AI agent 读取时机不可预知。
+  确认当前 HTTP MCP 是**同步 request/response**（无流式读取环节），落盘方案
+  同时解决：长命令零可见性、断链全丢、Host 内存无界。
+  用户选定 **直接异步化**：exec 立即返回 session_id + read_output 工具按偏移读取。
+- Q3 已验证：exec 输出已合并 stdout+stderr（POSIX dup2 0/1/2 + Windows hStdError）。
+  sshpass 保持分开展示。
+
+### 规划文件
+
+- task_plan.md: Phase 36 已写入（4 子阶段 36A-36D + 7 项架构决策 + 风险表）。
+- findings.md: 3 条新发现已写入。
+
+### 下一步
+
+等待用户确认 Phase 36 计划 → 开始 Phase 36A（download 哈希校验）。
+
 ## v0.18.44 → v0.18.68 — 三平台自动升级彻底打通
 
 **时间**: 2026-08-12 → 2026-08-13
