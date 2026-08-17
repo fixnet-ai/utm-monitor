@@ -1968,3 +1968,26 @@ POSIX 上 `file_io` 直接复用事件循环 Io（epoll/kqueue），而 `findUpg
   与 Phase 36 改动无关。推送时 sleep 8 + 重试可稳定绕过。
 - ver.txt 已 bump 到 0.18.71（两个测试 commit 0633c6c/0be5241 未 tag 未 push），
   发布与否待用户决定。
+
+### Phase 37 — 升级循环与 CLI status 缺失排查（2026-08-17 深夜）
+
+**症状**: 每次 CLI 管理命令触发 utmmd 升级循环；CLI --status 只显示 host；
+升级推送间歇 IpcNotRunning。
+
+**排查过程**:
+1. 定位触发点: main.zig 每次 CLI 调 `shouldUpdateUtmmd` → true 则 upgradeUtmmd
+2. 实测: 磁盘 utmmd（签名版）哈希 ≠ 内嵌 .sha256（未签名哈希）
+3. 实验: adhoc codesign 非确定性（独立签名结果不同）+ remove-signature
+   不可逆（sign→remove roundtrip 哈希变化）
+4. 第一版修复（剥离签名比较，fileSha256HexUnsigned）**失败**——roundtrip
+   不可逆导致仍不匹配
+5. 第二版修复（9390a50）: macOS 恒返回 false（utmmd 升级靠 --install 显式完成）
+
+**验证**（v0.18.72 全节点部署后）:
+- 连续 3 次 status: 零 upgrade 日志 ✓
+- CLI --status 完整显示 4 台 Guest ✓（37B 同根因，一并修复）
+- Host utmm PID 稳定（1m+ uptime）✓
+- 4 台 VM 升级推送全部一次成功（IpcNotRunning 消失）✓
+- exec 回归 OK ✓
+
+**部署状态**: 全节点 v0.18.72。37A/37B 完成。未 tag 未 push（发布待用户决定）。

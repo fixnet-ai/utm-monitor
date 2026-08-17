@@ -94,14 +94,45 @@ test_download_e2e 是协议级 loopback 模拟器，不走真实的
 **教训**: 帧解析结果的生命周期与接收缓冲复用必须成对审查；协议级模拟测试
 无法覆盖真实接收函数的缓冲复用 bug，真机 smoke 验证不可省。
 
+### 2026-08-17 — macOS adhoc codesign 破坏 utmmd 哈希比较 → 每次 CLI 触发升级循环（Phase 37 根因）
+
+**症状**: 每次 `sudo utmm --status/--exec/--upgrade` 输出开头都打
+"utmmd upgrade: utmmd-new → utmmd" + Host 日志每次出现 "ipc listening"
+（utmm 重启）；CLI --status 只显示 host 不显示 guests；升级推送间歇
+IpcNotRunning/ConnectFailed（10-30s 窗口）。
+
+**根因链**:
+1. 部署流程（forceInstall/replaceFileSafe）在 macOS 上对 utmmd 做
+   `codesign --force --sign -`（adhoc，Phase 35 引入修复 SSH 部署签名损坏）
+2. **adhoc 签名非确定性**：同内容两个副本独立签名 → 不同哈希（实测 a1b3... vs 58a3...）；
+   同一文件重复签（"replacing existing signature"）幂等
+3. **remove-signature 不可逆**：codesign 签名过程修改 Mach-O 结构
+   （LC_CODE_SIGNATURE 等），剥离后字节级与原始未签名文件不同
+   （实测 roundtrip a0846b26 → bddd5a93 → aea2ba71）
+4. `shouldUpdateUtmmd` 比较磁盘 utmmd 哈希 vs 内嵌未签名 .sha256 →
+   **永远不匹配** → 每次 CLI 都执行 upgradeUtmmd（disable→kill→replace→
+   enable→start）→ utmmd/utmm 重启 → LSA nonce 变 → mesh 抖动 → 
+   status 显示空 guest 表（查询恰好撞上重启窗口）
+
+**修复** (9390a50): macOS 上 `shouldUpdateUtmmd` 恒返回 false——macOS 的
+utmmd 升级由 `--install`（forceInstall 提取新 utmmd）显式完成，跳过隐式检查。
+Linux/Windows 无签名，保留哈希比较。
+
+**验证**: 连续 3 次 status 零 upgrade 日志、4 台 Guest 完整显示、
+Host utmm PID 稳定、4 台 VM 升级推送全部一次成功（此前必撞 IpcNotRunning）。
+
+**教训**: 对二进制文件做哈希比较时，任何后处理（签名、strip、打包）都会
+破坏可比性。签名类操作（codesign）在 macOS 部署链上是刚需（Phase 35），
+哈希比较必须在签名**之前**或使用签名不变的内容摘要（CDHash 也因随机
+identifier 不可用）。
+
 ### 2026-08-17 — 升级后 mesh 瞬态窗口（GuestNotFound/ConnectFailed 间歇）
 
-Host forceInstall 期间 utmm/utmmd 重启 → LSA nonce 变化 → Guests 端
-"LSA restart detected" → node table 短暂缺失节点。真机验证时 windowsvm
-exec 前两次失败（-1 / ConnectFailed）、第三次成功；linuxvm download 也曾
-GuestNotFound。窗口约 10-30 秒。**存量行为，非 Phase 36 引入**，但与
-connectGuest 的 10s 重试窗口重叠时会报错。已记录，修复（如 nonce 平滑
-过渡）留待后续评估。
+~~Host forceInstall 期间 utmm/utmmd 重启 → LSA nonce 变化 → node table
+短暂缺失节点。窗口约 10-30 秒。~~ **已定位真根因**：每次 CLI 管理命令
+触发 utmmd 升级循环（见上一条"macOS adhoc codesign 破坏哈希比较"），
+Host utmm 随每次 CLI 重启。Phase 37 修复（9390a50）后此现象消失——
+升级推送 4 台全部一次成功，无 IpcNotRunning。
 
 ### 2026-08-17 — ipc.zig 测试从未运行（standalone_test_modules 遗漏）
 
