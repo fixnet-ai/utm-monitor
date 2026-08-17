@@ -82,6 +82,27 @@ MDELIM 未命中时，只发 `pty_exec_done(-1)`，`accumulated` 里的输出从
 **教训**: 帧缓冲大小必须与对端单帧大小解耦（流式分块发送）；catch-all break 吞掉
 `BufferTooSmall` 违反"error.Unexpected 视为致命"铁律，把数据丢失伪装成正常结束。
 
+### 2026-08-17 — download_result 哈希悬空切片（真机抓到，测试未覆盖）
+
+`parseDownloadResult` 返回的 `sha256_hex` 是接收缓冲 `rbuf` 的切片；随后
+`rbuf` 被 sockRead 循环复用读文件数据，比对时期望哈希已被覆盖成文件内容 →
+真机上每次 download 都 HashMismatch（乱码 expected）。本地测试没抓到：
+test_download_e2e 是协议级 loopback 模拟器，不走真实的
+`mcp_handler.downloadFromGuest` / `ipc.zig handleDownload` 接收路径。
+修复：解析后立即把 64 字节 hex 拷贝到固定缓冲（commit ebca5ce）。
+
+**教训**: 帧解析结果的生命周期与接收缓冲复用必须成对审查；协议级模拟测试
+无法覆盖真实接收函数的缓冲复用 bug，真机 smoke 验证不可省。
+
+### 2026-08-17 — 升级后 mesh 瞬态窗口（GuestNotFound/ConnectFailed 间歇）
+
+Host forceInstall 期间 utmm/utmmd 重启 → LSA nonce 变化 → Guests 端
+"LSA restart detected" → node table 短暂缺失节点。真机验证时 windowsvm
+exec 前两次失败（-1 / ConnectFailed）、第三次成功；linuxvm download 也曾
+GuestNotFound。窗口约 10-30 秒。**存量行为，非 Phase 36 引入**，但与
+connectGuest 的 10s 重试窗口重叠时会报错。已记录，修复（如 nonce 平滑
+过渡）留待后续评估。
+
 ### 2026-08-17 — ipc.zig 测试从未运行（standalone_test_modules 遗漏）
 
 `build.zig` 的 `standalone_test_modules` 列表（dpipe/dpipe_shell/dpipe_file/guest/shm/utmmd）

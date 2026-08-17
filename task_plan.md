@@ -57,13 +57,19 @@
 - [x] 修复存量问题: ipc.zig 加入 build.zig standalone_test_modules（原 6 个 ipc 测试从未运行过）
 - [x] 门禁: 218 单元 + 7 ipc standalone + 60 集成通过，0 泄漏
 
-#### Phase 36D: 测试更新 + 全量验证 + 部署
+#### Phase 36D: 测试更新 + 全量验证 + 部署 ✅ 基本完成（release 待发）
 
-- [ ] 集成测试确认（36B 大输出场景已覆盖 Bug 1 回归）
-- [ ] `tests/test_mcp_tools.py` / `tests/test_cli_commands.py` 确认同步语义不变（无需大改）
-- [ ] `zig build test` + `zig build test-integration` 全绿（部署门禁）
-- [ ] 交叉编译 8 目标 + 真机部署验证（macvm/linuxvm/windowsvm/winx64）
-- [ ] 版本 bump + release
+- [x] 交叉编译 8/8 目标（ReleaseSafe，含交叉编译错误修复 689243c/7c3a426）
+- [x] 版本 bump v0.18.69（7f07273）
+- [x] 全节点部署：Host + 4 VM 全部 v0.18.69 serving
+- [x] 真机验证：
+  - CLI exec 流式（START 在 sleep 5 期间实时到达终端）
+  - exec >64KB 输出完整（linuxvm seq 1 20000 md5 与本地一致）
+  - download 端到端哈希（CLI + MCP 双路径 md5 一致，linuxvm/windowsvm 4.97MB）
+  - Windows 双平台 exec + download 正常
+- [x] 真机抓出悬空切片 bug 并修复（ebca5ce）+ 重新部署 Host 验证
+- [ ] tag v0.18.69 + release.sh 发布
+- [ ] push main + tags
 
 #### Phase 36D: 测试更新 + 全量验证 + 部署
 

@@ -1936,3 +1936,14 @@ POSIX 上 `file_io` 直接复用事件循环 Io（epoll/kqueue），而 `findUpg
 3. **跨平台测试不能只测一个 OS**：Phase 33 只在 Windows 上验证了 upgrade 流程，macOS 碰巧工作（kqueue 兼容），导致 Linux 上的 bug 被遗漏。
 
 4. **utmmd 崩溃恢复缺口**：SCM/systemd 配置了 restart，但两个 Windows VM 的 utmmd 都停止后未自动重启。需要排查 SCM 失败恢复配置或 utmmd 崩溃根因。
+
+### 36D 真机部署验证记录
+
+- 8/8 交叉编译通过 → Host forceInstall（发现 native Debug 二进制自复制问题，
+  改用 ReleaseSafe 重编）→ 4 VM --upgrade 推送全部 OK → 全部 v0.18.69 serving。
+- 真机验证抓到 **download 哈希悬空切片** bug（rbuf 复用覆盖 sha256_hex），
+  修复 ebca5ce 后 CLI/MCP 双路径 md5 一致。
+- CLI 流式验证：exec 命令 sleep 期间 START 已到达输出文件（实时转发生效）。
+- 100KB exec 输出 md5 与本地一致（Bug 1 真机回归通过）。
+- 观察到升级后 mesh 瞬态窗口（GuestNotFound/ConnectFailed 间歇 10-30s），
+  存量行为，已记录 findings。
