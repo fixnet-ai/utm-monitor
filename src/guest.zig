@@ -696,6 +696,31 @@ test "zigTarget - valid format" {
     );
 }
 
+test "partialMarkerKeepLen - no marker prefix,全部可发送" {
+    // 尾部与 MDELIM: 无前缀关系 → 全部可发送
+    try std.testing.expectEqual(@as(usize, 5), partialMarkerKeepLen("hello"));
+    try std.testing.expectEqual(@as(usize, 3), partialMarkerKeepLen("abc"));
+    try std.testing.expectEqual(@as(usize, 0), partialMarkerKeepLen(""));
+}
+
+test "partialMarkerKeepLen - 尾部是 MDELIM 前缀的保留" {
+    // "data MDEL" → 尾部 "MDEL" 是 "MDELIM:" 前缀，保留 4 字节
+    try std.testing.expectEqual(@as(usize, 5), partialMarkerKeepLen("data MDEL"));
+    // "data MDELI" → 保留 5 字节
+    try std.testing.expectEqual(@as(usize, 5), partialMarkerKeepLen("data MDELI"));
+    // "data MDELIM" → 保留 6 字节
+    try std.testing.expectEqual(@as(usize, 5), partialMarkerKeepLen("data MDELIM"));
+    // "data M" → 保留 1 字节
+    try std.testing.expectEqual(@as(usize, 5), partialMarkerKeepLen("data M"));
+}
+
+test "partialMarkerKeepLen - 尾部非前缀字符则全部发送" {
+    // "data X" → 'X' 不是 "MDELIM:" 任意前缀 → 全部发送
+    try std.testing.expectEqual(@as(usize, 6), partialMarkerKeepLen("data X"));
+    // "data preM" → 尾部 "M" 是 "MDELIM:" 前缀 → 保留 1 字节，发送前 8 字节
+    try std.testing.expectEqual(@as(usize, 8), partialMarkerKeepLen("data preM"));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Guest TCP 主循环（替代 meshSessionLoop）
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1087,7 +1112,10 @@ pub fn handleExecCmd(
         return;
     };
 
-    // 流式读取 shell 输出 → 发送 pty_exec_output 帧
+    // 流式读取 shell 输出 → 分块发送 pty_exec_output 帧。
+    // 每块输出在确认不含 MDELIM 标记前缀后立即发送，避免：
+    //   1. 全量累积导致单帧超过 Host 接收缓冲（BufferTooSmall → 输出丢失）
+    //   2. shell 异常退出（EOF）时已累积输出丢失
     var output_buf: [4096]u8 = undefined;
     var accumulated: std.ArrayList(u8) = .empty;
     defer accumulated.deinit(allocator);
@@ -1122,13 +1150,62 @@ pub fn handleExecCmd(
             std.log.info("[guest] exec done: cmd_id={s} exit={d}", .{ input.cmd_id, marker_result.exit_code });
             return;
         }
+
+        // 未命中：把确定不含部分标记的前缀立即发送，只保留尾部可能是
+        // "MDELIM:" 前缀（1~6 字节）的部分，避免标记被跨块拆断。
+        const send_len = partialMarkerKeepLen(accumulated.items);
+        if (send_len > 0) {
+            const chunk = accumulated.items[0..send_len];
+            const output_msg = protocol.buildPtyExecOutput(allocator, input.cmd_id, chunk) catch continue;
+            defer allocator.free(output_msg);
+            _ = conn.sendAndFlush(output_msg, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
+            // 移除已发送部分，仅保留尾部前缀
+            std.mem.copyForwards(u8, accumulated.items[0 .. accumulated.items.len - send_len], accumulated.items[send_len..]);
+            accumulated.shrinkRetainingCapacity(accumulated.items.len - send_len);
+        }
     }
 
-    // shell 异常关闭（无 MDELIM 标记）
+    // shell 异常关闭（无 MDELIM 标记）——先把剩余累积输出发出（修 Bug 2），再发 done
+    if (accumulated.items.len > 0) {
+        const output_msg = protocol.buildPtyExecOutput(allocator, input.cmd_id, accumulated.items) catch {
+            const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
+            defer allocator.free(done_msg);
+            _ = conn.sendAndFlush(done_msg, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
+            return;
+        };
+        defer allocator.free(output_msg);
+        _ = conn.sendAndFlush(output_msg, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
+    }
+
     const done_msg = protocol.buildPtyExecDone(allocator, input.cmd_id, -1) catch return;
     defer allocator.free(done_msg);
     _ = conn.sendAndFlush(done_msg, 0) catch |e| std.log.warn("[guest] send failed: {}", .{e});
     std.log.info("[guest] exec done (shell closed): cmd_id={s}", .{input.cmd_id});
+}
+
+/// 计算可安全发送的字节数：返回 accumulated 前缀中"确定不含部分 MDELIM 标记"的长度。
+/// 尾部最多保留 6 字节（可能是 "MDELIM:" 的任意前缀），其余全部可发送。
+/// 若尾部与 "MDELIM:" 无任何前缀关系，则全部可发送（返回 items.len）。
+fn partialMarkerKeepLen(items: []const u8) usize {
+    const marker = "MDELIM:";
+    // 尾部最多检查 marker.len - 1 = 6 字节（完整 7 字节标记在上层已 scanForMarker 命中剥离）
+    const max_tail = marker.len - 1;
+    const tail_start = if (items.len > max_tail) items.len - max_tail else 0;
+    const tail = items[tail_start..];
+
+    // 找到尾部能匹配 marker 前缀的最长长度
+    var keep: usize = 0;
+    var i: usize = tail.len;
+    while (i > 0) : (i -= 1) {
+        // tail[tail.len - i ..] 是尾部最后 i 字节；若它等于 marker[0..i] 则为前缀
+        const suffix = tail[tail.len - i ..];
+        if (std.mem.eql(u8, suffix, marker[0..i])) {
+            keep = i;
+            break;
+        }
+    }
+
+    return items.len - keep;
 }
 
 /// 从 TCP 连接读取并丢弃指定字节数。
@@ -1329,7 +1406,7 @@ pub fn handleUpgradeCmd(
     }
 }
 
-/// 处理 download：dpipe_file.readFile → 原始字节流发送到 TCP。
+/// 处理 download：stat + hash pre-pass → 发送 download_result 帧 → 流式读文件发原始字节。
 pub fn handleDownload(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1348,10 +1425,56 @@ pub fn handleDownload(
     var file_threaded = std.Io.Threaded.init(allocator, .{});
     const file_io = file_threaded.io();
 
-    // 创建读取管道
+    // 打开文件，stat 大小，positional read 全文件算 SHA256（不改变 seek 位置，与 upload 对称）。
+    const file = std.Io.Dir.cwd().openFile(file_io, cmd.path, .{}) catch |err| {
+        std.log.err("[guest] download openFile failed: {} path={s}", .{ err, cmd.path });
+        return;
+    };
+    defer file.close(file_io);
+
+    const file_stat = file.stat(file_io) catch |err| {
+        std.log.err("[guest] download stat failed: {} path={s}", .{ err, cmd.path });
+        return;
+    };
+    const file_size: u32 = @intCast(file_stat.size);
+
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash_buf: [65536]u8 = undefined;
+    var pos: u64 = 0;
+    while (pos < file_size) {
+        const to_read: usize = @min(hash_buf.len, file_size - pos);
+        const nr = file.readPositional(file_io, &.{hash_buf[0..to_read]}, pos) catch |err| {
+            std.log.err("[guest] download hash pre-pass read failed: {}", .{err});
+            return;
+        };
+        if (nr == 0) break;
+        sha.update(hash_buf[0..nr]);
+        pos += nr;
+    }
+    var file_hash: [32]u8 = undefined;
+    sha.final(&file_hash);
+
+    var hash_hex_buf: [64]u8 = undefined;
+    for (&file_hash, 0..) |b, i| {
+        hash_hex_buf[i * 2] = "0123456789abcdef"[b >> 4];
+        hash_hex_buf[i * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    const hash_hex = hash_hex_buf[0..64];
+
+    // 发送 download_result 帧：cmd_id + file_size + sha256_hex。
+    const resp = protocol.buildDownloadResult(allocator, cmd.cmd_id, file_size, hash_hex) catch |err| {
+        std.log.err("[guest] buildDownloadResult failed: {}", .{err});
+        return;
+    };
+    defer allocator.free(resp);
+    _ = conn.sendAndFlush(resp, 0) catch |e| {
+        std.log.warn("[guest] download_result send failed: {}", .{e});
+        return;
+    };
+
+    // 创建读取管道，流式读文件发原始字节（从文件头重新读，竞态与 upload 对称，不额外处理）。
     const file_pipe = dpipe_file.readFile(allocator, file_io, cmd.path) catch |err| {
         std.log.err("[guest] readFile failed: {}", .{err});
-        // 发送空文件（0字节）作为错误信号
         return;
     };
     defer file_pipe.close();

@@ -95,8 +95,12 @@ pub fn execOnGuest(
     while (true) {
         const nr = tcp_conn.recv(&rbuf) catch |err| {
             if (err == error.ConnectionClosed) break;
-            std.log.err("[mcp-handler-exec] recv error: {}", .{err});
-            break;
+            // 流式分块后单帧最大约 4KB+6B（Guest 端已分块），BufferTooSmall 不应再出现。
+            // 一旦出现即表示协议不变量被破坏，属于设计上不该发生的意外状态，立即 panic 暴露。
+            if (err == error.BufferTooSmall) {
+                @panic("exec recv BufferTooSmall: frame exceeds 64KB receive buffer after streaming chunking");
+            }
+            @panic("exec recv unexpected error");
         };
         if (nr == 0) break;
 
@@ -318,14 +322,35 @@ pub fn downloadFromGuest(
 
     std.log.info("[mcp-handler-download] requested {s} from {s}", .{ cmd_id, vm });
 
-    // Receive raw file bytes (unframed — guest sends raw bytes after download_cmd)
+    // 先收 download_result 帧（cmd_id + file_size + sha256_hex），确定期望长度与哈希。
     var rbuf: [65536]u8 = undefined;
-    var total_bytes: u32 = 0;
-    while (true) {
-        const nr = tcp.sockRead(tcp_conn.fd, rbuf[0..].ptr, rbuf.len);
-        if (nr <= 0) break; // EOF or error
+    const result_frame_nr = tcp_conn.recv(&rbuf) catch |err| {
+        std.log.err("[mcp-handler-download] recv download_result: {}", .{err});
+        return error.DownloadResultFailed;
+    };
+    if (result_frame_nr == 0 or rbuf[0] != @intFromEnum(ptcl.MsgType.download_result)) {
+        std.log.err("[mcp-handler-download] missing download_result frame", .{});
+        return error.DownloadResultFailed;
+    }
+    const result = ptcl.parseDownloadResult(rbuf[0..result_frame_nr][1..]) orelse {
+        std.log.err("[mcp-handler-download] parseDownloadResult failed", .{});
+        return error.DownloadResultFailed;
+    };
+    const expected_size: u32 = result.file_size;
 
+    // 增量 SHA256 校验：边收原始字节边写文件，读满 file_size 即停（不再依赖 EOF）。
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var total_bytes: u32 = 0;
+    while (total_bytes < expected_size) {
+        const to_read: usize = @min(rbuf.len, expected_size - total_bytes);
+        const nr = tcp.sockRead(tcp_conn.fd, rbuf[0..].ptr, to_read);
+        if (nr <= 0) {
+            // 连接提前 EOF：数据读满 size 之前连接关闭 = 错误。
+            std.log.err("[mcp-handler-download] premature EOF: got {d}/{d} bytes", .{ total_bytes, expected_size });
+            return error.TruncatedDownload;
+        }
         const data = rbuf[0..@intCast(nr)];
+        sha.update(data);
         file_writer.writeAll(data) catch |err| {
             std.log.err("[mcp-handler-download] writer error: {}", .{err});
             return error.WriteFailed;
@@ -333,7 +358,20 @@ pub fn downloadFromGuest(
         total_bytes += @intCast(nr);
     }
 
-    std.log.info("[mcp-handler-download] done {s}", .{cmd_id});
+    // 比对哈希，不匹配报错。
+    var actual_hash: [32]u8 = undefined;
+    sha.final(&actual_hash);
+    var actual_hex_buf: [64]u8 = undefined;
+    for (&actual_hash, 0..) |b, i| {
+        actual_hex_buf[i * 2] = "0123456789abcdef"[b >> 4];
+        actual_hex_buf[i * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    if (!std.mem.eql(u8, actual_hex_buf[0..], result.sha256_hex)) {
+        std.log.err("[mcp-handler-download] hash mismatch: expected={s} actual={s}", .{ result.sha256_hex, actual_hex_buf[0..] });
+        return error.HashMismatch;
+    }
+
+    std.log.info("[mcp-handler-download] done {s} bytes={d}", .{ cmd_id, total_bytes });
     return total_bytes;
 }
 
