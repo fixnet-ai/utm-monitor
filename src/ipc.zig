@@ -918,6 +918,14 @@ fn handleDownload(
     };
     const expected_size: u32 = result.file_size;
 
+    // 拷贝期望哈希 — result.sha256_hex 指向 rbuf，后续 sockRead 读文件数据会覆盖 rbuf。
+    var expected_hex_buf: [64]u8 = undefined;
+    if (result.sha256_hex.len != 64) {
+        sendError(conn, "DownloadResultFailed");
+        return;
+    }
+    @memcpy(expected_hex_buf[0..], result.sha256_hex);
+
     // 增量 SHA256 校验：边收原始字节边转发给 IPC client，读满 file_size 即停。
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
     var total_bytes: u32 = 0;
@@ -955,8 +963,8 @@ fn handleDownload(
         actual_hex_buf[i * 2] = "0123456789abcdef"[b >> 4];
         actual_hex_buf[i * 2 + 1] = "0123456789abcdef"[b & 0x0F];
     }
-    if (!std.mem.eql(u8, actual_hex_buf[0..], result.sha256_hex)) {
-        std.log.err("[ipc-download] hash mismatch: expected={s} actual={s}", .{ result.sha256_hex, actual_hex_buf[0..] });
+    if (!std.mem.eql(u8, actual_hex_buf[0..], expected_hex_buf[0..])) {
+        std.log.err("[ipc-download] hash mismatch: expected={s} actual={s}", .{ expected_hex_buf[0..], actual_hex_buf[0..] });
         sendError(conn, "HashMismatch");
         return;
     }
