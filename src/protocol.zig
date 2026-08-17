@@ -179,6 +179,9 @@ pub const MsgType = enum(u8) {
 
     // File transfer
     upload_cmd = 0x1b,
+
+    // Guest → Host: download 校验结果（file_size + sha256_hex）
+    download_result = 0x1c,
 };
 
 // ── Serialization helpers ──
@@ -330,6 +333,18 @@ pub fn buildUploadResult(allocator: std.mem.Allocator, cmd_id: []const u8, exit_
     return buf.toOwnedSlice(allocator);
 }
 
+/// 构建 download_result 帧：cmd_id(null-term) + file_size(u32 BE) + sha256_hex(null-term)。
+/// 布局与 upload_cmd 的 file_size/hash 字段写法对称（hash 字段用 writeString 带 null 终止）。
+pub fn buildDownloadResult(allocator: std.mem.Allocator, cmd_id: []const u8, file_size: u32, sha256_hex: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, @intFromEnum(MsgType.download_result));
+    try writeString(&buf, allocator, cmd_id);
+    try writeU32(&buf, allocator, file_size);
+    try writeString(&buf, allocator, sha256_hex);
+    return buf.toOwnedSlice(allocator);
+}
+
 // ── Parse result structs ──
 
 pub const PtyExecInputData = struct {
@@ -350,6 +365,12 @@ pub const PtyExecDoneData = struct {
 pub const UploadResultData = struct {
     cmd_id: []const u8,
     exit_code: i32,
+};
+
+pub const DownloadResultData = struct {
+    cmd_id: []const u8,
+    file_size: u32,
+    sha256_hex: []const u8,
 };
 
 pub const DownloadCmdData = struct {
@@ -403,6 +424,14 @@ pub fn parseUploadResult(data: []const u8) ?UploadResultData {
     const cmd_id = readString(data, &pos) orelse return null;
     const exit_code = readI32(data, &pos) orelse return null;
     return .{ .cmd_id = cmd_id, .exit_code = exit_code };
+}
+
+pub fn parseDownloadResult(data: []const u8) ?DownloadResultData {
+    var pos: usize = 0;
+    const cmd_id = readString(data, &pos) orelse return null;
+    const file_size = readU32(data, &pos) orelse return null;
+    const sha256_hex = readString(data, &pos) orelse return null;
+    return .{ .cmd_id = cmd_id, .file_size = file_size, .sha256_hex = sha256_hex };
 }
 
 pub fn parseDownloadCmd(data: []const u8) ?DownloadCmdData {
@@ -916,6 +945,28 @@ test "upload_result with error code" {
     const parsed = parseUploadResult(msg[1..]) orelse return error.ParseFailed;
     try std.testing.expectEqualStrings("u3", parsed.cmd_id);
     try std.testing.expectEqual(@as(i32, -1), parsed.exit_code);
+}
+
+test "download_result round-trip" {
+    const allocator = std.testing.allocator;
+    const hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const msg = try buildDownloadResult(allocator, "dr1", 1048576, hash);
+    defer allocator.free(msg);
+    try std.testing.expectEqual(@intFromEnum(MsgType.download_result), msg[0]);
+    const parsed = parseDownloadResult(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("dr1", parsed.cmd_id);
+    try std.testing.expectEqual(@as(u32, 1048576), parsed.file_size);
+    try std.testing.expectEqualStrings(hash, parsed.sha256_hex);
+}
+
+test "download_result empty hash" {
+    const allocator = std.testing.allocator;
+    const msg = try buildDownloadResult(allocator, "dr2", 0, "");
+    defer allocator.free(msg);
+    const parsed = parseDownloadResult(msg[1..]) orelse return error.ParseFailed;
+    try std.testing.expectEqualStrings("dr2", parsed.cmd_id);
+    try std.testing.expectEqual(@as(u32, 0), parsed.file_size);
+    try std.testing.expectEqualStrings("", parsed.sha256_hex);
 }
 
 test "download_cmd round-trip" {

@@ -902,19 +902,66 @@ fn handleDownload(
 
     std.log.info("[ipc-download] requested {s} from {s}", .{ cmd_id, vm });
 
-    // Receive raw file bytes (unframed — guest sends raw bytes after download_cmd)
+    // 先收 download_result 帧（cmd_id + file_size + sha256_hex），确定期望长度与哈希。
     var rbuf: [65536]u8 = undefined;
-    while (true) {
-        const nr = tcp_mod.sockRead(tcp_conn.fd, rbuf[0..].ptr, rbuf.len);
-        if (nr <= 0) break; // EOF or error
+    const result_frame_nr = tcp_conn.recv(&rbuf) catch |err| {
+        std.log.err("[ipc-download] recv download_result: {}", .{err});
+        sendError(conn, "DownloadResultFailed");
+        return;
+    };
+    if (result_frame_nr == 0 or rbuf[0] != @intFromEnum(ptcl.MsgType.download_result)) {
+        std.log.err("[ipc-download] missing download_result frame", .{});
+        sendError(conn, "DownloadResultFailed");
+        return;
+    }
+    const result = ptcl.parseDownloadResult(rbuf[0..result_frame_nr][1..]) orelse {
+        std.log.err("[ipc-download] parseDownloadResult failed", .{});
+        sendError(conn, "DownloadResultFailed");
+        return;
+    };
+    const expected_size: u32 = result.file_size;
+
+    // 增量 SHA256 校验：边收原始字节边转发给 IPC client，读满 file_size 即停。
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var total_bytes: u32 = 0;
+    while (total_bytes < expected_size) {
+        const to_read: usize = @min(rbuf.len, expected_size - total_bytes);
+        const nr = tcp_mod.sockRead(tcp_conn.fd, rbuf[0..].ptr, to_read);
+        if (nr <= 0) {
+            std.log.err("[ipc-download] premature EOF: got {d}/{d} bytes", .{ total_bytes, expected_size });
+            sendError(conn, "TruncatedDownload");
+            return;
+        }
 
         const data = rbuf[0..@intCast(nr)];
+        sha.update(data);
         // Send download_data frame to IPC client
         var fhdr: [5]u8 = undefined;
         fhdr[0] = @intFromEnum(Response.download_data);
         std.mem.writeInt(u32, fhdr[1..5], @intCast(data.len), .big);
-        conn.writeAll(&fhdr) catch break;
-        conn.writeAll(data) catch break;
+        conn.writeAll(&fhdr) catch {
+            sendError(conn, "IpcWriteFailed");
+            return;
+        };
+        conn.writeAll(data) catch {
+            sendError(conn, "IpcWriteFailed");
+            return;
+        };
+        total_bytes += @intCast(nr);
+    }
+
+    // 比对哈希，不匹配报错。
+    var actual_hash: [32]u8 = undefined;
+    sha.final(&actual_hash);
+    var actual_hex_buf: [64]u8 = undefined;
+    for (&actual_hash, 0..) |b, i| {
+        actual_hex_buf[i * 2] = "0123456789abcdef"[b >> 4];
+        actual_hex_buf[i * 2 + 1] = "0123456789abcdef"[b & 0x0F];
+    }
+    if (!std.mem.eql(u8, actual_hex_buf[0..], result.sha256_hex)) {
+        std.log.err("[ipc-download] hash mismatch: expected={s} actual={s}", .{ result.sha256_hex, actual_hex_buf[0..] });
+        sendError(conn, "HashMismatch");
+        return;
     }
 
     // Send RSP_DOWNLOAD_DONE
@@ -924,12 +971,12 @@ fn handleDownload(
         w.items.len = 0;
         w.appendAssumeCapacity(@intFromEnum(Response.download_done));
         writeI32(&w, 0) catch {}; // exit_code
-        writeU32(&w, 0) catch {}; // file_size (not tracked)
-        w.appendAssumeCapacity(0); // empty hash
+        writeU32(&w, expected_size) catch {}; // file_size
+        w.appendAssumeCapacity(0); // empty hash (最小改动：不填 hash 字段)
         conn.writeAll(w.items) catch {};
     }
 
-    std.log.info("[ipc-download] done {s}", .{cmd_id});
+    std.log.info("[ipc-download] done {s} bytes={d}", .{ cmd_id, total_bytes });
 }
 
 
