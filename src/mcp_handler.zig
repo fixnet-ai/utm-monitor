@@ -52,15 +52,36 @@ pub const ExecResult = struct {
     }
 };
 
-/// Execute a command on a guest. Returns accumulated output + exit code.
-/// Caller owns ExecResult.output (free with ExecResult.deinit).
-pub fn execOnGuest(
+/// execOnGuest 的收集器上下文：把流式输出累积到内存。
+const OutputCollector = struct {
+    gpa: std.mem.Allocator,
+    output: std.ArrayList(u8),
+
+    fn init(gpa: std.mem.Allocator) OutputCollector {
+        return .{ .gpa = gpa, .output = std.ArrayList(u8).empty };
+    }
+
+    fn deinit(self: *OutputCollector) void {
+        self.output.deinit(self.gpa);
+    }
+
+    fn onOutput(ctx: *anyopaque, data: []const u8) void {
+        const self: *OutputCollector = @ptrCast(@alignCast(ctx));
+        self.output.appendSlice(self.gpa, data) catch @panic("execOnGuest collector OOM");
+    }
+};
+
+/// 流式执行 Guest 命令：每收到一块 pty_exec_output 立即回调 on_output。
+/// 返回 exit_code；连接在 pty_exec_done 前关闭时返回 -1（已收到的输出仍经回调流出）。
+pub fn execOnGuestStream(
     io: std.Io,
     gpa: std.mem.Allocator,
     state: *host_mod.GuestTable,
     vm: []const u8,
     command: []const u8,
-) !ExecResult {
+    on_output: *const fn (ctx: *anyopaque, data: []const u8) void,
+    ctx: *anyopaque,
+) !i32 {
     // Per-command TCP connection (with ARP recovery)
     var tcp_conn = try host_mod.connectGuest(io, gpa, state, vm);
     defer tcp_conn.deinit();
@@ -84,10 +105,7 @@ pub fn execOnGuest(
 
     std.log.info("[mcp-handler-exec] sent {s} to {s}", .{ cmd_id, vm });
 
-    // Receive loop: accumulate pty_exec_output, return on pty_exec_done
-    var output: std.ArrayList(u8) = .empty;
-    errdefer output.deinit(gpa);
-
+    // Receive loop: stream pty_exec_output via callback, return on pty_exec_done
     var rbuf: [65536]u8 = undefined;
     var exit_code: i32 = 0;
     var got_done = false;
@@ -113,7 +131,7 @@ pub fn execOnGuest(
                 _ = readString(rbuf[0..nr], &mpos); // skip cmd_id
                 const data = readBlob(rbuf[0..nr], &mpos) orelse continue;
                 if (data.len > 0) {
-                    try output.appendSlice(gpa, data);
+                    on_output(ctx, data);
                 }
             },
             .pty_exec_done => {
@@ -128,12 +146,23 @@ pub fn execOnGuest(
         }
     }
 
+    return if (got_done) exit_code else -1;
+}
+
+/// Execute a command on a guest. Returns accumulated output + exit code.
+/// Caller owns ExecResult.output (free with ExecResult.deinit).
+pub fn execOnGuest(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    state: *host_mod.GuestTable,
+    vm: []const u8,
+    command: []const u8,
+) !ExecResult {
+    var collector = OutputCollector.init(gpa);
+    defer collector.deinit();
+    const exit_code = try execOnGuestStream(io, gpa, state, vm, command, OutputCollector.onOutput, &collector);
     return ExecResult{
-        .output = if (got_done) try output.toOwnedSlice(gpa) else blk: {
-            // Connection closed without pty_exec_done — return -1 exit code
-            exit_code = -1;
-            break :blk try output.toOwnedSlice(gpa);
-        },
+        .output = try collector.output.toOwnedSlice(gpa),
         .exit_code = exit_code,
     };
 }

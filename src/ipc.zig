@@ -633,6 +633,28 @@ fn handlePing(
     conn.writeAll(w.items) catch {};
 }
 
+/// ipc exec 流式转发上下文：把 mcp_handler 的流式输出逐块转发为 IPC exec_data 帧。
+const ExecIpcSink = struct {
+    conn: *Connection,
+    broken: bool,
+
+    fn onOutput(ctx: *anyopaque, data: []const u8) void {
+        const self: *ExecIpcSink = @ptrCast(@alignCast(ctx));
+        if (self.broken) return;
+        var hdr: [5]u8 = undefined;
+        hdr[0] = @intFromEnum(Response.exec_data);
+        std.mem.writeInt(u32, hdr[1..5], @intCast(data.len), .big);
+        self.conn.writeAll(&hdr) catch {
+            self.broken = true;
+            return;
+        };
+        self.conn.writeAll(data) catch {
+            self.broken = true;
+            return;
+        };
+    }
+};
+
 fn handleExec(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -653,47 +675,22 @@ fn handleExec(
     const host_mod = @import("host.zig");
     const state = @as(*host_mod.GuestTable, @ptrCast(@alignCast(state_ptr)));
 
-    // Delegate all TCP + protocol logic to mcp_handler
-    var result = mcp_handler.execOnGuest(io, gpa, state, vm, command) catch |err| {
+    // 流式转发：每收到一块 pty_exec_output 立即作为 exec_data IPC 帧发给 CLI，
+    // CLI 终端实时看到输出，无需等待命令结束。
+    var sink = ExecIpcSink{ .conn = &conn, .broken = false };
+    const exit_code = mcp_handler.execOnGuestStream(io, gpa, state, vm, command, ExecIpcSink.onOutput, &sink) catch |err| {
         std.log.err("[ipc-exec] exec on {s} failed: {}", .{ vm, err });
         sendError(conn, if (err == error.GuestNotFound) "GuestNotFound: VM not in mesh" else "ExecFailed");
         return;
     };
-    defer result.deinit(gpa);
-
-    // Encode output as single exec_data IPC frame (dynamic buf, output may be large)
-    const blob_header: usize = 5; // type(1) + len(4)
-    const output_len: u32 = @intCast(result.output.len);
-    var response = std.ArrayList(u8).initCapacity(gpa, blob_header + result.output.len + 5) catch {
-        sendError(conn, "AllocFailed");
-        return;
-    };
-    defer response.deinit(gpa);
-
-    // exec_data: [type][4B BE len][data]
-    response.appendAssumeCapacity(@intFromEnum(Response.exec_data));
-    var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &len_buf, output_len, .big);
-    response.appendSlice(gpa, &len_buf) catch {
-        sendError(conn, "AllocFailed");
-        return;
-    };
-    response.appendSlice(gpa, result.output) catch {
-        sendError(conn, "AllocFailed");
-        return;
-    };
+    if (sink.broken) return; // CLI 已断开，不再发送后续帧
 
     // exec_done: [type][4B BE exit_code]
-    response.appendAssumeCapacity(@intFromEnum(Response.exec_done));
-    var int_buf: [4]u8 = undefined;
-    std.mem.writeInt(i32, &int_buf, result.exit_code, .big);
-    response.appendSlice(gpa, &int_buf) catch {
-        sendError(conn, "AllocFailed");
-        return;
-    };
-
-    conn.writeAll(response.items) catch {};
-    std.log.info("[ipc-exec] done {s} exit={d}", .{ vm, result.exit_code });
+    var buf: [5]u8 = undefined;
+    buf[0] = @intFromEnum(Response.exec_done);
+    std.mem.writeInt(i32, buf[1..5], exit_code, .big);
+    conn.writeAll(&buf) catch {};
+    std.log.info("[ipc-exec] done {s} exit={d}", .{ vm, exit_code });
 }
 
 fn handleVersion(conn: Connection) void {
@@ -1074,6 +1071,8 @@ fn clientReadAll(conn: Connection, gpa: std.mem.Allocator, buf: *std.ArrayList(u
 /// Execute a command on a Guest via the Host daemon.
 /// Streams output to `stdout_writer` and returns the exit code.
 pub fn ipcExec(io: std.Io, gpa: std.mem.Allocator, vm: []const u8, cmd: []const u8, stdout_writer: *std.Io.Writer) !i32 {
+    _ = gpa; // 流式解析响应帧，不再缓冲整个响应
+
     const conn = try clientConnect(io);
     defer conn.close();
 
@@ -1092,35 +1091,54 @@ pub fn ipcExec(io: std.Io, gpa: std.mem.Allocator, vm: []const u8, cmd: []const 
         _ = std.posix.system.shutdown(conn.fd, std.posix.SHUT.WR);
     }
 
-    // Read response frames
-    var resp: std.ArrayList(u8) = .empty;
-    defer resp.deinit(gpa);
-    try clientReadAll(conn, gpa, &resp);
-
-    var pos: usize = 0;
-    while (pos < resp.items.len) {
-        const type_byte = readByte(resp.items, &pos) orelse break;
-        const rtype: Response = @enumFromInt(type_byte);
+    // 流式解析响应帧：exec_data 边读边写 stdout（实时显示），exec_done 返回退出码。
+    var type_buf: [1]u8 = undefined;
+    var len_buf: [4]u8 = undefined;
+    var rbuf: [65536]u8 = undefined;
+    while (true) {
+        const tn = conn.readFull(&type_buf) catch return error.IpcProtocolError;
+        if (tn == 0) return error.IpcProtocolError;
+        const rtype: Response = @enumFromInt(type_buf[0]);
 
         switch (rtype) {
             .exec_data => {
-                const data = readBlob(resp.items, &pos) orelse break;
-                _ = stdout_writer.write(data) catch {};
-                try stdout_writer.flush();
+                const ln = conn.readFull(&len_buf) catch return error.IpcProtocolError;
+                if (ln != 4) return error.IpcProtocolError;
+                const data_len = std.mem.readInt(u32, &len_buf, .big);
+                var remaining = data_len;
+                while (remaining > 0) {
+                    const to_read: usize = @min(rbuf.len, remaining);
+                    const n = conn.readFull(rbuf[0..to_read]) catch return error.IpcProtocolError;
+                    if (n == 0) return error.IpcProtocolError;
+                    _ = stdout_writer.write(rbuf[0..n]) catch {};
+                    try stdout_writer.flush();
+                    remaining -= n;
+                }
             },
             .exec_done => {
-                const ec = readI32(resp.items, &pos) orelse break;
-                return ec;
+                const ln = conn.readFull(&len_buf) catch return error.IpcProtocolError;
+                if (ln != 4) return error.IpcProtocolError;
+                return std.mem.readInt(i32, &len_buf, .big);
             },
             .err => {
-                const msg = readString(resp.items, &pos) orelse "UnknownError";
-                std.log.err("[ipc] exec error: {s}", .{msg});
+                // sendError 格式为 null-term 字符串，逐字节读到终止符。
+                var msg_buf: [256]u8 = undefined;
+                var mlen: usize = 0;
+                while (true) {
+                    const n = conn.readFull(type_buf[0..1]) catch return error.IpcProtocolError;
+                    if (n == 0) return error.IpcProtocolError;
+                    if (type_buf[0] == 0) break;
+                    if (mlen < msg_buf.len) {
+                        msg_buf[mlen] = type_buf[0];
+                        mlen += 1;
+                    }
+                }
+                std.log.err("[ipc] exec error: {s}", .{msg_buf[0..mlen]});
                 return error.IpcError;
             },
             else => return error.IpcProtocolError,
         }
     }
-    return error.IpcProtocolError;
 }
 
 /// Get guest status list as a raw JSON string (caller owns memory).
@@ -1519,6 +1537,35 @@ test "ipc Connection.writeAll does not lose data on non-blocking socket" {
     const n = tcp_mod.sockRead(nbp.b, buf[0..].ptr, buf.len);
     try std.testing.expect(test_data.len <= n);
     try std.testing.expectEqualStrings(test_data, buf[0..test_data.len]);
+}
+
+test "ExecIpcSink.onOutput encodes exec_data IPC frames" {
+    if (builtin.os.tag == .windows) return; // Windows IPC 用命名管道，非 socket
+
+    const tcp_mod = @import("tcp.zig");
+    const nbp = try tcp_mod.makeNonBlockingPair();
+    defer {
+        tcp_mod.sockClose(nbp.a);
+        tcp_mod.sockClose(nbp.b);
+    }
+
+    // 流式回调两次，每次一块数据 → 两个 exec_data 帧
+    var conn = Connection{ .fd = nbp.a };
+    var sink = ExecIpcSink{ .conn = &conn, .broken = false };
+    ExecIpcSink.onOutput(&sink, "hello");
+    ExecIpcSink.onOutput(&sink, "world");
+    try std.testing.expect(!sink.broken);
+
+    // 读回并验证帧格式：type(0x11) + 4B BE len + data，两块各一帧
+    const expected = "\x11\x00\x00\x00\x05hello\x11\x00\x00\x00\x05world";
+    var got: [expected.len]u8 = undefined;
+    var off: usize = 0;
+    while (off < got.len) {
+        const n = tcp_mod.sockRead(nbp.b, got[off..].ptr, got.len - off);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    try std.testing.expectEqualStrings(expected, got[0..off]);
 }
 
 test "ipc Connection.readFull byte-by-byte on non-blocking socket" {

@@ -187,6 +187,7 @@ pub fn build(b: *std.Build) void {
         "guest.zig",
         "shm.zig",
         "utmmd.zig",
+        "ipc.zig",
     };
     for (standalone_test_modules) |mod_src| {
         const mod = b.createModule(.{
