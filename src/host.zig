@@ -310,11 +310,12 @@ fn freeDeployConfig(gpa: std.mem.Allocator, config: []const VmDeployConfig) void
     gpa.free(config);
 }
 
-/// Hard-coded VM deploy table. Override with utmm-deploy.json if present.
+/// Hard-coded VM deploy table (IPs synced with live mesh 2026-08-18).
+/// Override with <canonical-dir>/deploy.json if present.
 const VM_DEPLOY_TABLE: []const VmDeployConfig = &[_]VmDeployConfig{
-    .{ .hostname = "linuxvm", .target = "aarch64-linux-musl", .ip = "192.168.64.2", .user = "root", .password = "111", .remote_dir = "/opt/utmm" },
-    .{ .hostname = "macvm", .target = "aarch64-macos", .ip = "192.168.64.4", .user = "root", .password = "111", .remote_dir = "/opt/utmm" },
-    .{ .hostname = "windowsvm", .target = "aarch64-windows", .ip = "192.168.65.2", .user = "Administrator", .password = "111", .remote_dir = "C:\\opt\\utmm" },
+    .{ .hostname = "linuxvm", .target = "aarch64-linux-musl", .ip = "192.168.64.6", .user = "root", .password = "111", .remote_dir = "/opt/utmm" },
+    .{ .hostname = "macvm", .target = "aarch64-macos", .ip = "192.168.65.4", .user = "root", .password = "111", .remote_dir = "/opt/utmm" },
+    .{ .hostname = "windowsvm", .target = "aarch64-windows", .ip = "192.168.64.3", .user = "Administrator", .password = "111", .remote_dir = "C:\\opt\\utmm" },
     .{ .hostname = "winx64", .target = "x86_64-windows", .ip = "192.168.3.108", .user = "Administrator", .password = "111", .remote_dir = "C:\\opt\\utmm" },
 };
 

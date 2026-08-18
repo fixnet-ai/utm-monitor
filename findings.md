@@ -365,3 +365,15 @@ Zig 0.16.0 的 `Threaded` Io 在 Windows 上不支持目录迭代：
 - `Debug`: 正常工作（utmmd 仅 ~429KB，性能影响可忽略）
 
 这是 Zig 0.16.0 交叉编译器的 bug，仅影响 aarch64-windows target。
+
+### 2026-08-18 — VM_DEPLOY_TABLE 硬编码 IP 过期（--deploy SSH 3/4 失败根因）
+
+**症状**: `utmm --deploy` 对 macvm/linuxvm/windowsvm SSH 超时，仅 winx64 成功。
+
+**根因**: host.zig `VM_DEPLOY_TABLE` 兜底表（无 deploy.json 时生效）的 IP 是
+旧拓扑：linuxvm .2（实 .6）、macvm .64.4（实 .65.4）、windowsvm .65.2（实 .64.3）。
+SSH 本身正常——IP 修正后 4/4 部署成功。
+
+**教训**: VM 的 DHCP 地址会变；硬编码兜底表要么定期与 mesh 实况核对，
+要么优先用 deploy.json 覆盖。mesh 推送通道（--upgrade）不依赖这些 IP，
+是 IP 漂移时更可靠的升级路径。

@@ -23,6 +23,16 @@
 | 38E | 邻居生命周期 info 日志（node up/down，每转换一条） | ✅ 部署后恰好 4 条 node up，稳态零重复 |
 | 38F | sweep 只 ping 直连邻居（消灭死胡同中继 ping 流量） | ✅ 中继 sweep ping 从未可测 RTT，属死代码流量，已移除 |
 
+### 发布与全量部署（2026-08-18 22:30）
+
+- release.sh v0.18.73：8 目标交叉编译 + 测试全过 + tag/push/publish，
+  https://github.com/fixnet-ai/utm-monitor/releases/tag/v0.18.73（utmm.zip 已挂）
+- 部署路径：serve-dir 拷贝 8 个版本化二进制 → mesh `--upgrade` 推送 4 台全部 OK
+- `--deploy` SSH 通道首次 3/4 失败 → 根因：**VM_DEPLOY_TABLE 硬编码 IP 过期**
+  （linuxvm .2→.6、macvm .64.4→.65.4、windowsvm .65.2→.64.3；winx64 未变）
+  修正后 `--deploy` 4/4 成功；顺带修正注释与代码不符（utmm-deploy.json → deploy.json）
+- 终态：5 节点（Host + 4 Guest）全部 v0.18.73 serving，`--deploy`/`--upgrade` 双通道可用
+
 ### 验证记录（2026-08-18 22:10）
 
 - `--ping` 四台 guest RTT 全部恢复个位数毫秒（归属过滤生效，过路 pong 被丢弃）
