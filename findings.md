@@ -60,6 +60,26 @@
 
 ## 最近发现
 
+### 2026-08-18 — 过路 pong RTT 错误归因（协议设计缺陷）+ 热路径日志刷 stderr
+
+**症状**: daemon stderr 日志出现 `rtt=2997503534ms`（≈34.7 天）垃圾值；
+`/private/var/log/utmmd-err.log` 以 ≈33MB/天 增长（曾堆 625MB）。
+
+**根因（RTT）**: pong 帧 `[responder_mac:6][timestamp:4]` **无目标字段**。
+中继 ping（guest A → Host → guest C）的 pong 按 `from`（= Host）直接回复，
+Host 的 `handlePong` 无法区分「自己 ping 的应答」和「过路包」，把后者回显的
+**A 的开机时钟**（`nowMs()` = awake-ms 截断 u32，各机不同）当自己的时间戳，
+`nowMs() -% send_ts` = 两机开机时长差（15~20 天）→ 垃圾 RTT。
+同时污染 `last_pong_*`，竞态下 `pingAndWait`（MCP ping 工具）返回垃圾值。
+`-%` 回绕减法本身正确——错的是**来源归因**，不是算术。
+
+**教训**: 无连接协议里「echo 回来的时间戳」只有在**能证明是自己发的**时才可信；
+帧里没有目标字段时，接收方必须维护 outstanding 时间戳集合做归属校验。
+
+**根因（日志）**: periodicTasks 每 ~60 tick 对全部节点 sendPing，每条
+ping/pong/中继都打 info 级 → ReleaseSafe std.log 默认 .info 全量输出到
+stderr → launchd StandardErrorPath 无轮转无限增长。热路径探测日志应为 debug 级。
+
 ### 2026-08-17 — MCP exec 输出丢失根因（Bug 1 + Bug 2）
 
 **症状**: 经常发生 MCP 响应 `content[0].text` 中 stdout 为空、exit_code=-1。

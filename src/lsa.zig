@@ -322,6 +322,12 @@ pub const Mesh = struct {
     last_pong_time: u64 = 0, // real monotonic ms from nowMs() when received
     last_pong_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
+    // Outstanding ping timestamps (guarded by last_pong_mutex). Pong frames
+    // carry no destination field — a relayed guest↔guest ping's pong comes
+    // back to us (the relay) carrying the ORIGINATOR's clock. Only pongs
+    // echoing a timestamp we actually sent are replies to our own pings.
+    outstanding_pings: OutstandingPings = .{},
+
     /// Create a new Mesh instance. Takes ownership of node_info (will free on deinit).
     /// socket should be a UDP socket already bound to :2121 with broadcast enabled.
     /// broadcast_addrs should contain subnet-directed broadcast + 255.255.255.255.
@@ -721,7 +727,7 @@ pub const Mesh = struct {
                 const diff: i32 = @bitCast(decoded.seq -% existing.seq);
                 if (diff <= 0) {
                     if (nonceChanged(decoded.node_info, existing.node_info)) {
-                        std.log.info("[lsa] LSA restart detected: nonce changed, accepting lower seq", .{});
+                        std.log.debug("[lsa] LSA restart detected: nonce changed, accepting lower seq", .{});
                         existing.deinit(self.allocator);
                         lsa_restart = true;
                     } else {
@@ -733,7 +739,7 @@ pub const Mesh = struct {
                     // Keep the current (lower-seq, newer-process) entry —
                     // replacing it would let the next genuine LSA trigger a
                     // spurious second restart.
-                    std.log.info("[lsa] Ignoring stale high-seq LSA from {any} (nonce differs)", .{decoded.origin});
+                    std.log.debug("[lsa] Ignoring stale high-seq LSA from {any} (nonce differs)", .{decoded.origin});
                     return;
                 } else {
                     existing.deinit(self.allocator);
@@ -815,6 +821,43 @@ pub const Mesh = struct {
     //              [src_mac:6][dst_mac:6][ttl:1][timestamp:4] (17 bytes, relayed)
     // Pong format: [src_mac:6][timestamp:4] — always 10 bytes (direct reply to sender)
 
+    /// Outstanding ping timestamps — sendPing records, handlePong validates.
+    ///
+    /// Pong frames have no destination field. When we relay a guest↔guest
+    /// ping, the target's pong comes back to US (the relay) carrying the
+    /// originator's clock; without ownership validation it would be mistaken
+    /// for a reply to our own ping and produce clock-skew garbage RTT
+    /// (observed 2997503534ms ≈ inter-machine uptime difference).
+    /// Wrap-safe: the age check uses wrapping subtraction, so u32 ms clock
+    /// rollover (~49.7 days) neither falsely expires nor falsely accepts.
+    const OutstandingPings = struct {
+        const CAP: usize = 64;
+        const MAX_AGE_MS: u32 = 15_000; // pingAndWait gives up after 10s
+
+        ts: [CAP]u32 = [_]u32{0} ** CAP,
+        at: [CAP]u32 = [_]u32{0} ** CAP, // nowMs() when recorded
+        valid: [CAP]bool = [_]bool{false} ** CAP,
+        head: usize = 0,
+
+        /// Record a ping timestamp as outstanding. Overwrites the oldest entry.
+        fn record(self: *OutstandingPings, ping_ts: u32, now_ms: u32) void {
+            self.ts[self.head] = ping_ts;
+            self.at[self.head] = now_ms;
+            self.valid[self.head] = true;
+            self.head = (self.head + 1) % CAP;
+        }
+
+        /// True if ping_ts was sent by us and is still within MAX_AGE_MS.
+        fn owns(self: *const OutstandingPings, ping_ts: u32, now_ms: u32) bool {
+            for (self.ts, self.at, self.valid) |t, a, v| {
+                if (!v) continue;
+                if (t != ping_ts) continue;
+                if (now_ms -% a <= MAX_AGE_MS) return true;
+            }
+            return false;
+        }
+    };
+
     fn handlePing(self: *Mesh, data: []const u8, from: net.IpAddress) void {
         if (data.len < 10) return;
 
@@ -830,7 +873,7 @@ pub const Mesh = struct {
             if (std.mem.eql(u8, &dst_mac, &self.node_id)) {
                 // Yes — respond with pong (direct reply to relay source)
                 var src_buf: [18]u8 = undefined;
-                std.log.info("[lsa] relayed ping reached target from {s}", .{formatNodeIdBuf(src_mac, &src_buf)});
+                std.log.debug("[lsa] relayed ping reached target from {s}", .{formatNodeIdBuf(src_mac, &src_buf)});
                 var pong: [11]u8 = undefined;
                 pong[0] = protocol.MESH_TYPE_PONG;
                 @memcpy(pong[1..7], &self.node_id);
@@ -856,7 +899,7 @@ pub const Mesh = struct {
                         var src_buf: [18]u8 = undefined;
                         var dst_buf: [18]u8 = undefined;
                         var hop_buf: [18]u8 = undefined;
-                        std.log.info("[lsa] ping relay fwd: {s} → {s} via {s} ttl={d}", .{
+                        std.log.debug("[lsa] ping relay fwd: {s} → {s} via {s} ttl={d}", .{
                             formatNodeIdBuf(src_mac, &src_buf),
                             formatNodeIdBuf(dst_mac, &dst_buf),
                             formatNodeIdBuf(next_hop, &hop_buf),
@@ -883,16 +926,36 @@ pub const Mesh = struct {
         var src_mac: NodeId = undefined;
         @memcpy(&src_mac, data[0..6]);
         const send_ts = std.mem.readInt(u32, data[6..10], .big);
-        const rtt = self.nowMs() -% send_ts;
-        var mac_buf: [18]u8 = undefined;
-        std.log.info("[lsa] pong from {s} rtt={d}ms", .{ formatNodeIdBuf(src_mac, &mac_buf), rtt });
+        const now = self.nowMs();
 
-        // Store for --ping command (lock-free read: worst case is stale data)
         self.last_pong_mutex.lock(self.io) catch return;
         defer self.last_pong_mutex.unlock(self.io);
+
+        // Ownership check: only accept pongs echoing a timestamp we sent.
+        // Relayed guest↔guest pings produce transit pongs addressed to us
+        // (the relay) carrying the originator's clock — accept those and RTT
+        // becomes inter-machine clock skew (garbage values up to ~days),
+        // polluting last_pong_* used by pingAndWait / the MCP ping tool.
+        if (!self.outstanding_pings.owns(send_ts, now)) return;
+
+        const rtt = now -% send_ts;
+        var mac_buf: [18]u8 = undefined;
+        std.log.debug("[lsa] pong from {s} rtt={d}ms", .{ formatNodeIdBuf(src_mac, &mac_buf), rtt });
+
+        // Store for --ping command (lock-free read: worst case is stale data)
         self.last_pong_src = src_mac;
         self.last_pong_rtt = rtt;
-        self.last_pong_time = self.nowMs();
+        self.last_pong_time = now;
+    }
+
+    /// Record an outgoing ping timestamp so handlePong can attribute pongs
+    /// to our own pings. Called AFTER releasing neighbors_mutex — no nested
+    /// neighbors→last_pong locking.
+    fn recordOutstandingPing(self: *Mesh, ts: u32) void {
+        const now = self.nowMs();
+        self.last_pong_mutex.lock(self.io) catch return;
+        defer self.last_pong_mutex.unlock(self.io);
+        self.outstanding_pings.record(ts, now);
     }
 
     /// Send a ping and wait for the pong from the specific target.
@@ -929,46 +992,58 @@ pub const Mesh = struct {
     pub fn sendPing(self: *Mesh, dest_id: NodeId) void {
         const next_hop = self.routeTo(dest_id) orelse {
             var mac_buf: [18]u8 = undefined;
-            std.log.info("[lsa] ping: no route to {s}", .{formatNodeIdBuf(dest_id, &mac_buf)});
+            std.log.debug("[lsa] ping: no route to {s}", .{formatNodeIdBuf(dest_id, &mac_buf)});
             return;
         };
 
         // Direct ping if next hop IS the destination itself
         if (std.mem.eql(u8, &next_hop, &dest_id)) {
-            self.neighbors_mutex.lock(self.io) catch return;
-            defer self.neighbors_mutex.unlock(self.io);
-            if (self.neighbors.get(dest_id)) |neighbor| {
-                var ping: [11]u8 = undefined;
-                ping[0] = protocol.MESH_TYPE_PING;
-                @memcpy(ping[1..7], &self.node_id);
-                std.mem.writeInt(u32, ping[7..11], self.nowMs(), .big);
-                self.socket.send(self.io, &neighbor.addr, &ping) catch {};
-                var dst_buf: [18]u8 = undefined;
-                std.log.info("[lsa] ping direct: → {s} addr={any}", .{ formatNodeIdBuf(dest_id, &dst_buf), neighbor.addr });
+            var sent_ts: ?u32 = null;
+            {
+                self.neighbors_mutex.lock(self.io) catch return;
+                defer self.neighbors_mutex.unlock(self.io);
+                if (self.neighbors.get(dest_id)) |neighbor| {
+                    var ping: [11]u8 = undefined;
+                    ping[0] = protocol.MESH_TYPE_PING;
+                    @memcpy(ping[1..7], &self.node_id);
+                    const ts = self.nowMs();
+                    std.mem.writeInt(u32, ping[7..11], ts, .big);
+                    self.socket.send(self.io, &neighbor.addr, &ping) catch {};
+                    sent_ts = ts;
+                    var dst_buf: [18]u8 = undefined;
+                    std.log.debug("[lsa] ping direct: → {s} addr={any}", .{ formatNodeIdBuf(dest_id, &dst_buf), neighbor.addr });
+                }
             }
+            if (sent_ts) |ts| self.recordOutstandingPing(ts);
             return;
         }
 
         // Relayed ping — send via next_hop with dst_mac + ttl
-        self.neighbors_mutex.lock(self.io) catch return;
-        defer self.neighbors_mutex.unlock(self.io);
-        if (self.neighbors.get(next_hop)) |nb| {
-            var ping: [18]u8 = undefined;
-            ping[0] = protocol.MESH_TYPE_PING;
-            @memcpy(ping[1..7], &self.node_id);     // src_mac
-            @memcpy(ping[7..13], &dest_id);          // dst_mac
-            ping[13] = protocol.MESH_MAX_TTL;        // ttl
-            std.mem.writeInt(u32, ping[14..18], self.nowMs(), .big); // timestamp
-            self.socket.send(self.io, &nb.addr, &ping) catch {};
-            var src_buf: [18]u8 = undefined;
-            var dst_buf: [18]u8 = undefined;
-            var hop_buf: [18]u8 = undefined;
-            std.log.info("[lsa] ping relay: {s} → {s} via {s}", .{
-                formatNodeIdBuf(self.node_id, &src_buf),
-                formatNodeIdBuf(dest_id, &dst_buf),
-                formatNodeIdBuf(next_hop, &hop_buf),
-            });
+        var sent_ts: ?u32 = null;
+        {
+            self.neighbors_mutex.lock(self.io) catch return;
+            defer self.neighbors_mutex.unlock(self.io);
+            if (self.neighbors.get(next_hop)) |nb| {
+                var ping: [18]u8 = undefined;
+                ping[0] = protocol.MESH_TYPE_PING;
+                @memcpy(ping[1..7], &self.node_id);     // src_mac
+                @memcpy(ping[7..13], &dest_id);          // dst_mac
+                ping[13] = protocol.MESH_MAX_TTL;        // ttl
+                const ts = self.nowMs();
+                std.mem.writeInt(u32, ping[14..18], ts, .big); // timestamp
+                self.socket.send(self.io, &nb.addr, &ping) catch {};
+                sent_ts = ts;
+                var src_buf: [18]u8 = undefined;
+                var dst_buf: [18]u8 = undefined;
+                var hop_buf: [18]u8 = undefined;
+                std.log.debug("[lsa] ping relay: {s} → {s} via {s}", .{
+                    formatNodeIdBuf(self.node_id, &src_buf),
+                    formatNodeIdBuf(dest_id, &dst_buf),
+                    formatNodeIdBuf(next_hop, &hop_buf),
+                });
+            }
         }
+        if (sent_ts) |ts| self.recordOutstandingPing(ts);
     }
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -1680,4 +1755,42 @@ test "updateHosts range replacement - no empty line accumulation" {
     try std.testing.expect(!std.mem.endsWith(u8, content, "\n\n"));
 
     allocator.free(content);
+}
+
+test "OutstandingPings ownership lifecycle" {
+    var p: Mesh.OutstandingPings = .{};
+
+    // Empty ring owns nothing — the valid=false sentinel must reject ts=0
+    // even while now_ms is still small (boot window).
+    try std.testing.expect(!p.owns(0, 100));
+
+    // Recorded ts is owned; foreign ts is not
+    p.record(1000, 2000);
+    try std.testing.expect(p.owns(1000, 2100));
+    try std.testing.expect(!p.owns(1001, 2100));
+
+    // Ages out after MAX_AGE_MS, still owned at/below the boundary
+    try std.testing.expect(p.owns(1000, 2000 + Mesh.OutstandingPings.MAX_AGE_MS - 1));
+    try std.testing.expect(p.owns(1000, 2000 + Mesh.OutstandingPings.MAX_AGE_MS));
+    try std.testing.expect(!p.owns(1000, 2000 + Mesh.OutstandingPings.MAX_AGE_MS + 1));
+}
+
+test "OutstandingPings u32 wraparound" {
+    var w: Mesh.OutstandingPings = .{};
+    // Recorded 7296ms before u32 rollover; checked 7000ms after rollover.
+    // True age = 14296ms (wrap-safe) → owned.
+    w.record(4_294_960_000, 4_294_960_000);
+    try std.testing.expect(w.owns(4_294_960_000, 7_000));
+    // 8000ms after rollover → true age 15296ms → expired
+    try std.testing.expect(!w.owns(4_294_960_000, 8_000));
+}
+
+test "OutstandingPings ring eviction" {
+    var r: Mesh.OutstandingPings = .{};
+    r.record(111, 1);
+    // Fill the ring past CAP → the oldest entry is evicted
+    var i: u32 = 0;
+    while (i < Mesh.OutstandingPings.CAP) : (i += 1) r.record(1000 + i, 10);
+    try std.testing.expect(!r.owns(111, 20));
+    try std.testing.expect(r.owns(1005, 20));
 }

@@ -1,3 +1,33 @@
+## Phase 38 — ping/pong 热路径日志 + 过路 pong RTT 错误归因（2026-08-18）
+
+### 起因
+
+用户排查本机磁盘持续写入，发现 utmmd stderr 日志堆到 625MB（截断后仍以
+≈33MB/天复发），且日志含 `rtt=2997503534ms` 垃圾值。定位为 utm-monitor
+两个 bug，同文件（lsa.zig）一并修复。
+
+### 排查证据
+
+- 12 分钟新鲜日志 3054 行：pong from 1481 + ping direct 1052 + ping relay fwd 521（100% 来源）
+- 垃圾 RTT 呈两簇固定值（2997503534±53 / 2595929310±13）= 两台 guest 的开机时长差
+- pong 帧格式 `[responder:6][ts:4]` 无目标字段 + handlePing 按 `from`（中继点）回 pong → 过路 pong 被 Host 误认
+
+### 实施清单
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 38A | lsa.zig 8 处热路径 info → debug | ✅ |
+| 38B | OutstandingPings 环 + handlePong 归属校验 + sendPing 记录 | ✅ |
+| 38T | OutstandingPings 单测 + zig build test + test-integration | ✅ 单测 221/0 失败（含 3 新测试）、集成 60/0、无泄漏 |
+| 38D | 版本 0.18.73 + 本机部署 + 日志增长归零观察 | ✅ Host 已上 0.18.73；ping RTT 1/1/1/4ms；75 秒日志 0 字节 |
+
+### 验证记录（2026-08-18 22:10）
+
+- `--ping` 四台 guest RTT 全部恢复个位数毫秒（归属过滤生效，过路 pong 被丢弃）
+- 部署后 75 秒（覆盖一个完整探测周期）utmmd-err.log 增长 0 字节（修复前 ≈390 B/s）
+- MCP HTTP 端点正常，serverInfo 上报 0.18.73
+- Guest VM 仍为 0.18.72（过路 pong 被 Host 侧过滤，无需强制同步升级）
+
 ## Phase 36 会话 1 — 设计修正与实施（2026-08-17）
 
 ### 用户设计修正（重要）

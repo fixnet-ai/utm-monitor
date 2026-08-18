@@ -1,13 +1,50 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.72 | **分支**: `main` | **更新**: 2026-08-17
+**版本**: v0.18.73 | **分支**: `main` | **更新**: 2026-08-18
 
 ## 当前状态
 
 - **源文件**: 22 src + 13 test + 2 embed + 2 Python test scripts
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
-- **真机部署**: 5 节点全部 v0.18.72 serving（Phase 36 + 37 修复全量部署）
-- **Phase 36/37 完成**: exec 输出可靠性 + CLI 流式 + download 校验 + 升级循环根因修复
+- **真机部署**: Host v0.18.73（Phase 38）；4 台 Guest 仍 v0.18.72（38 修复 Host 侧生效，无需强制同步）
+- **Phase 38 完成**: ping/pong 热路径日志 + 过路 pong RTT 错误归因修复（v0.18.73）
+
+## 已完成: Phase 38 — ping/pong 热路径日志 + 过路 pong RTT 错误归因（2026-08-18）
+
+**状态**: ✅ 完成（本机 Host 已部署 v0.18.73 并验证）
+
+**症状**:
+1. Host `/private/var/log/utmmd-err.log` 持续增长（曾堆至 625MB，≈33MB/天），
+   12 分钟实测 3054 行全部来自 `[lsa] ping/pong` 三类 info 日志
+   （pong from 1481 + ping direct 1052 + ping relay fwd 521）
+2. 日志出现 `rtt=2997503534ms`（≈34.7 天）垃圾值，同批还夹杂正常 `rtt=1~3ms`
+
+**根因**:
+1. 周期探测（periodicTasks 每 ~60 tick 对全部节点 sendPing）+ 每条 ping/pong/中继
+   都打 info 级日志 → std.log ReleaseSafe 默认 .info → 全量写 daemon stderr →
+   launchd StandardErrorPath。违反日志规范「禁止热路径打印」
+2. pong 帧 `[responder_mac:6][timestamp:4]` **无目标字段**：guest A 经 Host 中继
+   ping guest C 时，C 的 pong 直接回中继点（`handlePing` 用 `from` 回包）→
+   Host `handlePong` 把过路 pong 当自己 ping 的应答，拿 C 回显的 **A 的时钟**
+   （guest awake-ms 截断 u32）与 Host 自己的时钟相减 → 开机时长差 15~20 天
+   = 垃圾 RTT。且污染 `last_pong_src/rtt/time` → `pingAndWait` 竞态下
+   MCP ping 工具会把垃圾 RTT 返回给 AI agent
+
+**修复方案**:
+
+| # | 修复 | 位置 |
+|---|------|------|
+| 38A | 8 处热路径 info → debug（ping direct/relay/relay fwd/reached target/no route、pong from、LSA restart detected、Ignoring stale high-seq） | lsa.zig:724/736/833/859/888/932/947/966 |
+| 38B | `OutstandingPings` 环（64 槽 ts+at+valid，15s 过期，u32 回绕安全）：sendPing 记录（direct+relayed 两路径，锁外记录避免 neighbors→last_pong 嵌套），handlePong 仅接受命中环的 pong，未命中即过路包丢弃 | lsa.zig Mesh + handlePong + sendPing |
+
+**备选否决**: pong 帧加 dst_mac 字段——改线格式，滚动升级新旧混布期间不兼容；
+且新 Host 收旧格式 pong 仍需时间戳过滤兜底。ts 环零协议变更、全版本兼容，严格更优。
+
+**验证计划**: OutstandingPings 单元测试（记录/命中/过期/回绕/valid 哨兵）+
+`zig build test` + `zig build test-integration` 全绿（部署门禁）+ 本机升级后
+观察 utmmd-err.log 增长归零 + `--ping` RTT 恢复个位数毫秒。
+
+**版本**: v0.18.72 → v0.18.73
 
 ## 已完成: Phase 37 — macOS utmmd 升级循环 + CLI status 缺失（根因修复）
 
