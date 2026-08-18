@@ -20,6 +20,11 @@
 | 40C | build.zig `-Dutmmd` 选项门控两处构建点（单目标 + cross step），默认 true（裸 `zig build` 行为不变） | -Dutmmd=false 实测 embed 字节级不变（ec2ab207 前后一致） |
 | 40D | CLAUDE.md：发布流程写入模式判定规则；**升级通道约定——版本升级一律 `--deploy`**（`--upgrade` 只推 utmm，单独使用致 supervisor 漂移） | Phase 39 教训固化为规范 |
 
+**追加（v0.18.78，同日）**: `extractUtmmd` 字节级比较——磁盘 utmmd 与内嵌字节
+相同即跳过重写（--install 幂等无痕）。验证：v0.18.78 --no-utmmd 发布部署后，
+两台 Windows VM 的 utmmd.exe **mtime 分毫未动**（23:54:55 / 08:54:53 前后一致）
+且哈希 == embed（EC2AB207…）。README/MANUAL 同步升级通道约定与发布模式流程。
+
 **验证**: v0.18.77 以 `--no-utmmd` 发布（守卫放行 `utmmd unchanged since 64f9213`）→
 部署后 winx64 utmmd.exe 哈希 == embed 哈希（ec2ab207…逐字节一致，零漂移），
 全队 5 节点 v0.18.77 serving。utmmd.exe mtime 变化系 `--install` 的 extractUtmmd
