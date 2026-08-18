@@ -9,6 +9,24 @@
 - **真机部署**: Host v0.18.73（Phase 38）；4 台 Guest 仍 v0.18.72（38 修复 Host 侧生效，无需强制同步）
 - **Phase 38 完成**: ping/pong 热路径日志 + 过路 pong RTT 错误归因修复（v0.18.73）
 
+## 已完成: Phase 40 — 发布脚本 utmmd 构建模式 + 升级通道约定（v0.18.77）
+
+**状态**: ✅ 完成（用户裁定：utmmd 没变就不更新，避免复杂更新；AI agent 须能自行判断）
+
+| # | 变更 | 说明 |
+|---|------|------|
+| 40A | release.sh 强制 utmmd 模式参数：`--utmmd`（重建重嵌）/ `--no-utmmd`（复用现有 embed 字节）；缺省打 help（含 AI agent 判定流程） | help 给出决策命令：diff supervisor 源文件 vs `src/embed/UTMMD-BUILT-FROM` |
+| 40B | 双重防护：--no-utmmd 时 embed 缺失→报错（新克隆须 --utmmd）；supervisor 源（utmmd/shm/svc.zig）漂移→报错拒绝发旧 supervisor | 溯源文件在每次 --utmmd 构建成功后写入当前 commit |
+| 40C | build.zig `-Dutmmd` 选项门控两处构建点（单目标 + cross step），默认 true（裸 `zig build` 行为不变） | -Dutmmd=false 实测 embed 字节级不变（ec2ab207 前后一致） |
+| 40D | CLAUDE.md：发布流程写入模式判定规则；**升级通道约定——版本升级一律 `--deploy`**（`--upgrade` 只推 utmm，单独使用致 supervisor 漂移） | Phase 39 教训固化为规范 |
+
+**验证**: v0.18.77 以 `--no-utmmd` 发布（守卫放行 `utmmd unchanged since 64f9213`）→
+部署后 winx64 utmmd.exe 哈希 == embed 哈希（ec2ab207…逐字节一致，零漂移），
+全队 5 节点 v0.18.77 serving。utmmd.exe mtime 变化系 `--install` 的 extractUtmmd
+无条件重写同内容字节——内容零变化，服务重启本就是 utmm 更新所必需，无额外复杂度。
+附带：两台 Windows VM 的 C:\opt\utmm 历史调试残留（utmm-fix*/v0xx/prev 等 exe +
+test/deploy 杂物）按保留清单清理至最小集（utmm/utmmd/ssh*/lock/log）。
+
 ## 已完成: Phase 39 — Windows guest 重启循环根因修复 + utmmd 日志治理（v0.18.75/76）
 
 **状态**: ✅ 完成，5 节点 v0.18.76 全收敛
