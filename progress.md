@@ -1,3 +1,16 @@
+## v0.18.74 — 发布全流程流畅性验证（2026-08-18 22:39-22:42）
+
+用户要求完整走一遍新版本验证流程顺畅度。**总耗时 < 2.5 分钟**（bump→发布→全舰队收敛）：
+
+| 阶段 | 耗时 | 结果 |
+|------|------|------|
+| release.sh（测试 221+60 → 8 目标 → tag/push → publish） | 89s | 一次通过，https://github.com/fixnet-ai/utm-monitor/releases/tag/v0.18.74 |
+| serve-dir 拷贝 + `--deploy` 4 台 | 4s | **4/4 直接成功**（0.18.73 产物内含修正后的 deploy-table IP，SSH 通道无需人工干预） |
+| 收敛验证 `--status` | — | 5 节点全部 v0.18.74 serving |
+
+对比 v0.18.73 发布时的两个卡点（mesh 推送兜底 + deploy-table IP 过期 3/4 失败），
+本次零人工干预。发布流程状态：**顺畅**。
+
 ## Phase 38 — ping/pong 热路径日志 + 过路 pong RTT 错误归因（2026-08-18）
 
 ### 起因
