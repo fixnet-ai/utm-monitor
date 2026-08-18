@@ -575,10 +575,24 @@ git push origin main --tags
 
 ### Step 4: Build, zip & publish
 ```bash
-./release.sh vX.Y.Z "Release notes (markdown)"
+./release.sh vX.Y.Z "Release notes (markdown)" <--utmmd|--no-utmmd>
 ```
-This runs tests, cross-compiles 6 targets, creates `utmm.zip`, and calls
+This runs tests, cross-compiles 8 targets, creates `utmm.zip`, and calls
 `gh release create` to publish the GitHub release — all in one shot.
+
+**utmmd rebuild mode (mandatory, decide per release)**:
+
+- `--utmmd` — rebuild + re-embed the supervisor. REQUIRED when supervisor
+  sources changed since the last `--utmmd` build (`src/utmmd.zig`, `src/shm.zig`,
+  `src/svc.zig` vs the commit in `src/embed/UTMMD-BUILT-FROM`). Deploy then
+  updates utmmd on every node (complex path: service stop→kill→replace→restart).
+- `--no-utmmd` — reuse existing `src/embed/*/utmmd.bin` byte-identical →
+  embedded hash unchanged → `shouldUpdateUtmmd()` returns false on every node →
+  deploy skips the utmmd update entirely. Preferred when only utmm sources
+  changed; the script guards against accidental use after supervisor changes.
+
+Decide with: `git diff --name-only $(cat src/embed/UTMMD-BUILT-FROM) HEAD -- src/utmmd.zig src/shm.zig src/svc.zig`
+(empty → `--no-utmmd`, files → `--utmmd`). Running without a mode prints help.
 
 Cross-compilation targets:
 
@@ -603,9 +617,14 @@ Open the release URL printed by the script and confirm:
 - Tag points to the right commit
 
 ### Post-release
-After release, use `utmm --deploy` to compile and copy new binaries to the
-serve-dir (`/opt/utmm/`). Then use `utmm --upgrade <vm>` to push upgrades
-to individual Guest VMs via the Host-initiated push model.
+Use `utmm --deploy` — it scp's each VM and runs the full installer
+(`--install --hostname <vm>`), which updates **both** utmm and utmmd
+(utmmd only when its embedded hash differs).
+
+**升级通道约定（2026-08-18 裁定）**: 版本升级一律走 `--deploy`。
+`--upgrade <vm>`（mesh 推送）**只更新 utmm、永远不更新 utmmd**——单独使用
+会造成 utmm/utmmd 版本漂移（Windows VM 曾因此 supervisor 落后 6 天未察觉，
+见 findings 2026-08-18）。`--upgrade` 仅适用于紧急单机 utmm 热修。
 
 ## Project File Structure (22 src files + 13 test files + 2 test scripts)
 

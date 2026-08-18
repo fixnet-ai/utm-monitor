@@ -49,3 +49,6 @@ utmm.lock
 # Pre-built binaries (ssh.exe) in embed are TRACKED
 src/embed/*/utmmd.bin
 src/embed/*/utmmd.sha256
+
+# utmmd rebuild provenance (written by release.sh --utmmd, local build state)
+src/embed/UTMMD-BUILT-FROM

@@ -59,57 +59,69 @@ pub fn build(b: *std.Build) void {
     });
     const zio_mod = zio_dep.module("zio");
 
-    // ── Step 1: Build utmmd (supervisor daemon) ──
+    // ── utmmd rebuild gate ──
+    // release.sh 显式决定：supervisor（utmmd）没变 → -Dutmmd=false 复用现有
+    // src/embed/<target>/utmmd.bin（字节不变 → 内嵌哈希不变 → deploy 的哈希
+    // 检查完全跳过 utmmd 更新，避免全队 service stop/replace/restart 复杂路径）。
+    // supervisor 源码有变 → -Dutmmd=true 重建并重嵌。默认 true（开发直跑
+    // `zig build` 行为不变）。
+    const rebuild_utmmd = b.option(bool, "utmmd", "Rebuild + re-embed the utmmd supervisor (default: true)") orelse true;
+
+    // ── Step 1: Build utmmd (supervisor daemon) — 仅在 rebuild_utmmd 时 ──
     // ReleaseSafe on aarch64-windows produces incorrect code (crash 1067).
     // ReleaseSmall also crashed (c0000005 ACCESS VIOLATION in ucrtbase.dll).
     // Using Debug for Windows avoids cross-compiled optimizer bugs. utmmd is
     // a minimal supervisor (~429KB), so Debug size is not a concern.
-    const utmmd_optimize: std.builtin.OptimizeMode = if (target.result.os.tag == .windows)
-        .Debug
-    else
-        optimize;
-    const utmmd = b.addExecutable(.{
-        .name = "utmmd",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/utmmd.zig"),
-            .target = target,
-            .optimize = utmmd_optimize,
-            .link_libc = true,
-        }),
-    });
-    if (target.result.os.tag == .windows) {
-        utmmd.root_module.linkSystemLibrary("ws2_32", .{});
+    var hash_utmmd_step: ?*std.Build.Step = null;
+    if (rebuild_utmmd) {
+        const utmmd_optimize: std.builtin.OptimizeMode = if (target.result.os.tag == .windows)
+            .Debug
+        else
+            optimize;
+        const utmmd = b.addExecutable(.{
+            .name = "utmmd",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/utmmd.zig"),
+                .target = target,
+                .optimize = utmmd_optimize,
+                .link_libc = true,
+            }),
+        });
+        if (target.result.os.tag == .windows) {
+            utmmd.root_module.linkSystemLibrary("ws2_32", .{});
+        }
+
+        // Copy utmmd binary to target-specific embed directory for @embedFile by main.zig.
+        // Each target gets its own subdir (e.g., src/embed/aarch64-linux/utmmd.bin)
+        // so cross-compiling for multiple targets never overwrites the wrong binary.
+        const embed_dir = "src/embed";
+        const target_dir = b.fmt("{s}-{s}", .{
+            @tagName(target.result.cpu.arch),
+            @tagName(target.result.os.tag),
+        });
+        const target_embed_dir = b.fmt("{s}/{s}", .{ embed_dir, target_dir });
+        const embed_path = b.fmt("{s}/utmmd.bin", .{target_embed_dir });
+
+        // Ensure target-specific embed subdirectory exists
+        const mkdir_embed = b.addSystemCommand(&.{ "mkdir", "-p" });
+        mkdir_embed.addArg(target_embed_dir);
+
+        const copy_utmmd = b.addSystemCommand(&.{ "cp", "-f" });
+        copy_utmmd.addFileArg(utmmd.getEmittedBin());
+        copy_utmmd.addArg(embed_path);
+        copy_utmmd.step.dependOn(&utmmd.step);
+        copy_utmmd.step.dependOn(&mkdir_embed.step);
+
+        // Pre-compute SHA256 hash of utmmd.bin so main.zig can embed it at compile
+        // time without expensive comptime hashing (>20M eval branches for ~2MB binary).
+        const hash_utmmd = b.addSystemCommand(&.{ "sh", "-c" });
+        hash_utmmd.addArg(b.fmt(
+            "shasum -a 256 {s} | cut -d' ' -f1 | tr -d '\\n' > {s}/utmmd.sha256",
+            .{ embed_path, target_embed_dir },
+        ));
+        hash_utmmd.step.dependOn(&copy_utmmd.step);
+        hash_utmmd_step = &hash_utmmd.step;
     }
-
-    // Copy utmmd binary to target-specific embed directory for @embedFile by main.zig.
-    // Each target gets its own subdir (e.g., src/embed/aarch64-linux/utmmd.bin)
-    // so cross-compiling for multiple targets never overwrites the wrong binary.
-    const embed_dir = "src/embed";
-    const target_dir = b.fmt("{s}-{s}", .{
-        @tagName(target.result.cpu.arch),
-        @tagName(target.result.os.tag),
-    });
-    const target_embed_dir = b.fmt("{s}/{s}", .{ embed_dir, target_dir });
-    const embed_path = b.fmt("{s}/utmmd.bin", .{target_embed_dir});
-
-    // Ensure target-specific embed subdirectory exists
-    const mkdir_embed = b.addSystemCommand(&.{ "mkdir", "-p" });
-    mkdir_embed.addArg(target_embed_dir);
-
-    const copy_utmmd = b.addSystemCommand(&.{ "cp", "-f" });
-    copy_utmmd.addFileArg(utmmd.getEmittedBin());
-    copy_utmmd.addArg(embed_path);
-    copy_utmmd.step.dependOn(&utmmd.step);
-    copy_utmmd.step.dependOn(&mkdir_embed.step);
-
-    // Pre-compute SHA256 hash of utmmd.bin so main.zig can embed it at compile
-    // time without expensive comptime hashing (>20M eval branches for ~2MB binary).
-    const hash_utmmd = b.addSystemCommand(&.{ "sh", "-c" });
-    hash_utmmd.addArg(b.fmt(
-        "shasum -a 256 {s} | cut -d' ' -f1 | tr -d '\\n' > {s}/utmmd.sha256",
-        .{ embed_path, target_embed_dir },
-    ));
-    hash_utmmd.step.dependOn(&copy_utmmd.step);
 
     // ── Step 2: Build utmm (main binary, embeds utmmd + sha256) ──
     const exe = b.addExecutable(.{
@@ -122,7 +134,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("zio", zio_mod);
-    exe.step.dependOn(&hash_utmmd.step);
+    if (hash_utmmd_step) |hs| exe.step.dependOn(hs);
 
     // Windows: link ws2_32 (may be needed by Zig runtime for socket operations)
     if (target.result.os.tag == .windows) {
@@ -248,48 +260,53 @@ pub fn build(b: *std.Build) void {
     for (cross_targets) |query| {
         const tgt = b.resolveTargetQuery(query);
 
-        // Build utmmd for this target (Debug for Windows — see note above)
-        const cross_utmmd_optimize: std.builtin.OptimizeMode = if (tgt.result.os.tag == .windows)
-            .Debug
-        else
-            optimize;
-        const cross_utmmd = b.addExecutable(.{
-            .name = "utmmd",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/utmmd.zig"),
-                .target = tgt,
-                .optimize = cross_utmmd_optimize,
-                .link_libc = true,
-            }),
-        });
-        if (tgt.result.os.tag == .windows) {
-            cross_utmmd.root_module.linkSystemLibrary("ws2_32", .{});
+        // utmmd rebuild gate — 与单目标路径同一 -Dutmmd 选项
+        var cross_hash_step: ?*std.Build.Step = null;
+        if (rebuild_utmmd) {
+            // Build utmmd for this target (Debug for Windows — see note above)
+            const cross_utmmd_optimize: std.builtin.OptimizeMode = if (tgt.result.os.tag == .windows)
+                .Debug
+            else
+                optimize;
+            const cross_utmmd = b.addExecutable(.{
+                .name = "utmmd",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/utmmd.zig"),
+                    .target = tgt,
+                    .optimize = cross_utmmd_optimize,
+                    .link_libc = true,
+                }),
+            });
+            if (tgt.result.os.tag == .windows) {
+                cross_utmmd.root_module.linkSystemLibrary("ws2_32", .{});
+            }
+
+            // Copy utmmd to embed dir（使用解析后的 target，非 query 可选字段）
+            const cross_embed_dir = b.fmt("{s}-{s}", .{
+                @tagName(tgt.result.cpu.arch),
+                @tagName(tgt.result.os.tag),
+            });
+            const cross_target_embed_dir = b.fmt("src/embed/{s}", .{cross_embed_dir});
+            const cross_embed_path = b.fmt("{s}/utmmd.bin", .{cross_target_embed_dir});
+
+            const cross_mkdir = b.addSystemCommand(&.{ "mkdir", "-p" });
+            cross_mkdir.addArg(cross_target_embed_dir);
+
+            const cross_copy = b.addSystemCommand(&.{ "cp", "-f" });
+            cross_copy.addFileArg(cross_utmmd.getEmittedBin());
+            cross_copy.addArg(cross_embed_path);
+            cross_copy.step.dependOn(&cross_utmmd.step);
+            cross_copy.step.dependOn(&cross_mkdir.step);
+
+            // Hash utmmd for this target
+            const cross_hash = b.addSystemCommand(&.{ "sh", "-c" });
+            cross_hash.addArg(b.fmt(
+                "shasum -a 256 {s} | cut -d' ' -f1 | tr -d '\\n' > {s}/utmmd.sha256",
+                .{ cross_embed_path, cross_target_embed_dir },
+            ));
+            cross_hash.step.dependOn(&cross_copy.step);
+            cross_hash_step = &cross_hash.step;
         }
-
-        // Copy utmmd to embed dir（使用解析后的 target，非 query 可选字段）
-        const cross_embed_dir = b.fmt("{s}-{s}", .{
-            @tagName(tgt.result.cpu.arch),
-            @tagName(tgt.result.os.tag),
-        });
-        const cross_target_embed_dir = b.fmt("src/embed/{s}", .{cross_embed_dir});
-        const cross_embed_path = b.fmt("{s}/utmmd.bin", .{cross_target_embed_dir});
-
-        const cross_mkdir = b.addSystemCommand(&.{ "mkdir", "-p" });
-        cross_mkdir.addArg(cross_target_embed_dir);
-
-        const cross_copy = b.addSystemCommand(&.{ "cp", "-f" });
-        cross_copy.addFileArg(cross_utmmd.getEmittedBin());
-        cross_copy.addArg(cross_embed_path);
-        cross_copy.step.dependOn(&cross_utmmd.step);
-        cross_copy.step.dependOn(&cross_mkdir.step);
-
-        // Hash utmmd for this target
-        const cross_hash = b.addSystemCommand(&.{ "sh", "-c" });
-        cross_hash.addArg(b.fmt(
-            "shasum -a 256 {s} | cut -d' ' -f1 | tr -d '\\n' > {s}/utmmd.sha256",
-            .{ cross_embed_path, cross_target_embed_dir },
-        ));
-        cross_hash.step.dependOn(&cross_copy.step);
 
         // Build utmm for this target
         const cross_exe = b.addExecutable(.{
@@ -302,7 +319,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         cross_exe.root_module.addImport("zio", zio_mod);
-        cross_exe.step.dependOn(&cross_hash.step);
+        if (cross_hash_step) |chs| cross_exe.step.dependOn(chs);
         if (tgt.result.os.tag == .windows) {
             cross_exe.root_module.linkSystemLibrary("ws2_32", .{});
         }

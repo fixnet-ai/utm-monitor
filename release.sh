@@ -66,14 +66,43 @@ echo ""
 
 VERSION="${1:-}"
 NOTES="${2:-}"
+MODE="${3:-}"
 
-if [ -z "$VERSION" ]; then
-    echo "Usage: ./release.sh <version> [notes]"
-    echo "Example: ./release.sh v0.15.10 \"Bug fixes and performance improvements\""
+print_help() {
+    echo "Usage: ./release.sh <version> <notes> <--utmmd|--no-utmmd>"
+    echo ""
+    echo "Example: ./release.sh v0.18.77 \"Fix X\" --no-utmmd"
+    echo ""
+    echo "utmmd rebuild mode (REQUIRED — pick one):"
+    echo ""
+    echo "  --utmmd      Rebuild utmmd for all 8 targets and re-embed into utmm."
+    echo "               REQUIRED when supervisor sources changed since utmmd was"
+    echo "               last built: src/utmmd.zig, src/shm.zig, src/svc.zig."
+    echo "               Deploy will then update utmmd on every node (the complex"
+    echo "               path: service stop → kill → replace → restart)."
+    echo ""
+    echo "  --no-utmmd   Reuse the existing src/embed/*/utmmd.bin unchanged."
+    echo "               Embedded utmmd hash stays identical → shouldUpdateUtmmd()"
+    echo "               returns false on every node → deploy SKIPS the utmmd"
+    echo "               update entirely. Preferred when only utmm sources changed."
+    echo "               Fails if supervisor sources changed since the last"
+    echo "               --utmmd build (src/embed/UTMMD-BUILT-FROM), or embed"
+    echo "               binaries are missing (fresh clone → use --utmmd)."
+    echo ""
+    echo "How to decide (AI agents):"
+    echo "  PROV=\$(cat src/embed/UTMMD-BUILT-FROM 2>/dev/null)"
+    echo "  git diff --name-only \$PROV HEAD -- src/utmmd.zig src/shm.zig src/svc.zig"
+    echo "  → empty output → --no-utmmd   (preferred; avoids fleet-wide supervisor update)"
+    echo "  → any files   → --utmmd       (mandatory; stale supervisor would ship otherwise)"
     echo ""
     echo "Pre-condition: src/ver.txt must already be bumped to the target version."
+}
+
+if [ -z "$VERSION" ] || { [ "$MODE" != "--utmmd" ] && [ "$MODE" != "--no-utmmd" ]; }; then
+    print_help
     exit 1
 fi
+UTMMD_FLAG=$([ "$MODE" = "--utmmd" ] && echo true || echo false)
 
 # ── Verify ver.txt matches VERSION arg ──
 EXPECTED_VER="${VERSION#v}"  # strip leading 'v' if present
@@ -95,6 +124,43 @@ if [ -n "$(git status --porcelain | grep -v 'src/ver.txt')" ]; then
     exit 1
 fi
 echo "[OK] Working tree clean"
+
+# ── utmmd mode guards ──
+SUPERVISOR_SOURCES="src/utmmd.zig src/shm.zig src/svc.zig"
+PROVENANCE="src/embed/UTMMD-BUILT-FROM"
+
+if [ "$MODE" = "--no-utmmd" ]; then
+    # Guard 1: embed binaries must exist (fresh clone has none)
+    MISSING_EMBED=0
+    for d in src/embed/*/; do
+        if [ ! -f "$d/utmmd.bin" ]; then
+            echo "ERROR: $d/utmmd.bin missing — fresh checkout needs a full --utmmd build."
+            MISSING_EMBED=1
+        fi
+    done
+    [ "$MISSING_EMBED" -ne 0 ] && exit 1
+
+    # Guard 2: supervisor sources must be unchanged since last --utmmd build
+    if [ ! -f "$PROVENANCE" ]; then
+        echo "ERROR: $PROVENANCE missing — utmmd provenance unknown. Run once with --utmmd."
+        exit 1
+    fi
+    PROV=$(cat "$PROVENANCE")
+    if ! git rev-parse --verify "$PROV" >/dev/null 2>&1; then
+        echo "ERROR: provenance commit $PROV not found in this repo. Run with --utmmd."
+        exit 1
+    fi
+    DRIFTED=$(git diff --name-only "$PROV" HEAD -- $SUPERVISOR_SOURCES)
+    if [ -n "$DRIFTED" ]; then
+        echo "ERROR: supervisor sources changed since utmmd was last built ($PROV):"
+        echo "$DRIFTED" | sed 's/^/  /'
+        echo "Re-run with --utmmd — shipping a stale embedded supervisor is not allowed."
+        exit 1
+    fi
+    echo "[OK] utmmd unchanged since $PROV — reusing existing embedded binaries"
+else
+    echo "[MODE] utmmd will be rebuilt + re-embedded (deploy updates supervisor fleet-wide)"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Phase 1: Tests
@@ -120,8 +186,21 @@ rm -rf release && mkdir -p release
 rm -f zig-out/bin/utmm-*
 
 # Single parallel step — replaces the serial for-loop over 8 targets.
-zig build cross -Doptimize=ReleaseSafe
+# -Dutmmd 由模式参数决定：false 时复用现有 embed（字节级不变）。
+zig build cross -Doptimize=ReleaseSafe -Dutmmd=$UTMMD_FLAG
+BUILD_STATUS=$?
 echo ""
+
+# Record provenance AFTER a successful --utmmd build so future --no-utmmd
+# runs can verify supervisor sources did not drift.
+if [ "$MODE" = "--utmmd" ] && [ "$BUILD_STATUS" -eq 0 ]; then
+    git rev-parse HEAD > "$PROVENANCE"
+    echo "[OK] utmmd provenance recorded: $(cat $PROVENANCE)"
+fi
+if [ "$BUILD_STATUS" -ne 0 ]; then
+    echo "ERROR: zig build cross failed."
+    exit 1
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Phase 3: Package
