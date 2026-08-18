@@ -396,3 +396,29 @@ WriteFile 直写 `utmmd-debug.log`，monitorLoop 每次迭代打多条
 unversioned 残留（deploymentFilename 只读带版本文件名，unversioned 从不
 被引用）+ 调试垃圾文件，本机 /opt/utmm 3.4GB → 62MB（仅留 canonical
 utmm/utmmd + 当前版本 ×8）。
+
+### 2026-08-18 — Windows guest 重启循环双根因（心跳冻结 + deploy 绕过安装器）
+
+**根因 1 — 监听 socket 漏设 FIONBIO**: `TcpListener.init` 的 POSIX 分支设
+O_NONBLOCK（accept 空闲返回 EAGAIN → 循环 10Hz 轮转刷心跳），Windows 分支漏设
+对等的 FIONBIO → `ws2_accept` 永久阻塞 → accept 循环（顶部写 shm 心跳）停摆 →
+utmmd 10s 心跳超时杀 utmm。**LSA 在独立线程照常广播，--status 一切正常，完全
+掩盖了每 ~10s 一次的杀死循环**（winx64 utmm PID 持续变化才发现）。
+sockAccept 还把 WSAEWOULDBLOCK 一律当 AcceptFailed，即使设了非阻塞也走不到
+轮转路径。两处都修后与 POSIX 行为对齐。
+
+**教训**: ① 心跳这类活性信号禁止依赖「可能阻塞的循环」的迭代频率——要么循环
+保证非阻塞轮转，要么独立线程定时写。② 同一逻辑的跨平台分支（POSIX/Windows）
+必须逐项核对 socket 选项设置，一分支有的选项另一分支漏设 = 平台特有死锁。
+③ 掩蔽效应：多线程架构下一条线程死亡不等于进程死亡，表面功能正常（LSA/exec
+都活着）不代表监督心跳还在写——心跳路径必须独立可验证。
+
+**根因 2 — deploy Windows 分支绕过安装器**: SSH 安装命令只做
+`sc stop → taskkill → move utmm.exe → sc start`，从不跑 `--install`，而 utmmd 的
+提取/哈希比较/替换逻辑全在 forceInstall 里。POSIX 分支一直正确（chmod +x &&
+utmm-new --install）。后果：**Windows 两台 VM 的 utmmd 自 08-12 起从未更新**，
+utmm/utmmd 版本漂移六天无人察觉。修复：Windows 对齐 POSIX 跑完整安装器。
+
+**教训**: 同一功能（deploy 安装）的跨平台双实现必须共享语义核心——两分支
+各自手写命令序列必然漂移；「部署成功」的判定标准应包含关键文件的时效验证
+（如 utmmd.exe mtime），本例中若有此检查六天前就会报警。

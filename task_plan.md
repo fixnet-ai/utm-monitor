@@ -9,6 +9,24 @@
 - **真机部署**: Host v0.18.73（Phase 38）；4 台 Guest 仍 v0.18.72（38 修复 Host 侧生效，无需强制同步）
 - **Phase 38 完成**: ping/pong 热路径日志 + 过路 pong RTT 错误归因修复（v0.18.73）
 
+## 已完成: Phase 39 — Windows guest 重启循环根因修复 + utmmd 日志治理（v0.18.75/76）
+
+**状态**: ✅ 完成，5 节点 v0.18.76 全收敛
+
+**症状链**: debugLogWindows 热路径写盘（88 B/s）→ 深挖发现 winx64 utmm 每 ≤30s 重启
+→ v0.18.75 加事件探针（时间戳 + 心跳超时 hb/now/age）→ 日志实锤
+`heartbeat timeout (hb frozen since 0.4s after spawn)` → 代码定位双重根因。
+
+| # | 根因 | 修复 | 版本 |
+|---|------|------|------|
+| 1 | **Windows 监听 socket 漏设 FIONBIO**（POSIX 有 O_NONBLOCK）→ ws2_accept 永久阻塞 → accept 循环（顶部写 shm 心跳）停摆 → utmmd 10s 超时杀 utmm。LSA 在独立线程照常广播，掩盖了循环 | `makeNonBlocking(s)` + `sockAccept` WSAEWOULDBLOCK→WouldBlock，循环 10Hz 轮转与 POSIX 对齐 | 0.18.76 |
+| 2 | **Windows deploy 绕过安装器**（只 move + sc start）→ 内嵌 utmmd 从未提取/更新，自 08-12 起一直旧版（utmm 一直新） | deploy 改跑 `utmm --install --hostname <vm>`（与 POSIX 对齐），forceInstall 含 utmmd 哈希更新 | 0.18.76 |
+| 3 | debugLogWindows 无时间戳 + 稳态 trace 刷盘 | 每行 [GetTickCount64 ms] 前缀；删每迭代 trace；致死路径（心跳超时/自退/稳定期死亡）补为可见事件行 | 0.18.75 |
+
+**验证**: winx64/windowsvm PID 40s/30s 采样稳定不变（此前 ≤30s 必死）；utmmd-debug.log
+零增长、无 heartbeat timeout 事件；utmmd.exe 时间戳刷新（23:17）；5 节点 0.18.76 serving。
+注：`std.time.milliTimestamp` 在 0.16.0 已移除，改 kernel32 GetTickCount64。
+
 ## 已完成: Phase 38 — ping/pong 热路径日志 + 过路 pong RTT 错误归因（2026-08-18）
 
 **状态**: ✅ 完成（本机 Host 已部署 v0.18.73 并验证）
