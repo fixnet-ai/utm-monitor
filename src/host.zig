@@ -538,13 +538,16 @@ fn cmdDeploy(io: std.Io, gpa: std.mem.Allocator, target_opt: ?[]const u8) !void 
             gpa.free(scp_result.stdout);
             gpa.free(scp_result.stderr);
 
-            // SSH: stop service → kill processes → replace binary → start service
+            // SSH: stop service → kill processes → replace binary → run full installer.
+            // 必须跑 --install（forceInstall）：它负责提取/哈希更新内嵌 utmmd 并
+            // 重装服务。此前只 move + sc start，绕过了安装器 → Windows 的 utmmd
+            // 自 2026-08-12 起从未被更新过（utmm 一直新、utmmd 一直旧）。
             std.debug.print("[deploy]   ssh install (Windows)...\n", .{});
             const utmm_path = try std.fmt.allocPrint(gpa, "{s}\\utmm.exe", .{vm.remote_dir});
             defer gpa.free(utmm_path);
             const install_cmd = try std.fmt.allocPrint(gpa,
-                \\sc stop UTM-MonitorD 2>nul & timeout /t 3 /nobreak >nul & taskkill /f /im utmm.exe 2>nul & taskkill /f /im utmmd.exe 2>nul & timeout /t 2 /nobreak >nul & move /Y {s} {s} & sc start UTM-MonitorD
-            , .{ remote_tmp, utmm_path });
+                \\sc stop UTM-MonitorD 2>nul & timeout /t 3 /nobreak >nul & taskkill /f /im utmm.exe 2>nul & taskkill /f /im utmmd.exe 2>nul & timeout /t 2 /nobreak >nul & move /Y {s} {s} & {s} --install --hostname {s}
+            , .{ remote_tmp, utmm_path, utmm_path, vm.hostname });
             defer gpa.free(install_cmd);
 
             const ssh_result = std.process.run(gpa, io, .{

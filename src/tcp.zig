@@ -110,6 +110,10 @@ pub fn sockAccept(listen_fd: socket_t) !socket_t {
         var addr_len: std.posix.socklen_t = @sizeOf(sockaddr_in);
         const raw = ws2_accept(listen_fd, @ptrCast(&addr), &addr_len);
         if (raw == INVALID_SOCKET) {
+            // 非阻塞监听 socket 空闲时返回 WSAEWOULDBLOCK — 与 POSIX EAGAIN
+            // 同语义。accept 循环依赖 WouldBlock → sleep(100ms) 轮转来刷新
+            // shm 心跳；此前一律 AcceptFailed 会让循环走 1s 错误退避路径。
+            if (ws2_getLastError() == WSAEWOULDBLOCK) return error.WouldBlock;
             return error.AcceptFailed;
         }
         return raw;
@@ -852,6 +856,13 @@ pub const TcpListener = struct {
                 _ = ws2_closesocket(s);
                 return error.BindFailed;
             }
+
+            // 非阻塞监听 — 与 POSIX 分支的 O_NONBLOCK 对齐：空闲时 ws2_accept
+            // 返回 WSAEWOULDBLOCK（sockAccept 映射为 WouldBlock），accept 循环
+            // 得以 10Hz 轮转并刷新 shm 心跳。此前 Windows 漏设此项 → accept
+            // 永久阻塞 → 循环停摆 → 心跳启动后 0.4s 即冻结 → utmmd 每 ~10s
+            // 杀掉 utmm（Windows guest 重启循环根因，2026-08-18）。
+            makeNonBlocking(s);
 
             std.log.info("[tcp] raw Winsock2 TCP listener bound :{d}", .{actual_port});
             return TcpListener{ .server = null, .io = io, .listener_fd = s, .use_raw_accept = true, .port = actual_port };
