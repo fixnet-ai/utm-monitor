@@ -377,3 +377,22 @@ SSH 本身正常——IP 修正后 4/4 部署成功。
 **教训**: VM 的 DHCP 地址会变；硬编码兜底表要么定期与 mesh 实况核对，
 要么优先用 deploy.json 覆盖。mesh 推送通道（--upgrade）不依赖这些 IP，
 是 IP 漂移时更可靠的升级路径。
+
+### 2026-08-18 — utmmd Windows 端 debugLogWindows 热路径写盘（待修）
+
+**症状**: Windows Guest 的 `C:\opt\utmm\utmmd-debug.log` 持续增长（winx64 实测
+88 B/s ≈ 7.4MB/天；两台 Windows VM 清理前各积 23~25MB）。
+
+**根因**: `utmmd.zig` 的 `debugLogWindows`（Phase 33 排障期遗留）用 kernel32
+WriteFile 直写 `utmmd-debug.log`，monitorLoop 每次迭代打多条
+（before/after tryApplyPendingUpgrade、startUtmm 等）。Windows 服务 stdout
+不可见（已知限制 #2），它是当时唯一的调试通道，但从未在排障结束后移除。
+
+**修复方向**: 排障日志应 comptime 门控（debug 构建才编译）或仅在升级/异常
+路径保留——monitorLoop 稳态循环内的逐行 trace 必须去掉。升级事件本身
+（tryApplyPendingUpgrade 命中/失败）可保留，属低频生命周期事件。
+
+**连带**: 本次清理同时删除了 serve-dir 的 386 个旧版本二进制 + 8 个
+unversioned 残留（deploymentFilename 只读带版本文件名，unversioned 从不
+被引用）+ 调试垃圾文件，本机 /opt/utmm 3.4GB → 62MB（仅留 canonical
+utmm/utmmd + 当前版本 ×8）。
