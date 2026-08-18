@@ -558,15 +558,12 @@ fn moveFileExWindows(src: []const u8, dst: []const u8) bool {
 /// 返回 RestartReason 表示升级已应用（调用者应重启 utmm），null 表示无待处理升级。
 /// file_io: 文件 I/O 用 Io（Windows 上需为 Threaded，IOCP 不支持文件操作）。
 fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator, proc: ?ProcessRef, shm_ptr: *volatile shm.ShmLayout) ?RestartReason {
-    if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: entry");
-
     // 1. 从 SHM cmd_data 读 Guest 写入的升级文件全路径。
     //    Guest 在 handleUpgradeCmd 中将 .tmp 路径写入 SHM 后才发 restart。
     var path_buf: [512]u8 = undefined;
     const tp: []const u8 = if (shm.readCmdPath(shm_ptr, &path_buf)) |p|
         alloc.dupe(u8, p) catch return null
     else {
-        if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: no path in SHM, return null");
         return null;
     };
     if (builtin.os.tag == .windows) debugLogWindows("tryApplyPendingUpgrade: tmp found");
@@ -750,8 +747,15 @@ fn sleepMsWin(ms: u32) void {
 /// 用原始 kernel32 WriteFile 写调试日志到 C:\opt\utmm\utmmd-debug.log。
 /// 每次调用都 open→write→close，确保进程崩溃时日志不丢失。
 /// 绕过所有 CRT/Zig stdlib，直接使用 kernel32 API。
+/// 每行自动加 [unix-ms] 时间戳前缀——没有时间戳的排障日志无法定位节奏。
+/// 只记录事件（启动/杀进程/升级/超时/退出），禁止在 monitorLoop 稳态循环内
+/// 逐条 trace（曾以 ~88 B/s 持续写盘，见 findings 2026-08-18）。
 fn debugLogWindows(msg: []const u8) void {
     const log_path = "C:\\opt\\utmm\\utmmd-debug.log";
+    var line_buf: [640]u8 = undefined;
+    // GetTickCount64：kernel32 启动后毫秒（单调）。与 shm.nowMs 的 awake 钟
+    // 语义近似，仅作行间节奏/关联用；消息内数值仍用 shm 时钟。
+    const line = std.fmt.bufPrint(&line_buf, "[{d}] {s}", .{ GetTickCount64(), msg }) catch return;
     var path_utf16: [512]u16 = [_]u16{0} ** 512;
     const path_len = std.unicode.utf8ToUtf16Le(&path_utf16, log_path) catch return;
     if (path_len >= path_utf16.len) return;
@@ -768,9 +772,16 @@ fn debugLogWindows(msg: []const u8) void {
     );
     if (handle == INVALID_HANDLE_VALUE_DBG) return;
 
-    _ = WriteFile(handle, msg.ptr, @intCast(msg.len), null, null);
+    _ = WriteFile(handle, line.ptr, @intCast(line.len), null, null);
     _ = WriteFile(handle, "\r\n", 2, null, null);
     _ = CloseHandle(handle);
+}
+
+/// debugLogWindows 的带格式化版本（事件行需要携带数值，如心跳超时的 hb/now）。
+fn debugLogWindowsFmt(comptime fmt: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    debugLogWindows(msg);
 }
 
 // kernel32 API for debugLogWindows（使用真实 kernel32 导出名，手动声明以避免
@@ -783,6 +794,7 @@ const FILE_ATTRIBUTE_NORMAL_DBG: u32 = 128;
 extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: ?*anyopaque, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn WriteFile(hFile: ?*anyopaque, lpBuffer: [*]const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: ?*u32, lpOverlapped: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 
 /// 用 DeleteFileW 删除绝对路径文件（避免 std.Io.Dir.cwd().deleteFile 在
 /// Windows 上对绝对路径处理不一致的问题）。失败静默忽略。
@@ -921,19 +933,14 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
         // （--install 进程本身、上次 crash 遗留的孤儿进程等）持有 exe 文件句柄，
         // 导致 rename 失败。先通过 taskkill 确保所有 utmm.exe 已终止。
         if (builtin.os.tag == .windows) {
-            if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: before killAllUtmmWindows#1");
             taskkillUtmmWindows();
-            if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: after killAllUtmmWindows#1");
         }
-        if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: before tryApplyPendingUpgrade");
         if (tryApplyPendingUpgrade(file_io, io, alloc, null, shm_ptr)) |_| {
             if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: upgrade applied, looping to start new utmm");
             // 升级已应用，继续循环启动新的（已升级的）utmm
         }
-        if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: after tryApplyPendingUpgrade");
 
         // 启动 utmm
-        if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: before startUtmm");
         const proc = startUtmm(io, alloc, shm_ptr, utmm_args) catch |err| {
             if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: startUtmm FAILED");
             std.log.err("[utmmd] start failed: {}", .{err});
@@ -998,6 +1005,7 @@ fn stabilityCheck(io: std.Io, shm_ptr: *volatile shm.ShmLayout, proc: ProcessRef
         if (!isProcessAlive(proc)) {
             shm_ptr.last_exit_code = 0; // waitpid 已获取，简化
             std.log.warn("[utmmd] utmm crashed during stability check", .{});
+            if (builtin.os.tag == .windows) debugLogWindows("stabilityCheck: utmm died within stability window");
             return false;
         }
 
@@ -1053,6 +1061,7 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
         const hb = shm.readUtmmHeartbeat(shm_ptr);
         if (hb > 0 and now - hb > HEARTBEAT_TIMEOUT_SEC * 1000) {
             std.log.warn("[utmmd] heartbeat timeout, killing utmm", .{});
+            if (builtin.os.tag == .windows) debugLogWindowsFmt("monitorUtmm: heartbeat timeout, killing utmm (hb={d} now={d} age={d}ms)", .{ hb, now, now - hb });
             _ = killProcess(proc);
             return .crashed;
         }
@@ -1060,6 +1069,7 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
         // 进程退出检测
         if (!isProcessAlive(proc)) {
             std.log.info("[utmmd] utmm exited", .{});
+            if (builtin.os.tag == .windows) debugLogWindows("monitorUtmm: utmm exited by itself (not killed by us)");
             const cmd = shm.readCmd(shm_ptr);
             if (cmd == .restart) {
                 shm.clearCmd(shm_ptr);
