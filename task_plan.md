@@ -46,6 +46,17 @@
 
 **版本**: v0.18.72 → v0.18.73
 
+**追加改进（同日，用户裁定「mesh 探测本不该 info 级落盘」后扩展）**:
+
+| # | 改进 | 理由 |
+|---|------|------|
+| 38E | 邻居生命周期 info 日志：`handleLsa` getOrPut 首见打 `node up: mac=...`（每状态转换一条，非每 LSA）；`expireStale` 淘汰时打 `node down: mac=... (no LSA > 15000ms)` | 规范语义：info=生命周期事件（连接建立/关闭）。生产可观察 mesh 健康度，天然低频 |
+| 38F | 周期 sweep 只 ping **直连邻居**（改遍历 neighbors 表，原遍历 lsas 全表含中继远端） | 中继 ping 的 pong 按设计回中继点不回发起者（pong 无目标字段），发起者永远测不到 RTT——原 sweep 对远端节点的中继 ping 是纯死胡同流量，从未产生过可用测量 |
+
+**追加验证**: 部署后启动日志恰好 4 条 `node up`（每 guest 一条一次性事件）；75 秒完整探测周期稳态零增长（仅 852B 一次性启动事件）；ping 1/1/1/4ms 正常。
+
+**审计结论（无其他刷屏向量）**: host.zig/utmmd.zig 全部 info/warn 为事件驱动（配置加载、进程启停、升级事件）；`handleLsa failed` err 级实为内存分配失败（协议解析失败走 `orelse return` 静默丢弃），级别归属正确，不改。
+
 ## 已完成: Phase 37 — macOS utmmd 升级循环 + CLI status 缺失（根因修复）
 
 **状态**: ✅ 完成（commit 9390a50 + 7f6cced）

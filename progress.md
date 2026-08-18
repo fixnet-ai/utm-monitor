@@ -20,6 +20,8 @@
 | 38B | OutstandingPings 环 + handlePong 归属校验 + sendPing 记录 | ✅ |
 | 38T | OutstandingPings 单测 + zig build test + test-integration | ✅ 单测 221/0 失败（含 3 新测试）、集成 60/0、无泄漏 |
 | 38D | 版本 0.18.73 + 本机部署 + 日志增长归零观察 | ✅ Host 已上 0.18.73；ping RTT 1/1/1/4ms；75 秒日志 0 字节 |
+| 38E | 邻居生命周期 info 日志（node up/down，每转换一条） | ✅ 部署后恰好 4 条 node up，稳态零重复 |
+| 38F | sweep 只 ping 直连邻居（消灭死胡同中继 ping 流量） | ✅ 中继 sweep ping 从未可测 RTT，属死代码流量，已移除 |
 
 ### 验证记录（2026-08-18 22:10）
 

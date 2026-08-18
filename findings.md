@@ -76,6 +76,12 @@ Host 的 `handlePong` 无法区分「自己 ping 的应答」和「过路包」�
 **教训**: 无连接协议里「echo 回来的时间戳」只有在**能证明是自己发的**时才可信；
 帧里没有目标字段时，接收方必须维护 outstanding 时间戳集合做归属校验。
 
+**连带发现（38F）**: 周期 sweep 对非直连节点的中继 ping 是**纯死胡同流量**——
+pong 按设计回中继点（`handlePing` 用 `from` 回包），发起者永远收不到应答，
+RTT 从不可测量（该"特性"从未真正工作过）。修正为 sweep 只 ping 直连邻居。
+若未来需要「发起者可测中继 RTT」，pong 帧须携带目标字段并支持回程中继——
+属协议演进，当前无消费方，不做。
+
 **根因（日志）**: periodicTasks 每 ~60 tick 对全部节点 sendPing，每条
 ping/pong/中继都打 info 级 → ReleaseSafe std.log 默认 .info 全量输出到
 stderr → launchd StandardErrorPath 无轮转无限增长。热路径探测日志应为 debug 级。

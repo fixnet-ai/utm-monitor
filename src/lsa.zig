@@ -631,20 +631,23 @@ pub const Mesh = struct {
             }
         }
 
-        // Periodic ping of all known nodes (every ~60 periodicTasks calls,
-        // roughly 60s when idle) — measures RTT for both direct neighbors
-        // and relayed paths.
+        // Periodic ping of DIRECT neighbors (every ~60 periodicTasks calls,
+        // roughly 60s when idle) — measures RTT to each direct neighbor.
+        // Relayed targets are excluded on purpose: a relayed ping's pong is
+        // sent back to the relay (pong frames carry no destination field),
+        // so the originator can never measure RTT that way — pinging remote
+        // nodes from the sweep is dead-end traffic.
         self.periodic_tick +%= 1;
         if (self.periodic_tick % 60 == 0) {
-            // Collect known node IDs (release lsas_mutex before calling sendPing
-            // to avoid holding lsas → neighbors/routes lock nesting)
+            // Collect neighbor IDs (release neighbors_mutex before calling
+            // sendPing to avoid holding neighbors → routes lock nesting)
             var ping_targets: [64]NodeId = undefined;
             var ping_count: usize = 0;
             {
-                self.lsas_mutex.lock(self.io) catch return;
-                defer self.lsas_mutex.unlock(self.io);
-                var l_iter = self.lsas.iterator();
-                while (l_iter.next()) |entry| {
+                self.neighbors_mutex.lock(self.io) catch return;
+                defer self.neighbors_mutex.unlock(self.io);
+                var n_iter = self.neighbors.iterator();
+                while (n_iter.next()) |entry| {
                     const node = entry.key_ptr.*;
                     if (std.mem.eql(u8, &node, &self.node_id)) continue;
                     if (ping_count >= ping_targets.len) break;
@@ -774,6 +777,7 @@ pub const Mesh = struct {
             defer self.neighbors_mutex.unlock(self.io);
 
             const result = try self.neighbors.getOrPut(decoded.origin);
+            const is_new_neighbor = !result.found_existing;
             result.value_ptr.* = .{
                 .id = decoded.origin,
                 .addr = switch (from) {
@@ -783,6 +787,12 @@ pub const Mesh = struct {
                 .last_seen_ms = self.clock_ms,
                 .cost = 1, // direct neighbor
             };
+            // Lifecycle event (info-worthy): first LSA from a node we haven't
+            // seen — one line per transition, not per 2s LSA refresh.
+            if (is_new_neighbor) {
+                var mac_buf: [18]u8 = undefined;
+                std.log.info("[lsa] node up: mac={s}", .{formatNodeIdBuf(decoded.origin, &mac_buf)});
+            }
         }
         // ── neighbors_mutex released here ──
 
@@ -1187,6 +1197,10 @@ pub const Mesh = struct {
                 }
             }
             for (to_remove.items) |nid| {
+                // Lifecycle event (info-worthy): neighbor timed out —
+                // one line per transition (VM shutdown / mesh partition).
+                var mac_buf: [18]u8 = undefined;
+                std.log.info("[lsa] node down: mac={s} (no LSA > {d}ms)", .{ formatNodeIdBuf(nid, &mac_buf), timeout_ms });
                 _ = self.neighbors.remove(nid);
             }
             to_remove.deinit(self.allocator);
