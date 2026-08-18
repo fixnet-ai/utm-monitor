@@ -614,6 +614,21 @@ fn extractUtmmd(io: std.Io, alloc: std.mem.Allocator) !void {
     const dest = svc.canonicalSvcPath();
     const dest_dir = svc.canonicalDir();
 
+    // 内容未变时跳过重写——字节级直接比较磁盘文件与内嵌 utmmd。
+    // --no-utmmd 发布后字节相同，若仍重写只是徒增 mtime 抖动与排查噪音
+    // （内容并无漂移，但"时间戳为何变了"会误导排障）。比较失败（文件缺失/
+    // 读取错误）照常走完整提取路径。
+    {
+        const existing = std.Io.Dir.cwd().readFileAlloc(io, dest, alloc, std.Io.Limit.limited(64 * 1024 * 1024)) catch null;
+        if (existing) |bytes| {
+            defer alloc.free(bytes);
+            if (std.mem.eql(u8, bytes, utmmd_bin)) {
+                std.log.debug("[main] utmmd on disk matches embedded bytes — skip extract", .{});
+                return;
+            }
+        }
+    }
+
     // Ensure canonical directory exists
     std.Io.Dir.cwd().createDirPath(io, dest_dir) catch |err| {
         fail.err("extractUtmmd/mkdir", err);

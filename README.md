@@ -89,12 +89,12 @@ utmm sshpass -p '111' ssh root@linuxvm 'uname -a'
 utmm sshpass -f ~/.ssh/pass ssh user@server 'uptime'      # password from file
 utmm sshpass -e ssh admin@host 'cmd'                        # password from SSHPASS env
 
-# Push upgrade to Guest
-utmm --upgrade linuxvm
-
-# One-shot deploy to all machines
+# One-shot deploy to all machines (STANDARD upgrade path — updates utmm + utmmd)
 utmm --deploy
 utmm --deploy linuxvm
+
+# Push upgrade to Guest (utmm only — never updates utmmd; emergency hot-fix only)
+utmm --upgrade linuxvm
 
 # Mesh ping
 utmm --ping linuxvm

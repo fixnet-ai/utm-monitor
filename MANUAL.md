@@ -486,28 +486,43 @@ curl --socks5 gateway:2121 http://windowsvm:8080
 
 ### Software Upgrade
 
-```bash
-# 1. Build and stage binaries for all Guests
-utmm --deploy
+**Standard path — `--deploy` (updates both utmm and utmmd):**
 
-# 2. Push upgrade to specific Guests (Host → Guest via SOCKS5)
-utmm --upgrade linuxvm
-utmm --upgrade windowsvm
+```bash
+# 1. Release with an explicit utmmd mode (see CLAUDE.md release process):
+#    --no-utmmd  supervisor sources unchanged → embedded utmmd bytes reused →
+#                deploy skips the utmmd update entirely (preferred)
+#    --utmmd     supervisor sources changed → utmmd rebuilt + re-embedded
+./release.sh vX.Y.Z "notes" --no-utmmd
+
+# 2. Deploy to every VM: scp + full installer (--install) per machine.
+#    utmmd is replaced only when its embedded hash differs from disk.
+utmm --deploy
 
 # 3. Verify all Guests are on the new version
 utmm --status
-
-# Single-Guest quick upgrade cycle:
-utmm --deploy linuxvm && utmm --upgrade linuxvm && utmm --status
 ```
 
-`--deploy` cross-compiles for all target platforms (first run only — subsequent
-runs use cached binaries from serve-dir), SCPs binaries to each Guest using built-in
-`utmm sshpass` (no external sshpass needed), and stages them in the Host serve-dir.
-VM credentials are read from `/opt/utmm/deploy.json` (falls back to compile-time
-defaults). `--upgrade` pushes the binary from Host to Guest over the SOCKS5 channel
-(no SSH needed), verifies SHA256, and triggers a zero-downtime restart via the utmmd
-supervisor. Error messages include actionable guidance for common failures.
+**Emergency hot-fix — `--upgrade` (utmm ONLY, never updates utmmd):**
+
+```bash
+# Push a single utmm binary Host → Guest over the SOCKS5 mesh channel
+# (no SSH needed), SHA256-verified, zero-downtime restart via utmmd.
+utmm --upgrade linuxvm
+```
+
+> **Channel convention**: version upgrades always go through `--deploy`.
+> `--upgrade` pushes utmm only — using it alone causes utmm/utmmd version
+> drift (the Windows VMs' supervisor once lagged 6 days unnoticed this way).
+> utmmd unchanged releases (`--no-utmmd`) keep the supervisor byte-identical
+> fleet-wide: no service stop/replace/restart beyond what the utmm update
+> itself requires, and `extractUtmmd` skips the rewrite when disk bytes
+> already match the embedded binary.
+
+`--deploy` SCPs each Guest's binary using built-in `utmm sshpass` (no external
+sshpass needed), then runs the full installer over SSH. VM credentials are read
+from `/opt/utmm/deploy.json` (falls back to compile-time defaults). Error
+messages include actionable guidance for common failures.
 
 ### Bootstrap a New Machine
 
