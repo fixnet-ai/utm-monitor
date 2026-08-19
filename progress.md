@@ -18,6 +18,14 @@
 - [x] 43F 单测 231 全绿 / 集成 62 全绿 ×3 连续（新增 test_exec_cancel：断连杀进程 + 自然完成回归）/ aarch64-windows + x86_64-linux-musl 交叉编译过 / ver.txt 0.18.80 / CLAUDE+MANUAL 文档 / 顺带修复存量 macOS pty closeFn 5s 隐性延迟（E-state 根因见 findings）
 - [ ] 真机验证（发布 + --deploy 后逐 VM：MCP abort 杀 sleep、CLI Ctrl-C、孙进程组、旧 Guest 混部退化）
 
+### v0.18.81 追加（真机验证驱动的两连修）
+
+真机测试 A（MCP abort）/B（CLI 死亡）通过；**测试 C（孙进程）失败** → 作业控制
+盲区（后台作业独立进程组逃逸 kill(-pgid)）→ `+m` 修复（真机 `set +m` 实验
+先行验证）→ 过程中踩中 argv 哨兵槽未初始化 bug（子进程秒退）→ 集成场景 1
+扩展为双作业击杀回归 → TempDir BadPathName 抽风同期定位（u48 {x} 不补零 +
+undefined 字节入路径）。62/0/0 ×3 连续。
+
 ### 调试记录（E-state 根因排查）
 
 场景 1（取消）PASS 但场景 2（自然完成）3s 超时 → ps 实测卡 E 状态 4.5s →

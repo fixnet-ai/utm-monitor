@@ -575,6 +575,24 @@ close master（slave read 立即 EOF → shell 干净退出）再 kill+收割，
 完成。注意 shell 阻塞在 waitpid（前台任务运行中）时 SIGKILL 秒杀无此问题
 ——只有 idle 在 read 的 shell 受影响。
 
+**实施中发现 3 — 真机验证抓出的作业控制盲区（v0.18.81 修复）**:
+真机测试 C（`(sleep 300) & sleep 300` 取消）暴露：**交互式 shell 的作业控制
+给每个 `&` 作业创建独立进程组**，`kill(-bash_pgid)` 够不到，master 关闭的
+SIGHUP 又因 bash `huponexit=off` 不发给后台组 → 后台作业幸存（实测 pgid
+自成一组的进程在取消后存活）。修复：spawn shell 时对 bash/zsh 追加 `+m`
+（关闭作业控制，后代全部留在本组）——dash 会把 "+m" 当文件名执行，故仅
+对已知 shell 追加。真机 `set +m` 实验先行验证（两个后台作业 pgid 均为
+shell 本组）。
+
+**实施中发现 4 — 两处 argv/格式化低级 bug（+m 改造过程中踩中）**:
+1. `var argv: [3:null]?[*:0]const u8 = undefined` 的**哨兵槽不初始化**
+   （undefined=0xAA），`argv[0..argc :null]` 切片断言 panic → 子进程秒退
+   （集成测试 bash 无输出退出、单测碰巧栈零通过）。正确姿势：数组字面量
+   初始化（哨兵自动就位），execve 传完整数组（首个 null 即终止）。
+2. tests/common.zig TempDir（历史死代码）：`{x}` 格式化 u48 **高位为零时
+   不足 12 位不补零**，剩余 undefined 字节混入路径 → `error.BadPathName`
+   （1/40 概率，1000 次循环 standalone 定位）。修复：缓冲预填 '0'。
+
 **实施中发现 2 — Zig 0.16.0 API**:
 - `std.Thread.Mutex` 不存在 → 用 `std.Io.Mutex`（`lockUncancelable(io)`/
   `unlock(io)`，需 io 参数；lsa.zig 先例）

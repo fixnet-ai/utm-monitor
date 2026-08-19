@@ -350,7 +350,9 @@ pub const TempDir = struct {
     pub fn create(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8) !TempDir {
         var rand_bytes: [6]u8 = undefined;
         io.random(&rand_bytes);
-        var hex: [12]u8 = undefined;
+        // 预填 '0'：{x} 对高位为 0 的 u48 不足 12 位且不补零，剩余字节保持
+        // undefined（0xAA）混入路径 → error.BadPathName（实测 1/40 概率复现）
+        var hex = [_]u8{'0'} ** 12;
         _ = std.fmt.bufPrint(&hex, "{x}", .{std.mem.readInt(u48, &rand_bytes, .little)}) catch unreachable;
         const path = try std.fmt.allocPrint(allocator, "/tmp/{s}{s}", .{ prefix, hex[0..12] });
         errdefer allocator.free(path);

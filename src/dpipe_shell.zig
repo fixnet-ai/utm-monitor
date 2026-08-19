@@ -155,7 +155,23 @@ fn spawnPosix(allocator: std.mem.Allocator, shell: []const u8) !ShellCtx {
             break :blk "/bin/sh";
         } else "/bin/sh";
 
-        const argv = [_:null]?[*:0]const u8{ shell_path.ptr, @as(?[*:0]const u8, @ptrFromInt(@intFromPtr("-l"))), null };
+        // +m 关闭作业控制（bash/zsh）：交互式 shell 会给每个后台作业创建独立
+        // 进程组，脱离 kill(-pid) 进程组击杀范围（实测取消后 `(sleep 300) &`
+        // 幸存，pgid 自成一组）。关闭后所有后代留在本组，断连取消可完整清除。
+        // 仅对支持 `+m` 语法 的 bash/zsh 追加 — dash 会把 "+m"
+        // 当作脚本文件名执行。
+        const base = if (std.mem.lastIndexOfScalar(u8, shell_path, '/')) |i| shell_path[i + 1 ..] else shell_path;
+        const plus_m = std.mem.eql(u8, base, "bash") or std.mem.eql(u8, base, "zsh");
+
+        // 数组字面量初始化（哨兵槽自动就位）— 不可用 `= undefined`：哨兵
+        // 槽保持垃圾值，后续 execve 的 argv 终止符未定义（Debug 下 sentinel
+        // 切片断言 panic，实测子进程秒退）。plus_m 为假时中段即 null，
+        // execve 在首个 null 处终止，多余元素被忽略。
+        const argv = [_:null]?[*:0]const u8{
+            shell_path.ptr,
+            "-l",
+            if (plus_m) @as(?[*:0]const u8, "+m") else null,
+        };
         _ = std.c.execve(shell_path.ptr, &argv, std.c.environ);
         std.log.err("[dpipe-shell] execve failed", .{});
         std.process.exit(1);

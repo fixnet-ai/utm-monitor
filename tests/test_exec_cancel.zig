@@ -86,12 +86,16 @@ fn scenarioDisconnectKillsCommand(io: std.Io, alloc: std.mem.Allocator, runner: 
         defer alloc.free(started_path);
         const alive_path = try tmp.join("alive");
         defer alloc.free(alive_path);
+        const galive_path = try tmp.join("galive");
+        defer alloc.free(galive_path);
 
         const pair = try common.makePair();
 
-        // 命令：touch started 证明已启动；sleep 30 模拟长命令；
-        // touch alive 只在未被杀而自然跑完时出现（断言其不存在）。
-        const cmd = try std.fmt.allocPrint(alloc, "touch {s}; sleep 30; touch {s}", .{ started_path, alive_path });
+        // 命令：touch started 证明已启动；前台 sleep 30 模拟长命令；
+        // 后台 (sleep 30) 验证进程组击杀覆盖作业控制的独立进程组（+m 已
+        // 关闭作业控制，后代应全部留在本组）。alive/galive 只在未被杀而
+        // 自然跑完时出现（断言其不存在）。
+        const cmd = try std.fmt.allocPrint(alloc, "touch {s}; (sleep 30; touch {s}) & sleep 30; touch {s}", .{ started_path, galive_path, alive_path });
         defer alloc.free(cmd);
         const cmd_with_marker = try protocol.buildCmdWithMarker(alloc, info.shell, cmd);
         defer alloc.free(cmd_with_marker);
@@ -132,10 +136,12 @@ fn scenarioDisconnectKillsCommand(io: std.Io, alloc: std.mem.Allocator, runner: 
         }.check);
         tc.expectTrue(returned, "断连后 handleExecCmd 3s 内返回（命令被杀而非跑完 sleep 30）");
 
-        // 再观察 1s：alive 若出现 = 命令未被杀（进程组击杀失效）
+        // 再观察 1s：alive/galive 若出现 = 命令未被杀（进程组击杀未覆盖
+        // 前台/后台作业）
         if (returned) {
             std.Io.sleep(io, std.Io.Duration.fromMilliseconds(1000), .awake) catch {};
-            tc.expectTrue(!fileExists(io, alive_path), "进程组被杀（alive 未创建）");
+            tc.expectTrue(!fileExists(io, alive_path), "进程组被杀（前台 alive 未创建）");
+            tc.expectTrue(!fileExists(io, galive_path), "进程组被杀（后台作业 galive 未创建）");
         }
 
         // 失败兜底：join 最长等 sleep 30 自然结束（有界），成功路径立即返回
