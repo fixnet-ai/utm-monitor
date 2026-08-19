@@ -1,16 +1,17 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.79 | **分支**: `main` | **更新**: 2026-08-19
+**版本**: v0.18.82 | **分支**: `main` | **更新**: 2026-08-20
 
 ## 当前状态
 
 - **源文件**: 22 src + 13 test + 2 embed + 2 Python test scripts
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
-- **真机部署**: 5 节点 v0.18.79 serving
+- **真机部署**: 5 节点 v0.18.82 serving
 - **Phase 41 完成**: Windows exec OEM↔UTF-8 转码 + marker 独立行修复（v0.18.79）
 - **Phase 42 完成**: CI 修复 (zio clone) + CI 接管发布 + MIT + SignPath 步骤待启用 (PR #6)
+- **Phase 43 完成**: exec 断连取消传播 + 进程树整杀 + Guest 并发化（v0.18.80-82）
 
-## 进行中: Phase 43 — exec 断连取消传播（连接生命周期 = 命令生命周期）
+## 已完成: Phase 43 — exec 断连取消传播（连接生命周期 = 命令生命周期）
 
 **背景**（证据见 findings.md 2026-08-19 Phase 43 段）: AI agent 中途取消 exec /
 CLI Ctrl-C 后，命令在 Guest 上失控继续跑——链路三层（Guest handleExecCmd /
@@ -27,7 +28,7 @@ accept 循环。**关键实测**: macOS poll 对半关闭也上报 POLLHUP → I
 | 43C | mcp_handler: ClientWatch 可插拔检测接口（checkFn 带 done 参数，等待分片 ≤50ms 保证 join 快速）+ execWatchThread + on_output 返回 bool | abort 检查置于 @panic 之前；join 先于 tcp_conn.deinit | ✅ |
 | 43D | ipc.zig: ExecIpcLink 写探测（零长 exec_data 帧探针 2s 周期 + std.Io.Mutex 序列化双写者） | CLI 零改动、server 读逻辑零改动；检测延迟 ≤2s（有输出即时） | ✅ |
 | 43E | tcp.zig sockPollReadable（POSIX poll / Windows ws2_select）+ threadSleepMs + mcp_http HttpProbe + McpContext.client_watch | HTTP 检测延迟 ≤50ms 分片轮询 | ✅ |
-| 43F | 测试 + 门禁 + 版本 + 文档 + 真机 | 单测 231 全绿；集成 62 全绿（新增 test_exec_cancel 2 场景）×3 连续；aarch64-windows + x86_64-linux-musl 交叉编译过；ver.txt 0.18.80；CLAUDE/MANUAL 更新；**附带修复存量 macOS pty closeFn 5s 隐性延迟**（E-state，findings 2026-08-19）；真机验证待发布部署 | 🔄 |
+| 43F | 测试 + 门禁 + 版本 + 文档 + 真机 | 单测 230 全绿；集成 62 全绿 ×3；三平台交叉编译过；发布 v0.18.80/81/82 三连（真机验证驱动迭代）；**四平台真机验证矩阵全绿**（linuxvm MCP abort/CLI 死亡/孙进程、macvm 孙进程、windowsvm Job Object 整树）；附带修复存量 macOS pty closeFn 5s 隐性延迟（E-state）；v0.18.82 最终态：`set +m; ` 前缀（argv +m 被交互式 shell 覆盖）+ Windows Job Object | ✅ |
 
 **版本混部矩阵**（全安全）: 新 Host+旧 Guest=现行为退化；旧 CLI+新 daemon=探针
 无害跳过；新 CLI+旧 daemon=CLI 零改动。零协议消息变更。
