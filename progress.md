@@ -2112,3 +2112,12 @@ POSIX 上 `file_io` 直接复用事件循环 Io（epoll/kqueue），而 `findUpg
 main (331ee0b)。**真实 tag 端到端发布留待下次版本**（softprops 发布段为
 标准 action 调用，风险低）。CI 修复完成：15+ 连败 → PR/push 测试门禁 +
 tag 发布链全绿。
+
+**Phase 42 补充 — 项目主页（08-19）**:
+- SignPath OSS 申请需填 Homepage URL → 启用 GitHub Pages 项目页
+- 方案裁定（用户选择）: main 分支 /docs 目录，URL
+  `https://fixnet-ai.github.io/utm-monitor/`，单页手写 HTML（内联 CSS、
+  零 JS 框架、零外部请求）
+- 新增 `docs/index.html`（hero + 终端演示、8 能力卡片、7 MCP 工具表、
+  Quick Start、SOCKS5 架构图、8 目标芯片）+ `docs/.nojekyll`
+- 仓库 homepage 设为 Pages URL，SignPath 申请表可直接填写

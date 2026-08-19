@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UTM Monitor — Remote debugging sidekick for VMs and machines</title>
+<meta name="description" content="One Zig binary gives AI agents and humans remote exec, file transfer, SOCKS5 mesh and a built-in MCP server on Linux, macOS and Windows. Zero dependencies.">
+<link rel="canonical" href="https://fixnet-ai.github.io/utm-monitor/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230d1117'/%3E%3Cpath d='M28 32 L50 50 L28 68' stroke='%233fb950' stroke-width='10' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Crect x='52' y='62' width='22' height='8' rx='4' fill='%2358a6ff'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #0a0e14;
+    --bg-soft: #0d1117;
+    --panel: #111823;
+    --panel-2: #161f2c;
+    --border: #21293a;
+    --border-2: #2d3850;
+    --text: #dbe4f0;
+    --muted: #8b98ad;
+    --green: #3fb950;
+    --green-dim: #238636;
+    --blue: #58a6ff;
+    --amber: #d29922;
+    --red: #f85149;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre, .mono { font-family: var(--mono); }
+
+  /* ---------- nav ---------- */
+  nav {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; align-items: center; gap: 1.5rem;
+    padding: 0.85rem 2rem;
+    background: rgba(10, 14, 20, 0.85);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border);
+  }
+  nav .brand { display: flex; align-items: center; gap: 0.6rem; font-weight: 700; color: var(--text); }
+  nav .brand .glyph { color: var(--green); font-family: var(--mono); font-weight: 700; }
+  nav .links { margin-left: auto; display: flex; gap: 1.4rem; font-size: 0.92rem; }
+  nav .links a { color: var(--muted); }
+  nav .links a:hover { color: var(--text); text-decoration: none; }
+  nav .links a.pill {
+    border: 1px solid var(--border-2); border-radius: 999px; padding: 0.2rem 0.9rem;
+    color: var(--text); transition: border-color .15s, background .15s;
+  }
+  nav .links a.pill:hover { border-color: var(--green); background: rgba(63, 185, 80, 0.08); }
+  @media (max-width: 640px) { nav .links a:not(.pill) { display: none; } }
+
+  /* ---------- layout ---------- */
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 1.5rem; }
+  section { padding: 4.5rem 0 1rem; }
+  h2 {
+    font-size: 1.45rem; letter-spacing: 0.01em; margin-bottom: 0.5rem;
+    display: flex; align-items: baseline; gap: 0.7rem;
+  }
+  h2 .num { color: var(--green); font-family: var(--mono); font-size: 0.95rem; }
+  .section-sub { color: var(--muted); margin-bottom: 2.2rem; max-width: 46rem; }
+
+  /* ---------- hero ---------- */
+  header.hero {
+    padding: 5.5rem 0 4rem;
+    background:
+      radial-gradient(900px 420px at 75% -10%, rgba(88, 166, 255, 0.10), transparent 60%),
+      radial-gradient(700px 380px at 12% 8%, rgba(63, 185, 80, 0.10), transparent 55%),
+      var(--bg);
+    border-bottom: 1px solid var(--border);
+  }
+  .hero-grid { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 3rem; align-items: center; }
+  @media (max-width: 880px) { .hero-grid { grid-template-columns: 1fr; } }
+  .eyebrow {
+    display: inline-block; font-family: var(--mono); font-size: 0.8rem;
+    color: var(--green); border: 1px solid rgba(63, 185, 80, 0.35);
+    background: rgba(63, 185, 80, 0.07);
+    border-radius: 999px; padding: 0.22rem 0.85rem; margin-bottom: 1.3rem;
+  }
+  h1 { font-size: clamp(2.2rem, 5vw, 3.3rem); line-height: 1.12; letter-spacing: -0.02em; }
+  h1 .accent { color: var(--green); }
+  .tagline { font-size: 1.13rem; color: var(--muted); margin: 1.1rem 0 1.8rem; max-width: 34rem; }
+  .cta-row { display: flex; flex-wrap: wrap; gap: 0.8rem; margin-bottom: 1.6rem; }
+  .cta {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    border-radius: 8px; padding: 0.62rem 1.25rem; font-weight: 600; font-size: 0.95rem;
+    border: 1px solid var(--border-2); transition: transform .12s, border-color .15s, background .15s;
+  }
+  .cta:hover { text-decoration: none; transform: translateY(-1px); }
+  .cta-primary { background: var(--green-dim); border-color: rgba(63, 185, 80, 0.6); color: #fff; }
+  .cta-primary:hover { background: #2ea043; }
+  .cta-ghost { color: var(--text); }
+  .cta-ghost:hover { border-color: var(--blue); }
+  .hero-meta { display: flex; flex-wrap: wrap; gap: 1.4rem; color: var(--muted); font-size: 0.88rem; }
+  .hero-meta span b { color: var(--text); font-weight: 600; }
+
+  /* ---------- terminal ---------- */
+  .term {
+    background: var(--bg-soft);
+    border: 1px solid var(--border-2);
+    border-radius: 12px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+    overflow: hidden;
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 0.55rem;
+    padding: 0.65rem 0.9rem; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .dot { width: 11px; height: 11px; border-radius: 50%; }
+  .dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
+  .term-title { margin-left: 0.6rem; color: var(--muted); font-family: var(--mono); font-size: 0.78rem; }
+  .term-body {
+    padding: 1.1rem 1.25rem 1.3rem; font-family: var(--mono);
+    font-size: 0.8rem; line-height: 1.75; overflow-x: auto;
+  }
+  .term-body .p { color: var(--green); }
+  .term-body .cmd { color: var(--text); }
+  .term-body .dim { color: var(--muted); }
+  .term-body .ok { color: var(--green); }
+  .term-body .warn { color: var(--amber); }
+  .term-body .hl { color: var(--blue); }
+
+  /* ---------- capability cards ---------- */
+  .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; }
+  @media (max-width: 980px) { .cards { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .cards { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem 1.3rem;
+    transition: border-color .15s, transform .12s;
+  }
+  .card:hover { border-color: var(--border-2); transform: translateY(-2px); }
+  .card .icon { font-size: 1.35rem; margin-bottom: 0.7rem; display: block; }
+  .card h3 { font-size: 0.98rem; margin-bottom: 0.45rem; }
+  .card p { color: var(--muted); font-size: 0.87rem; line-height: 1.55; }
+  .card code {
+    color: var(--green); font-size: 0.8rem; background: rgba(63, 185, 80, 0.08);
+    padding: 0.08rem 0.35rem; border-radius: 4px;
+  }
+
+  /* ---------- mcp table ---------- */
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 0.7rem 1rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  td:first-child code, .tool {
+    font-family: var(--mono); color: var(--green); font-size: 0.86rem;
+    background: rgba(63, 185, 80, 0.08); padding: 0.12rem 0.45rem; border-radius: 4px;
+    white-space: nowrap;
+  }
+  td { color: var(--muted); }
+  td b { color: var(--text); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  .table-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; overflow-x: auto;
+  }
+  .table-note { color: var(--muted); font-size: 0.86rem; margin-top: 1rem; }
+  .table-note code { color: var(--blue); }
+
+  /* ---------- code blocks ---------- */
+  .codeblock {
+    background: var(--bg-soft); border: 1px solid var(--border-2);
+    border-radius: 12px; padding: 1.15rem 1.3rem;
+    font-family: var(--mono); font-size: 0.84rem; line-height: 1.8;
+    overflow-x: auto; margin-bottom: 1.1rem;
+  }
+  .codeblock .cm { color: #6a7d99; }
+  .codeblock .p { color: var(--green); }
+  .codeblock .s { color: #a5d6ff; }
+  .codeblock .f { color: var(--amber); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1.1rem; }
+  @media (max-width: 880px) { .cols { grid-template-columns: 1fr; } }
+
+  /* ---------- architecture ---------- */
+  .arch {
+    background: var(--bg-soft); border: 1px solid var(--border-2);
+    border-radius: 12px; padding: 1.4rem 1.5rem; overflow-x: auto;
+  }
+  .arch pre {
+    font-family: var(--mono); font-size: 0.78rem; line-height: 1.55; color: var(--text);
+    min-width: 540px;
+  }
+  .arch .a { color: var(--green); }
+  .arch .b { color: var(--blue); }
+  .arch .m { color: var(--muted); }
+
+  /* ---------- targets ---------- */
+  .chips { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+  .chip {
+    font-family: var(--mono); font-size: 0.82rem;
+    border: 1px solid var(--border-2); border-radius: 8px;
+    padding: 0.38rem 0.8rem; color: var(--text); background: var(--panel);
+  }
+  .chip b { color: var(--green); font-weight: 600; }
+
+  /* ---------- footer ---------- */
+  footer {
+    margin-top: 5rem; border-top: 1px solid var(--border);
+    padding: 2.5rem 0 3rem; color: var(--muted); font-size: 0.88rem;
+  }
+  footer .cols-f { display: flex; flex-wrap: wrap; gap: 2.5rem; justify-content: space-between; }
+  footer a { color: var(--muted); }
+  footer a:hover { color: var(--text); }
+  footer .heart { color: var(--red); }
+</style>
+</head>
+<body>
+
+<nav>
+  <a class="brand" href="#top"><span class="glyph">&gt;_</span> utmm</a>
+  <div class="links">
+    <a href="#capabilities">Capabilities</a>
+    <a href="#mcp">MCP</a>
+    <a href="#quickstart">Quick Start</a>
+    <a href="#architecture">Architecture</a>
+    <a class="pill" href="https://github.com/fixnet-ai/utm-monitor" target="_blank" rel="noopener">GitHub</a>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap hero-grid">
+    <div>
+      <span class="eyebrow">single binary &middot; zero dependencies &middot; MIT</span>
+      <h1>Remote debugging sidekick for <span class="accent">VMs &amp; machines</span></h1>
+      <p class="tagline">
+        UTM Monitor (<code>utmm</code>) lets you — and your AI agents — check processes,
+        read logs, run commands and transfer files on any Linux, macOS or Windows box.
+        One Zig binary, no SSH daemon, no runtime dependencies.
+      </p>
+      <div class="cta-row">
+        <a class="cta cta-primary" href="https://github.com/fixnet-ai/utm-monitor/releases" target="_blank" rel="noopener">&#11015;&#65039; Download from Releases</a>
+        <a class="cta cta-ghost" href="https://github.com/fixnet-ai/utm-monitor/blob/main/MANUAL.md" target="_blank" rel="noopener">Read the Manual</a>
+      </div>
+      <div class="hero-meta">
+        <span><b>8</b> cross-compile targets</span>
+        <span><b>7</b> MCP tools over HTTP</span>
+        <span><b>1</b> port for everything (:2121)</span>
+        <span><b>0</b> runtime deps</span>
+      </div>
+    </div>
+
+    <div class="term">
+      <div class="term-bar">
+        <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+        <span class="term-title">host &mdash; utmm</span>
+      </div>
+      <div class="term-body">
+<span class="p">$</span> <span class="cmd">utmm --status</span><br>
+<span class="dim">ROLE   HOSTNAME    TARGET             VERSION   STATUS     SHELL  CONPTY</span><br>
+host   hostvm      <span class="hl">aarch64-macos</span>     0.18.80   <span class="ok">serving</span>   pty    n/a<br>
+guest  linuxvm     <span class="hl">aarch64-linux</span>     0.18.80   <span class="ok">serving</span>   pty    n/a<br>
+guest  macvm       <span class="hl">aarch64-macos</span>     0.18.80   <span class="ok">serving</span>   pty    n/a<br>
+guest  windowsvm   <span class="hl">aarch64-windows</span>   0.18.80   <span class="ok">serving</span>   pipe   <span class="ok">yes</span><br>
+<br>
+<span class="p">$</span> <span class="cmd">utmm --exec linuxvm "uname -a"</span><br>
+Linux linuxvm 6.6.x #1 SMP aarch64 GNU/Linux<br>
+<span class="dim">exit code: 0</span><br>
+<br>
+<span class="p">$</span> <span class="cmd">utmm --mcp</span><br>
+<span class="ok">MCP endpoint:</span> <span class="hl">http://127.0.0.1:2121/</span>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section id="capabilities">
+    <h2><span class="num">01</span> Core capabilities</h2>
+    <p class="section-sub">Everything a debugging session needs, packed into one static binary
+      that installs itself and supervises itself.</p>
+    <div class="cards">
+      <div class="card"><span class="icon">&#9000;</span>
+        <h3>Streaming exec</h3>
+        <p>Per-command pty on the target, output streamed back in real time. Exit code embedded as a marker — no timeout, no truncation.</p>
+      </div>
+      <div class="card"><span class="icon">&#128193;</span>
+        <h3>File transfer</h3>
+        <p>Upload &amp; download over direct TCP streaming with end-to-end <code>SHA256</code> verification and atomic rename on write.</p>
+      </div>
+      <div class="card"><span class="icon">&#127760;</span>
+        <h3>SOCKS5 mesh</h3>
+        <p>Host is the central proxy on <code>:2121</code>. Reach any Guest's services from the Host — no SSH tunnels, no port mapping.</p>
+      </div>
+      <div class="card"><span class="icon">&#128273;</span>
+        <h3>Built-in sshpass</h3>
+        <p>Non-interactive SSH password auth, 100% CLI-compatible with standalone sshpass. POSIX PTY + Windows ConPTY.</p>
+      </div>
+      <div class="card"><span class="icon">&#128225;</span>
+        <h3>Zero-config discovery</h3>
+        <p>Guests auto-discover the Host via LSA broadcast over UDP and keep <code>/etc/hosts</code> in sync automatically.</p>
+      </div>
+      <div class="card"><span class="icon">&#129302;</span>
+        <h3>MCP over HTTP</h3>
+        <p>AI agents drive machines via JSON-RPC POST to <code>:2121</code>. First-byte dispatch shares one port with SOCKS5.</p>
+      </div>
+      <div class="card"><span class="icon">&#128230;</span>
+        <h3>Self-copy install</h3>
+        <p><code>--install</code> is a single atomic operation: stop &rarr; kill &rarr; copy to canonical path &rarr; install service &rarr; start.</p>
+      </div>
+      <div class="card"><span class="icon">&#9889;</span>
+        <h3>utmmd supervisor</h3>
+        <p>A lightweight daemon manages utmm's lifecycle via shared memory: heartbeats, crash recovery with backoff, atomic upgrades.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="mcp">
+    <h2><span class="num">02</span> MCP tools for AI agents</h2>
+    <p class="section-sub">
+      <code style="font-family:var(--mono)">utmm --mcp</code> prints the HTTP endpoint and ensures the Host daemon is running.
+      Every response carries both human-readable <code>content[0].text</code> and machine-readable
+      <code>structuredContent</code> — agents parse JSON, not markdown.
+    </p>
+    <div class="table-card">
+      <table>
+        <thead>
+          <tr><th>Tool</th><th>What it does</th><th>structuredContent</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><span class="tool">status</span></td>
+              <td>List all nodes: hostname, role, IP, OS/arch, MAC, version, status, shell, ConPTY</td>
+              <td><b>guests[]</b>, counts{total, serving, offline}</td></tr>
+          <tr><td><span class="tool">exec</span></td>
+              <td>Execute a shell command on any Guest via per-command pty</td>
+              <td><b>vm</b>, command, <b>exit_code</b></td></tr>
+          <tr><td><span class="tool">ping</span></td>
+              <td>Ping a Guest over the mesh network and measure RTT</td>
+              <td><b>vm</b>, <b>reachable</b>, mac, rtt_ms</td></tr>
+          <tr><td><span class="tool">upload</span></td>
+              <td>Upload file Host &rarr; Guest (TCP/SOCKS5, SHA256 verified)</td>
+              <td><b>vm</b>, local_path, remote_path, <b>success</b></td></tr>
+          <tr><td><span class="tool">download</span></td>
+              <td>Download file Guest &rarr; Host (TCP/SOCKS5, SHA256 verified)</td>
+              <td><b>vm</b>, remote_path, local_path, <b>bytes</b>, success</td></tr>
+          <tr><td><span class="tool">sshpass</span></td>
+              <td>Non-interactive SSH password auth — direct shell access to any machine</td>
+              <td><b>host</b>, user, <b>exit_code</b></td></tr>
+          <tr><td><span class="tool">manual</span></td>
+              <td>Return the full reference manual (embedded at compile time)</td>
+              <td>—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="table-note">
+      Things your agent can now handle: <i>"linuxvm just crashed — grab the system logs and core
+      dump, find the root cause"</i> &middot; <i>"push the new build to all machines and run the
+      test suite"</i> &middot; <i>"this binary works on Linux but panics on Windows — run it on
+      both and compare"</i>. Full protocol reference in the
+      <a href="https://github.com/fixnet-ai/utm-monitor/blob/main/MANUAL.md#mcp-protocol" target="_blank" rel="noopener">Manual</a>.
+    </p>
+  </section>
+
+  <section id="quickstart">
+    <h2><span class="num">03</span> Quick start</h2>
+    <p class="section-sub">Download <code style="font-family:var(--mono)">utmm.zip</code> from
+      <a href="https://github.com/fixnet-ai/utm-monitor/releases" target="_blank" rel="noopener">Releases</a>,
+      pick your platform's binary, and install. That's the whole setup.</p>
+    <div class="cols">
+      <div class="codeblock"><span class="cm"># POSIX (Linux / macOS)</span><br>
+unzip utmm.zip<br>
+<span class="p">sudo</span> ./utmm-&lt;target&gt;-&lt;version&gt; <span class="f">--install</span> --hostname &lt;name&gt;<br>
+<br>
+<span class="cm"># Windows (PowerShell as Administrator)</span><br>
+Expand-Archive utmm.zip<br>
+C:\opt\utmm\utmm-&lt;target&gt;-&lt;version&gt;.exe <span class="f">--install</span> --hostname &lt;name&gt;</div>
+      <div class="codeblock"><span class="cm"># Exec on any machine</span><br>
+<span class="p">utmm</span> <span class="f">--exec</span> linuxvm <span class="s">"ps aux | grep myapp"</span><br>
+<span class="p">utmm</span> <span class="f">--exec</span> windowsvm <span class="s">"tasklist | findstr myapp"</span><br>
+<br>
+<span class="cm"># Files &amp; upgrades</span><br>
+<span class="p">utmm</span> <span class="f">--upload</span> build.zip linuxvm<br>
+<span class="p">utmm</span> <span class="f">--deploy</span>&nbsp;&nbsp;<span class="cm"># build + push to all guests</span><br>
+<br>
+<span class="cm"># Reach a Guest's service through the SOCKS5 mesh</span><br>
+curl --socks5 localhost:2121 http://linuxvm:8080</div>
+    </div>
+  </section>
+
+  <section id="architecture">
+    <h2><span class="num">04</span> Architecture</h2>
+    <p class="section-sub">Hub-and-spoke: one Host, many Guests, everything on port 2121.
+      TCP handles SOCKS5 + frame protocol + HTTP MCP (first-byte dispatch);
+      UDP handles LSA mesh discovery.</p>
+    <div class="arch"><pre>                         <span class="a">┌── HTTP MCP ← AI Agent (POST to :2121)</span>
+Guest (macvm)    ──TCP──┐
+Guest (linuxvm)  ──TCP──┤──→ <span class="b">Host TCP :2121</span> ──┼── CLI (IPC)
+Guest (windows)  ──TCP──┘   <span class="m">(SOCKS5 + HTTP MCP
+                         │    via first-byte)</span>
+Guest ←── LSA broadcast (UDP :2121) ──┘  <span class="m">(auto-discovery + topology)</span>
+
+<span class="m">Every node's TCP :2121 is a SOCKS5 endpoint. Guests route through the Host
+(gateway:2121); the Host chain-forwards between Guests. Third-party tools use
+any node as a proxy to reach any other node.</span></pre></div>
+  </section>
+
+  <section id="targets">
+    <h2><span class="num">05</span> One codebase, eight targets</h2>
+    <p class="section-sub">Every release ships all eight binaries, cross-compiled with
+      <code style="font-family:var(--mono)">zig build cross</code> and packaged as
+      <code style="font-family:var(--mono)">utmm.zip</code>.</p>
+    <div class="chips">
+      <span class="chip"><b>aarch64</b>-linux-musl</span>
+      <span class="chip"><b>x86_64</b>-linux-musl</span>
+      <span class="chip"><b>x86</b>-linux-musl</span>
+      <span class="chip"><b>aarch64</b>-macos</span>
+      <span class="chip"><b>x86_64</b>-macos</span>
+      <span class="chip"><b>aarch64</b>-windows</span>
+      <span class="chip"><b>x86_64</b>-windows</span>
+      <span class="chip"><b>x86</b>-windows</span>
+    </div>
+  </section>
+
+  <footer>
+    <div class="cols-f">
+      <div>
+        <div style="font-weight:700; margin-bottom:0.4rem"><span style="color:var(--green); font-family:var(--mono)">&gt;_</span> UTM Monitor</div>
+        Built with <span class="heart">&#10084;</span> in Zig &middot; MIT License<br>
+        &copy; 2026 fixnet &middot; <a href="https://github.com/fixnet-ai/utm-monitor/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
+      </div>
+      <div>
+        <a href="https://github.com/fixnet-ai/utm-monitor" target="_blank" rel="noopener">GitHub</a> &middot;
+        <a href="https://github.com/fixnet-ai/utm-monitor/releases" target="_blank" rel="noopener">Releases</a> &middot;
+        <a href="https://github.com/fixnet-ai/utm-monitor/blob/main/MANUAL.md" target="_blank" rel="noopener">Manual</a> &middot;
+        <a href="https://github.com/fixnet-ai/utm-monitor/blob/main/mcp.json.example" target="_blank" rel="noopener">MCP config example</a>
+      </div>
+    </div>
+  </footer>
+
+</div>
+
+</body>
+</html>
