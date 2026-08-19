@@ -634,7 +634,12 @@ pub fn buildCmdWithMarker(allocator: std.mem.Allocator, shell: []const u8, comma
     if (std.mem.indexOf(u8, shell, "cmd.exe") != null) {
         return try std.fmt.allocPrint(allocator, "{s}\r\necho MDELIM:%errorlevel%\r\n", .{command});
     }
-    return try std.fmt.allocPrint(allocator, "{s}; echo MDELIM:$?\n", .{command});
+    // set +m 运行时关闭作业控制：交互式 shell 初始化会强制开启作业控制
+    // （argv +m 被覆盖，实测 linuxvm），每个后台作业获得独立进程组，
+    // kill(-pgid) 断连击杀够不到（残留 +1/次）。运行时 set +m 使所有
+    // 后代留在本组（真机 linuxvm/macvm 实验验证）。set +m 无输出，
+    // 不影响 MDELIM 的 $? 取值（紧跟用户命令之后）。
+    return try std.fmt.allocPrint(allocator, "set +m; {s}; echo MDELIM:$?\n", .{command});
 }
 
 // ── VT 转义序列剥离（ConPTY 输出净化）──────────────────────────────
@@ -1390,7 +1395,7 @@ test "buildCmdWithMarker: posix marker unchanged" {
     const allocator = arena.allocator();
 
     const cmd = try buildCmdWithMarker(allocator, "/bin/bash", "uname -a");
-    try std.testing.expectEqualStrings("uname -a; echo MDELIM:$?\n", cmd);
+    try std.testing.expectEqualStrings("set +m; uname -a; echo MDELIM:$?\n", cmd);
 }
 
 test "stripVtSequences: removes CSI sequences" {

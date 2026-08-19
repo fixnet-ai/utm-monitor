@@ -18,6 +18,16 @@
 - [x] 43F 单测 231 全绿 / 集成 62 全绿 ×3 连续（新增 test_exec_cancel：断连杀进程 + 自然完成回归）/ aarch64-windows + x86_64-linux-musl 交叉编译过 / ver.txt 0.18.80 / CLAUDE+MANUAL 文档 / 顺带修复存量 macOS pty closeFn 5s 隐性延迟（E-state 根因见 findings）
 - [ ] 真机验证（发布 + --deploy 后逐 VM：MCP abort 杀 sleep、CLI Ctrl-C、孙进程组、旧 Guest 混部退化）
 
+### v0.18.82 追加（真机验证闭环）
+
+- argv `+m` 真机无效（交互式 shell 初始化强制开启作业控制）→ 改命令前缀
+  `set +m; `（buildCmdWithMarker）→ linuxvm/macvm 真机 2→0 验证通过
+- Windows 孙进程残留（cmd.exe 死、PING.EXE 活）→ Job Object
+  （KILL_ON_JOB_CLOSE + TerminateJobObject 整树）→ windowsvm 真机 1→0
+- 四平台取消验证矩阵全绿：linuxvm（MCP abort / CLI 死亡 / 孙进程 ×2）、
+  macvm（孙进程）、windowsvm（孙进程/Job Object）
+- 真机验出部署重启窗口瞬态 Socks5AuthFailed（~1min 自愈，观察项）
+
 ### v0.18.81 追加（真机验证驱动的两连修）
 
 真机测试 A（MCP abort）/B（CLI 死亡）通过；**测试 C（孙进程）失败** → 作业控制

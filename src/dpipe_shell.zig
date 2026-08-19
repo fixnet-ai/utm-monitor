@@ -50,6 +50,10 @@ const ShellCtx = struct {
     child_pid: std.posix.pid_t,
     shell: []const u8,
     stdin_fd: std.posix.fd_t, // Windows: stdin_write pipe handle
+    /// Windows: Job Object 句柄（KILL_ON_JOB_CLOSE）— 取消时整树击杀
+    /// cmd.exe 的子进程（ping/python/make 等）。INVALID_HANDLE_VALUE = 未启用
+    ///（降级为仅杀 cmd）。POSIX 侧不使用。
+    job_handle: std.posix.fd_t = if (builtin.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else 0,
     // Windows OEM↔UTF-8 跨块转码暂存（详见 readFn/writeFn）
     out_pending: [4]u8 = undefined, // 尾部 DBCS 前导字节（OEM 侧）
     out_pending_len: usize = 0,
@@ -155,23 +159,12 @@ fn spawnPosix(allocator: std.mem.Allocator, shell: []const u8) !ShellCtx {
             break :blk "/bin/sh";
         } else "/bin/sh";
 
-        // +m 关闭作业控制（bash/zsh）：交互式 shell 会给每个后台作业创建独立
-        // 进程组，脱离 kill(-pid) 进程组击杀范围（实测取消后 `(sleep 300) &`
-        // 幸存，pgid 自成一组）。关闭后所有后代留在本组，断连取消可完整清除。
-        // 仅对支持 `+m` 语法 的 bash/zsh 追加 — dash 会把 "+m"
-        // 当作脚本文件名执行。
-        const base = if (std.mem.lastIndexOfScalar(u8, shell_path, '/')) |i| shell_path[i + 1 ..] else shell_path;
-        const plus_m = std.mem.eql(u8, base, "bash") or std.mem.eql(u8, base, "zsh");
-
         // 数组字面量初始化（哨兵槽自动就位）— 不可用 `= undefined`：哨兵
-        // 槽保持垃圾值，后续 execve 的 argv 终止符未定义（Debug 下 sentinel
-        // 切片断言 panic，实测子进程秒退）。plus_m 为假时中段即 null，
-        // execve 在首个 null 处终止，多余元素被忽略。
-        const argv = [_:null]?[*:0]const u8{
-            shell_path.ptr,
-            "-l",
-            if (plus_m) @as(?[*:0]const u8, "+m") else null,
-        };
+        // 槽保持垃圾值，execve 的 argv 终止符未定义（Debug 下 sentinel 切片
+        // 断言 panic，实测子进程秒退）。作业控制关闭（set +m）在
+        // buildCmdWithMarker 的命令前缀完成 — argv +m 会被交互式 shell
+        // 初始化强制覆盖（实测 linuxvm 无效）。
+        const argv = [_:null]?[*:0]const u8{ shell_path.ptr, "-l" };
         _ = std.c.execve(shell_path.ptr, &argv, std.c.environ);
         std.log.err("[dpipe-shell] execve failed", .{});
         std.process.exit(1);
@@ -279,7 +272,70 @@ fn spawnWindowsPipe(allocator: std.mem.Allocator) !ShellCtx {
     _ = CloseHandle(stdin_read);
     _ = CloseHandle(stdout_write);
 
-    std.log.info("[dpipe-shell] Windows pipe pty: cmd.exe /k (OEM xcode) pid={d}", .{pi.dwProcessId});
+    // Job Object（KILL_ON_JOB_CLOSE）：Windows 无进程组，TerminateProcess 只杀
+    // cmd.exe 直系，孙进程（ping/python/make）残留 — 断连取消的核心漏洞。
+    // Job 内所有后代（cmd 默认不 breakaway）随 TerminateJobObject 整树终止；
+    // 句柄关闭（含 utmm 自身崩溃）亦触发全灭。分配失败降级为仅杀 cmd。
+    const CreateJobObjectW = @extern(
+        *const fn (lpJobAttributes: ?*w.SECURITY_ATTRIBUTES, lpName: ?[*:0]const u16) callconv(.winapi) HANDLE,
+        .{ .name = "CreateJobObjectW", .library_name = "kernel32" },
+    );
+    const SetInformationJobObject = @extern(
+        *const fn (hJob: HANDLE, JobObjectInformationClass: DWORD, lpJobObjectInformation: *const anyopaque, cbJobObjectInformationLength: DWORD) callconv(.winapi) BOOL,
+        .{ .name = "SetInformationJobObject", .library_name = "kernel32" },
+    );
+    const AssignProcessToJobObject = @extern(
+        *const fn (hJob: HANDLE, hProcess: HANDLE) callconv(.winapi) BOOL,
+        .{ .name = "AssignProcessToJobObject", .library_name = "kernel32" },
+    );
+    const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
+        PerProcessUserTimeLimit: i64,
+        PerJobUserTimeLimit: i64,
+        LimitFlags: DWORD,
+        MinimumWorkingSetSize: usize,
+        MaximumWorkingSetSize: usize,
+        ActiveProcessLimit: DWORD,
+        Affinity: usize,
+        PriorityClass: DWORD,
+        SchedulingClass: DWORD,
+    };
+    const IO_COUNTERS = extern struct {
+        ReadOperationCount: u64,
+        WriteOperationCount: u64,
+        OtherOperationCount: u64,
+        ReadTransferCount: u64,
+        WriteTransferCount: u64,
+        OtherTransferCount: u64,
+    };
+    const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
+        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        IoInfo: IO_COUNTERS,
+        ProcessMemoryLimit: usize,
+        JobMemoryLimit: usize,
+        PeakProcessMemoryUsed: usize,
+        PeakJobMemoryUsed: usize,
+    };
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: DWORD = 0x2000;
+    const JobObjectExtendedLimitInformation: DWORD = 9;
+
+    const INVALID_HANDLE: HANDLE = std.os.windows.INVALID_HANDLE_VALUE;
+    var job: HANDLE = INVALID_HANDLE;
+    {
+        const h = CreateJobObjectW(null, null);
+        if (h != INVALID_HANDLE) {
+            var info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (@intFromEnum(SetInformationJobObject(h, JobObjectExtendedLimitInformation, &info, @sizeOf(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))) != 0 and
+                @intFromEnum(AssignProcessToJobObject(h, pi.hProcess)) != 0)
+            {
+                job = h;
+            } else {
+                _ = CloseHandle(h); // 设置/分配失败 — 降级
+            }
+        }
+    }
+
+    std.log.info("[dpipe-shell] Windows pipe pty: cmd.exe /k (OEM xcode) pid={d} job={}", .{ pi.dwProcessId, job != INVALID_HANDLE });
 
     return ShellCtx{
         .allocator = allocator,
@@ -287,6 +343,7 @@ fn spawnWindowsPipe(allocator: std.mem.Allocator) !ShellCtx {
         .child_pid = pi.hProcess,
         .shell = try allocator.dupe(u8, "cmd.exe /k"),
         .stdin_fd = stdin_write,
+        .job_handle = job,
     };
 }
 
@@ -405,16 +462,19 @@ fn xcodeWrite(self: *ShellCtx, data: []const u8) !void {
 fn closeFn(ctx: *anyopaque) void {
     const self: *ShellCtx = @ptrCast(@alignCast(ctx));
     if (builtin.os.tag == .windows) {
-        killChild(self.child_pid); // TerminateProcess → stdout pipe EOF
+        killChild(self); // TerminateJobObject 整树 → stdout pipe EOF
         closePtyFd(self.master_fd);
         closePtyFd(self.stdin_fd);
+        if (self.job_handle != std.os.windows.INVALID_HANDLE_VALUE) {
+            closePtyFd(self.job_handle); // 释放 Job（触发 kill-on-close 兜底）
+        }
     } else {
         // 先关 master 再 kill：从属端 read 立即得到 EOF/HUP，shell 干净退出。
         // macOS 实测：SIGKILL 一个阻塞在 slave read 的 shell，进程卡 E 状态
         // ~5s 直到 master 关闭才真正退出（killChild waitpid 轮询白等满）—
         // findings 2026-08-19。先关 master 使收割在 ~100ms 内完成。
         closePtyFd(self.master_fd);
-        killChild(self.child_pid); // 清理残余进程组 + 收割
+        killChild(self); // 清理残余进程组 + 收割
     }
     self.allocator.free(self.shell);
     self.allocator.destroy(self);
@@ -537,16 +597,27 @@ fn ptyRead(master_fd: std.posix.fd_t, buf: []u8) !usize {
     }
 }
 
-fn killChild(pid: std.posix.pid_t) void {
+fn killChild(self: *ShellCtx) void {
     switch (builtin.os.tag) {
         .windows => {
+            // Job Object 整树击杀：cmd.exe + 其全部子进程（ping/python 等）
+            const TerminateJobObject = @extern(
+                *const fn (std.os.windows.HANDLE, std.os.windows.UINT) callconv(.winapi) std.os.windows.BOOL,
+                .{ .name = "TerminateJobObject", .library_name = "kernel32" },
+            );
+            if (self.job_handle != std.os.windows.INVALID_HANDLE_VALUE) {
+                _ = TerminateJobObject(self.job_handle, 1);
+                return;
+            }
+            // 降级：Job 未启用（创建失败）— 仅杀 cmd.exe 直系，孙进程残留
             const TerminateProcess = @extern(
                 *const fn (std.os.windows.HANDLE, std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL,
                 .{ .name = "TerminateProcess", .library_name = "kernel32" },
             );
-            _ = TerminateProcess(pid, 1);
+            _ = TerminateProcess(self.child_pid, 1);
         },
         .linux, .macos => {
+            const pid = self.child_pid;
             // 杀整个进程组 — 子进程 setsid 后是组长（spawnPosix），覆盖命令
             // 派生的孙进程（make/cc/管道链/nohup 型守护）。组长已死或非组长
             // 时 kill(-pid) 失败，回退仅杀本进程。
@@ -575,7 +646,7 @@ fn killChild(pid: std.posix.pid_t) void {
 /// 与后续 close() 的 killChild 双重调用无害（kill 对已回收 pid 返回 ESRCH）。
 pub fn requestKill(pipe: dpipe.DuplexPipe) void {
     const self: *ShellCtx = @ptrCast(@alignCast(pipe.ctx));
-    killChild(self.child_pid);
+    killChild(self);
 }
 
 fn closePtyFd(fd: std.posix.fd_t) void {

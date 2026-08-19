@@ -575,14 +575,29 @@ close master（slave read 立即 EOF → shell 干净退出）再 kill+收割，
 完成。注意 shell 阻塞在 waitpid（前台任务运行中）时 SIGKILL 秒杀无此问题
 ——只有 idle 在 read 的 shell 受影响。
 
-**实施中发现 3 — 真机验证抓出的作业控制盲区（v0.18.81 修复）**:
+**实施中发现 3 — 真机验证抓出的作业控制盲区（v0.18.81→0.18.82 修复）**:
 真机测试 C（`(sleep 300) & sleep 300` 取消）暴露：**交互式 shell 的作业控制
 给每个 `&` 作业创建独立进程组**，`kill(-bash_pgid)` 够不到，master 关闭的
 SIGHUP 又因 bash `huponexit=off` 不发给后台组 → 后台作业幸存（实测 pgid
-自成一组的进程在取消后存活）。修复：spawn shell 时对 bash/zsh 追加 `+m`
-（关闭作业控制，后代全部留在本组）——dash 会把 "+m" 当文件名执行，故仅
-对已知 shell 追加。真机 `set +m` 实验先行验证（两个后台作业 pgid 均为
-shell 本组）。
+自成一组的进程在取消后存活，每次取消残留 +1）。
+
+**两次修复迭代**（第一版无效）:
+- ❌ argv `+m`（`bash -l +m`）：真机实测残留依旧——**交互式 shell 初始化
+  强制开启作业控制，覆盖 argv 初值**（单测/本地 pty 无法暴露：恰好通过）。
+- ✅ 命令前缀 `set +m; `（buildCmdWithMarker POSIX 分支）：运行时关闭，
+  后代全部留在本组。linuxvm(bash)/macvm(zsh) 真机验证 2→0。
+
+**Windows 孙进程残留（v0.18.82 Job Object 修复）**:
+TerminateProcess 只杀 cmd.exe 直系，PING.EXE 等子进程残留（实测取消 5s 后
+仍存活）。修复：spawnWindowsPipe 创建 Job Object（`KILL_ON_JOB_CLOSE`）+
+AssignProcessToJobObject；killChild Windows 分支改 TerminateJobObject 整树
+击杀（job 创建失败降级 TerminateProcess）；closeFn 关闭 job 句柄兜底
+（utmm 崩溃也全灭）。真机 windowsvm 验证 1→0。
+注意 0.16 的 `std.os.windows.HANDLE` 是**非可选** `*anyopaque`，null 判断
+用 `INVALID_HANDLE_VALUE` 比较（ipc.zig 惯例）。
+
+**附带观察**: 部署后立刻 exec 可能瞬态 `Socks5AuthFailed`（两台 Windows VM
+部署重启窗口各复现一次，~1min 自愈）——服务切换期旧监听残留，暂不处理。
 
 **实施中发现 4 — 两处 argv/格式化低级 bug（+m 改造过程中踩中）**:
 1. `var argv: [3:null]?[*:0]const u8 = undefined` 的**哨兵槽不初始化**
