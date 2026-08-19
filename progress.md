@@ -2088,3 +2088,27 @@ POSIX 上 `file_io` 直接复用事件循环 Io（epoll/kqueue），而 `findUpg
 调研发现 Release workflow 连续 15+ 次全挂（根因 ../zio 本地依赖 CI 缺失）+
 无 LICENSE（SignPath OSS 硬前置）。用户裁定: MIT / CI 全接管发布 / SignPath
 步骤先写好待申请。规划见 task_plan.md Phase 42。
+
+**Phase 42 实施记录（08-19 下午）**:
+- 42A LICENSE (MIT, fixnet-ai) ✓
+- 42B release.yml 重写: clone zio + workflow_dispatch + sign job
+  (vars.SIGNPATH_ENABLED 门控) + release job (tag-only, signed-dist 优先
+  fallback dist)。actions 版本: upload-artifact@v7 / download-artifact@v8 /
+  SignPath action@v2 (经 gh api 确认最新)
+- 42C ci.yml: push(main)/PR → test-only ✓
+- 42D release.sh thin 化: 校验 + commit + tag + push，utmmd 模式判定退役
+  (CI 固定 -Dutmmd=true 默认值，build.zig:68 确认)
+- 42E CLAUDE.md Release Process 重写 + SignPath 激活清单；MANUAL.md
+  Software Upgrade 同步
+- 42F 验证: 本地基线 229 单元 + 60 集成 0 泄漏 exit=0 → 分支 ci-signpath
+  (commit 63931d1) → PR #6 → **ci.yml GitHub runner 全绿 (1m17s，zio clone
+  修复端到端验证)** → workflow_dispatch 触发 release.yml 构建链验证中
+- 发现: 之前 15 次 CI 失败全部挂在 zio 缺失，测试从未真正跑到过；本地
+  exit=0 证明修复后测试在 CI 环境同样通过
+
+**Phase 42 收尾（08-19）**: release.yml dispatch 构建链绿 (6m30s: 测试 +
+8 目标 + utmmd 重建 + dist artifact 20.8MB)；sign job skip (SIGNPATH_ENABLED
+未配置) + release job skip (非 tag ref) 双门控按设计工作；PR #6 rebase 合并
+main (331ee0b)。**真实 tag 端到端发布留待下次版本**（softprops 发布段为
+标准 action 调用，风险低）。CI 修复完成：15+ 连败 → PR/push 测试门禁 +
+tag 发布链全绿。

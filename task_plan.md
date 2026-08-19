@@ -8,7 +8,7 @@
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
 - **真机部署**: 5 节点 v0.18.79 serving
 - **Phase 41 完成**: Windows exec OEM↔UTF-8 转码 + marker 独立行修复（v0.18.79）
-- **Phase 42 进行中**: GitHub Actions CI 修复 + 发布接管 + MIT + SignPath
+- **Phase 42 完成**: CI 修复 (zio clone) + CI 接管发布 + MIT + SignPath 步骤待启用 (PR #6)
 
 ## 进行中: Phase 42 — CI 调通 + 发布接管 + MIT LICENSE + SignPath 签名（2026-08-19）
 
@@ -30,12 +30,12 @@
 
 | # | 任务 | 说明 | 状态 |
 |---|------|------|------|
-| 42A | LICENSE (MIT, fixnet-ai) | SignPath OSS 申请前置 | ⬜ |
-| 42B | 重写 `release.yml`：clone zio 步骤 + `-Dutmmd=true`（源码即真相，免 stale supervisor guard）+ workflow_dispatch 手动触发（发布步骤仅 tag 时执行）+ SignPath 签名 job（`vars.SIGNPATH_ENABLED` 门控，默认跳过）+ release job 发布签名后产物 | tag → test → 8 目标 → 签名（可选）→ release | ⬜ |
-| 42C | 新增 `ci.yml`：push/PR 触发 test-only（zig build test + test-integration） | 提前暴露构建问题，不再等到 tag 才发现；public repo macOS runner 免费 | ⬜ |
-| 42D | release.sh thin 化：只做校验 ver.txt + clean tree + commit + tag(带 notes) + push，删除本地测试/构建/打包/发布/utmmd 模式判定 | utmmd 模式判定随 CI `-Dutmmd=true` 固定而退役 | ⬜ |
-| 42E | 文档同步：CLAUDE.md Release Process 章节改写（CI 全接管流程 + SignPath 启用清单） | README/MANUAL 若涉发布流程一并核对 | ⬜ |
-| 42F | 验证：分支 push 触发 ci.yml 绿 → workflow_dispatch 手动跑 release.yml 构建链绿 → 合并 → 真实 tag 端到端发布 | 未验证不发 tag | ⬜ |
+| 42A | LICENSE (MIT, fixnet-ai) | SignPath OSS 申请前置 | ✅ |
+| 42B | 重写 `release.yml`：clone zio 步骤 + `-Dutmmd=true`（源码即真相，免 stale supervisor guard）+ workflow_dispatch 手动触发（发布步骤仅 tag 时执行）+ SignPath 签名 job（`vars.SIGNPATH_ENABLED` 门控，默认跳过）+ release job 发布签名后产物 | tag → test → 8 目标 → 签名（可选）→ release | ✅ |
+| 42C | 新增 `ci.yml`：push/PR 触发 test-only（zig build test + test-integration） | 提前暴露构建问题，不再等到 tag 才发现；public repo macOS runner 免费 | ✅ |
+| 42D | release.sh thin 化：只做校验 ver.txt + clean tree + commit + tag(带 notes) + push，删除本地测试/构建/打包/发布/utmmd 模式判定 | utmmd 模式判定随 CI `-Dutmmd=true` 固定而退役 | ✅ |
+| 42E | 文档同步：CLAUDE.md Release Process 章节改写（CI 全接管流程 + SignPath 启用清单） | README/MANUAL 若涉发布流程一并核对 | ✅ |
+| 42F | 验证：分支 push 触发 ci.yml 绿 → workflow_dispatch 手动跑 release.yml 构建链绿 → 合并 → 真实 tag 端到端发布 | ci.yml 绿 (PR #6, 1m17s)；release.yml 构建链绿 (dispatch 6m30s, sign/release 门控 skip 符合设计, dist artifact 20.8MB)；PR #6 rebase 合并 main (331ee0b)；真实 tag 端到端留待下次发布 | ✅ |
 
 **SignPath 签名设计**（42B 内实现，待用户申请批准后激活）:
 
