@@ -491,3 +491,36 @@ attr list/CreateProcessW 返回 pid，cmd 进程 STILL_ACTIVE）但 cmd **零输
 dpipe_shell 双向转码（输出 GetOEMCP→UTF-8 / 输入 UTF-8→GetOEMCP，DBCS/UTF-8
 跨块 pending）。真机验证: ipconfig「以太网」/中文标签全部正确 UTF-8、
 exit 7/9009/5 传播、UTF-8 中文输入正确回显、&&/|/net user 中文正常。
+
+## 2026-08-19 (Phase 42) — CI 失败根因 + SignPath 调研
+
+**CI 失败根因**（`gh run view 32201183126 --log-failed`）:
+```
+unable to open '/Users/runner/work/utm-monitor/utm-monitor/../zio': FileNotFound
+error: the following build command failed with exit code 1 (zig build test)
+```
+`build.zig.zon` 声明 `.zio = .{ .path = "../zio" }`（fork 注释：x86-32 支持在
+fixnet-ai/zio feat/x86-32 分支，等 PR #646 合并后转上游 URL）。CI checkout
+只拉本仓库 → sibling 目录不存在 → `zig build test` 必挂。**连续 15+ 次 tag
+发布 CI 全部 failure**（v0.18.36 起），此前发布实际全靠本地 release.sh，
+GitHub Releases 上的 utmm.zip 是本地构建的。
+
+**zio fork 状态**: fixnet-ai/zio PUBLIC，分支 feat/x86-32 存在（本地即该分支，
+HEAD 5907d1f "fix: address PR #646 review feedback"）。CI 修复 = checkout 后
+`git clone -b feat/x86-32 https://github.com/fixnet-ai/zio.git ../zio`。
+
+**SignPath 调研结论**（docs.signpath.io/trusted-build-systems/github）:
+- OSS 免费：OV 证书签给 SignPath Foundation（非个人），条件之一是 **OSI 开源
+  许可证、无商业双许可** → 本仓库缺 LICENSE，必须先补（用户选 MIT）
+- Trusted Build System 机制：GitHub App 验证 origin 不可伪造；artifact 必须
+  先经 actions/upload-artifact 存在 GitHub 服务器上；**OSS 要求全部前置 job
+  在 GitHub 托管 runner**（macos-latest 满足）
+- workflow 用法：`upload-artifact@v7` → `SignPath/github-action-submit-signing-request@v2`
+  （api-token / organization-id / project-slug / signing-policy-slug /
+  github-artifact-id / wait-for-completion: true / output-artifact-directory）
+  → action 自动下载解压签名后产物
+- 签名范围决策：**只签 3 个 Windows .exe**（Authenticode 消 SmartScreen/杀软
+  误报——远程调试工具无签名最易被标记）。macOS 保持 adhoc（自部署 VM 场景
+  够用，SignPath macOS 签名需自备 Apple 开发者证书，无增益）
+- 申请为人工审批（社区案例约 1 周），AI 无法代办 → CI 用
+  `vars.SIGNPATH_ENABLED` repository variable 门控签名 job，批准前整段跳过

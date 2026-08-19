@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # 与 release.yml 保持一致——build.zig.zon 的 sibling 依赖
+  # (等上游 PR #646 合并后改回 URL 依赖并删除克隆步骤)。
+  ZIO_REPO: https://github.com/fixnet-ai/zio.git
+  ZIO_BRANCH: feat/x86-32
+
+jobs:
+  test:
+    name: Unit + integration tests
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone zio dependency (sibling path)
+        run: git clone --depth 1 -b "$ZIO_BRANCH" "$ZIO_REPO" ../zio
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.16.0'
+
+      - name: Run unit tests
+        # Avoid --summary all on macOS — can trigger --listen=- protocol hang
+        run: zig build test
+
+      - name: Run integration tests
+        run: zig build test-integration
+
+      # 交叉编译验证留给 release.yml（tag / workflow_dispatch）——
+      # 单元+集成测试已覆盖日常回归，8 目标 ReleaseSafe 全量构建
+      # 耗时长，不值得每个 PR 跑一遍

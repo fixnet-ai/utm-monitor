@@ -556,12 +556,22 @@ utmm --version                       # Print version and exit
 > a management command ensures once then executes. `--gen-init`
 > does not require the Host.
 
-## Release Process
+## Release Process (CI-owned since v0.18.80)
+
+Local side only bumps the version and pushes a tag; **tests, 8-target build,
+SignPath signing, and GitHub Release all run in CI** (`.github/workflows/release.yml`).
+Push/PR test gating lives in `.github/workflows/ci.yml`.
+
+> **CI sibling dependency**: `build.zig.zon` declares `.zio = .{ .path = "../zio" }`
+> (fixnet-ai/zio fork, branch feat/x86-32 — x86-32 support pending upstream PR #646).
+> Both workflows clone it to `../zio` after checkout — without this step
+> `zig build test` fails with `unable to open '../zio': FileNotFound`
+> (root cause of 15+ consecutive CI failures before v0.18.80).
+> Local dev requires: `git clone -b feat/x86-32 https://github.com/fixnet-ai/zio.git ../zio`
 
 ### Prerequisites
-- `gh` CLI authenticated (`gh auth status`)
-- Zig 0.16.0 in PATH
 - Clean working tree (no uncommitted changes)
+- (gh CLI / Zig only needed for local `--deploy`, not for releasing)
 
 ### Step 1: Determine version
 Read `src/ver.txt` for the current version. Ask the user what the next version
@@ -570,41 +580,35 @@ If already bumped and not yet tagged, use that.
 
 ### Step 2: Bump version (if needed)
 Update one file:
-- `src/ver.txt`: change version number (e.g. `0.17.16` → `0.17.17`)
+- `src/ver.txt`: change version number (e.g., `0.17.16` → `0.17.17`)
 
 `build.zig.zon` version is permanently `0.0.0` (never changes). Runtime version
 comes from `src/ver.txt` via `@embedFile` at compile time — single source of truth.
 `--install` is a single self-contained operation — no external scripts needed.
 
-### Step 3: Commit & tag
+### Step 3: Tag & push (CI does the rest)
 ```bash
-git add -A
-git commit -m "vX.Y.Z: <brief summary>"
-git tag -a vX.Y.Z -m "vX.Y.Z: <description>"
-git push origin main --tags
+./release.sh vX.Y.Z "Release notes"
 ```
+Thin script: verifies `src/ver.txt` + clean tree → commits the bump →
+annotated tag (notes) → push. The tag triggers the CI pipeline:
+unit + integration tests → `zig build cross` 8 targets ReleaseSafe →
+SignPath Windows signing (if enabled) → GitHub Release with `utmm.zip`
+(auto-generated release notes).
 
-### Step 4: Build, zip & publish
-```bash
-./release.sh vX.Y.Z "Release notes (markdown)" <--utmmd|--no-utmmd>
-```
-This runs tests, cross-compiles 8 targets, creates `utmm.zip`, and calls
-`gh release create` to publish the GitHub release — all in one shot.
+**utmmd mode decision is retired**: CI always builds with `-Dutmmd=true`
+(default) — the supervisor is rebuilt from source every release, so published
+binaries can never carry a stale embedded utmmd. The old
+`--utmmd/--no-utmmd` per-release decision (and the
+`src/embed/UTMMD-BUILT-FROM` drift guard) no longer applies to releases.
+Repo-tracked `src/embed/*/utmmd.bin` still serves the local `--deploy` path.
 
-**utmmd rebuild mode (mandatory, decide per release)**:
+**CI failure handling**: fix the issue, then re-run the failed run from the
+Actions page, or delete and re-create the tag:
+`git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z && ./release.sh ...`
 
-- `--utmmd` — rebuild + re-embed the supervisor. REQUIRED when supervisor
-  sources changed since the last `--utmmd` build (`src/utmmd.zig`, `src/shm.zig`,
-  `src/svc.zig` vs the commit in `src/embed/UTMMD-BUILT-FROM`). Deploy then
-  updates utmmd on every node (complex path: service stop→kill→replace→restart).
-- `--no-utmmd` — reuse existing `src/embed/*/utmmd.bin` byte-identical →
-  embedded hash unchanged → `shouldUpdateUtmmd()` returns false on every node →
-  deploy skips the utmmd update entirely. Preferred when only utmm sources
-  changed; the script guards against accidental use after supervisor changes.
-
-Decide with: `git diff --name-only $(cat src/embed/UTMMD-BUILT-FROM) HEAD -- src/utmmd.zig src/shm.zig src/svc.zig`
-(empty → `--no-utmmd`, files → `--utmmd`). Running without a mode prints help.
-
+**Manual build-chain verification** (no release): Actions → Release workflow →
+"Run workflow" (workflow_dispatch). The release job only publishes on tag refs.
 Cross-compilation targets:
 
 | # | Target | Output Binary |
@@ -622,10 +626,28 @@ Cross-compilation targets:
 > x86 32-bit Linux + Windows added in v0.18.0 (zio feat/x86-32 branch).
 
 ### Step 5: Verify
-Open the release URL printed by the script and confirm:
+Watch the CI run (Actions → Release workflow) turn green, then confirm on the
+release page:
 - `utmm.zip` is attached
 - Release notes are correct
 - Tag points to the right commit
+- (Once SignPath is enabled) downloaded `utmm-*-windows.exe` show a valid
+  Authenticode signature on Windows (file Properties → Digital Signatures)
+
+### SignPath enablement (one-time, after OSS application is approved)
+
+1. Apply at signpath.org (open source program, MIT license, public repo) —
+   manual approval, ~1 week
+2. SignPath portal: add Trusted Build System "GitHub.com" + install the
+   SignPath GitHub App authorized for this repo; create project
+   `utm-monitor`, signing policy `release-signing`, Artifact Configuration
+   with a `<zip-file>` root element signing `utmm-*.exe`
+3. GitHub repo settings → Secrets and variables → Actions:
+   - Secrets: `SIGNPATH_API_TOKEN`, `SIGNPATH_ORGANIZATION_ID`
+   - Variables: `SIGNPATH_ENABLED=true`
+
+The sign job stays skipped (green neutral) until step 3 flips it on — releases
+are unsigned but never blocked.
 
 ### Post-release
 Use `utmm --deploy` — it scp's each VM and runs the full installer

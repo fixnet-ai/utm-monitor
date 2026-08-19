@@ -489,11 +489,9 @@ curl --socks5 gateway:2121 http://windowsvm:8080
 **Standard path — `--deploy` (updates both utmm and utmmd):**
 
 ```bash
-# 1. Release with an explicit utmmd mode (see CLAUDE.md release process):
-#    --no-utmmd  supervisor sources unchanged → embedded utmmd bytes reused →
-#                deploy skips the utmmd update entirely (preferred)
-#    --utmmd     supervisor sources changed → utmmd rebuilt + re-embedded
-./release.sh vX.Y.Z "notes" --no-utmmd
+# 1. Release: thin script verifies ver.txt + tags + pushes; CI runs tests,
+#    8-target build (utmmd always rebuilt from source) and publishes.
+./release.sh vX.Y.Z "notes"
 
 # 2. Deploy to every VM: scp + full installer (--install) per machine.
 #    utmmd is replaced only when its embedded hash differs from disk.
@@ -514,10 +512,9 @@ utmm --upgrade linuxvm
 > **Channel convention**: version upgrades always go through `--deploy`.
 > `--upgrade` pushes utmm only — using it alone causes utmm/utmmd version
 > drift (the Windows VMs' supervisor once lagged 6 days unnoticed this way).
-> utmmd unchanged releases (`--no-utmmd`) keep the supervisor byte-identical
-> fleet-wide: no service stop/replace/restart beyond what the utmm update
-> itself requires, and `extractUtmmd` skips the rewrite when disk bytes
-> already match the embedded binary.
+> On the deploy path `extractUtmmd` skips the rewrite when disk bytes already
+> match the embedded binary, so unchanged supervisors stay byte-identical
+> fleet-wide with no extra service churn.
 
 `--deploy` SCPs each Guest's binary using built-in `utmm sshpass` (no external
 sshpass needed), then runs the full installer over SSH. VM credentials are read

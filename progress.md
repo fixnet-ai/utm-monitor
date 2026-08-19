@@ -2081,3 +2081,10 @@ POSIX 上 `file_io` 直接复用事件循环 Io（epoll/kqueue），而 `findUpg
 - 最终: 两台 Windows VM 转码版部署验证全过（中文/exit_code/操作符/管道），
   测试残留清理完毕，229 单元 + 60 集成 0 泄漏
 - 遗留: L1 `--upgrade` 不替换 bug、L2 sshpass ConPTY 假模式（见 task_plan）
+
+## Phase 42 — CI 调通 + 发布接管 + MIT + SignPath（2026-08-19）
+
+**会话开始**: 用户要求调通 GitHub Actions CI + SignPath 签名。
+调研发现 Release workflow 连续 15+ 次全挂（根因 ../zio 本地依赖 CI 缺失）+
+无 LICENSE（SignPath OSS 硬前置）。用户裁定: MIT / CI 全接管发布 / SignPath
+步骤先写好待申请。规划见 task_plan.md Phase 42。
