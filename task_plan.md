@@ -1,13 +1,73 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.78 | **分支**: `main` | **更新**: 2026-08-19
+**版本**: v0.18.79 | **分支**: `main` | **更新**: 2026-08-19
 
 ## 当前状态
 
 - **源文件**: 22 src + 13 test + 2 embed + 2 Python test scripts
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
-- **真机部署**: 5 节点 v0.18.78 serving（windowsvm 08-19 掉线，与代码无关）
+- **真机部署**: 5 节点 v0.18.79 serving
 - **Phase 41 完成**: Windows exec OEM↔UTF-8 转码 + marker 独立行修复（v0.18.79）
+- **Phase 42 进行中**: GitHub Actions CI 修复 + 发布接管 + MIT + SignPath
+
+## 进行中: Phase 42 — CI 调通 + 发布接管 + MIT LICENSE + SignPath 签名（2026-08-19）
+
+**背景**（证据见 findings.md 2026-08-19 CI 段）:
+1. **Release workflow 连续 15+ 次全失败**（每次 tag push 必挂）——根因：
+   `build.zig.zon` 声明本地 sibling 依赖 `.zio = .{ .path = "../zio" }`（fixnet-ai/zio
+   fork feat/x86-32 分支），CI checkout 后不存在 → `unable to open '../zio': FileNotFound`
+   → `zig build test` 阶段即死。仓库 PUBLIC、zio fork PUBLIC 均可直接克隆。
+2. **发布双轨撞车**: 本地 release.sh 与 CI 都会创建 GitHub Release，CI 修好后必然冲突。
+3. **SignPath OSS 免费代码签名前置缺失**: 仓库无 LICENSE 文件（OSI 许可证是硬性要求）。
+
+**用户裁定（2026-08-19）**:
+- LICENSE 用 **MIT**
+- 发布 **CI 全接管**（本地只 bump + tag + push；测试/构建/签名/发布全在 CI）
+- SignPath **还没申请**——CI 签名步骤先写好，用 repository variable 门控（默认跳过），
+  批准后配 secrets + variable 即生效。申请为人工流程（约 1 周），AI 无法代办。
+
+**方案**:
+
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| 42A | LICENSE (MIT, fixnet-ai) | SignPath OSS 申请前置 | ⬜ |
+| 42B | 重写 `release.yml`：clone zio 步骤 + `-Dutmmd=true`（源码即真相，免 stale supervisor guard）+ workflow_dispatch 手动触发（发布步骤仅 tag 时执行）+ SignPath 签名 job（`vars.SIGNPATH_ENABLED` 门控，默认跳过）+ release job 发布签名后产物 | tag → test → 8 目标 → 签名（可选）→ release | ⬜ |
+| 42C | 新增 `ci.yml`：push/PR 触发 test-only（zig build test + test-integration） | 提前暴露构建问题，不再等到 tag 才发现；public repo macOS runner 免费 | ⬜ |
+| 42D | release.sh thin 化：只做校验 ver.txt + clean tree + commit + tag(带 notes) + push，删除本地测试/构建/打包/发布/utmmd 模式判定 | utmmd 模式判定随 CI `-Dutmmd=true` 固定而退役 | ⬜ |
+| 42E | 文档同步：CLAUDE.md Release Process 章节改写（CI 全接管流程 + SignPath 启用清单） | README/MANUAL 若涉发布流程一并核对 | ⬜ |
+| 42F | 验证：分支 push 触发 ci.yml 绿 → workflow_dispatch 手动跑 release.yml 构建链绿 → 合并 → 真实 tag 端到端发布 | 未验证不发 tag | ⬜ |
+
+**SignPath 签名设计**（42B 内实现，待用户申请批准后激活）:
+
+```
+build job (macos-latest, GitHub 托管 = SignPath OSS 硬性要求)
+  → 测试 + zig build cross -Dutmmd=true + 收集 8 二进制 + utmm.zip
+  → upload-artifact: dist（全部产物）
+sign job（if vars.SIGNPATH_ENABLED == 'true'）
+  → download dist → upload-artifact: 3 个 Windows .exe（unsigned）
+  → SignPath/github-action-submit-signing-request@v2
+      (SIGNPATH_API_TOKEN / SIGNPATH_ORGANIZATION_ID / project=utm-monitor
+       / signing-policy=release-signing / wait-for-completion / output-artifact-directory)
+  → 签名后 exe 覆盖回 dist → upload-artifact: signed-dist
+release job（tag only）
+  → download（signed-dist 优先，fallback dist）→ utmm.zip → softprops/action-gh-release
+```
+
+**用户侧 SignPath 激活清单**（申请批准后，写入 CLAUDE.md）:
+1. signpath.org 提交 OSS 申请（项目 utm-monitor，MIT，公开仓库）
+2. SignPath 后台：添加 Trusted Build System "GitHub.com" + 安装 SignPath GitHub App 授权本仓库
+3. SignPath 项目配置 Artifact Configuration（zip 根元素内 3 个 `utmm-*.exe`）+ signing policy `release-signing`
+4. GitHub repo settings：Secrets 加 `SIGNPATH_API_TOKEN`、`SIGNPATH_ORGANIZATION_ID`；
+   Variables 加 `SIGNPATH_ENABLED=true`
+
+**风险**:
+
+| # | 风险 | 对策 |
+|---|------|------|
+| R1 | CI 构建时长（8 目标 ReleaseSafe + utmmd 重建，估 10-25 分钟） | public repo 免费，无成本问题；tag 发布从即时变异步，deploy 路径不受影响（本地构建） |
+| R2 | SignPath GitHub App 未安装时 signing job 误触发 | 门控变量默认不存在 → job 跳过 |
+| R3 | CI 重建 utmmd 与仓库 embed 字节不一致（若 Zig 构建非确定） | CI 发布产物以源码重建为准（永远新鲜）；仓库 embed 仅作本地 deploy 路径用途 |
+| R4 | release notes 来源变化（原 release.sh 传参） | tag annotation 携带 notes（annotated tag -m），CI release 用 tag message |
 
 ## 已完成: Phase 41 — Windows exec 多语言转码 + exit_code marker 修复（v0.18.79，2026-08-19）
 
