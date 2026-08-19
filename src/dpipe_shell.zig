@@ -5,7 +5,15 @@
 // 共享 shell 状态（cd、export 等不持久）。
 //
 // POSIX: posix_openpt → fork → setsid → dup2 → exec $SHELL
-// Windows: CreatePipe + CreateProcessW("cmd.exe /k chcp 65001 ...")
+// Windows: CreatePipe + cmd.exe /k（会话保持系统本地 OEM 代码页）+ Guest 侧
+//   OEM↔UTF-8 双向转码 — 模拟真实控制台的转码职责：
+//   - 输出：cmd/系统命令按本地 OEM（GetOEMCP：中日韩 936/932/949 自动匹配）
+//     输出字节 → 转成 UTF-8 再发给 Host → 多语言通解，无需知道目标内码。
+//     老命令（ipconfig 等 ANSI API）无视 chcp 始终按 OEM 输出，chcp 65001
+//     既救不了输出又会破坏 cmd 管道 stdin 的多字节输入 — 因此不设 chcp。
+//   - 输入：Host 发来的 UTF-8 命令 → 转成本地 OEM 写给 cmd stdin。
+//   注意：ConPTY（CreatePseudoConsole）实测在本环境（Session 0 服务链）不可用
+//   ——所有 API 成功但 cmd 拿不到伪控制台（零输出），见 findings 2026-08-19。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -42,6 +50,11 @@ const ShellCtx = struct {
     child_pid: std.posix.pid_t,
     shell: []const u8,
     stdin_fd: std.posix.fd_t, // Windows: stdin_write pipe handle
+    // Windows OEM↔UTF-8 跨块转码暂存（详见 readFn/writeFn）
+    out_pending: [4]u8 = undefined, // 尾部 DBCS 前导字节（OEM 侧）
+    out_pending_len: usize = 0,
+    in_pending: [4]u8 = undefined, // 尾部不完整 UTF-8 序列
+    in_pending_len: usize = 0,
 };
 
 // ── 工厂函数 ──────────────────────────────────────────────────
@@ -71,6 +84,12 @@ fn spawn(allocator: std.mem.Allocator, shell: []const u8) !ShellCtx {
         return spawnWindows(allocator);
     }
     return spawnPosix(allocator, shell);
+}
+
+// ── Windows 派生 ──────────────────────────────────────────────
+
+fn spawnWindows(allocator: std.mem.Allocator) !ShellCtx {
+    return spawnWindowsPipe(allocator);
 }
 
 // ── POSIX PTY 派生 ────────────────────────────────────────────
@@ -161,7 +180,9 @@ fn spawnPosix(allocator: std.mem.Allocator, shell: []const u8) !ShellCtx {
 
 // ── Windows 管道派生 ──────────────────────────────────────────
 
-fn spawnWindows(allocator: std.mem.Allocator) !ShellCtx {
+/// 管道模式：cmd.exe /k（会话保持系统本地 OEM 代码页），
+/// OEM↔UTF-8 转码在 readFn/writeFn（见文件头注释）。
+fn spawnWindowsPipe(allocator: std.mem.Allocator) !ShellCtx {
     const w = std.os.windows;
     const BOOL = w.BOOL;
     const HANDLE = w.HANDLE;
@@ -189,14 +210,6 @@ fn spawnWindows(allocator: std.mem.Allocator) !ShellCtx {
     const CreateProcessW = @extern(
         *const fn (lpApplicationName: ?[*:0]const u16, lpCommandLine: [*:0]u16, lpProcessAttributes: ?*w.SECURITY_ATTRIBUTES, lpThreadAttributes: ?*w.SECURITY_ATTRIBUTES, bInheritHandles: BOOL, dwCreationFlags: DWORD, lpEnvironment: ?LPVOID, lpCurrentDirectory: ?[*:0]const u16, lpStartupInfo: *w.STARTUPINFOW, lpProcessInformation: *PROCESS_INFORMATION) callconv(.winapi) BOOL,
         .{ .name = "CreateProcessW", .library_name = "kernel32" },
-    );
-    const SetConsoleOutputCP = @extern(
-        *const fn (wCodePageID: w.UINT) callconv(.winapi) w.BOOL,
-        .{ .name = "SetConsoleOutputCP", .library_name = "kernel32" },
-    );
-    const SetConsoleCP_ext = @extern(
-        *const fn (wCodePageID: w.UINT) callconv(.winapi) w.BOOL,
-        .{ .name = "SetConsoleCP", .library_name = "kernel32" },
     );
 
     const HANDLE_FLAG_INHERIT: DWORD = 1;
@@ -234,10 +247,9 @@ fn spawnWindows(allocator: std.mem.Allocator) !ShellCtx {
 
     var pi: PROCESS_INFORMATION = undefined;
 
-    _ = SetConsoleOutputCP(65001);
-    _ = SetConsoleCP_ext(65001);
-
-    const cmd_u8 = "cmd.exe /k chcp 65001 >nul & set LANG=en_US.UTF-8";
+    // 不设 chcp/SetConsoleCP：会话保持系统本地 OEM 代码页。cmd/系统命令
+    // 按 OEM 输出与解读输入，转码统一在 readFn/writeFn（见文件头注释）。
+    const cmd_u8 = "cmd.exe /k";
     const cmd_utf16 = try allocator.alloc(u16, cmd_u8.len + 1);
     defer allocator.free(cmd_utf16);
     const end_idx = try std.unicode.utf8ToUtf16Le(cmd_utf16, cmd_u8);
@@ -251,13 +263,13 @@ fn spawnWindows(allocator: std.mem.Allocator) !ShellCtx {
     _ = CloseHandle(stdin_read);
     _ = CloseHandle(stdout_write);
 
-    std.log.info("[dpipe-shell] Windows pipe pty: cmd.exe /k pid={d}", .{pi.dwProcessId});
+    std.log.info("[dpipe-shell] Windows pipe pty: cmd.exe /k (OEM xcode) pid={d}", .{pi.dwProcessId});
 
     return ShellCtx{
         .allocator = allocator,
         .master_fd = stdout_read,
         .child_pid = pi.hProcess,
-        .shell = try allocator.dupe(u8, "cmd.exe /k chcp 65001 >nul & set LANG=en_US.UTF-8"),
+        .shell = try allocator.dupe(u8, "cmd.exe /k"),
         .stdin_fd = stdin_write,
     };
 }
@@ -266,12 +278,112 @@ fn spawnWindows(allocator: std.mem.Allocator) !ShellCtx {
 
 fn readFn(ctx: *anyopaque, buf: []u8) anyerror!usize {
     const self: *ShellCtx = @ptrCast(@alignCast(ctx));
+    if (builtin.os.tag == .windows) {
+        return xcodeRead(self, buf);
+    }
     return ptyRead(self.master_fd, buf);
+}
+
+/// Windows 读：拼接上一块遗留的 DBCS 前导字节 → ReadFile → OEM→UTF-8。
+/// cmd/系统命令按本地 OEM（GetOEMCP）输出，转成 UTF-8 后 Host 侧 JSON
+/// 始终有效（中日韩多语言自动匹配，无需硬编码内码）。
+fn xcodeRead(self: *ShellCtx, buf: []u8) !usize {
+    // OEM→UTF-8 最大膨胀 1.5×（GBK 2B→3B）：限制原始读取量防 dst 溢出
+    const max_raw = @min(buf.len / 3 * 2, buf.len);
+    if (max_raw == 0) return 0;
+
+    var raw: [4096]u8 = undefined;
+    var prefix: usize = 0;
+    if (self.out_pending_len > 0) {
+        prefix = @min(self.out_pending_len, @min(raw.len, max_raw));
+        @memcpy(raw[0..prefix], self.out_pending[0..prefix]);
+        self.out_pending_len = 0;
+    }
+    const n = try ptyRead(self.master_fd, raw[prefix .. @min(raw.len, prefix + max_raw)]);
+    const total = prefix + n;
+    if (total == 0) return 0;
+
+    // 尾部 DBCS 前导字节（可能缺尾字节）→ 暂存拼入下一块。
+    // 误报无害：完整双字节字符的尾字节被暂存也只是延迟一块转码。
+    const consume = total - dbcsPendingLen(raw[0..total]);
+    const pending = total - consume;
+    if (pending > 0 and pending <= self.out_pending.len) {
+        @memcpy(self.out_pending[0..pending], raw[consume..total]);
+        self.out_pending_len = pending;
+    }
+    if (consume == 0) {
+        // 单块全是疑似前导字节（4KB 块下实际不可能）。丢弃 pending 防
+        // EOF 误判（返回 0 会被调用方当 EOF），下块重新对齐。
+        self.out_pending_len = 0;
+        std.log.warn("[dpipe-shell] xcode consume=0, dropped {d}B lead bytes", .{pending});
+        return ptyReadToUtf8(self, buf);
+    }
+
+    return oemToUtf8(buf, raw[0..consume]);
+}
+
+/// consume=0 兜底：直接透传一块原始字节转码（不做 pending 处理）。
+fn ptyReadToUtf8(self: *ShellCtx, buf: []u8) !usize {
+    var raw: [4096]u8 = undefined;
+    const max_raw = @min(buf.len / 3 * 2, @min(raw.len, buf.len));
+    const n = try ptyRead(self.master_fd, raw[0..max_raw]);
+    if (n == 0) return 0;
+    return oemToUtf8(buf, raw[0..n]);
 }
 
 fn writeFn(ctx: *anyopaque, data: []const u8) anyerror!void {
     const self: *ShellCtx = @ptrCast(@alignCast(ctx));
+    if (builtin.os.tag == .windows) {
+        return xcodeWrite(self, data);
+    }
     return ptyWrite(self, data);
+}
+
+/// Windows 写：Host 发来的 UTF-8 → 本地 OEM 后写给 cmd stdin。
+/// cmd 管道 stdin 按 OEM 解读输入字节；不转码则 UTF-8 中文直接乱码。
+/// 尾部不完整 UTF-8 序列暂存拼入下一块。
+fn xcodeWrite(self: *ShellCtx, data: []const u8) !void {
+    var pending_buf: [8]u8 = undefined;
+    var pending_len: usize = 0;
+    if (self.in_pending_len > 0) {
+        pending_len = @min(self.in_pending_len, pending_buf.len - self.in_pending_len);
+        @memcpy(pending_buf[0..self.in_pending_len], self.in_pending[0..self.in_pending_len]);
+        pending_len = self.in_pending_len;
+        self.in_pending_len = 0;
+    }
+
+    // 拼接 pending + data 后取完整 UTF-8 前缀
+    var joined_buf: [8192]u8 = undefined;
+    const joined_len = pending_len + @min(data.len, joined_buf.len - pending_len);
+    @memcpy(joined_buf[0..pending_len], pending_buf[0..pending_len]);
+    @memcpy(joined_buf[pending_len..joined_len], data[0 .. joined_len - pending_len]);
+
+    const complete = completeUtf8Prefix(joined_buf[0..joined_len]);
+    const leftover = joined_len - complete;
+    if (leftover > 0 and leftover <= self.in_pending.len) {
+        @memcpy(self.in_pending[0..leftover], joined_buf[complete..joined_len]);
+        self.in_pending_len = leftover;
+    }
+
+    var oem_buf: [8192]u8 = undefined;
+    const oem_len = utf8ToOem(&oem_buf, joined_buf[0..complete]);
+    if (oem_len > 0) {
+        try ptyWrite(self, oem_buf[0..oem_len]);
+    }
+    // data 超出 joined_buf 容量的部分（单次 write >8KB，实际不发生：
+    // guest.zig 单次写入整条命令 <4KB）——直接透传 OEM 转码
+    if (joined_len < data.len) {
+        const rest = data[joined_len - pending_len ..];
+        const rest_complete = completeUtf8Prefix(rest);
+        var rest_oem: [8192]u8 = undefined;
+        const rl = utf8ToOem(&rest_oem, rest[0..rest_complete]);
+        if (rl > 0) try ptyWrite(self, rest_oem[0..rl]);
+        const rleft = rest.len - rest_complete;
+        if (rleft > 0 and rleft <= self.in_pending.len) {
+            @memcpy(self.in_pending[0..rleft], rest[rest_complete..]);
+            self.in_pending_len = rleft;
+        }
+    }
 }
 
 fn closeFn(ctx: *anyopaque) void {
@@ -290,6 +402,73 @@ const shell_vtable = dpipe.VTable{
     .writeFn = writeFn,
     .closeFn = closeFn,
 };
+
+// ── Windows OEM↔UTF-8 转码 ────────────────────────────────────
+
+
+
+/// DBCS 前导字节范围（GBK/Shift-JIS/EUC-KR 均为 0x81-0xFE）。
+/// 块尾字节落在此范围时可能是缺尾字节的双字节字符前导 → 暂存 1 字节。
+/// 误报无害：完整双字节字符的尾字节被暂存也只是延迟一块转码。
+fn dbcsPendingLen(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    const last = bytes[bytes.len - 1];
+    if (last >= 0x81 and last <= 0xFE) return 1;
+    return 0;
+}
+
+/// 返回 data 头部完整且合法的 UTF-8 序列前缀长度。
+/// 尾部不完整/非法序列留给调用方暂存拼入下一块。
+fn completeUtf8Prefix(data: []const u8) usize {
+    var i: usize = 0;
+    while (i < data.len) {
+        const n = std.unicode.utf8ByteSequenceLength(data[i]) catch return i;
+        if (i + n > data.len) return i;
+        _ = std.unicode.utf8Decode(data[i .. i + n]) catch return i;
+        i += n;
+    }
+    return i;
+}
+
+/// OEM → UTF-8（经 UTF-16 中转）。返回写入 dst 的字节数；失败时 best-effort
+/// 拷贝（MultiByteToWideChar 对无效序列以默认字符替换，不报错）。
+fn oemToUtf8(dst: []u8, src: []const u8) usize {
+    const w = std.os.windows;
+    const MultiByteToWideChar = @extern(
+        *const fn (codepage: w.UINT, dwflags: w.DWORD, lpmultibytestr: [*]const u8, cbmultibyte: c_int, lpwidecharstr: [*]u16, cchwidechar: c_int) callconv(.winapi) c_int,
+        .{ .name = "MultiByteToWideChar", .library_name = "kernel32" },
+    );
+    const WideCharToMultiByte = @extern(
+        *const fn (codepage: w.UINT, dwflags: w.DWORD, lpwidecharstr: [*]const u16, cchwidechar: c_int, lpmultibytestr: [*]u8, cbmultibyte: c_int, lpdefaultchar: ?[*]const u8, lpuseddefaultchar: ?*w.BOOL) callconv(.winapi) c_int,
+        .{ .name = "WideCharToMultiByte", .library_name = "kernel32" },
+    );
+
+    var wbuf: [8192]u16 = undefined;
+    const wlen = MultiByteToWideChar(1, 0, src.ptr, @intCast(src.len), &wbuf, wbuf.len); // 1 = CP_OEMCP
+    if (wlen <= 0) return 0;
+    const ulen = WideCharToMultiByte(65001, 0, &wbuf, wlen, dst.ptr, @intCast(dst.len), null, null); // 65001 = CP_UTF8
+    return if (ulen > 0) @intCast(ulen) else 0;
+}
+
+/// UTF-8 → OEM（经 UTF-16 中转）。返回写入 dst 的字节数。
+/// 无法映射的字符（OEM 无对应字形）被默认字符替换。
+fn utf8ToOem(dst: []u8, src: []const u8) usize {
+    const w = std.os.windows;
+    const MultiByteToWideChar = @extern(
+        *const fn (codepage: w.UINT, dwflags: w.DWORD, lpmultibytestr: [*]const u8, cbmultibyte: c_int, lpwidecharstr: [*]u16, cchwidechar: c_int) callconv(.winapi) c_int,
+        .{ .name = "MultiByteToWideChar", .library_name = "kernel32" },
+    );
+    const WideCharToMultiByte = @extern(
+        *const fn (codepage: w.UINT, dwflags: w.DWORD, lpwidecharstr: [*]const u16, cchwidechar: c_int, lpmultibytestr: [*]u8, cbmultibyte: c_int, lpdefaultchar: ?[*]const u8, lpuseddefaultchar: ?*w.BOOL) callconv(.winapi) c_int,
+        .{ .name = "WideCharToMultiByte", .library_name = "kernel32" },
+    );
+
+    var wbuf: [8192]u16 = undefined;
+    const wlen = MultiByteToWideChar(65001, 0, src.ptr, @intCast(src.len), &wbuf, wbuf.len);
+    if (wlen <= 0) return 0;
+    const olen = WideCharToMultiByte(1, 0, &wbuf, wlen, dst.ptr, @intCast(dst.len), null, null); // 1 = CP_OEMCP
+    return if (olen > 0) @intCast(olen) else 0;
+}
 
 // ── 跨平台 PTY I/O ────────────────────────────────────────────
 
@@ -428,4 +607,32 @@ test "dpipe_shell close releases resources" {
     // close 会 kill 子进程、关闭 fd、释放 shell 字符串、释放 ctx
     sh.close();
     // 如果到这里没有 crash/fail，说明资源已正确释放
+}
+
+// ── Windows 转码纯函数测试（跨平台可测）─────────────────────────
+
+test "dbcsPendingLen: DBCS lead byte at tail" {
+    // ASCII 结尾 → 0
+    try std.testing.expectEqual(@as(usize, 0), dbcsPendingLen("hello"));
+    try std.testing.expectEqual(@as(usize, 0), dbcsPendingLen(""));
+    // GBK "以太网" 完整 6 字节 → 尾字节 0xF8 是合法尾字节（0x40-0xFE）→ 误报 1（无害延迟）
+    try std.testing.expectEqual(@as(usize, 1), dbcsPendingLen("\xd2\xf4\xcc\xab\xcd\xf8"));
+    // 孤立前导字节（真实待拼接场景）→ 1
+    try std.testing.expectEqual(@as(usize, 1), dbcsPendingLen("abc\xd2"));
+    // 0x80/0xFF 范围外 → 0
+    try std.testing.expectEqual(@as(usize, 0), dbcsPendingLen("abc\x80"));
+    try std.testing.expectEqual(@as(usize, 0), dbcsPendingLen("abc\xff"));
+}
+
+test "completeUtf8Prefix: complete sequences only" {
+    // 全部合法
+    try std.testing.expectEqual(@as(usize, 6), completeUtf8Prefix("ab\u{4e2d}c"));
+    // 尾部不完整序列（"中" 的前 2 字节）→ 前缀停在 2
+    try std.testing.expectEqual(@as(usize, 2), completeUtf8Prefix("ab\xe4\xb8"));
+    // 非法起始字节 → 前缀停在 0
+    try std.testing.expectEqual(@as(usize, 0), completeUtf8Prefix("\xff\xfe"));
+    // 合法后接非法
+    try std.testing.expectEqual(@as(usize, 2), completeUtf8Prefix("ab\xc3\x28"));
+    // 空输入
+    try std.testing.expectEqual(@as(usize, 0), completeUtf8Prefix(""));
 }

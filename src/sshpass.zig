@@ -736,6 +736,20 @@ const windows = if (builtin.os.tag == .windows) struct {
         resolveConpty();
         return conpty_create != null and conpty_close != null;
     }
+
+    /// dpipe_shell 复用：创建 ConPTY。返回 false = ConPTY 不可用（< Win10 1809）
+    /// 或创建失败。hInput/hOutput 为喂给 ConPTY 的管道读/写端（所有权移交 ConPTY）。
+    pub fn pseudoConsoleCreate(size_x: i16, size_y: i16, hInput: HANDLE, hOutput: HANDLE, phPC: *HANDLE) bool {
+        resolveConpty();
+        const create = conpty_create orelse return false;
+        return create(.{ .X = size_x, .Y = size_y }, hInput, hOutput, 0, phPC) == 0;
+    }
+
+    /// dpipe_shell 复用：关闭 ConPTY。
+    pub fn pseudoConsoleClose(hPC: HANDLE) void {
+        resolveConpty();
+        if (conpty_close) |f| f(hPC);
+    }
     const GetExitCodeProcess = @extern(
         *const fn (hProcess: HANDLE, lpExitCode: *DWORD) callconv(.winapi) BOOL,
         .{ .name = "GetExitCodeProcess", .library_name = "kernel32" },
@@ -1234,6 +1248,21 @@ pub fn conptyAvailable() bool {
         return windows.conpty_create != null and windows.conpty_close != null;
     }
     return true; // POSIX always has PTY
+}
+
+/// dpipe_shell 复用：创建 ConPTY（Windows only，非 Windows 返回 false）。
+/// input_read/output_write 为喂给 ConPTY 的管道端（所有权移交 ConPTY），
+/// out_hpc 接收 ConPTY 句柄。返回 false = ConPTY 不可用或创建失败。
+/// fd_t 在 Windows 上即 HANDLE。
+pub fn conptyCreate(size_x: i16, size_y: i16, input_read: std.posix.fd_t, output_write: std.posix.fd_t, out_hpc: *std.posix.fd_t) bool {
+    if (builtin.os.tag != .windows) return false;
+    return windows.pseudoConsoleCreate(size_x, size_y, input_read, output_write, out_hpc);
+}
+
+/// dpipe_shell 复用：关闭 ConPTY（非 Windows 无操作）。
+pub fn conptyClose(hpc: std.posix.fd_t) void {
+    if (builtin.os.tag != .windows) return;
+    windows.pseudoConsoleClose(hpc);
 }
 
 const is_windows = builtin.os.tag == .windows;

@@ -626,12 +626,81 @@ pub fn jsonBuildError(allocator: std.mem.Allocator, id: std.json.Value, code: i6
 
 /// Build command with appropriate MDELIM marker for the guest's shell.
 /// POSIX (/bin/sh, /bin/bash, ...): uses "; echo MDELIM:$?\n"
-/// Windows (cmd.exe): uses "& echo MDELIM:%errorlevel%\r\n"
+/// Windows (cmd.exe): uses "\r\necho MDELIM:%errorlevel%\r\n" — marker 必须独立成行：
+/// 交互式 cmd 在**整行解析时**展开 %errorlevel%（命令执行前），若与命令同行
+/// 拼接（"& echo ..."），marker 报告的永远是执行前的旧值（通常 0）。
+/// 独立成行后 cmd 逐行读取，读到 marker 行时上一行已执行完，展开的是新值。
 pub fn buildCmdWithMarker(allocator: std.mem.Allocator, shell: []const u8, command: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, shell, "cmd.exe") != null) {
-        return try std.fmt.allocPrint(allocator, "{s} & echo MDELIM:%errorlevel%\r\n", .{command});
+        return try std.fmt.allocPrint(allocator, "{s}\r\necho MDELIM:%errorlevel%\r\n", .{command});
     }
     return try std.fmt.allocPrint(allocator, "{s}; echo MDELIM:$?\n", .{command});
+}
+
+// ── VT 转义序列剥离（ConPTY 输出净化）──────────────────────────────
+
+pub const StripVtResult = struct {
+    /// 剥离后的有效数据长度
+    len: usize,
+    /// 尾部不完整 VT 序列的字节数（应暂存并拼入下一块再解析）
+    pending: usize,
+};
+
+/// 原地剥离 ANSI/VT 转义序列。ConPTY 的输出是屏幕渲染 VT 流（光标定位、
+/// 清行等序列混在文本中），剥离后才是干净的命令输出文本，MDELIM 扫描也
+/// 不受 VT 序列干扰。
+/// 支持：CSI (ESC [ ... final 0x40-0x7E)、字符串类 OSC/DCS/SOS/PM/APC
+/// (ESC ]/P/X/^/_ ... BEL 或 ST)、ESC + 单字节。
+pub fn stripVtSequences(buf: []u8) StripVtResult {
+    var r: usize = 0; // 读指针
+    var w: usize = 0; // 写指针
+    const n = buf.len;
+    while (r < n) {
+        if (buf[r] == 0x1b) {
+            if (parseVtSequence(buf[r..])) |seq_len| {
+                r += seq_len;
+            } else {
+                // 序列延续到块尾（不完整）——剩余全部留给下一块
+                break;
+            }
+        } else {
+            buf[w] = buf[r];
+            r += 1;
+            w += 1;
+        }
+    }
+    return .{ .len = w, .pending = n - r };
+}
+
+/// 解析 buf 开头的 VT 序列。返回序列总长；null = 序列不完整（到块尾未终结）。
+fn parseVtSequence(s: []const u8) ?usize {
+    if (s.len < 2) return null;
+    return switch (s[1]) {
+        // CSI: ESC [ 参数(0x30-0x3F)* 中间(0x20-0x2F)* final(0x40-0x7E)
+        '[' => blk: {
+            var i: usize = 2;
+            while (i < s.len) : (i += 1) {
+                const b = s[i];
+                if (b >= 0x40 and b <= 0x7e) break :blk i + 1;
+                if (b < 0x20 or b > 0x3f) break :blk 2; // 异常字节：仅剥 ESC [（防御）
+            }
+            break :blk null; // 未终结
+        },
+        // 字符串类: OSC/DCS/SOS/PM/APC，以 BEL(0x07) 或 ST(ESC \) 终结
+        ']', 'P', 'X', '^', '_' => blk: {
+            var i: usize = 2;
+            while (i < s.len) : (i += 1) {
+                if (s[i] == 0x07) break :blk i + 1;
+                if (s[i] == 0x1b) {
+                    if (i + 1 < s.len and s[i + 1] == '\\') break :blk i + 2;
+                    break :blk i; // ESC 开新内容：序列到此为止，ESC 留给下一轮
+                }
+            }
+            break :blk null; // 未终结
+        },
+        // ESC + 单字节（ESC 7/8/M/=/> 等）
+        else => 2,
+    };
 }
 
 /// Result of scanning accumulated pty output for MDELIM marker.
@@ -1300,4 +1369,78 @@ test "recvExact handles partial reads on non-blocking socket" {
     const n = try recvExact(pair.a, buf[0..]);
     try std.testing.expectEqual(data.len, n);
     try std.testing.expectEqualStrings(data, buf[0..n]);
+}
+
+// ── buildCmdWithMarker / stripVtSequences 测试 ─────────────────────
+
+test "buildCmdWithMarker: windows marker on its own line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // marker 必须独立成行：交互式 cmd 整行解析时展开 %errorlevel%（执行前），
+    // 同行拼接（"& echo ..."）会报告旧值。独立行 → 逐行读取时展开新值。
+    const cmd = try buildCmdWithMarker(allocator, "cmd.exe", "dir C:\\");
+    try std.testing.expectEqualStrings("dir C:\\\r\necho MDELIM:%errorlevel%\r\n", cmd);
+}
+
+test "buildCmdWithMarker: posix marker unchanged" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const cmd = try buildCmdWithMarker(allocator, "/bin/bash", "uname -a");
+    try std.testing.expectEqualStrings("uname -a; echo MDELIM:$?\n", cmd);
+}
+
+test "stripVtSequences: removes CSI sequences" {
+    var buf = "abc\x1b[2Jdef\x1b[10;1Hghi".*;
+    const res = stripVtSequences(&buf);
+    try std.testing.expectEqual(@as(usize, 9), res.len);
+    try std.testing.expectEqual(@as(usize, 0), res.pending);
+    try std.testing.expectEqualStrings("abcdefghi", buf[0..res.len]);
+}
+
+test "stripVtSequences: removes OSC terminated by BEL and ST" {
+    var buf1 = "\x1b]0;title\x07xyz".*;
+    const r1 = stripVtSequences(&buf1);
+    try std.testing.expectEqualStrings("xyz", buf1[0..r1.len]);
+
+    var buf2 = "\x1b]0;title\x1b\\xyz".*;
+    const r2 = stripVtSequences(&buf2);
+    try std.testing.expectEqualStrings("xyz", buf2[0..r2.len]);
+}
+
+test "stripVtSequences: ESC + single char" {
+    var buf = "a\x1bMb".*;
+    const res = stripVtSequences(&buf);
+    try std.testing.expectEqualStrings("ab", buf[0..res.len]);
+    try std.testing.expectEqual(@as(usize, 0), res.pending);
+}
+
+test "stripVtSequences: incomplete CSI tail reported as pending" {
+    var buf = "text\x1b[3".*;
+    const res = stripVtSequences(&buf);
+    try std.testing.expectEqualStrings("text", buf[0..res.len]);
+    try std.testing.expectEqual(@as(usize, 3), res.pending); // ESC [ 3
+
+    // 拼接下一块后完整剥离
+    var joined = [_]u8{ 't', 'e', 'x', 't', 0x1b, '[', '3', '1', 'm', 'o', 'k' };
+    const r2 = stripVtSequences(&joined);
+    try std.testing.expectEqualStrings("textok", joined[0..r2.len]);
+    try std.testing.expectEqual(@as(usize, 0), r2.pending);
+}
+
+test "stripVtSequences: lone ESC at end is pending" {
+    var buf = "ok\x1b".*;
+    const res = stripVtSequences(&buf);
+    try std.testing.expectEqualStrings("ok", buf[0..res.len]);
+    try std.testing.expectEqual(@as(usize, 1), res.pending);
+}
+
+test "stripVtSequences: plain text unchanged" {
+    var buf = "plain\r\ntext with CRLF\n".*;
+    const res = stripVtSequences(&buf);
+    try std.testing.expectEqualStrings("plain\r\ntext with CRLF\n", buf[0..res.len]);
+    try std.testing.expectEqual(@as(usize, 0), res.pending);
 }

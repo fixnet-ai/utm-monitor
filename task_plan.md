@@ -1,13 +1,47 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.73 | **分支**: `main` | **更新**: 2026-08-18
+**版本**: v0.18.78 | **分支**: `main` | **更新**: 2026-08-19
 
 ## 当前状态
 
 - **源文件**: 22 src + 13 test + 2 embed + 2 Python test scripts
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
-- **真机部署**: Host v0.18.73（Phase 38）；4 台 Guest 仍 v0.18.72（38 修复 Host 侧生效，无需强制同步）
-- **Phase 38 完成**: ping/pong 热路径日志 + 过路 pong RTT 错误归因修复（v0.18.73）
+- **真机部署**: 5 节点 v0.18.78 serving（windowsvm 08-19 掉线，与代码无关）
+- **Phase 41 完成**: Windows exec OEM↔UTF-8 转码 + marker 独立行修复（v0.18.79）
+
+## 已完成: Phase 41 — Windows exec 多语言转码 + exit_code marker 修复（v0.18.79，2026-08-19）
+
+**背景**（实测证据见 findings.md 2026-08-19）:
+1. **乱码**: 中文系统 winx64 上 exec 输出乱码——老命令（ipconfig 等）无视
+   chcp 65001 按 ANSI/OEM(GBK) 输出 → 字节透传 → MCP JSON invalid UTF-8；
+   且 chcp 65001 下 cmd 管道 stdin 逐字节解码，UTF-8 中文输入毁成 U+FFFD×N。
+   目标机内码不定（中日韩），按内码转码不可行。
+2. **exit_code 失真**: `buildCmdWithMarker` Windows 用 `& echo MDELIM:%errorlevel%`
+   拼一行——交互式 cmd 整行解析时展开 %errorlevel%（命令执行前）→ marker
+   永远报告旧值（实测 `cmd /c exit 7 & echo EXPANDED=%errorlevel%` → 0）。
+
+**最终方案**（pipe + Guest 侧 GetOEMCP 自适应转码）:
+cmd.exe /k 会话保持系统本地 OEM 代码页；dpipe_shell readFn/writeFn 做双向
+转码（输出 OEM→UTF-8 / 输入 UTF-8→OEM，DBCS/UTF-8 跨块 pending）。
+`GetOEMCP()` 对中日韩（936/932/949）自动匹配 → 多语言通解，零环境依赖。
+**ConPTY 方案被实测否决**：Session 0 服务链下所有 API 成功但 cmd 拿不到
+伪控制台（零输出，5 个实现变体全灭，含微软 EchoCon 精确复刻）；sshd 同
+环境工作但机制未复现。详见 findings 2026-08-19。
+
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| 41A | marker 修复: Windows 分支 `{s}\r\necho MDELIM:%errorlevel%\r\n`（独立行） | cmd 逐行读取，marker 行展开时上一行已执行完 → 新值 | ✅ |
+| 41B | dpipe_shell Windows pipe 模式：去 chcp 65001/LANG + readFn/writeFn OEM↔UTF-8 双向转码（DBCS/UTF-8 跨块 pending） | GetOEMCP 自适应多语言；ConPTY 分支实现后被实测否决删除 | ✅ |
+| 41C | （随 ConPTY 否决而取消）stripVtSequences 函数+测试保留在 protocol.zig 备用 | — | ✅ |
+| 41D | 单元测试 + 集成测试门禁 | 新增 14 单测（marker 格式 2 + VT 剥离 7 + 转码纯函数 2 + 原有）；229 单元 + 60 集成 0 泄漏 | ✅ |
+| 41E | 真机验证 winx64 + windowsvm | ipconfig「以太网」正确 UTF-8、中文输入正确、exit 7/9009/5 传播、&&/\| 回归全过；net user 机器名缺失为无 console 管道固有行为 | ✅ |
+
+**遗留问题**（另行处理）:
+| # | 问题 | 说明 |
+|---|------|------|
+| L1 | `--upgrade` 推送后 utmmd 未实际替换二进制（本次两次复现：ConPTY→转码、转码→诊断版，`[upgrade] OK` 但磁盘 utmm.exe mtime/size 不变） | 排查 utmmd tryApplyPendingUpgrade 链路；期间版本升级一律 scp + `--install` |
+| L2 | sshpass.zig 的 runWindowsConpty 属性列表未挂 STARTUPINFOEXW（cb=sizeof(STARTUPINFOW)）——该「ConPTY 模式」从未真正走 ConPTY | sshpass 实际一直走 pipe fallback；修复或删除该分支待定 |
+| L3 | 混合编码场景（agent 显式 `chcp 65001 & <cmd>` 后命令输出 UTF-8 会被误按 OEM 转码） | 文档说明；实际 agent 场景罕见 |
 
 ## 已完成: Phase 40 — 发布脚本 utmmd 构建模式 + 升级通道约定（v0.18.77）
 

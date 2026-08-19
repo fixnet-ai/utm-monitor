@@ -422,3 +422,72 @@ utmm/utmmd 版本漂移六天无人察觉。修复：Windows 对齐 POSIX 跑完
 **教训**: 同一功能（deploy 安装）的跨平台双实现必须共享语义核心——两分支
 各自手写命令序列必然漂移；「部署成功」的判定标准应包含关键文件的时效验证
 （如 utmmd.exe mtime），本例中若有此检查六天前就会报警。
+
+### 2026-08-19 — Windows 中文乱码机制实锤 + ConPTY 通解验证（Phase 41 前置调查）
+
+**乱码双路径实锤**（winx64，中文系统 InstallLanguage=0804/OEM=CP936）:
+1. **输出路径**: ipconfig 等老命令用 ANSI API 输出，**无视 chcp 65001** ——
+   抓 MCP 原始响应字节 = GBK 原样透传（`Ethernet adapter \xd2\xd4\xcc\xab\xcd\xf8`
+   =「以太网」），JSON 变 invalid UTF-8。chcp 只改 console CP，管不到命令输出编码；
+   utmm 链路（jsonEscape 等）纯字节透传不转码。chcp 936 下同样 GBK → 改代码页治不了。
+2. **输入路径**: chcp 65001 下 cmd 对管道 stdin **逐字节解码** —— agent 发
+   `echo 中文`（6 字节 UTF-8），Guest 返回 6×U+FFFD（每字节独立替换）。
+3. net user 在 65001 会话行为异常（丢机器名 + "one or more errors"，65001 下
+   net.exe 已知病症）。
+
+**ConPTY 通解验证**（微软契约: 输入管道 UTF-8 → INPUT_RECORD；输出统一 UTF-8 VT）:
+ConPTY 内部 console 默认 CP = 系统本地 OEM（中日韩自动匹配）→ 老命令本地编码
+被正确解码 UTF-16 → 输出统一 UTF-8，**宿主无需知道目标内码**。实机对照（同一
+`ipconfig /all`）: utmm exec（pipe+chcp 65001）❌ GBK；`ssh -T`（sshd 纯管道）❌ GBK；
+`ssh -tt`（sshd 内部创建 ConPTY）✅ **valid UTF-8 + 字节级正确「以太网」+ 全中文
+标签正常**。sshd 本身是 Session 0 服务 → 服务环境创建 ConPTY 有生产先例。
+
+**exit_code marker bug**: `buildCmdWithMarker` Windows 分支 `{s} & echo
+MDELIM:%errorlevel%` —— 交互式 cmd **整行解析时展开** %errorlevel%（执行前）
+→ marker 报旧值。实测 `cmd /c exit 7 & echo EXPANDED=%errorlevel%` → `EXPANDED=0`。
+影响: Windows 所有命令 exit_code 恒 0（`nonexist_command_xyz` 也报 0）。
+修法: marker 独立成行 `{s}\r\necho MDELIM:%errorlevel%\r\n`（cmd 逐行读取，
+读到 marker 行时上一行已执行完，展开新值）。
+
+**CreateProcessW 无 per-process 编码/语言参数**: dwCreationFlags 与
+STARTUPINFOEX 属性列表均无编码相关项；CRT 代码页从系统 locale 继承、MUI 语言
+从用户配置继承，均不能按进程覆盖。系统级唯一开关 = 控制面板「Beta: Use
+Unicode UTF-8」（全局 + 重启）。per-process 控制台编码的唯一现代机制就是 ConPTY。
+
+### 2026-08-19 — ConPTY 在 Session 0 服务链不可用（Phase 41 排障记录）
+
+**现象**: spawnWindowsConpty 全链 API 成功（CreatePipe/CreatePseudoConsole S_OK/
+attr list/CreateProcessW 返回 pid，cmd 进程 STILL_ACTIVE）但 cmd **零输出、
+不执行 stdin 命令**（探针文件不出现）——attach 伪控制台失败。
+
+**排查矩阵**（5 个实现变体 + 2 个环境全部失败）:
+- 变体: sa.bInheritHandle=TRUE/FALSE × bInheritHandles=TRUE/FALSE × 立即关/
+  不关 PTY 端句柄 × cmd/powershell × 微软 EchoCon 示例精确复刻（sa=NULL +
+  CreatePseudoConsole 后立即关 PTY 端 + FALSE）——全部同样症状。
+- 结构体布局已验证正确（STARTUPINFOW=104/STARTUPINFOEXW=112/HANDLE=8）。
+- 环境: sshd 用户会话跑 standalone 失败；schtasks SYSTEM 任务同样失败（stdin
+  命令能到达 cmd 执行、stdout 管道读不到输出 → 读循环挂）。
+- 对照: `ssh -tt`（sshd 内部建 ConPTY）同机工作正常（UTF-8 中文正确），Session 0
+  也有 conhost 运行——**sshd 的成功机制未复现**（OpenSSH conpty.c 未定位到）。
+
+**连带发现**:
+1. sshpass.zig runWindowsConpty 的属性列表从未挂进 STARTUPINFOEXW（startup_info
+   是裸 STARTUPINFOW，attr_list_buf 独立变量，cb 只声明 STARTUPINFOW 大小）——
+   该「ConPTY 模式」从未真正走 ConPTY，一直靠密码提示匹配的 pipe fallback 工作。
+2. `--upgrade` 推送显示 OK 但 utmmd 不实际替换二进制（同日两次复现）——版本
+   升级期间一律 scp + `--install` 通道。
+
+**教训**:
+1. **部署纪律**: 未在单机验证的实现绝不全量 deploy——本次 ConPTY 版直接推 4 台，
+   导致 Windows exec 全挂 + 心跳冻结崩溃循环 + 孤儿 cmd 堆积（windowsvm 疑似
+   因此资源耗尽死机重启）。正确顺序: standalone 验证 → 单机验证 → 全量。
+2. **挂起的 exec 是全局毒药**: Guest exec read 永久阻塞 → 心跳冻结 → utmmd 杀
+   utmm 循环；且 Host 侧等待线程堆积可拖死 MCP 线程池（status 正常但 upload/
+   exec 全超时——LSA/UDP 独立线程掩盖 TCP 侧死亡，排查时勿被 serving 状态迷惑）。
+3. **升级验证三要素**: 推送后必须核对磁盘 utmm.exe 的 **mtime + size + 行为**，
+   `[upgrade] OK` 只代表字节送达。
+
+**最终方案**（已实施 v0.18.79）: pipe + cmd.exe /k（会话保持本地 OEM）+
+dpipe_shell 双向转码（输出 GetOEMCP→UTF-8 / 输入 UTF-8→GetOEMCP，DBCS/UTF-8
+跨块 pending）。真机验证: ipconfig「以太网」/中文标签全部正确 UTF-8、
+exit 7/9009/5 传播、UTF-8 中文输入正确回显、&&/|/net user 中文正常。

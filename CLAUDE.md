@@ -348,7 +348,7 @@ pub fn relay(a: DuplexPipe, b: DuplexPipe) !void;
 ```
 
 Implementations:
-- `dpipe_shell.zig`: pty master ↔ DuplexPipe (posix_openpt/fork/execve or CreatePipe/CreateProcessW)
+- `dpipe_shell.zig`: pty master ↔ DuplexPipe (posix_openpt/fork/execve or CreatePipe/CreateProcessW; Windows pipe mode does bidirectional OEM↔UTF-8 codec in readFn/writeFn — GetOEMCP() auto-matches CJK locales, session stays OEM, never chcp)
 - `dpipe_file.zig`: file read/write ↔ DuplexPipe with incremental SHA256
 - `tcp.duplexPipe(fd, allocator)`: TCP connection ↔ DuplexPipe (adapter)
 
@@ -424,8 +424,10 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
 - **Per-command shell** (v0.13.0) — each exec spawns a fresh pty. No cd/export persistence
   across commands. Simpler model that matches independent TCP connections.
 - Single UDP port 2121 for LSA mesh (LSA broadcast only — no KCP data)
-- **MDELIM markers**: `; echo MDELIM:$?\n` appended to each command. Host-side
-  `scanForMarker` uses `lastIndexOf` — handles echoed command text on macOS/BSD
+- **MDELIM markers**: POSIX `; echo MDELIM:$?\n`; Windows `\r\necho MDELIM:%errorlevel%\r\n`
+  — the marker MUST be on its own line: interactive cmd expands `%errorlevel%` at whole-line
+  parse time, so appending it to the same line (`& echo ...`) reports the pre-execution value.
+  Host-side `scanForMarker` uses `lastIndexOf` — handles echoed command text on macOS/BSD
   (where pty master doesn't support tcsetattr ECHO disable)
 - **Chunked file transfer → direct TCP streaming** (v0.13.0): TCP provides reliable
   ordered delivery — application-level chunking and SHA256-per-chunk are unnecessary.
@@ -466,6 +468,15 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
   symmetric with upload. Host reads exactly file_size bytes and verifies
   incremental SHA256. Parse results must be copied out of the recv buffer
   before reuse (dangling-slice bug found in live verification).
+- **Windows exec OEM↔UTF-8 codec** (v0.18.79) — cmd.exe /k session keeps the system
+  local OEM codepage; dpipe_shell converts output OEM→UTF-8 and input UTF-8→OEM
+  (GetOEMCP() auto-matches GBK/Shift-JIS/EUC-KR — multilingual without knowing the
+  target's codepage). Legacy commands (ipconfig etc.) ignore `chcp` and always emit
+  local ANSI/OEM — `chcp 65001` never fixed output and corrupts cmd's piped stdin
+  (byte-at-a-time decode → U+FFFD). ConPTY was attempted and **rejected**: in the
+  Session 0 service chain every API succeeds but cmd never attaches (zero output,
+  5 implementation variants incl. exact EchoCon replica all fail) — see findings
+  2026-08-19. Never deploy an unverified implementation fleet-wide.
 - **macOS utmmd hash check disabled** (v0.18.72) — adhoc codesign is
   non-deterministic and remove-signature is not byte-reversible, so the
   installed utmmd hash can never match the embedded unsigned hash.

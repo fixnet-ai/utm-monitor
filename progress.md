@@ -2060,3 +2060,24 @@ POSIX 上 `file_io` 直接复用事件循环 Io（epoll/kqueue），而 `findUpg
 - exec 回归 OK ✓
 
 **部署状态**: 全节点 v0.18.72。37A/37B 完成。未 tag 未 push（发布待用户决定）。
+
+## Phase 41 — Windows exec ConPTY 统一 UTF-8 + marker 修复（2026-08-19）
+
+**会话开始**: 用户提出两点验证（shell 操作符 / Windows 中文乱码）→ 实测确认
+两个真问题 + 用户指出多语言内码不可硬编码 → 查证 ConPTY 契约并实机验证通解
+（证据链见 findings.md 2026-08-19）→ 用户确认实施方案。
+
+**计划**: 41A marker 独立行修复 / 41B dpipe_shell ConPTY 优先 + fallback pipe /
+41C VT 剥离 + 宽度调优 / 41D 测试门禁 / 41E 真机验证。
+
+**Phase 41 完成记录（08-19 上午）**:
+- 41A marker 独立行修复 → winx64 实测 exit 7/9009/5 全部正确传播
+- 41B 最终采用 pipe+OEM↔UTF-8 转码（ConPTY 5 变体+2 环境实测全灭后否决）
+- 排障弯路: 「转码版挂起」为假象——`--upgrade` 两次推送均未实际替换二进制
+  （winx64 一直跑 ConPTY 版）；靠 dbgLog 文件日志 + mtime/size 比对戳穿
+- 事故与恢复: ConPTY 版全量 deploy 致 Windows exec 挂 + 心跳冻结崩溃循环，
+  windowsvm 疑似资源耗尽死机（用户重启恢复）；winx64 utmmd 进程崩溃退出
+  （WIN32_EXIT_CODE 1067）一次，sc start 恢复
+- 最终: 两台 Windows VM 转码版部署验证全过（中文/exit_code/操作符/管道），
+  测试残留清理完毕，229 单元 + 60 集成 0 泄漏
+- 遗留: L1 `--upgrade` 不替换 bug、L2 sshpass ConPTY 假模式（见 task_plan）
