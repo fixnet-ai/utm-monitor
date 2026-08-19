@@ -23,6 +23,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zio = @import("zio");
 const mcp_handler = @import("mcp_handler.zig");
+const tcp = @import("tcp.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Windows API externs (removed from std.os.windows in Zig 0.16.0)
@@ -633,25 +634,60 @@ fn handlePing(
     conn.writeAll(w.items) catch {};
 }
 
-/// ipc exec 流式转发上下文：把 mcp_handler 的流式输出逐块转发为 IPC exec_data 帧。
-const ExecIpcSink = struct {
+/// ipc exec 转发 + 断连探测共享上下文：sink 写 exec_data 帧与 watcher 的
+/// 零长探针帧共用同一 conn，必须互斥；broken 共享（任一写失败即 CLI 断开）。
+const ExecIpcLink = struct {
     conn: Connection,
-    broken: bool,
+    io: std.Io, // std.Io.Mutex lock/unlock 需要
+    broken: bool = false,
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
 
-    fn onOutput(ctx: *anyopaque, data: []const u8) void {
-        const self: *ExecIpcSink = @ptrCast(@alignCast(ctx));
-        if (self.broken) return;
+    fn onOutput(ctx: *anyopaque, data: []const u8) bool {
+        const self: *ExecIpcLink = @ptrCast(@alignCast(ctx));
+        if (self.broken) return false;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         var hdr: [5]u8 = undefined;
         hdr[0] = @intFromEnum(Response.exec_data);
         std.mem.writeInt(u32, hdr[1..5], @intCast(data.len), .big);
         self.conn.writeAll(&hdr) catch {
             self.broken = true;
-            return;
+            return false; // CLI 已断 — 请求 execOnGuestStream 立即中止
         };
         self.conn.writeAll(data) catch {
             self.broken = true;
-            return;
+            return false;
         };
+        return true;
+    }
+
+    /// 断连检测（watcher 线程调用，mcp_handler.ClientWatch.checkFn 实现）：
+    /// 写零长 exec_data 探针帧 — 所有版本 CLI 解析 len=0 后直接读下一帧，
+    /// 无害；对端已死则写立即失败（POSIX EPIPE / Windows BROKEN_PIPE）。
+    /// 写探测无半关闭歧义（server 依赖 CLI 的 SHUT_WR 判断请求结束，
+    /// macOS poll 对半关闭也上报 HUP，读侧检测不可用 — findings 2026-08-19）。
+    /// 探针周期 2s，按 50ms 分片睡眠以便 done 时快速返回。
+    fn checkDisconnect(ctx: *anyopaque, done: *const std.atomic.Value(bool)) bool {
+        const self: *ExecIpcLink = @ptrCast(@alignCast(ctx));
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.broken) return true;
+            var probe: [5]u8 = undefined;
+            probe[0] = @intFromEnum(Response.exec_data);
+            std.mem.writeInt(u32, probe[1..5], 0, .big);
+            self.conn.writeAll(&probe) catch {
+                self.broken = true;
+                return true;
+            };
+        }
+        var slept_ms: u32 = 0;
+        while (slept_ms < 2000) {
+            if (done.load(.acquire)) return false;
+            tcp.threadSleepMs(50);
+            slept_ms += 50;
+        }
+        return false;
     }
 };
 
@@ -676,14 +712,16 @@ fn handleExec(
     const state = @as(*host_mod.GuestTable, @ptrCast(@alignCast(state_ptr)));
 
     // 流式转发：每收到一块 pty_exec_output 立即作为 exec_data IPC 帧发给 CLI，
-    // CLI 终端实时看到输出，无需等待命令结束。
-    var sink = ExecIpcSink{ .conn = conn, .broken = false };
-    const exit_code = mcp_handler.execOnGuestStream(io, gpa, state, vm, command, ExecIpcSink.onOutput, &sink) catch |err| {
+    // CLI 终端实时看到输出，无需等待命令结束。断连 watcher 经零长探针帧检测
+    // CLI 存活 — CLI Ctrl-C/死亡 → 取消 Guest 上的命令（连接生命周期=命令生命周期）。
+    var link = ExecIpcLink{ .conn = conn, .io = io };
+    const watch = mcp_handler.ClientWatch{ .ctx = &link, .checkFn = ExecIpcLink.checkDisconnect };
+    const exit_code = mcp_handler.execOnGuestStream(io, gpa, state, vm, command, ExecIpcLink.onOutput, &link, watch) catch |err| {
         std.log.err("[ipc-exec] exec on {s} failed: {}", .{ vm, err });
         sendError(conn, if (err == error.GuestNotFound) "GuestNotFound: VM not in mesh" else "ExecFailed");
         return;
     };
-    if (sink.broken) return; // CLI 已断开，不再发送后续帧
+    if (link.broken) return; // CLI 已断开，不再发送后续帧
 
     // exec_done: [type][4B BE exit_code]
     var buf: [5]u8 = undefined;
@@ -1547,7 +1585,7 @@ test "ipc Connection.writeAll does not lose data on non-blocking socket" {
     try std.testing.expectEqualStrings(test_data, buf[0..test_data.len]);
 }
 
-test "ExecIpcSink.onOutput encodes exec_data IPC frames" {
+test "ExecIpcLink.onOutput encodes exec_data IPC frames" {
     if (builtin.os.tag == .windows) return; // Windows IPC 用命名管道，非 socket
 
     const tcp_mod = @import("tcp.zig");
@@ -1557,11 +1595,12 @@ test "ExecIpcSink.onOutput encodes exec_data IPC frames" {
         tcp_mod.sockClose(nbp.b);
     }
 
+    var threaded: std.Io.Threaded = .init_single_threaded;
     // 流式回调两次，每次一块数据 → 两个 exec_data 帧
     const conn = Connection{ .fd = nbp.a };
-    var sink = ExecIpcSink{ .conn = conn, .broken = false };
-    ExecIpcSink.onOutput(&sink, "hello");
-    ExecIpcSink.onOutput(&sink, "world");
+    var sink = ExecIpcLink{ .conn = conn, .io = threaded.io() };
+    _ = ExecIpcLink.onOutput(&sink, "hello");
+    _ = ExecIpcLink.onOutput(&sink, "world");
     try std.testing.expect(!sink.broken);
 
     // 读回并验证帧格式：type(0x11) + 4B BE len + data，两块各一帧
@@ -1574,6 +1613,41 @@ test "ExecIpcSink.onOutput encodes exec_data IPC frames" {
         off += @intCast(n);
     }
     try std.testing.expectEqualStrings(expected, got[0..off]);
+}
+
+test "ExecIpcLink.checkDisconnect probes live conn and detects peer close" {
+    if (builtin.os.tag == .windows) return; // named pipe 路径在 Windows 真机验证
+
+    const tcp_mod = @import("tcp.zig");
+    var done = std.atomic.Value(bool).init(false);
+    var threaded: std.Io.Threaded = .init_single_threaded;
+
+    // 场景 1：对端存活 → 探针写成功 → false（done 已置位，2s 等待分片立即退出）
+    const nbp1 = try tcp_mod.makeNonBlockingPair();
+    defer tcp_mod.sockClose(nbp1.a);
+    defer tcp_mod.sockClose(nbp1.b);
+    var live = ExecIpcLink{ .conn = .{ .fd = nbp1.a }, .io = threaded.io() };
+    done.store(true, .release);
+    try std.testing.expect(!ExecIpcLink.checkDisconnect(&live, &done));
+    // 对端应恰好收到 5 字节零长 exec_data 探针帧（所有版本 CLI 无害跳过）
+    var probe: [5]u8 = undefined;
+    var off: usize = 0;
+    while (off < 5) {
+        const n = tcp_mod.sockRead(nbp1.b, probe[off..].ptr, 5 - off);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+    try std.testing.expectEqual(@as(usize, 5), off);
+    try std.testing.expectEqual(@intFromEnum(Response.exec_data), probe[0]);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, probe[1..5], .big));
+
+    // 场景 2：对端全关闭 → 探针写 EPIPE → true（CLI 已死）
+    const nbp2 = try tcp_mod.makeNonBlockingPair();
+    tcp_mod.sockClose(nbp2.b);
+    defer tcp_mod.sockClose(nbp2.a);
+    var dead = ExecIpcLink{ .conn = .{ .fd = nbp2.a }, .io = threaded.io() };
+    done.store(false, .release);
+    try std.testing.expect(ExecIpcLink.checkDisconnect(&dead, &done));
 }
 
 test "ipc Connection.readFull byte-by-byte on non-blocking socket" {

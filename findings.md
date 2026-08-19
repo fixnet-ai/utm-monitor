@@ -524,3 +524,65 @@ HEAD 5907d1f "fix: address PR #646 review feedback"）。CI 修复 = checkout �
   够用，SignPath macOS 签名需自备 Apple 开发者证书，无增益）
 - 申请为人工审批（社区案例约 1 周），AI 无法代办 → CI 用
   `vars.SIGNPATH_ENABLED` repository variable 门控签名 job，批准前整段跳过
+
+## 2026-08-19 (Phase 43) — exec 断连后命令失控（三层无取消传播）+ macOS POLLHUP 半关闭歧义实测
+
+**问题链**（AI agent 中途取消 exec / CLI Ctrl-C 后，Guest 命令失控继续跑）:
+
+1. **Guest** `handleExecCmd`（guest.zig:1123-1166）: 主循环阻塞在 `shell.read`，
+   `sendAndFlush` 失败仅 warn 后继续；`defer shell.close()`（SIGKILL）只在命令
+   自然结束后执行——kill 逻辑永远不会中途触发；从不检测 TCP conn 断开。
+2. **Host IPC** `ExecIpcSink.broken`（ipc.zig:637-656）: 只停转发不中止执行；
+   命令无输出时永远发现不了 CLI 已死。
+3. **Host HTTP MCP** `execOnGuest`（mcp_handler.zig:154-163）: OutputCollector
+   全量累积输出在 Host 内存直到命令结束——取消后线程池槽 + 无上限内存被
+   僵尸 exec 占据整个命令时长。
+
+**关键实测（决定检测方式）**: macOS poll 对**半关闭也上报 POLLHUP**
+（unix socketpair 与 TCP loopback 的 `SHUT_WR` 全测得 `IN|HUP`，2026-08-19
+python 探针）→ 读侧信号无法区分 CLI 的 `SHUT_WR` 半关闭（server 依赖它判断
+请求结束，ipc.zig:1099）与进程死亡 → IPC 路径弃用读侧检测。
+（Linux 有 POLLRDHUP 可区分，但 macOS 无此标志，不能跨平台依赖。）
+
+**最终设计**: 连接生命周期 = 命令生命周期，零协议变更：
+- **IPC 路径写探测**: 周期向 CLI 写零长度 `exec_data` 帧（`0x11`+4B len=0，
+  所有版本 CLI 无害跳过——ipcExec 解析 len=0 → remaining=0 → 读下一帧），
+  EPIPE/BROKEN_PIPE = CLI 死亡。写探测无歧义（半关闭不影响写）。
+- **HTTP 路径读侧检测**: 等响应的 HTTP 客户端不会半关闭 → poll + recv==0 即死。
+- **Host 检测到断开** → shutdown Guest TCP → **Guest watcher**（阻塞 sockRead
+  1B，Host 发完首帧后 conn 任何可读事件=断开）→ `killChild`。
+- **进程组击杀**: `kill(-pid, SIGKILL)`（子进程 setsid 是组长）回退
+  `kill(pid)`——孙进程（nohup 型守护）一并清除。
+- 版本混部矩阵全安全（新 Host+旧 Guest=现行为；旧 CLI+新 daemon=探针被无害
+  跳过；新 CLI+旧 daemon=CLI 零改动）。
+
+**附带发现**: Guest utmm 帧命令（exec/upload/download）在 accept 循环线程
+内联串行处理（guest.zig:995-1010）——一条长 exec 阻塞该 Guest 所有后续
+命令（agent 取消后重跑的命令排队等旧命令跑完）。本次一并改为每连接
+`std.Thread.spawn`（detach，先例 guest.zig:898/902 hosts_sync；理由：分钟级
+阻塞任务不能占 zio 线程池槽）。
+
+**行为变更**: CLI Ctrl-C 现在真正终止远端命令（旧行为：本机 CLI 死、远端
+失控继续）。Windows TerminateProcess 只杀 cmd.exe 直系，孙进程残留为已知
+限制（无进程组概念）。
+
+**实施中发现 1 — macOS pty E-state（存量 bug，本次附带修复）**:
+SIGKILL 一个阻塞在 pty slave read 的 shell，进程卡 E(exiting) 状态 ~4.5s，
+直到 master 关闭才真正退出（ps 实测：`Ss+` → `?Es` ×4.5s → `Z`）。旧
+closeFn 顺序（kill → waitpid 轮询 5s → close master）使**每次 macOS exec
+的善后都白烧 ~5s**（done 帧已发但线程/limit 名额被占）。修复：closeFn 先
+close master（slave read 立即 EOF → shell 干净退出）再 kill+收割，~100ms
+完成。注意 shell 阻塞在 waitpid（前台任务运行中）时 SIGKILL 秒杀无此问题
+——只有 idle 在 read 的 shell 受影响。
+
+**实施中发现 2 — Zig 0.16.0 API**:
+- `std.Thread.Mutex` 不存在 → 用 `std.Io.Mutex`（`lockUncancelable(io)`/
+  `unlock(io)`，需 io 参数；lsa.zig 先例）
+- `std.Thread.sleep` 不存在 → tcp.zig 新增 `threadSleepMs`（POSIX nanosleep
+  / Windows kernel32 Sleep，先例 dpipe_shell/lsa）
+- `std.time.nanoTimestamp`/`milliTimestamp` 已移除 → 用 `std.Io.Timestamp.now(io, .awake)`
+- `Io.Dir.createDir` 直接收 `Permissions`（`.default_dir`），不是 options struct
+- `Io.Dir.iterate()` 不接 io，`Iterator.next(io)` 接 — common.zig TempDir
+  死代码修正（连同 bufPrint 16 字节缓冲 NoSpaceLeft panic）
+- spawnPosix 忽略传入 shell 参数、实际用 `$SHELL`（集成测试中是 /bin/bash
+  而非 /bin/zsh — 影响测试假设）

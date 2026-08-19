@@ -12,12 +12,32 @@ const tcp = @import("tcp.zig");
 const host_mod = @import("host.zig");
 const protocol = @import("protocol.zig");
 const mcp = @import("mcp.zig");
+const mcp_handler = @import("mcp_handler.zig");
 
 /// Max HTTP request body size (matches mcp.zig's stdin buffer).
 const MAX_BODY_SIZE: usize = 65536;
 
 /// Max combined request line + headers size.
 const MAX_HEADERS_SIZE: usize = 8192;
+
+/// HTTP 客户端断连检测器（exec 取消传播，mcp_handler.ClientWatch 实现）。
+/// 等响应的 HTTP 客户端不会半关闭（无 SHUT_WR），单请求连接也不会多发 —
+/// 可读事件（EOF/错误/垃圾字节）即客户端已断开。poll 按 50ms 分片，
+/// done 置位后快速返回（join 延迟 ≤50ms，不给命令响应加尾延迟）。
+const HttpProbe = struct {
+    fd: tcp.socket_t,
+
+    fn check(ctx: *anyopaque, done: *const std.atomic.Value(bool)) bool {
+        const self: *HttpProbe = @ptrCast(@alignCast(ctx));
+        while (!done.load(.acquire)) {
+            if (!tcp.sockPollReadable(self.fd, 50)) continue;
+            var b: [1]u8 = undefined;
+            _ = tcp.sockRead(self.fd, @as([*]u8, @ptrCast(&b)), 1);
+            return true; // EOF(0)/错误/意外数据 — 均判客户端断开
+        }
+        return false;
+    }
+};
 
 /// Handle an HTTP MCP request on a raw TCP socket.
 /// `first_byte` is the already-peeked first character of the HTTP method
@@ -48,7 +68,9 @@ pub fn handleHttpMcp(
     };
     defer gpa.free(body);
 
-    // Build McpContext with the Host daemon's state
+    // Build McpContext with the Host daemon's state + client disconnect
+    // watcher (exec cancellation: agent abort → kill command on guest)
+    var probe = HttpProbe{ .fd = fd };
     const ctx = mcp.McpContext{
         .io = io,
         .gpa = gpa,
@@ -56,6 +78,7 @@ pub fn handleHttpMcp(
         .state = state,
         .mesh_ptr = mesh_ptr,
         .hostname = hostname,
+        .client_watch = mcp_handler.ClientWatch{ .ctx = &probe, .checkFn = HttpProbe.check },
     };
 
     // Call MCP JSON-RPC processor directly (no IPC, no serialization)
@@ -269,4 +292,29 @@ test "parseContentLength: empty" {
     const headers = "";
     const len = parseContentLength(headers);
     try std.testing.expectEqual(@as(?usize, null), len);
+}
+
+test "HttpProbe detects peer close and honors done" {
+    const pair = try tcp.makePair();
+    defer tcp.sockClose(pair.a);
+    var done = std.atomic.Value(bool).init(false);
+
+    // 对端关闭 → poll readable(EOF) → 判断开
+    tcp.sockShutdown(pair.b, 2);
+    tcp.sockClose(pair.b);
+    var probe = HttpProbe{ .fd = pair.a };
+    try std.testing.expect(HttpProbe.check(&probe, &done));
+
+    // done 已置位 → 不进入长等待，快速返回 false
+    const pair2 = try tcp.makePair();
+    defer tcp.sockClose(pair2.a);
+    defer tcp.sockClose(pair2.b);
+    done.store(true, .release);
+    var probe2 = HttpProbe{ .fd = pair2.a };
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const t0 = std.Io.Timestamp.now(io, .awake);
+    try std.testing.expect(!HttpProbe.check(&probe2, &done));
+    const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - t0.nanoseconds;
+    try std.testing.expect(elapsed < 500_000_000); // <500ms（join 快速返回的保证）
 }

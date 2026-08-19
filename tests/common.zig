@@ -348,14 +348,13 @@ pub const TempDir = struct {
 
     /// 创建临时目录。prefix 用于标识（如 "utmm-test-"）。
     pub fn create(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8) !TempDir {
-        var rand_bytes: [8]u8 = undefined;
+        var rand_bytes: [6]u8 = undefined;
         io.random(&rand_bytes);
-        var hex: [16]u8 = undefined;
-        _ = std.fmt.bufPrint(&hex, "{x}{x}", .{ std.mem.readInt(u64, &rand_bytes, .little), @as(u64, 0) }) catch unreachable;
-        // 只用前 12 个 hex 字符
+        var hex: [12]u8 = undefined;
+        _ = std.fmt.bufPrint(&hex, "{x}", .{std.mem.readInt(u48, &rand_bytes, .little)}) catch unreachable;
         const path = try std.fmt.allocPrint(allocator, "/tmp/{s}{s}", .{ prefix, hex[0..12] });
         errdefer allocator.free(path);
-        try std.Io.Dir.cwd().createDir(io, path, .{ .permissions = @enumFromInt(0o755) });
+        try std.Io.Dir.cwd().createDir(io, path, .default_dir);
         return TempDir{ .io = io, .allocator = allocator, .path = path };
     }
 
@@ -375,8 +374,8 @@ pub const TempDir = struct {
         var dir = try std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true });
         defer dir.close(self.io);
 
-        var iter = dir.iterate(self.io);
-        while (try iter.next()) |entry| {
+        var iter = dir.iterate();
+        while (try iter.next(self.io)) |entry| {
             const full = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name });
             defer self.allocator.free(full);
             if (entry.kind == .directory) {

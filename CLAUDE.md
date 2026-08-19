@@ -482,6 +482,21 @@ Host pushes upgrades on demand — no autonomous Guest-side version polling.
   installed utmmd hash can never match the embedded unsigned hash.
   `shouldUpdateUtmmd` returns false on macOS (utmmd updates come from
   explicit `--install`); Linux/Windows keep hash comparison.
+- **Exec cancellation propagation** (v0.18.80) — connection lifetime =
+  command lifetime. Client disconnect (agent abort / CLI Ctrl-C) → Host
+  detects (HTTP: poll+recv EOF; IPC: zero-length exec_data write probe every
+  2s — EPIPE/BROKEN_PIPE = dead; write probing because macOS poll reports
+  POLLHUP for half-closes too, findings 2026-08-19) → shutdown Guest TCP →
+  Guest watcher (per-exec thread, 250ms poll) → `dpipe_shell.requestKill` →
+  process-group SIGKILL (`kill(-pid)`). Zero protocol changes; mixed-version
+  fleets degrade to the old behavior. Guest frame commands now run on
+  per-connection threads (`std.Thread.spawn` detached) instead of inline in
+  the accept loop — a long exec no longer blocks the Guest's other commands.
+- **macOS pty closeFn order** (v0.18.80) — POSIX closeFn closes the pty
+  master BEFORE killing: a shell blocked in slave-read that receives SIGKILL
+  lingers in E-state ~5s on macOS until the master closes; master-close-first
+  gives EOF → clean exit → reap in ~100ms (previously every exec burned a
+  hidden 5s in teardown).
 
 ## Build & Run
 

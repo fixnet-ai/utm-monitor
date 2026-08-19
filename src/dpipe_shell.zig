@@ -388,10 +388,17 @@ fn xcodeWrite(self: *ShellCtx, data: []const u8) !void {
 
 fn closeFn(ctx: *anyopaque) void {
     const self: *ShellCtx = @ptrCast(@alignCast(ctx));
-    killChild(self.child_pid);
-    closePtyFd(self.master_fd);
     if (builtin.os.tag == .windows) {
+        killChild(self.child_pid); // TerminateProcess → stdout pipe EOF
+        closePtyFd(self.master_fd);
         closePtyFd(self.stdin_fd);
+    } else {
+        // 先关 master 再 kill：从属端 read 立即得到 EOF/HUP，shell 干净退出。
+        // macOS 实测：SIGKILL 一个阻塞在 slave read 的 shell，进程卡 E 状态
+        // ~5s 直到 master 关闭才真正退出（killChild waitpid 轮询白等满）—
+        // findings 2026-08-19。先关 master 使收割在 ~100ms 内完成。
+        closePtyFd(self.master_fd);
+        killChild(self.child_pid); // 清理残余进程组 + 收割
     }
     self.allocator.free(self.shell);
     self.allocator.destroy(self);
@@ -524,7 +531,12 @@ fn killChild(pid: std.posix.pid_t) void {
             _ = TerminateProcess(pid, 1);
         },
         .linux, .macos => {
-            _ = kill(pid, SIGKILL);
+            // 杀整个进程组 — 子进程 setsid 后是组长（spawnPosix），覆盖命令
+            // 派生的孙进程（make/cc/管道链/nohup 型守护）。组长已死或非组长
+            // 时 kill(-pid) 失败，回退仅杀本进程。
+            if (kill(-pid, SIGKILL) != 0) {
+                _ = kill(pid, SIGKILL);
+            }
             // 非阻塞等待（5s 超时）— 子进程可能卡在 E（正在退出）状态。
             // waitpid 阻塞 → 主 accept 循环停止 → SOCKS5 握手无响应。
             // 超时后不再等待：子进程已 SIGKILL，OS 最终会回收。
@@ -539,6 +551,15 @@ fn killChild(pid: std.posix.pid_t) void {
         },
         else => @compileError("unsupported OS for killChild"),
     }
+}
+
+/// 请求异步终止 shell 进程组（exec 断连取消传播用，由 Guest watcher 线程调用）。
+/// 线程安全：另一线程阻塞在 read() 时调用安全 —— SIGKILL/TerminateProcess
+/// 使阻塞的 pty master / stdout pipe read 返回 EOF/BROKEN_PIPE。
+/// 与后续 close() 的 killChild 双重调用无害（kill 对已回收 pid 返回 ESRCH）。
+pub fn requestKill(pipe: dpipe.DuplexPipe) void {
+    const self: *ShellCtx = @ptrCast(@alignCast(pipe.ctx));
+    killChild(self.child_pid);
 }
 
 fn closePtyFd(fd: std.posix.fd_t) void {
@@ -607,6 +628,46 @@ test "dpipe_shell close releases resources" {
     // close 会 kill 子进程、关闭 fd、释放 shell 字符串、释放 ctx
     sh.close();
     // 如果到这里没有 crash/fail，说明资源已正确释放
+}
+
+test "requestKill kills process group and unblocks read" {
+    // 断连取消传播核心：requestKill 后阻塞的 read 必须在 2s 内返回 EOF/error
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const shell_path = if (builtin.os.tag == .macos) "/bin/zsh" else "/bin/sh";
+    const sh = try create(testing.allocator, shell_path);
+    defer sh.close();
+
+    // 长命令 — read 将长时间无数据
+    try sh.write("sleep 30\n");
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    std.Io.sleep(io, std.Io.Duration.fromMilliseconds(300), .awake) catch {};
+
+    // 模拟 Guest watcher 判定断连：请求终止进程组
+    requestKill(sh);
+
+    // read 必须在 2s 内返回 EOF(0)/error（SIGKILL → pty master EOF）；
+    // 可能先读到 echo/prompt 残留输出，继续读直到 EOF/error 或超时。
+    var buf: [256]u8 = undefined;
+    const deadline = std.Io.Timestamp.now(io, .awake);
+    const timeout_ns: u64 = 2_000_000_000;
+    var unblocked = false;
+    while (true) {
+        const n = sh.read(&buf) catch {
+            unblocked = true; // read error 同样是被终止的表现
+            break;
+        };
+        if (n == 0) {
+            unblocked = true; // EOF
+            break;
+        }
+        // 有输出（echo/prompt）— 未到 EOF，继续
+        const now = std.Io.Timestamp.now(io, .awake);
+        if (now.nanoseconds - deadline.nanoseconds > timeout_ns) break; // 超时 → unblocked 保持 false
+    }
+    try testing.expect(unblocked);
 }
 
 // ── Windows 转码纯函数测试（跨平台可测）─────────────────────────

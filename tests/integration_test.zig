@@ -17,6 +17,7 @@ const test_lsa = @import("test_lsa_routing.zig");
 const test_dpipe = @import("test_dpipe_relay.zig");
 const test_svc = @import("test_svc_install.zig");
 const test_exec = @import("test_exec_e2e.zig");
+const test_exec_cancel = @import("test_exec_cancel.zig");
 const test_upload = @import("test_upload_e2e.zig");
 const test_download = @import("test_download_e2e.zig");
 const test_upgrade = @import("test_upgrade_e2e.zig");
@@ -73,6 +74,10 @@ pub fn main(init: std.process.Init) !void {
 
     test_exec.test_exec_e2e(io, alloc, &runner) catch |err| {
         std.debug.print("test_exec_e2e 异常终止: {}\n", .{err});
+    };
+
+    test_exec_cancel.test_exec_cancel(io, alloc, &runner) catch |err| {
+        std.debug.print("test_exec_cancel 异常终止: {}\n", .{err});
     };
 
     test_upload.test_upload_e2e(io, alloc, &runner) catch |err| {

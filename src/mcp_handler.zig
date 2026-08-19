@@ -65,13 +65,51 @@ const OutputCollector = struct {
         self.output.deinit(self.gpa);
     }
 
-    fn onOutput(ctx: *anyopaque, data: []const u8) void {
+    fn onOutput(ctx: *anyopaque, data: []const u8) bool {
         const self: *OutputCollector = @ptrCast(@alignCast(ctx));
         self.output.appendSlice(self.gpa, data) catch @panic("execOnGuest collector OOM");
+        return true; // 收集器永不断开
     }
 };
 
+/// 客户端断连检测器（exec 取消传播）。checkFn 阻塞至多 ~tick 后返回；
+/// true = 客户端已断开。done：主路径已自然结束 — 检测器应在等待分片间隙
+/// 检查并尽快返回 false（保证 join 延迟 ≤ 一个分片，不给命令响应加尾延迟）。
+/// 由调用方实现（IPC 写探测 / HTTP 读侧检测），避免 mcp_handler 反向依赖。
+pub const ClientWatch = struct {
+    ctx: *anyopaque,
+    checkFn: *const fn (ctx: *anyopaque, done: *const std.atomic.Value(bool)) bool,
+};
+
+/// exec 主路径与断连 watcher 线程的共享状态。
+const ExecWatchCtx = struct {
+    client: ClientWatch,
+    guest_fd: tcp.socket_t,
+    /// 主→watcher：命令已结束，watcher 不得再 shutdown guest fd
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// watcher→主：已触发取消（recv 错误分类时优先于 panic）
+    aborted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+/// 断连 watcher：检测到客户端断开 → shutdown Guest 连接（不 close），
+/// 唤醒主循环阻塞的 recv（recvExact 把读错误映射为 ConnectionClosed /
+/// EOF → 主循环 break 返回 -1）。Guest 侧随后检测到连接关闭并杀进程组
+/// （连接生命周期 = 命令生命周期）。
+fn execWatchThread(ctx: *ExecWatchCtx) void {
+    while (!ctx.done.load(.acquire)) {
+        if (ctx.client.checkFn(ctx.client.ctx, &ctx.done)) {
+            ctx.aborted.store(true, .release);
+            std.log.warn("[mcp-handler-exec] client disconnected, cancelling exec on guest", .{});
+            tcp.sockShutdown(ctx.guest_fd, 2);
+            return;
+        }
+    }
+}
+
 /// 流式执行 Guest 命令：每收到一块 pty_exec_output 立即回调 on_output。
+/// on_output 返回 false 表示输出侧已断（调用方请求立即中止）。
+/// watch 非 null 时启动断连 watcher：客户端断开 → shutdown Guest 连接 →
+/// 主循环提前返回 -1，Guest 侧杀进程组。
 /// 返回 exit_code；连接在 pty_exec_done 前关闭时返回 -1（已收到的输出仍经回调流出）。
 pub fn execOnGuestStream(
     io: std.Io,
@@ -79,12 +117,25 @@ pub fn execOnGuestStream(
     state: *host_mod.GuestTable,
     vm: []const u8,
     command: []const u8,
-    on_output: *const fn (ctx: *anyopaque, data: []const u8) void,
+    on_output: *const fn (ctx: *anyopaque, data: []const u8) bool,
     ctx: *anyopaque,
+    watch: ?ClientWatch,
 ) !i32 {
     // Per-command TCP connection (with ARP recovery)
     var tcp_conn = try host_mod.connectGuest(io, gpa, state, vm);
     defer tcp_conn.deinit();
+
+    // 断连取消 watcher：join 必须先于 tcp_conn.deinit()（defer LIFO 已保证），
+    // fd 在 join 期间未被 close，watcher 的 sockShutdown 无 fd 复用竞态。
+    var watch_ctx: ?ExecWatchCtx = if (watch) |w| .{ .client = w, .guest_fd = tcp_conn.fd } else null;
+    const watcher: ?std.Thread = if (watch_ctx != null)
+        std.Thread.spawn(.{}, execWatchThread, .{&watch_ctx.?}) catch null
+    else
+        null;
+    defer if (watcher) |t| {
+        if (watch_ctx) |*wc| wc.done.store(true, .release);
+        t.join();
+    };
 
     // Look up guest for shell (needed for buildCmdWithMarker)
     const guest = state.findByHostname(vm) orelse return error.GuestNotFound;
@@ -113,6 +164,10 @@ pub fn execOnGuestStream(
     while (true) {
         const nr = tcp_conn.recv(&rbuf) catch |err| {
             if (err == error.ConnectionClosed) break;
+            // watcher 触发的取消：shutdown 使 recv 报错 —— 预期取消，非协议 bug
+            if (watch_ctx) |*wc| {
+                if (wc.aborted.load(.acquire)) break;
+            }
             // 流式分块后单帧最大约 4KB+6B（Guest 端已分块），BufferTooSmall 不应再出现。
             // 一旦出现即表示协议不变量被破坏，属于设计上不该发生的意外状态，立即 panic 暴露。
             if (err == error.BufferTooSmall) {
@@ -131,7 +186,12 @@ pub fn execOnGuestStream(
                 _ = readString(rbuf[0..nr], &mpos); // skip cmd_id
                 const data = readBlob(rbuf[0..nr], &mpos) orelse continue;
                 if (data.len > 0) {
-                    on_output(ctx, data);
+                    if (!on_output(ctx, data)) {
+                        // 输出侧已断（如 CLI 死亡导致 sink 写失败）— 不等 watcher
+                        // tick，立即中止；defer 链关 Guest 连接 → Guest 杀进程组
+                        std.log.warn("[mcp-handler-exec] output sink broken, aborting {s}", .{cmd_id});
+                        break;
+                    }
                 }
             },
             .pty_exec_done => {
@@ -157,10 +217,11 @@ pub fn execOnGuest(
     state: *host_mod.GuestTable,
     vm: []const u8,
     command: []const u8,
+    watch: ?ClientWatch,
 ) !ExecResult {
     var collector = OutputCollector.init(gpa);
     defer collector.deinit();
-    const exit_code = try execOnGuestStream(io, gpa, state, vm, command, OutputCollector.onOutput, &collector);
+    const exit_code = try execOnGuestStream(io, gpa, state, vm, command, OutputCollector.onOutput, &collector, watch);
     return ExecResult{
         .output = try collector.output.toOwnedSlice(gpa),
         .exit_code = exit_code,
@@ -483,4 +544,53 @@ test "readI32" {
     try std.testing.expect(val != null);
     try std.testing.expectEqual(@as(i32, -42), val.?);
     try std.testing.expectEqual(@as(usize, 4), pos);
+}
+
+test "execWatchThread shutdown wakes blocked guest recv" {
+    // 断连取消核心机制：watcher 检测断开 → sockShutdown(guest_fd) →
+    // 主循环阻塞的 sockRead 立即返回 0/错误（而非永远阻塞）。
+    const pair = try tcp.makePair();
+    defer tcp.sockClose(pair.a);
+    defer tcp.sockClose(pair.b);
+
+    const Probe = struct {
+        fn immediateDisconnect(ctx: *anyopaque, done: *const std.atomic.Value(bool)) bool {
+            _ = ctx;
+            _ = done;
+            return true; // 立即报告客户端已断开
+        }
+    };
+    var dummy: u8 = 0;
+    var ctx = ExecWatchCtx{
+        .client = .{ .ctx = &dummy, .checkFn = Probe.immediateDisconnect },
+        .guest_fd = pair.a,
+    };
+    const watcher = try std.Thread.spawn(.{}, execWatchThread, .{&ctx});
+
+    // 主循环模拟：阻塞 sockRead guest fd
+    var woken = std.atomic.Value(bool).init(false);
+    const Reader = struct {
+        fn run(fd: tcp.socket_t, flag: *std.atomic.Value(bool)) void {
+            var b: [1]u8 = undefined;
+            _ = tcp.sockRead(fd, &b, 1); // 0 (EOF) 或错误 — 均为被 shutdown 唤醒
+            flag.store(true, .release);
+        }
+    };
+    const reader = try std.Thread.spawn(.{}, Reader.run, .{ pair.a, &woken });
+
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const deadline = std.Io.Timestamp.now(io, .awake);
+    var ok = false;
+    while (std.Io.Timestamp.now(io, .awake).nanoseconds - deadline.nanoseconds < 2_000_000_000) {
+        if (woken.load(.acquire)) {
+            ok = true;
+            break;
+        }
+        std.Io.sleep(io, std.Io.Duration.fromMilliseconds(20), .awake) catch {};
+    }
+    try std.testing.expect(ok); // watcher shutdown 后 2s 内唤醒
+    reader.join();
+    watcher.join();
+    try std.testing.expect(ctx.aborted.load(.acquire)); // 取消标志已置位
 }

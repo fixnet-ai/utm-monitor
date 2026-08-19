@@ -995,19 +995,34 @@ pub fn guestTcpLoop(
         if (std.mem.eql(u8, req.hostname, info.hostname)) {
             // 目标是本机
             if (req.port == mesh_port) {
-                // utmm 内部帧协议 — 连接限制计数（单连接 inline 处理）
+                // utmm 内部帧协议 — 连接限制计数，名额所有权随线程转移
                 if (!conn_limit.tryAcquire()) {
                     socks5.replyRejected(fd);
                     tcp.sockClose(fd);
                     continue;
                 }
-                defer conn_limit.release();
                 socks5.replyOk(fd);
-                var conn = protocol.Connection{ .fd = fd, .alive = true };
-                handleOneCommand(io, allocator, info, &conn, shutdown, shm_handle) catch |err| {
-                    std.log.err("[guest] handleOneCommand: {}", .{err});
+                // 帧命令（exec 可能运行数分钟）移出 accept 循环 — 内联处理会阻塞
+                // 循环，使该 Guest 的所有后续命令排队。std.Thread.spawn + detach
+                // （先例 guestHostsSync）：分钟级阻塞任务不占 zio 线程池槽；
+                // 线程独占 fd 与 limit 名额，命令结束或断连取消后自清理。
+                const task = GuestCmdTask{
+                    .io = io,
+                    .allocator = allocator,
+                    .info = info,
+                    .fd = fd,
+                    .shutdown = shutdown,
+                    .shm_handle = shm_handle,
+                    .limit = &conn_limit,
                 };
-                conn.deinit();
+                if (std.Thread.spawn(.{}, guestCmdThread, .{task})) |t| {
+                    t.detach();
+                } else |_| {
+                    std.log.err("[guest] cmd thread spawn failed", .{});
+                    tcp.sockClose(fd);
+                    conn_limit.release();
+                }
+                continue;
             } else {
                 // 本机 localhost relay — 连接限制计数
                 if (!conn_limit.tryAcquire()) {
@@ -1030,6 +1045,30 @@ pub fn guestTcpLoop(
             tcp.sockClose(fd);
         }
     }
+}
+
+/// 帧命令线程任务：fd 与连接限制名额所有权随线程转移。
+const GuestCmdTask = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    info: SystemInfo,
+    fd: tcp.socket_t,
+    shutdown: ?*std.atomic.Value(bool),
+    shm_handle: ?*volatile shm.ShmLayout,
+    limit: *tcp.ConnLimit,
+};
+
+/// 每连接独立线程处理一条帧命令（exec/upload/download/upgrade）。
+/// detach：命令结束（或断连取消）后自清理 fd 与 limit 名额。
+/// 生命周期与既有 localRelay 任务一致：进程退出即终点（guestTcpLoop
+/// 返回 = 服务停止 = 进程退出），limit 指针不会先于线程失效。
+fn guestCmdThread(task: GuestCmdTask) void {
+    defer task.limit.release();
+    var conn = protocol.Connection{ .fd = task.fd, .alive = true };
+    defer conn.deinit(); // shutdown + close 恰好一次
+    handleOneCommand(task.io, task.allocator, task.info, &conn, task.shutdown, task.shm_handle) catch |err| {
+        std.log.err("[guest] handleOneCommand: {}", .{err});
+    };
 }
 
 /// 处理一条命令（单个 TCP 连接）。
@@ -1077,6 +1116,32 @@ pub fn handleOneCommand(
     }
 }
 
+/// exec 断连 watcher 参数（按值拷贝进线程）。
+/// Host 发完首帧后本连接不再有数据 — conn 上任何可读事件（EOF/错误/垃圾
+/// 字节）= Host 侧已断开（其 execOnGuestStream 在客户端断连时 shutdown 本连接）。
+const ConnWatch = struct {
+    fd: tcp.socket_t,
+    done: *std.atomic.Value(bool),
+    shell: dpipe.DuplexPipe,
+    cmd_id: []const u8,
+
+    fn run(w: @This()) void {
+        // 轮询模式（250ms）：Windows 下接受的 SOCKET 继承监听端的 FIONBIO
+        // 非阻塞模式，裸 sockRead 会在 WSAEWOULDBLOCK 上忙转。
+        while (!w.done.load(.acquire)) {
+            if (!tcp.sockPollReadable(w.fd, 250)) continue;
+            var b: [1]u8 = undefined;
+            _ = tcp.sockRead(w.fd, &b, 1);
+            // 主线程 done.store 先于其 sockShutdown — 唤醒后再查一次，
+            // 已结束即为自然完成，不得误杀
+            if (w.done.load(.acquire)) return;
+            std.log.warn("[guest] exec cancelled (host disconnect): cmd_id={s}", .{w.cmd_id});
+            dpipe_shell.requestKill(w.shell);
+            return;
+        }
+    }
+};
+
 /// 处理 exec 命令：dpipe_shell 创建 shell → 写入命令 → 流式读取输出 → 发送 exec_done。
 pub fn handleExecCmd(
     io: std.Io,
@@ -1102,6 +1167,20 @@ pub fn handleExecCmd(
         return;
     };
     defer shell.close();
+
+    // 断连取消 watcher：触发即杀 shell 进程组（requestKill → 主循环阻塞的
+    // shell.read 得到 EOF 退出，走"shell 异常关闭"收尾）。
+    var conn_done = std.atomic.Value(bool).init(false);
+    const cw = ConnWatch{ .fd = conn.fd, .done = &conn_done, .shell = shell, .cmd_id = input.cmd_id };
+    const conn_watcher = std.Thread.spawn(.{}, ConnWatch.run, .{cw}) catch null;
+    defer {
+        // 自然结束路径：done 先于 shutdown 置位 — watcher 被唤醒后必先见
+        // done=true，不会误判取消。join 先于 defer shell.close()（LIFO），
+        // ShellCtx 在 join 期间仍有效；conn 的 close 由外层 guestCmdThread 稍后执行。
+        conn_done.store(true, .release);
+        tcp.sockShutdown(conn.fd, 2); // 立即唤醒 watcher 的 poll 等待
+        if (conn_watcher) |t| t.join();
+    }
 
     // 写入命令到 shell（命令已由 Host 端 ipc.zig buildCmdWithMarker 添加 MDELIM 标记）
     shell.write(input.command) catch |err| {

@@ -101,6 +101,53 @@ pub inline fn sockShutdown(fd: socket_t, how: i32) void {
     }
 }
 
+/// Poll a socket for readability with timeout. Returns true if data is pending
+/// OR the peer closed/errored (EOF also reports readable — caller must read to
+/// distinguish); false = timeout expired.
+/// Windows: accepted SOCKETs inherit FIONBIO non-blocking mode from the
+/// listener, so a bare sockRead would busy-spin on WSAEWOULDBLOCK — select()
+/// gates the read.
+pub fn sockPollReadable(fd: socket_t, timeout_ms: u32) bool {
+    if (builtin.os.tag == .windows) {
+        var tv: timeval = .{
+            .tv_sec = @intCast(timeout_ms / 1000),
+            .tv_usec = @intCast((timeout_ms % 1000) * 1000),
+        };
+        var rfds: fd_set = undefined;
+        rfds.fd_count = 1;
+        rfds.fd_array[0] = fd;
+        const ret = ws2_select(0, &rfds, null, null, &tv);
+        return ret > 0; // 0 = timeout；<0 = error，报事件让调用方 read 观察到
+    }
+    var pfd: [1]std.posix.pollfd = .{.{ .fd = @intCast(fd), .events = std.posix.POLL.IN, .revents = 0 }};
+    const ret = posix_poll(&pfd, 1, @intCast(timeout_ms));
+    if (ret < 0) {
+        const e = std.posix.errno(ret);
+        if (e == .INTR) return false;
+        return true; // poll error → 报事件，调用方 read 能观察到具体错误
+    }
+    return ret > 0;
+}
+
+/// 线程内睡眠（无 Io 依赖）— 断连 watcher 的 tick 分片等待用。
+/// POSIX: 原生 nanosleep（先例 dpipe_shell killChild）；Windows: kernel32 Sleep
+/// （先例 lsa runWindowsTimer）。等待按调用粒度分片，调用方每片检查 done。
+pub fn threadSleepMs(ms: u32) void {
+    if (builtin.os.tag == .windows) {
+        const Sleep = @extern(
+            *const fn (std.os.windows.DWORD) callconv(.winapi) void,
+            .{ .name = "Sleep", .library_name = "kernel32" },
+        );
+        Sleep(ms);
+    } else {
+        var req = std.posix.timespec{
+            .sec = @intCast(ms / 1000),
+            .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+        };
+        _ = std.c.nanosleep(&req, null);
+    }
+}
+
 /// Accept a connection on a listening socket. Returns the client socket.
 /// On Windows: uses Winsock2 accept() returning a proper SOCKET handle
 /// (compatible with ws2_recv/ws2_send), NOT an AFD kernel handle.

@@ -26,6 +26,9 @@ need to know:
 **Key rules**:
 - Hostnames are case-insensitive — `LinuxVM`, `linuxvm`, `LINUXVM` are identical.
 - Each `exec` runs in a fresh shell — no `cd` or `export` persistence across calls.
+- **Connection lifetime = command lifetime**: aborting an `exec` call (agent
+  timeout, HTTP disconnect, CLI Ctrl-C) kills the command on the target
+  machine — the process group is SIGKILLed within ~2s. No zombie commands.
 - Windows `exec` commands: use `&&` for chaining, NOT `;`.
 - LSA mesh sync takes ~10–15s after Guest restart before it appears in `status`.
 

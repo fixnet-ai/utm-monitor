@@ -1,3 +1,32 @@
+## Phase 43 — exec 断连取消传播（2026-08-19）
+
+**起因**: 用户指出 MCP/CLI exec 断开后 Guest 命令继续跑——"ai agent 故意终止执行，
+造成两端不一致的进程存活偏差"。逐层核实代码确认为真（三层均无取消传播），
+附带发现 Guest 帧命令内联串行阻塞 accept 循环。
+
+**规划**: 计划模式完成 6 步方案并获批准（~/.claude/plans/adaptive-jumping-teacup.md）。
+关键实测：macOS poll 对半关闭也上报 POLLHUP（python socketpair 探针）→ IPC 路径
+弃读侧检测改零长帧写探测。用户拍板：进程组击杀 + Guest 并发化一并做。
+
+### 实施进度
+
+- [x] 43A dpipe_shell 进程组击杀 + requestKill + 单测
+- [x] 43B guest 并发化 + Guest watcher（watcher 改 250ms 轮询——Windows 继承 FIONBIO 非阻塞，裸 sockRead 会忙转）
+- [x] 43C mcp_handler ClientWatch（checkFn 加 done 参数 + 分片等待，join 延迟 ≤50ms，不给 exec 响应加尾延迟）
+- [x] 43D ipc ExecIpcLink 写探测（std.Io.Mutex；std.Thread.Mutex 0.16 不存在）
+- [x] 43E tcp sockPollReadable + threadSleepMs + HttpProbe 链路
+- [x] 43F 单测 231 全绿 / 集成 62 全绿 ×3 连续（新增 test_exec_cancel：断连杀进程 + 自然完成回归）/ aarch64-windows + x86_64-linux-musl 交叉编译过 / ver.txt 0.18.80 / CLAUDE+MANUAL 文档 / 顺带修复存量 macOS pty closeFn 5s 隐性延迟（E-state 根因见 findings）
+- [ ] 真机验证（发布 + --deploy 后逐 VM：MCP abort 杀 sleep、CLI Ctrl-C、孙进程组、旧 Guest 混部退化）
+
+### 调试记录（E-state 根因排查）
+
+场景 1（取消）PASS 但场景 2（自然完成）3s 超时 → ps 实测卡 E 状态 4.5s →
+killChild waitpid 轮询耗尽 5s → 根因 = macOS SIGKILL 阻塞在 slave read 的
+shell 不立即死，master 关闭才退 → closeFn 改先关 master 再 kill → 100ms 收割。
+顺带发现：该 5s 隐性延迟自始存在（旧代码同样顺序），macOS Guest 每次 exec
+都在烧。standalone（fork+setsid 无 pty）100ms 收割成功反而误导排除过
+killChild——差异就在 pty。
+
 ## Phase 39 — Windows 重启循环三连修（2026-08-18 23:00-23:30）
 
 从「修日志刷盘」出发，靠 v0.18.75 探针逐层挖出两个潜伏 bug（详见 task_plan Phase 39）。

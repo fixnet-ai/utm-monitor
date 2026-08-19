@@ -34,6 +34,9 @@ pub const McpContext = struct {
     state: ?*host_mod.GuestTable,
     mesh_ptr: ?*anyopaque,
     hostname: []const u8,
+    /// HTTP 客户端断连检测器（exec 取消传播）— mcp_http 每请求设置；
+    /// stdio MCP 路径为 null（退化为无取消的旧行为）。
+    client_watch: ?mcp_handler.ClientWatch = null,
 };
 
 /// Maximum JSON-RPC request size (64KB).
@@ -448,7 +451,7 @@ fn formatStatusMCP(gpa: std.mem.Allocator, json_str: []const u8) ![]const u8 {
 /// Handle exec — direct mcp_handler call (no IPC).
 fn handleVmExec(ctx: McpContext, vm: []const u8, command: []const u8) ![]const u8 {
     const state = ctx.state orelse return error.NoHostState;
-    var result = try mcp_handler.execOnGuest(ctx.io, ctx.gpa, state, vm, command);
+    var result = try mcp_handler.execOnGuest(ctx.io, ctx.gpa, state, vm, command, ctx.client_watch);
     defer result.deinit(ctx.gpa);
     return formatExecMCP(ctx.gpa, vm, command, result.output, result.exit_code);
 }
