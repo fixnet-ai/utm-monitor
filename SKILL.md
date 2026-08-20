@@ -26,20 +26,20 @@ Use this skill when the user requests:
 
 ### Check Status
 ```bash
-sudo utmm --status
+sudo utmm --status    # CLI needs root (binary checks isAdmin). In this repo prefer the utmm MCP `status` tool — no sudo needed.
 ```
 
 ### Execute on Guest
 ```bash
-sudo utmm --exec <hostname> "<command>"
+sudo utmm --exec <hostname> "<command>"   # CLI needs root. In this repo prefer the utmm MCP `exec` tool — no sudo needed.
 # POSIX: use sh syntax (bash/zsh)
 # Windows: use cmd.exe syntax (UTF-8). `&&` not `;` for chaining.
 ```
 
 ### File Transfer
 ```bash
-sudo utmm --upload <local-file> <vm>[:<remote-path>]
-sudo utmm --download <vm> <remote-path> [<local-path>]
+sudo utmm --upload <local-file> <vm>[:<remote-path>]   # CLI needs root. In this repo prefer the utmm MCP `upload` tool.
+sudo utmm --download <vm> <remote-path> [<local-path>] # CLI needs root. In this repo prefer the utmm MCP `download` tool.
 # Windows remote paths: single-quote if backslashes are used in bash
 ```
 
@@ -118,7 +118,7 @@ utmm sshpass -p <pass> ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --
 
 ## Key Notes
 
-- **sudo required** for all commands except `sshpass` and `--version`
+- **CLI needs sudo** for `status`/`exec`/`upload`/`download`/`install` (binary checks `isAdmin()`); `sshpass` and `--version` are exempt. **In this repo prefer the utmm MCP tools** (`status`/`exec`/`ping`/`upload`/`download`/`sshpass`) — they reach the running Host daemon over the mesh and need no sudo in the agent session.
 - **No external sshpass** — `utmm sshpass` is built-in for all password-auth operations
 - **deploy.json** at `/opt/utmm/deploy.json` configures VM credentials for `--deploy`
 - **Serve-dir cache**: `--deploy` skips recompilation when binaries exist in serve-dir

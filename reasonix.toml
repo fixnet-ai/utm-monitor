@@ -1,0 +1,8 @@
+[permissions]
+  # Reasonix self-diagnostics (existing)
+  # Project build / test / version (no sudo, no deploy)
+  # Git read-only inspection
+allow = ["run_skill", "Bash=reasonix --help 2>&1 | head -50", "Bash=reasonix doctor --json 2>&1 | head -60", "Bash=reasonix setup --help 2>&1 | head -40; echo \"===\"; reasonix config --help 2>&1 | head -20", "Bash=command -v reasonix; echo \"---\"; reasonix setup < /dev/null 2>&1 | head -30", "Bash=reasonix mcp list", "Bash=zig build -Doptimize=ReleaseSafe", "Bash=zig build test", "Bash=zig build test-integration", "Bash=cat src/ver.txt", "Bash=perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/test 2>&1 | tail -5", "Bash=perl -e 'alarm 30; exec @ARGV' -- .zig-cache/o/*/integration_test 2>&1", "Bash=python3 tests/test_mcp_tools.py", "Bash=python3 tests/test_cli_commands.py", "Bash=git status --short", "Bash=git diff --stat", "Bash=git log --oneline -5", "Bash=./utmm status 2>&1 || utmm status 2>&1 || echo \"---trying zig---\"; ls"]
+
+[sandbox]
+allow_write = ["/private/tmp"]

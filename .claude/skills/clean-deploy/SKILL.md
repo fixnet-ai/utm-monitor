@@ -1,3 +1,7 @@
+---
+name: clean-deploy
+description: UTM Monitor 裸机部署测试（build → wipe → deploy → test 全清空重建）。触发词：裸机部署测试 / clean deploy / 从零开始部署并测试 / 全清空重建。
+---
 # Clean Deploy Skill — UTM Monitor 裸机部署测试
 
 Complete "build → wipe → deploy → test" cycle. Simulates bare-metal deployment from

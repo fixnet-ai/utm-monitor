@@ -1,3 +1,7 @@
+---
+name: utmm
+description: UTM Monitor 构建、部署与日常运维（build / cross-compile / status / exec / upload / download / sshpass / upgrade / SOCKS5 / VM 排障）。触发词：build / deploy / status / exec / sshpass / 升级 / SOCKS5。
+---
 # UTM Monitor Skill — build, deploy, daily ops
 
 Remote debugging sidekick. Single Zig binary (`utmm` embeds `utmmd` supervisor),
@@ -42,9 +46,11 @@ Output: `zig-out/bin/utmm-<target>-<version>` (cross build) or `zig-out/bin/utmm
 ### Host (local macOS)
 
 ```bash
-sudo zig-out/bin/utmm --host --install
-sudo utmm --status
+sudo zig-out/bin/utmm --host --install   # install/uninstall need root (writes /opt + launchd service)
+sudo utmm --status                       # CLI checks isAdmin() → needs sudo
 ```
+
+> **In this repo prefer the utmm MCP tools** (`status`/`exec`/`ping`/`upload`/`download`/`sshpass`) — they reach the running Host daemon over the mesh and need no sudo in the agent session.
 
 ### Guest (manual scp + --install, using built-in utmm sshpass)
 
@@ -74,13 +80,13 @@ utmm --upgrade linuxvm  # push upgrade via SOCKS5 mesh (no SSH, zero-downtime)
 ## Daily Ops
 
 ```bash
-sudo utmm --status                                    # all nodes
-sudo utmm --exec <vm> "<command>"                     # exec on guest
-sudo utmm --upload <file> <vm>[:<remote-path>]        # upload
-sudo utmm --download <vm> <remote-path> [<local-path>] # download
-sudo utmm --ping <vm>                                 # mesh ping
+sudo utmm --status                                    # all nodes (CLI checks isAdmin → sudo; prefer MCP status)
+sudo utmm --exec <vm> "<command>"                     # exec on guest (prefer MCP exec)
+sudo utmm --upload <file> <vm>[:<remote-path>]        # upload (prefer MCP upload)
+sudo utmm --download <vm> <remote-path> [<local-path>] # download (prefer MCP download)
+sudo utmm --ping <vm>                                 # mesh ping (prefer MCP ping)
 sudo utmm --upgrade <vm>                              # push upgrade
-utmm sshpass -p '<pass>' ssh <user>@<hostname> '<cmd>'       # SSH password auth
+utmm sshpass -p '<pass>' ssh <user>@<hostname> '<cmd>'       # SSH password auth (no sudo)
 
 # SOCKS5 forwarding (from Host):
 curl --socks5 localhost:2121 http://linuxvm:8080      # reach any Guest service
@@ -102,7 +108,7 @@ sudo utmm --exec <vm> "echo OK"           # one per VM
 
 ## Key Notes
 
-- **sudo required** (except `sshpass` and `--version`)
+- **CLI needs sudo** for `status`/`exec`/`upload`/`download`/`install` (binary checks `isAdmin()`); `sshpass` and `--version` are exempt. **In this repo prefer the utmm MCP tools** (`status`/`exec`/`ping`/`upload`/`download`/`sshpass`) — they reach the running Host daemon over the mesh and need no sudo in the agent session.
 - **Hub-spoke SOCKS5**: Host is the only relay; Guests use `gateway:2121`
 - **Per-command pty**: no `cd`/`export` persistence across execs
 - **LSA sync**: wait 10-15s after guest restart before testing

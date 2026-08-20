@@ -1,3 +1,7 @@
+---
+name: deploy
+description: UTM Monitor 一键部署（build → test → deploy Host → deploy Guests → verify）。触发词：deploy / 部署 / 上线 / update all VMs / 升级到 vX.Y.Z / cross-compile and deploy。
+---
 # Deploy Skill — UTM Monitor 一键部署
 
 Build → test → deploy Host → deploy Guests → verify. For VM table and prerequisites
