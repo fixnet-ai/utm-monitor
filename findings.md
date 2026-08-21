@@ -667,3 +667,168 @@ AssignProcessToJobObject；killChild Windows 分支改 TerminateJobObject 整树
   <test binary>"。不影响结果：Build Summary 18/18 succeeded，测试二进制直接
   运行 EXIT=0。
 
+### 2026-08-22 — T3 研究：sshpass runWindowsConpty 假模式真相（Phase 45 前置调查）
+
+**起点**: task_plan 遗留 L2（Phase 41 连带发现）——runWindowsConpty 属性列表
+未挂 STARTUPINFOEXW（cb=sizeof(STARTUPINFOW)），「ConPTY 模式」从未真正走
+ConPTY。需决策修复 vs 删除。
+
+**代码定位**（src/sshpass.zig:918-1043 runWindowsConpty）:
+- `startup_info` 是裸 `w.STARTUPINFOW`，`cb = @sizeOf(w.STARTUPINFOW)`（948 行）
+- `attr_list_buf` 是独立 [1024]u8，`InitializeProcThreadAttributeList` +
+  `UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE)` 正确初始化，
+  但**从未挂进任何 STARTUPINFOEXW 的 lpAttributeList 字段**
+- CreateProcessW 带 `EXTENDED_STARTUPINFO_PRESENT` 但传 `&startup_info`
+  （STARTUPINFOW 指针）→ cb=68 ≠ sizeof(STARTUPINFOEXW)=104 → 系统按
+  STARTUPINFOW 解析，**读不到 lpAttributeList，PSEUDOCONSOLE 属性未生效**
+
+**实测后果**（windowsvm v0.18.82，MCP exec 远程跑）:
+```
+C:\opt\utmm\utmm.exe sshpass -p test ssh -o StrictHostKeyChecking=no \
+  -o ConnectTimeout=3 127.0.0.1 -p 1 echo hi   →   exit_code=3 (runtime_error)
+```
+CreateProcessW 因 EXTENDED_STARTUPINFO_PRESENT + cb 不符**直接返回
+ERROR_INVALID_PARAMETER** → runWindowsConpty 返回 runtime_error → sshpass
+立即 exit 3，不挂死、不降级。→ **Windows 10/11（ConPTY 可用）上 `utmm sshpass`
+spawn 任何子进程都失败**。
+
+**连锁结论**:
+1. runWindowsPipe（pipe fallback）只在无 ConPTY 的老 Windows（<17763）才走到；
+   现代 Windows 恒走坏掉的 runWindowsConpty。findings 2026-08-19 原文
+   "一直靠密码提示匹配的 pipe fallback 工作" **不准确**——实际是现代 Windows
+   上根本不可用，pipe 分支从未在现代 Windows 上跑过。
+2. MCP sshpass 工具（mcp.zig:600 spawn `utmm sshpass`）在 Windows Host
+   （utmmd Session 0）上同样 exit 3 失败；TOOLS_JSON 描述 "Works on Linux,
+   macOS, and Windows (ConPTY dynamic loading)" 与实际不符。
+3. deploy Windows VM 走 **macOS Host 的 runPosix**（host.zig:525/584 spawn
+   `utmm sshpass`，cmdDeploy 是本机 CLI）→ 不受影响。这解释了为何自 v0.18.0
+   引入 ConPTY 分支以来 Windows sshpass 一直坏而从未暴露。
+4. 历史测试只覆盖 linuxvm/macvm（test_mcp_tools.py:242-264 sshpass 测试跑
+   linuxvm）；Windows 上 utmm sshpass 从 v0.18.0 起从未验证过。
+5. `conptyCreate`/`conptyClose`（sshpass.zig:1257/1263，标注"dpipe_shell 复用"）
+   **零调用点**——dpipe_shell 已弃用 ConPTY（Phase 41 后走 pipe+OEM 转码）。
+6. Phase 41 实证：即使修复 ConPTY 附加（正确 STARTUPINFOEXW），Session 0 服务链
+   下 attach 仍"全 API 成功但零输出"（5 变体全灭）→ 修复无益于主要 MCP 场景
+   （Windows Host 是 utmmd 服务）。
+
+**conptyAvailable() 使用面**: 仅 status 显示（guest.zig:867、host.zig:828/861）
+与 LSA node_info 上报。删除 ConPTY 机制后该列语义需裁定（保留恒 false / 移除）。
+
+**方案候选**（详见 task_plan Phase 45）:
+- A（推荐）: 删 runWindowsConpty + 调度器恒走 runWindowsPipe。修复 Win10/11
+  sshpass 完全不可用的真实故障；符合简单优先 + Phase 41 实证。需真机验证
+  Windows OpenSSH 管道读密码机制（ssh.exe 非 TTY 时从 stdin 读）。
+- B: 修复 STARTUPINFOEXW 附加。仅交互会话获益，Session 0 服务链仍不可用，
+  需不可靠的降级检测，Phase 41 教训反对。
+- 风险提示（A 路径）: runWindowsPipe 在现代 Windows 上**从未实测过**——即便
+  逻辑上 OpenSSH 支持管道读密码，也必须先单机验证再全量（Phase 41 部署纪律）。
+
+
+### 2026-08-22 — 45D 真机验证：Session 0 下 ConPTY 与管道密码认证均不可行（决定性）
+
+**环境**: windowsvm（aarch64-windows，Win10.0.26200 / Win11，有 ConPTY API），
+v0.18.83 修复版（45A STARTUPINFOEXW 附加）。所有测试跑在 Session 0：
+mcp exec（Guest utmm 服务链）或 本机 macOS utmm sshpass → windowsvm OpenSSH
+sshd（OpenSSH 服务默认也在 Session 0）。
+
+**证据链（逐条实测）**:
+1. `utmm sshpass -p x ssh ... 127.0.0.1 -p 1 echo hi`（拒绝端口，Session 0 服务链）
+   → 30s 内返回，非 exit 3 → CreateProcessW 成功（45A 生效的间接证据）。
+2. `utmm sshpass -p 111 ssh ... 127.0.0.1 echo ok`（真实 sshd，服务链）
+   → **挂起 >90s**（ssh 等密码输入，密码注入从未触发）。
+3. `utmm sshpass -p x cmd /c echo CONPTYTEST`（服务链 mcp exec）
+   → **MCP transport dropped**（ConPTY 附加破坏通道）。
+4. bat 脚本 `echo ===` + `utmm sshpass -p x cmd /c echo CONPTYTEST`
+   （OpenSSH Session 0 会话）→ **连第一行 echo === 都无输出**，整个 SSH 会话输出阻塞。
+5. `cmd /c echo BASIC_TEST`（服务链）→ exit 0（通道健康，对照组）。
+6. `ssh.exe -V`（服务链）→ exit 0（ssh.exe 基础 spawn OK）。
+7. `ping -n 6`（~5s 服务链）→ exit 0（mcp exec 超时 >5s，故 #3 dropped 非超时）。
+8. PowerShell v3 纯管道测试（非 ConPTY：RedirectStandardOutput + 事件驱动匹配
+   "assword:" 后注入 111）→ **TIMEOUT INJECTED=False OUT=[] ERR=[]**
+   （ssh.exe 10s 零输出、从未出现密码 prompt，15s 未退出被 Kill）。
+9. `ssh.exe -v -o ConnectTimeout=5 Administrator@127.0.0.1 echo ok`
+   （OpenSSH Session 0 会话）→ **挂起**（verbose 也零输出）。
+10. bat `ssh.exe ... 127.0.0.1 -p 1 echo ok` → **RC=255** + "banner exchange:
+    Connection to UNKNOWN port -1: Connection refused"（ssh.exe 立即失败退出，
+    非挂起——确认 ssh.exe 本身可用，断点在密码交互）。
+
+**结论**:
+- 45A 修复**生效**（#1/#10：CreateProcessW 成功，修复前恒 exit 3）。
+- **ConPTY 在 Session 0（无交互窗口站）不可用**（#2/#3/#4）：附加后阻塞进程/通道。
+- **管道模式在 Session 0 同样不可用**（#8/#9）：ssh.exe 无 TTY 需要密码时挂起
+  （零输出，从不提示 password:），而非失败。
+- **唯一断点 = 密码交互**（#10 vs #8/#9 对比）：无 TTY + 无交互控制台 → 挂起。
+- 交互式桌面会话（用户手动跑 utmm sshpass）下 ConPTY 应正常（"主要且必须支持"成立），
+  但 Session 0 服务链（Windows Host 的 MCP sshpass）**无任何密码认证路径**。
+
+**服务链处置候选**（task_plan Phase 45 已列 A/B/C）: A 会话感知显式失败 + 密钥保留 /
+B 跨机操作走 utmm 自有协议 / C 深挖 Session 0 ConPTY（Phase 41 已 5 变体失败）。
+
+---
+
+### 2026-08-22 — 45D 深挖结论 + SSH_ASKPASS 决定性突破（服务链正解）
+
+**深挖 C 推翻前提（决定性）**:
+- Win32-OpenSSH sshpty.c `WIN32_FIXME` 分支**不用 ConPTY**：
+  `*ttyfd = 0; *ptyfd = 0;`（stdin/stdout 直通）。→ `ssh -tt` 的成功 = 管道直通，
+  不是 ConPTY → "复现 OpenSSH Win32 conpty 机制"是死路。
+- readpass.c Win32 `read_passphrase`：**只要 getenv(SSH_ASKPASS) 就走 ssh_askpass**，
+  完全绕过 TTY/`_getch()`。ssh_askpass Win32 实现 = CreatePipe + CreateProcess
+  (`"askpass" "msg"`) + ReadFile 读 askpass stdout 作为密码（buf[strcspn(buf,"\r\n")] 去换行）。
+- **关键**: ssh.exe 密码认证成功 + 命令完成后**退出挂起**（Win32-OpenSSH issue #1769
+  无 TTY 带命令挂起 / #1427 异步 STDERR 写挂起）——根因是 **stdin 保持打开**，
+  `< nul`（stdin 立即 EOF）根治。
+
+**SSH_ASKPASS + stdin EOF 实测（windowsvm Session 0，mcp exec 上下文）全通过**:
+1. diag3（-vv + SSHPASS=askpass2.bat + `< nul` + echo ok）：
+   `read_passphrase: requested to askpass` + `Authenticated to 127.0.0.1 using "password"`
+   + `Sending command: echo ok` + `ok` + `Exit status 0` + **RC=0**（干净退出，无残留）。
+2. diag4（SSHPASS 环境变量动态密码 + 多行 `echo LINE1 & echo LINE2 & echo LINE3`）：
+   RC=0 + 三行完整返回。
+3. diag5（`exit 42`）：**RC=42** —— 远程退出码正确传播到 ssh.exe 退出码。
+
+**askpass 程序设计**: SSH_ASKPASS 指向**固定** askpass.bat（`@echo off` + `echo %SSHPASS%`），
+sshpass 把密码经 **SSHPASS 环境变量**传给子进程（ssh.exe 继承 → spawn askpass 时继承）。
+无需每次生成临时文件。askpass.bat 输出 "111\r\n"，Win32 ssh_askpass 去 CRLF 后为密码。
+
+**实施方向（45D'）**: sshpass.zig runWindows 加 `hasConsole()`（GetConsoleWindow() != null）:
+- **无控制台（Session 0 服务链）→ runWindowsAskpass**（SSH_ASKPASS/SSHPASS env +
+  hStdInput=NUL + 读 stdout/stderr 回传 + 退出码透传；无密码提示匹配注入）。
+  所有 Windows 版本可用（不依赖 ConPTY）。
+- **有控制台 + ConPTY → runWindowsConpty**（交互式体验保留）。
+- **有控制台 + 无 ConPTY（老 Windows）→ runWindowsAskpass**（runWindowsPipe 在
+  Win32 OpenSSH 下注入无效：ssh.exe 无 TTY 用 `_getch()` 读控制台而非 stdin）。
+- 服务链分层后，Windows Host 的 MCP sshpass（Session 0）获得正解密码认证路径。
+
+### 2026-08-22 — 45D' 实施 + 真机验证全通过（SSH_ASKPASS 模式）+ Permission denied root cause
+
+**实施（sshpass.zig）**:
+- `runWindows` 调度器：**ssh 命令永远走 runWindowsAskpass**（无论有无控制台）——ConPTY 下
+  ssh 用 `_getch()` 读键盘 → 死锁（实证）。非 ssh 命令才有控制台 + ConPTY → runWindowsConpty。
+- runWindowsAskpass：extractPasswordWindows（.pass/.file/stdin/fd）→ ensureAskpassBat 写
+  `C:\opt\utmm\askpass.bat`（`@echo off` + `echo %SSHPASS%`）→ SetEnvironmentVariableW
+  （SSHPASS/SSH_ASKPASS/SSH_ASKPASS_REQUIRE=force）→ hStdInput=NUL（立即 EOF 根治退出挂起）→
+  CreatePipe stdout/stderr 合并 → 读循环透传 → 退出码返回。
+- **Permission denied → exit 5**：读循环检测合并管道中的 "Permission denied" → 返回
+  incorrect_password(5)（sshpass 约定）。无密码提示匹配（askpass 一次性提供密码）。
+
+**真机验证（windowsvm，mcp exec 通道，正确密码/错误密码/主机不可达/多行/非零退出码）**:
+- 正确密码 `-p 111` → **RC=0**，输出 T45D1_OK
+- 错误密码 `-p wrongpass` → **RC=5**（ssh 报 Permission denied 3 次）
+- 主机不可达 `10.255.255.1` → RC=255（透传 ssh 连接超时）
+- 多行输出 `echo LINE1 && echo LINE2 && echo LINE3` → 三行完整透传 + RC=0
+- 远程 `exit 7` → **RC=7**（退出码正确传播）
+
+**Permission denied root cause（关键排障记录）**:
+- 症状：utmm-fix sshpass -p 111 走 askpass 分支（debug 确认 requested to askpass）却拿到
+  错误密码（Permission denied RC=255），而手动 cmd `set SSHPASS=111` 同参数成功。
+- diag1（读回环境变量）: `SSHPASS_LEN=3 SSH_ASKPASS_LEN=23` → 误判 SSHPASS 值正确
+  （"111" 与 "zzz" 长度都是 3！）。
+- diag2（诊断版 askpass.bat 写文件）: `VAL=[zzz]` ×3 → **SSHPASS 实际是 "zzz"**。
+- **root cause**：sshpass.main 密码隐藏（C 版复刻）`@memset(@constCast(argv[密码位置]), 'z')`
+  覆写原始 argv 内存；`.pass` 分支 `pwsrc.password = argv[i]` **不 dupe** → 两处共用同一内存，
+  隐藏覆写把密码改成 "zzz"。C 版先 strdup 再覆写 argv，Zig 版"不 dupe"优化与之冲突。
+- **修复**：`.pass` 分支 `gpa.dupe`（函数级 errdefer 释放，块内 errdefer 在 case 块结束时失效
+  无法覆盖块外 NoCommand 错误返回）；测试补 defer free。
+- **教训**：`SSHPASS_LEN=3` 这类只量长度不读值的诊断有误导性；askpass.bat 写值诊断是决定性证据。
+- 修复后全场景通过（见上表），单测 230 通过无泄漏 + 集成 62 通过无泄漏。

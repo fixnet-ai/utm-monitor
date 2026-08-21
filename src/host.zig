@@ -72,6 +72,14 @@ pub fn runWithIo(rt: ?*zio.Runtime, block_io: std.Io, gpa: std.mem.Allocator, cl
 
     // --host (via --svc): start Host daemon
     if (cli.is_host) {
+        // 老 Windows（无 CreatePseudoConsole，< Windows 10 1809 / build 17763）不能
+        // 运行 Host 模式——Host 的交互式 exec（pty 体验）依赖 ConPTY。sshpass 密码
+        // 认证本身已用 SSH_ASKPASS（v0.18.83，不依赖 ConPTY）；老 Windows 只能作
+        // Guest（sshpass 用 SSH_ASKPASS 仍可密码认证）。
+        if (builtin.os.tag == .windows and !sshpass.conptyAvailable()) {
+            std.debug.print("[host] ERROR: Host mode requires ConPTY (CreatePseudoConsole, Windows 10 1809+ / build 17763+). This Windows is too old to act as Host.\n", .{});
+            std.process.exit(1);
+        }
         try startHost(rt.?, block_io, gpa, cli.mesh_port, serve_dir, cli.peer_mesh, shutdown, cli.hostname, shm_handle);
         return;
     }

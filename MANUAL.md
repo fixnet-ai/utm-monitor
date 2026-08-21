@@ -149,9 +149,14 @@ utmm sshpass -f ~/.ssh/pass ssh user@server 'uptime'
 utmm sshpass -e ssh admin@host 'cat /proc/cpuinfo'
 ```
 
-**ConPTY support**: On Windows, sshpass dynamically loads `CreatePseudoConsole`
-API at runtime. If unavailable (Windows < 10.0.17763), it falls back to pipe
-mode. Check `--status` for `conpty:yes/no` on each node.
+**Windows password authentication (SSH_ASKPASS)**: On Windows, `utmm sshpass`
+uses the Win32 OpenSSH `SSH_ASKPASS` mechanism — it sets the `SSH_ASKPASS`/
+`SSHPASS` environment variables pointing to a fixed `askpass.bat` and spawns
+`ssh.exe` with stdin redirected to `NUL` (immediate EOF). This bypasses TTY/
+ConPTY entirely, so password auth works in every Windows version and in
+Session 0 service contexts (no interactive console). Non-ssh interactive
+commands may still use ConPTY (Windows 10 1809+); `--status` shows each node's
+`conpty:yes/no` platform capability.
 
 ---
 
@@ -211,8 +216,9 @@ tool. It is also available as a CLI command for shell-based automation.
 **Why sshpass matters:**
 
 - **Cross-platform SSH automation** — works identically on Linux, macOS, and
-  Windows. On Windows, dynamically loads ConPTY (Windows 10 1809+) or falls back
-  to pipe mode. No external sshpass binary needed.
+  Windows. On Windows it uses the `SSH_ASKPASS` mechanism (no TTY/ConPTY
+  dependency), so it works in all Windows versions including Session 0 service
+  contexts. No external sshpass binary needed.
 - **Bootstrap and recovery** — SSH into a VM before utmm is installed, during
   upgrades, or when the Guest daemon is down.
 - **Unified AI agent interface** — calling sshpass through MCP means AI agents
@@ -582,14 +588,18 @@ utmm sshpass -p <pass> ssh Administrator@winvm "C:\\opt\\utmm\\utmm-new.exe --in
 | macOS | `/bin/zsh` | `;` or `&&` |
 | Windows | `cmd.exe` (UTF-8) | `&&` only |
 
-### ConPTY Support Matrix
+### Password Auth Matrix
 
-| Platform | PTY/ConPTY | sshpass Mode |
-|----------|-----------|--------------|
-| Linux | PTY (posix_openpt) | native |
-| macOS | PTY (posix_openpt) | native |
-| Windows 10 1809+ | ConPTY (CreatePseudoConsole) | full |
-| Windows < 17763 | pipe fallback | degraded (stdin-based password input) |
+| Platform | ssh password auth | Non-ssh interactive commands |
+|----------|-------------------|------------------------------|
+| Linux | PTY prompt injection | PTY (posix_openpt) |
+| macOS | PTY prompt injection | PTY (posix_openpt) |
+| Windows (all versions) | SSH_ASKPASS + NUL stdin (no TTY/ConPTY needed) | ConPTY (Win10 1809+) / askpass pipe |
+
+> On Windows, `utmm sshpass` password auth is **not** tied to ConPTY — it uses
+> Win32 OpenSSH's `SSH_ASKPASS` path, which works in Session 0 (service context)
+> and on Windows < 1809. ConPTY remains the interactive path for non-ssh
+> commands. See `--status` for each node's `conpty:yes/no` capability.
 
 ---
 

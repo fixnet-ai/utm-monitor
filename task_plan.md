@@ -1,6 +1,6 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.82 | **分支**: `main` | **更新**: 2026-08-20
+**版本**: v0.18.82（Phase 45 目标 v0.18.83） | **分支**: `main` | **更新**: 2026-08-22
 
 ## 当前状态
 
@@ -11,6 +11,73 @@
 - **Phase 42 完成**: CI 修复 (zio clone) + CI 接管发布 + MIT + SignPath 步骤待启用 (PR #6)
 - **Phase 43 完成**: exec 断连取消传播 + 进程树整杀 + Guest 并发化（v0.18.80-82）
 - **Phase 44 完成**: MCP 长任务超时修复（SSE 流式响应 + progress 心跳）
+- **Phase 45 进行中**: 遗留 L2 — sshpass runWindowsConpty 假模式（Windows 10/11 sshpass 实测完全不可用）
+
+## 进行中: Phase 45 — 遗留 L2: sshpass Windows ConPTY 假模式（v0.18.83 目标）
+
+**状态**: ✅ 45A/45B/45C 完成；45D 验证完成 → 服务链处置已实施 **45D'（runWindowsAskpass）**，2026-08-22 windowsvm 真机验证全场景通过 → 下一步 45E
+
+**背景**（证据链见 findings.md 2026-08-22 T3 研究段 + 下方实测）:
+runWindowsConpty（sshpass.zig:918）的 startup_info 是裸 STARTUPINFOW
+（cb=68），lpAttributeList 从未挂进 STARTUPINFOEXW → CreateProcessW 带
+EXTENDED_STARTUPINFO_PRESENT + cb 不符 → **ERROR_INVALID_PARAMETER 直接失败**。
+**实测**（windowsvm v0.18.82）: `utmm sshpass -p test ssh ... 127.0.0.1 -p 1`
+→ exit 3 (runtime_error)。→ **Windows 10/11 上 `utmm sshpass` spawn 任何
+子进程都立即失败**；MCP sshpass 工具在 Windows Host 上同样失败。deploy
+Windows VM 走 macOS Host runPosix，不受影响（故自 v0.18.0 引入以来从未暴露）。
+
+**用户裁定（2026-08-22）**:
+1. Windows 必同时承担 Host/Guest 角色，**ConPTY 是主要且必须支持**——不是删除，而是**修复**。
+2. 老 Windows（< 1809 无 CreatePseudoConsole）**按版本判断**走非 ConPTY（pipe）。
+3. 老 Windows **不能运行 Host 模式**——启动时检测到无 ConPTY 则提示后退出。
+4. 服务链 ConPTY（MCP sshpass on Windows Host 跑 Session 0）问题：**先修后定（分阶段）**
+   ——先修 ConPTY 附加 + 老 Windows 分层，真机验证后视结果再定服务链处置。
+
+**45D 真机验证结论（2026-08-22，windowsvm v0.18.83 修复版，关键）**:
+- **45A 修复已生效**: 连拒绝端口 `ssh 127.0.0.1 -p 1` → RC=255 + "banner exchange: Connection refused"
+  （修复前恒 exit 3/CreateProcessW 失败）。CreateProcessW + ConPTY 附加成功。
+- **ConPTY 在 Session 0（无交互窗口站）不可用**: 内层 ConPTY 附加的命令导致整个
+  SSH 会话/通道阻塞挂起（test1.bat 连 `echo ===` 都无输出；mcp exec transport dropped）。
+- **管道模式在 Session 0 同样不可用**: PowerShell 纯管道测试（事件驱动匹配 password:
+  后注入 111）→ ssh.exe 10s 零输出 + 15s TIMEOUT；`ssh.exe -v` 连真实 sshd 同样挂起。
+- **ssh.exe 本身可用**: `ssh.exe -V` exit 0；连拒绝端口立即失败退出（非挂起）。
+  唯一断点 = **密码交互**环节（无 TTY + 无交互控制台 → 挂起而非失败）。
+- **推论**: Session 0 服务链下 Windows ssh 密码认证**无论 ConPTY 还是管道都不可行**。
+  "ConPTY 是主要且必须支持"在**交互式桌面会话**成立，但在 Session 0 服务链不成立。
+  完整证据链见 findings.md「2026-08-22 45D 真机验证」。
+
+**服务链处置（用户裁定 2026-08-22 = C: 深挖 Session 0 ConPTY）——深挖结论 + 新方案**:
+- **深挖推翻前提（决定性）**: Win32-OpenSSH sshpty.c `WIN32_FIXME` 分支**根本不用
+  ConPTY**（ptyfd=0/ttyfd=0 = stdin/stdout 直通）→ `ssh -tt` 的成功是管道直通而非
+  ConPTY → "复现 OpenSSH ConPTY 机制"是死路。ConPTY 在 Session 0 不可用是**平台事实**。
+- **新正解 = SSH_ASKPASS + stdin EOF**（2026-08-22 windowsvm Session 0 实测全通过）:
+  Win32 OpenSSH read_passphrase 检查 `SSH_ASKPASS` 环境变量 → 走 ssh_askpass 程序
+  （CreatePipe + CreateProcess(`"askpass" "msg"`) + ReadFile 读密码）→ **完全避开 TTY/
+  ConPTY**。ssh.exe 的 stdin 重定向为 NUL（`< nul`，立即 EOF）→ 根治"认证成功 + 命令
+  完成后退出挂起"（Win32-OpenSSH issue #1769/#1427，stdin 保持打开所致）。
+- **验证证据链**（windowsvm Session 0，mcp exec 上下文）:
+  - `read_passphrase: requested to askpass` + `Authenticated ... using "password"` + `Exit status 0` + **RC=0**
+  - 多行输出（LINE1/2/3）+ 非零退出码传播（远程 `exit 42` → RC=42）
+  - 无残留 ssh.exe 进程
+- **实施方向（45D'）**: sshpass.zig runWindows 增加 `hasConsole()` 检测 →
+  **无控制台（Session 0 服务链）→ runWindowsAskpass**（SSH_ASKPASS + NUL stdin +
+  SSHPASS 环境变量传密码，全部 Windows 版本可用）；有控制台 + ConPTY → runWindowsConpty
+  （交互式保留）；有控制台 + 无 ConPTY（老 Windows）→ runWindowsAskpass（不依赖 ConPTY）。
+  askpass 实现复用 ssh.exe 环境：SSH_ASKPASS 指向固定 askpass.bat（`@echo %SSHPASS%`），
+  无需每次生成临时文件。**待用户确认后实施**。
+
+**实施步骤**:
+
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| 45A | 修复 runWindowsConpty ConPTY 附加：自定义 STARTUPINFOEXW（StartupInfo + lpAttributeList，@sizeOf=112）+ cb=@sizeOf(STARTUPINFOEXW) + lpAttributeList 挂载 + CreateProcessW 传 &StartupInfo（EXTENDED_STARTUPINFO_PRESENT） | Zig 0.16 无 STARTUPINFOEXW，extern struct 自定义；ConPTY 真正附加后密码提示/交互认证可用 | ✅ 代码完成；真机验证 CreateProcessW 成功（连拒绝端口 RC=255 非 3） |
+| 45B | 老 Windows 分层：conptyAvailable()==false 时 —— sshpass 调度走 runWindowsPipe（Guest/CLI 场景，已有）；**Host 模式启动时检测并提示退出**（host.zig cmdHost / utmmd ensure? 定位 Host 入口） | 老 Windows 不能当 Host；提示信息含 build 要求（Windows 10 1809+） | ✅ 代码完成（host.zig 启动检测） |
+| 45C | 交叉编译 aarch64-windows + x86_64-windows + 单元/集成测试门禁（zig build test + test-integration 全绿） | 门禁先行再真机 | ✅ 230 单测 + 62 集成全绿 |
+| 45D | **先单机验证**（Phase 41 部署纪律）: deploy windowsvm → 实测 `utmm sshpass` 连真实 sshd（正确密码 exit 0 / 错误密码 exit 5 / 主机不可达） | 45A 附加生效✅；ConPTY 与管道在 Session 0 均无法密码认证（挂起）；**SSH_ASKPASS + stdin EOF 方案实测全通过**（正确密码 RC=0 / exit 42 → RC=42） | ✅ 验证完成 → 新方案 45D' 待用户确认 |
+| 45D' | **实施 SSH_ASKPASS 模式**（runWindowsAskpass）：ssh 命令永远走 askpass（不依赖控制台）+ SSH_ASKPASS/SSHPASS 环境变量 + NUL stdin + 读输出回传 + "Permission denied"→exit 5；.pass 分支必须 dupe（否则密码隐藏 @memset(argv,'z') 覆写同一内存 → SSHPASS="zzz" 认证失败） | **✅ 已实施 + windowsvm 真机验证全通过**（2026-08-22）：正确密码 RC=0 / 错误密码 RC=5 / 主机不可达 RC=255 / 多行输出完整透传 / 远程 exit 7 → RC=7。修复前 Permission denied（SSHPASS 被覆写为 zzz），diag 诊断定位 root cause | ✅ 完成 |
+| 45D'' | （新增）交叉编译 + 门禁测试确认无回归（.pass dupe + 检测逻辑改动） | 单测 230 通过无泄漏 + 集成 62 通过无泄漏（2026-08-22）；泄漏修复：-p password 测试补 defer free + .pass dupe 加函数级 errdefer（块内 errdefer 在 case 块结束时失效，无法覆盖块外 NoCommand 错误返回） | ✅ 完成 |
+| 45E | winx64 第二台验证 + MCP sshpass 工具全路径 + status 列确认 | **✅ 完成**（2026-08-22）：winx64（x86_64-windows）全场景与 windowsvm 一致（RC=0/5/多行/RC=7）；MCP sshpass 工具 macOS host→windowsvm/winx64 正确密码 exit 0 + 错误密码 exit 5；status 5 节点全 serving。**待办**：Windows Host 模式下的 MCP sshpass（Session 0 服务链）已由 exec 通道验证覆盖（同 runWindowsAskpass 底层），切换 host 部署后补验 | ✅ |
+| 45F | 版本 bump v0.18.83 + 文档（README/MANUAL/TOOLS_JSON/SKILL/DESIGN/host.zig 注释更正 Windows ConPTY→SSH_ASKPASS）+ 发布 | **🔄 代码+文档+bump 完成，门禁全绿**（单测 230 + 集成 62）；发布待用户确认 | 发布 🔲 |
 
 ## 已完成: Phase 44 — MCP 长任务超时修复（SSE 流式响应 + progress 心跳）
 

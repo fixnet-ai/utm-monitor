@@ -46,8 +46,8 @@ See [MANUAL.md](MANUAL.md#mcp-protocol) for the full MCP protocol reference
   Reach any Guest's services from the Host — no SSH tunnels, no port mapping.
   **Windows: disable firewall** for BIND + UDP ASSOCIATE (dynamic ports).
 - **sshpass built-in** — non-interactive SSH password auth, 100% CLI-compatible
-  with standalone `sshpass`. POSIX PTY + Windows ConPTY (dynamic load, pipe
-  fallback on older Windows).
+  with standalone `sshpass`. POSIX PTY injection; Windows uses `SSH_ASKPASS`
+  (no TTY/ConPTY dependency — works in all Windows versions, incl. Session 0).
 - **LSA mesh zero-config** — Guests auto-discover Host over the local network,
   `/etc/hosts` kept in sync automatically.
 - **MCP HTTP** — AI agents get seven tools (`status`, `exec`, `ping`, `upload`,
@@ -106,9 +106,11 @@ curl --socks5 localhost:2121 http://windowsvm:3389          # RDP on windowsvm
 #   curl --socks5 gateway:2121 http://linuxvm:8080
 ```
 
-> **ConPTY**: On Windows, `--status` shows `conpty:yes/no` for each node.
-> Windows < 10.0.17763 lacks the ConPTY API — sshpass falls back to pipe mode.
-> POSIX always reports `conpty:yes`. This is critical for MCP SSH operations.
+> **ConPTY**: On Windows, `--status` shows `conpty:yes/no` for each node —
+> the platform's ConPTY API availability. `utmm sshpass` password auth does
+> **not** depend on ConPTY: it uses `SSH_ASKPASS`, so it works on every Windows
+> version including Session 0 (service) contexts. ConPTY is only used for
+> non-ssh interactive commands.
 
 
 ## Install

@@ -46,8 +46,10 @@ sudo utmm --download <vm> <remote-path> [<local-path>] # CLI needs root. In this
 ### SSH with Password (built-in sshpass)
 
 Built-in non-interactive SSH password auth — identical to standalone `sshpass(1)`.
-Works on **Linux, macOS, and Windows** (ConPTY dynamic loading + pipe fallback).
-No external sshpass binary needed. This is the primary tool for direct VM access
+Works on **Linux, macOS, and Windows**. On Windows it uses the `SSH_ASKPASS`
+mechanism (no TTY/ConPTY dependency — works in all Windows versions incl.
+Session 0 service contexts). No external sshpass binary needed. This is the
+primary tool for direct VM access
 when MCP tools are not applicable (bootstrap, recovery, pre-install debugging).
 
 ```bash
@@ -123,7 +125,7 @@ utmm sshpass -p <pass> ssh Administrator@<hostname> 'C:\opt\utmm\utmm-new.exe --
 - **deploy.json** at `/opt/utmm/deploy.json` configures VM credentials for `--deploy`
 - **Serve-dir cache**: `--deploy` skips recompilation when binaries exist in serve-dir
 - **Per-command pty**: each exec opens a fresh shell. No `cd`/`export` persistence across commands
-- **ConPTY**: `--status` shows `conpty:yes/no`. Windows < 10.0.17763 falls back to pipe mode. POSIX always `yes`
+- **ConPTY**: `--status` shows `conpty:yes/no` (platform ConPTY API availability). `utmm sshpass` password auth uses `SSH_ASKPASS` and does **not** depend on ConPTY — works on all Windows versions incl. Session 0. ConPTY is only used for non-ssh interactive commands. POSIX always `yes`
 - **macOS launchctl** may throttle bootstrap — if `--install` fails, kill processes first then retry
 - **Windows SSH** does NOT handle `;` command chaining — use `&&` or separate calls
 - **LSA sync** takes ~10-15s after guest restart before it appears in `--status`

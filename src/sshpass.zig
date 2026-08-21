@@ -2,8 +2,10 @@
 //
 // 100% CLI-compatible with the original sshpass(1) C utility.
 // POSIX: posix_openpt → fork → pselect → prompt-matching → password injection.
-// Windows: CreatePseudoConsole (ConPTY, requires Windows 10 1809+),
-// with automatic pipe fallback on older Windows builds (< 17763).
+// Windows: 交互式桌面会话 → CreatePseudoConsole (ConPTY, requires Windows 10 1809+)；
+// Session 0 服务链（无控制台）与老 Windows → SSH_ASKPASS + NUL stdin：
+// Win32 OpenSSH read_passphrase 检测到 SSH_ASKPASS 即走 askpass 程序获取密码，
+// 完全绕过 TTY/ConPTY（ConPTY 在 Session 0 不可用，Phase 41/45D 实证）。
 //
 // Usage: utmm sshpass [-p password | -f file | -d fd | -e] [-hV] command [args...]
 //
@@ -12,8 +14,9 @@
 //   utmm sshpass -f ~/.ssh/pass ssh user@server 'uptime'
 //   utmm sshpass -e ssh admin@host 'cat /proc/cpuinfo'   # reads SSHPASS env var
 //
-// ConPTY support is critical for MCP/CLI SSH operations on Windows.
-// Use conptyAvailable() to detect support — reported in LSA node_info
+// Windows password auth uses SSH_ASKPASS (no TTY/ConPTY dependency) — works in
+// all Windows versions and Session 0 service contexts. conptyAvailable() only
+// gates non-ssh interactive commands (ConPTY pty); reported in LSA node_info
 // and visible in utmm --status output.
 
 const std = @import("std");
@@ -118,6 +121,10 @@ fn showVersion() void {
 
 fn parseArgs(gpa: std.mem.Allocator, argv: []const []const u8) !struct { args: SshpassArgs, cmd_offset: usize } {
     var result = SshpassArgs{};
+    // 函数级 errdefer：跟踪 -p dupe 的内存，任何后续错误返回（NoCommand 等）
+    // 都释放它。块内 errdefer 在 case 块结束时即失效，无法覆盖块外错误返回。
+    var duped_pass: ?[]u8 = null;
+    errdefer if (duped_pass) |d| gpa.free(d);
     var i: usize = 0;
 
     while (i < argv.len) {
@@ -168,8 +175,11 @@ fn parseArgs(gpa: std.mem.Allocator, argv: []const []const u8) !struct { args: S
                 if (i + 1 >= argv.len) return error.MissingArg;
                 i += 1;
                 result.pwtype = .pass;
-                // 不 dupe — argv 在进程生命周期内有效，避免错误路径中的内存泄漏
-                result.pwsrc = .{ .password = argv[i] };
+                // 必须 dupe：main() 里密码隐藏会 @memset(argv[密码], 'z') 覆写原
+                // argv 内存，若 password 直接引用 argv，提取时读到的是被覆写的 "zzz"。
+                // C 版先 strdup 再覆写 argv，此处同理。
+                duped_pass = try gpa.dupe(u8, argv[i]);
+                result.pwsrc = .{ .password = duped_pass.? };
             },
             'e' => {
                 if (result.pwtype != .stdin_source) {
@@ -654,15 +664,17 @@ const posix = if (is_posix) struct {
 } else struct {}; // Windows: no posix namespace
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Windows 实现（ConPTY: CreatePseudoConsole / 管道降级 fallback）
+// Windows 实现（SSH_ASKPASS 主路径 / ConPTY 交互辅助）
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// ConPTY API (CreatePseudoConsole) 仅在 Windows 10 1809 (build 17763) 及之后可用。
-// 老版本 Windows 不支持 ConPTY，sshpass 降级为纯管道模式：
-//   - ConPTY 路径：子进程（ssh.exe）认为自己连着一个真正的控制台 → 交互式提示 → 密码注入
-//   - 管道降级：直接用 CreatePipe 连接 stdin/stdout → 仍可匹配提示 → 注入密码
-//     （Windows OpenSSH 客户端在非 TTY 模式下会从 stdin 读取密码）
+// ssh 命令（sshpass 核心场景）永远走 SSH_ASKPASS：设 SSH_ASKPASS/SSHPASS 环境
+// 变量指向固定 askpass.bat，spawn ssh.exe 时 stdin 重定向 NUL（立即 EOF）。
+// Win32 OpenSSH read_passphrase 检测到 SSH_ASKPASS 即走 askpass 程序读密码，
+// 完全绕过 TTY/ConPTY——在 Session 0 服务链与所有 Windows 版本都可用。
+// （管道注入对 ssh 无效：ssh 非 TTY 时用 _getch() 读控制台而非 stdin，Phase 45D 实证。）
 //
+// 非 ssh 交互命令：有控制台 + ConPTY 可用 → runWindowsConpty（CreatePseudoConsole，
+// 交互式提示）；否则 → runWindowsAskpass（通用管道透传）。
 // ConPTY 可用性通过 LoadLibraryA/GetProcAddress 运行时检测，避免 @extern 在
 // 老版本 Windows 上导致 DLL 加载失败。
 
@@ -771,11 +783,41 @@ const windows = if (builtin.os.tag == .windows) struct {
         .{ .name = "GetStdHandle", .library_name = "kernel32" },
     );
 
+    // ── SSH_ASKPASS 模式所需（Session 0 服务链 / 老 Windows）──
+    const GetConsoleWindow = @extern(
+        *const fn () callconv(.winapi) ?HANDLE,
+        .{ .name = "GetConsoleWindow", .library_name = "kernel32" },
+    );
+    const SetEnvironmentVariableW = @extern(
+        *const fn (lpName: [*:0]const u16, lpValue: [*:0]const u16) callconv(.winapi) BOOL,
+        .{ .name = "SetEnvironmentVariableW", .library_name = "kernel32" },
+    );
+    const CreateFileW = @extern(
+        *const fn (lpFileName: [*:0]const u16, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*w.SECURITY_ATTRIBUTES, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) HANDLE,
+        .{ .name = "CreateFileW", .library_name = "kernel32" },
+    );
+
+    const GENERIC_READ: DWORD = 0x80000000;
+    const GENERIC_WRITE: DWORD = 0x40000000;
+    const FILE_SHARE_READ: DWORD = 1;
+    const OPEN_EXISTING: DWORD = 3;
+    const CREATE_ALWAYS: DWORD = 2;
+    const FILE_ATTRIBUTE_NORMAL: DWORD = 0x80;
+
     const PROCESS_INFORMATION = extern struct {
         hProcess: HANDLE,
         hThread: HANDLE,
         dwProcessId: DWORD,
         dwThreadId: DWORD,
+    };
+
+    /// ConPTY 附加需要扩展 STARTUPINFO：cb 必须 = sizeof(STARTUPINFOEXW)，
+    /// lpAttributeList 指向已初始化的 proc-thread attribute list。
+    /// Zig 0.16 std.os.windows 无此类型，自定义（StartupInfo 104B + 8B 指针 = 112B，
+    /// 64 位下对齐 8；Phase 41 实测布局 104/112 正确）。
+    const STARTUPINFOEXW = extern struct {
+        StartupInfo: w.STARTUPINFOW,
+        lpAttributeList: ?*anyopaque,
     };
 
     const HANDLE_FLAG_INHERIT: DWORD = 1;
@@ -810,37 +852,146 @@ const windows = if (builtin.os.tag == .windows) struct {
         return cmd_utf16;
     }
 
-    /// 管道降级模式（老版本 Windows，无 ConPTY）。
-    /// 直接用 CreatePipe 连接子进程 stdin/stdout，仍可匹配 SSH 提示并注入密码。
-    /// Windows OpenSSH 客户端在非 TTY 模式下会从 stdin 读取密码。
-    fn runWindowsPipe(allocator: std.mem.Allocator, sp_args: SshpassArgs, cmd_args: []const []const u8) ExitCode {
+    /// 当前进程是否有交互控制台。
+    /// Session 0 服务进程（utmmd / utmm 服务）无控制台 → GetConsoleWindow() == null。
+    /// ConPTY 在 Session 0 不可用（Phase 41/45D 实证：CreatePseudoConsole 成功但
+    /// 零输出/阻塞），必须走 SSH_ASKPASS。
+    fn hasConsole() bool {
+        return GetConsoleWindow() != null;
+    }
+
+    /// UTF-8 → UTF-16LE 以 null 结尾（返回 len+1 的 slice，调用者 free）。
+    fn toUtf16Z(gpa: std.mem.Allocator, s: []const u8) ![]u16 {
+        const buf = try gpa.alloc(u16, s.len + 1);
+        errdefer gpa.free(buf);
+        const len = try std.unicode.utf8ToUtf16Le(buf[0..s.len], s);
+        buf[len] = 0;
+        return buf;
+    }
+
+    /// 从 SshpassArgs 提取单行密码（UTF-8，去掉尾部 CR/LF）。
+    /// -p → 直接截断；-f/-d/stdin → 读内容后截断到首个换行。
+    fn extractPasswordWindows(sp_args: *const SshpassArgs, buf: []u8) ?[]const u8 {
+        switch (sp_args.pwtype) {
+            .pass => {
+                return std.mem.trimEnd(u8, std.mem.sliceTo(sp_args.pwsrc.password, '\n'), "\r\n");
+            },
+            .file => {
+                const fname_u16 = toUtf16Z(std.heap.page_allocator, sp_args.pwsrc.filename) catch return null;
+                defer std.heap.page_allocator.free(fname_u16);
+                const fh = CreateFileW(
+                    @ptrCast(fname_u16.ptr),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    null,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    null,
+                );
+                if (fh == w.INVALID_HANDLE_VALUE) return null;
+                defer _ = CloseHandle(fh);
+                return readPasswordHandle(fh, buf);
+            },
+            .stdin_source => {
+                const sh = GetStdHandle(STD_INPUT_HANDLE) orelse return null;
+                return readPasswordHandle(sh, buf);
+            },
+            .fd => {
+                const sh = GetStdHandle(@intCast(@intFromPtr(sp_args.pwsrc.fd))) orelse return null;
+                return readPasswordHandle(sh, buf);
+            },
+        }
+    }
+
+    fn readPasswordHandle(handle: HANDLE, buf: []u8) ?[]const u8 {
+        var n: DWORD = 0;
+        if (@intFromEnum(ReadFile(handle, buf.ptr, @intCast(buf.len), &n, null)) == 0) return null;
+        return std.mem.trimEnd(u8, buf[0..@intCast(n)], "\r\n");
+    }
+
+    /// 确保 C:\opt\utmm\askpass.bat 存在（@echo off + echo %SSHPASS%）。
+    /// SSH_ASKPASS 指向它：ssh.exe spawn 它时输出密码（密码经 SSHPASS 环境变量传入）。
+    /// 输出 "111\r\n"，Win32 OpenSSH ssh_askpass 去 CRLF 后作为密码。
+    /// 注意：密码不得含 cmd 元字符（& | < > ^），否则 echo %SSHPASS% 展开出错。
+    fn ensureAskpassBat() bool {
+        const path_u16 = toUtf16Z(std.heap.page_allocator, "C:\\opt\\utmm\\askpass.bat") catch return false;
+        defer std.heap.page_allocator.free(path_u16);
+        const handle = CreateFileW(
+            @ptrCast(path_u16.ptr),
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            null,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            null,
+        );
+        if (handle == w.INVALID_HANDLE_VALUE) return false;
+        defer _ = CloseHandle(handle);
+
+        const content = "@echo off\r\necho %SSHPASS%\r\n";
+        var written: DWORD = 0;
+        return @intFromEnum(WriteFile(handle, content.ptr, @intCast(content.len), &written, null)) != 0;
+    }
+
+    /// SSH_ASKPASS 模式（Session 0 服务链 / 老 Windows，所有 Windows 版本可用）。
+    /// 原理：Win32 OpenSSH read_passphrase 检测到 SSH_ASKPASS 即走 ssh_askpass 程序
+    /// （CreatePipe + CreateProcess + ReadFile 读密码），完全绕过 TTY/ConPTY。
+    /// 密码经 SSHPASS 环境变量传入；ssh.exe stdin 用 NUL（立即 EOF）根治
+    /// Win32-OpenSSH "认证成功 + 命令完成后退出挂起"（issue #1769/#1427）。
+    fn runWindowsAskpass(allocator: std.mem.Allocator, sp_args: SshpassArgs, cmd_args: []const []const u8) ExitCode {
         const cmd_utf16 = buildCmdLine(allocator, cmd_args) catch return .runtime_error;
         defer allocator.free(cmd_utf16);
 
+        // 提取密码（UTF-8 单行）
+        var pass_buf: [8192]u8 = undefined;
+        const password = extractPasswordWindows(&sp_args, &pass_buf) orelse return .runtime_error;
+        if (password.len == 0) return .runtime_error;
+
+        // ensure askpass.bat 存在
+        if (!ensureAskpassBat()) return .runtime_error;
+
+        // 密码 → UTF-16，设置环境变量（本进程即 utmm sshpass 子进程，spawn ssh.exe 后即退出）
+        const gpa = std.heap.page_allocator;
+        const pass_u16 = toUtf16Z(gpa, password) catch return .runtime_error;
+        defer gpa.free(pass_u16);
+        const key_sshpass = toUtf16Z(gpa, "SSHPASS") catch return .runtime_error;
+        defer gpa.free(key_sshpass);
+        const key_askpass = toUtf16Z(gpa, "SSH_ASKPASS") catch return .runtime_error;
+        defer gpa.free(key_askpass);
+        const key_require = toUtf16Z(gpa, "SSH_ASKPASS_REQUIRE") catch return .runtime_error;
+        defer gpa.free(key_require);
+        const val_askpass = toUtf16Z(gpa, "C:\\opt\\utmm\\askpass.bat") catch return .runtime_error;
+        defer gpa.free(val_askpass);
+        const val_force = toUtf16Z(gpa, "force") catch return .runtime_error;
+        defer gpa.free(val_force);
+        const nul_name = toUtf16Z(gpa, "NUL") catch return .runtime_error;
+        defer gpa.free(nul_name);
+
+        _ = SetEnvironmentVariableW(@ptrCast(key_sshpass.ptr), @ptrCast(pass_u16.ptr));
+        _ = SetEnvironmentVariableW(@ptrCast(key_askpass.ptr), @ptrCast(val_askpass.ptr));
+        _ = SetEnvironmentVariableW(@ptrCast(key_require.ptr), @ptrCast(val_force.ptr));
+
+        // NUL 作为子进程 stdin（立即 EOF → 根治退出挂起）。需设为可继承供 STARTF_USESTDHANDLES。
+        const nul_handle = CreateFileW(@ptrCast(nul_name.ptr), GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, 0, null);
+        if (nul_handle == w.INVALID_HANDLE_VALUE) return .runtime_error;
+        defer _ = CloseHandle(nul_handle);
+        _ = SetHandleInformation(nul_handle, HANDLE_FLAG_INHERIT, 1);
+
+        // 子进程 stdout/stderr 管道（合并，父进程读取透传）
+        var stdout_read: HANDLE = undefined;
+        var stdout_write: HANDLE = undefined;
         var sa: w.SECURITY_ATTRIBUTES = .{
             .nLength = @sizeOf(w.SECURITY_ATTRIBUTES),
             .bInheritHandle = @enumFromInt(1),
             .lpSecurityDescriptor = null,
         };
-
-        // 子进程 stdin 管道（父进程写入密码）
-        var stdin_read: HANDLE = undefined;
-        var stdin_write: HANDLE = undefined;
-        if (@intFromEnum(CreatePipe(&stdin_read, &stdin_write, &sa, 0)) == 0) return .runtime_error;
-        defer _ = CloseHandle(stdin_read);
-        _ = SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
-
-        // 子进程 stdout 管道（父进程读取输出）
-        var stdout_read: HANDLE = undefined;
-        var stdout_write: HANDLE = undefined;
         if (@intFromEnum(CreatePipe(&stdout_read, &stdout_write, &sa, 0)) == 0) return .runtime_error;
         defer _ = CloseHandle(stdout_write);
         _ = SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
 
-        // 使用标准 STARTUPINFO（非 ConPTY 的 EXTENDED_STARTUPINFO）
         var startup_info: w.STARTUPINFOW = std.mem.zeroes(w.STARTUPINFOW);
         startup_info.cb = @sizeOf(w.STARTUPINFOW);
-        startup_info.hStdInput = stdin_read;
+        startup_info.hStdInput = nul_handle;
         startup_info.hStdOutput = stdout_write;
         startup_info.hStdError = stdout_write;
         startup_info.dwFlags = @as(DWORD, @bitCast(@as(c_ulong, 0x100))); // STARTF_USESTDHANDLES
@@ -851,9 +1002,9 @@ const windows = if (builtin.os.tag == .windows) struct {
             @as([*:0]u16, @ptrCast(cmd_utf16.ptr)),
             null,
             null,
-            @enumFromInt(1), // inherit handles
-            0, // 无特殊 flag
-            null,
+            @enumFromInt(1), // inherit handles（NUL + stdout_write）
+            0,
+            null, // lpEnvironment=null → 继承当前环境（含已设置的 SSH_ASKPASS/SSHPASS）
             null,
             &startup_info,
             &pi,
@@ -862,19 +1013,13 @@ const windows = if (builtin.os.tag == .windows) struct {
         defer _ = CloseHandle(pi.hThread);
         defer _ = CloseHandle(pi.hProcess);
 
-        // 关闭子进程端的句柄
-        _ = CloseHandle(stdin_read);
         _ = CloseHandle(stdout_write);
 
-        // 读取/写入循环（与 ConPTY 路径相同的 prompt 匹配逻辑）
-        var prevmatch: bool = false;
-        var state1: usize = 0;
-        var state2: usize = 0;
-        var state3: usize = 0;
-        var state4: usize = 0;
-        var terminate: i32 = 0;
-
-        var tmp_buf: [40]u8 = undefined;
+        // 读循环：透传子进程输出到父进程 stdout。密码由 askpass 一次性提供，无
+        // 交互提示匹配；但需检测 stderr 中的 "Permission denied"（合并管道）→
+        // 密码被拒 → sshpass 约定 exit 5（incorrect password）。
+        var password_rejected = false;
+        var tmp_buf: [4096]u8 = undefined;
         const Sleep = @extern(*const fn (dwMilliseconds: DWORD) callconv(.winapi) void, .{ .name = "Sleep", .library_name = "kernel32" });
 
         while (true) {
@@ -886,29 +1031,20 @@ const windows = if (builtin.os.tag == .windows) struct {
             const read_ok = ReadFile(stdout_read, &tmp_buf, @intCast(tmp_buf.len), &bytes_read, null);
             if (@intFromEnum(read_ok) != 0 and bytes_read > 0) {
                 const data = tmp_buf[0..@intCast(bytes_read)];
-
-                // 透传到父进程 stdout
+                if (!password_rejected and std.mem.indexOf(u8, data, "Permission denied") != null) {
+                    password_rejected = true;
+                }
                 var written: DWORD = 0;
                 const stdout_handle = GetStdHandle(STD_OUTPUT_HANDLE) orelse return .runtime_error;
                 _ = WriteFile(stdout_handle, data.ptr, @intCast(data.len), &written, null);
-
-                const ret = handleoutputWindows(
-                    &sp_args, &prevmatch, &state1, &state2, &state3, &state4,
-                    data, stdin_write,
-                );
-                if (ret != 0) { terminate = ret; break; }
             } else {
                 Sleep(50);
             }
         }
 
-        if (terminate > 0) {
-            _ = TerminateProcess(pi.hProcess, @as(w.UINT, @intCast(terminate)));
-            return @enumFromInt(@as(u8, @intCast(terminate)));
-        }
-
         var final_exit: DWORD = 0;
         _ = GetExitCodeProcess(pi.hProcess, &final_exit);
+        if (password_rejected) return .incorrect_password;
         return @enumFromInt(@as(u8, @truncate(final_exit)));
     }
 
@@ -944,8 +1080,8 @@ const windows = if (builtin.os.tag == .windows) struct {
         if (hr != 0) return .runtime_error;
         defer conpty_close.?(hpc);
 
-        var startup_info: w.STARTUPINFOW = std.mem.zeroes(w.STARTUPINFOW);
-        startup_info.cb = @sizeOf(w.STARTUPINFOW);
+        var startup_info_ex: STARTUPINFOEXW = std.mem.zeroes(STARTUPINFOEXW);
+        startup_info_ex.StartupInfo.cb = @sizeOf(STARTUPINFOEXW);
 
         var pi: PROCESS_INFORMATION = undefined;
 
@@ -979,7 +1115,10 @@ const windows = if (builtin.os.tag == .windows) struct {
             return .runtime_error;
         }
 
-        startup_info.cb = @sizeOf(w.STARTUPINFOW);
+        // ConPTY 附加：lpAttributeList 必须挂进 STARTUPINFOEXW。此前漏挂（cb 只声明
+        // STARTUPINFOW 大小）→ CreateProcessW 带 EXTENDED_STARTUPINFO_PRESENT + cb 不符
+        // 直接 ERROR_INVALID_PARAMETER → sshpass 恒 exit 3（Windows 10/11 完全不可用）。
+        startup_info_ex.lpAttributeList = @ptrCast(&attr_list_buf);
 
         const create_result = CreateProcessW(
             null,
@@ -988,7 +1127,7 @@ const windows = if (builtin.os.tag == .windows) struct {
             @enumFromInt(1),
             EXTENDED_STARTUPINFO_PRESENT,
             null, null,
-            &startup_info,
+            @ptrCast(&startup_info_ex.StartupInfo),
             &pi,
         );
         if (@intFromEnum(create_result) == 0) return .runtime_error;
@@ -1042,7 +1181,13 @@ const windows = if (builtin.os.tag == .windows) struct {
         return @enumFromInt(@as(u8, @truncate(final_exit)));
     }
 
-    /// runWindows 调度器：检测 ConPTY 可用性，选择最优路径。
+    /// runWindows 调度器：按"命令类型"而非"有无控制台"选择路径。
+    ///   - ssh 命令（自动密码认证）→ 永远 runWindowsAskpass。ConPTY 下 Win32 OpenSSH
+    ///     用 _getch() 从键盘读密码（readpass.c WIN32_FIXME），不读管道 → 密码无法注入
+    ///     → 双向死锁（实测 SSH 会话 / exec 通道 / SYSTEM schtask 全复现，GetConsoleWindow
+    ///     在三者下均非空，"Session 0 无控制台"假设错误）。SSH_ASKPASS 不依赖 TTY。
+    ///   - 非 ssh 交互命令 + 有控制台 + ConPTY → runWindowsConpty（交互式桌面会话）
+    ///   - 非 ssh 命令 + 无控制台 / 老 Windows（无 ConPTY）→ runWindowsAskpass
     /// Check if the command is "ssh" or "ssh.exe" (no path prefix).
     fn isSshCommand(cmd: []const u8) bool {
         // Only match bare "ssh" / "ssh.exe" — don't override explicit paths
@@ -1058,8 +1203,8 @@ const windows = if (builtin.os.tag == .windows) struct {
         // OpenSSH is not in PATH. The binary is extracted during --install / ensure.
         const SSH_EXE_PATH = "C:\\opt\\utmm\\ssh.exe";
         var ssh_args_buf: [64][]const u8 = undefined;
-        const effective_args = if (cmd_args.len > 0 and
-            isSshCommand(cmd_args[0]) and
+        const is_ssh = cmd_args.len > 0 and isSshCommand(cmd_args[0]);
+        const effective_args = if (is_ssh and
             cmd_args.len < ssh_args_buf.len)
         blk: {
             @memcpy(ssh_args_buf[0..cmd_args.len], cmd_args);
@@ -1067,12 +1212,19 @@ const windows = if (builtin.os.tag == .windows) struct {
             break :blk ssh_args_buf[0..cmd_args.len];
         } else cmd_args;
 
-        resolveConpty();
-        if (conpty_create != null and conpty_close != null) {
-            return runWindowsConpty(allocator, sp_args, effective_args);
-        } else {
-            return runWindowsPipe(allocator, sp_args, effective_args);
+        // ssh 命令（sshpass 的核心场景：自动密码认证）永远走 SSH_ASKPASS，
+        // 无论有无控制台。ConPTY 下 ssh 会 _getch() 读键盘 → 死锁（见函数注释）。
+        if (is_ssh) {
+            return runWindowsAskpass(allocator, sp_args, effective_args);
         }
+
+        // 非 ssh 交互命令：有控制台 + ConPTY → ConPTY；否则 askpass（通用管道透传）。
+        resolveConpty();
+        const conpty_ok = conpty_create != null and conpty_close != null;
+        if (conpty_ok and hasConsole()) {
+            return runWindowsConpty(allocator, sp_args, effective_args);
+        }
+        return runWindowsAskpass(allocator, sp_args, effective_args);
     }
 
     fn handleoutputWindows(
@@ -1153,22 +1305,19 @@ const windows = if (builtin.os.tag == .windows) struct {
                 }.writeFn);
             },
             .file => {
-                // 使用 CreateFileW 打开文件
-                const CreateFileW = @extern(
-                    *const fn (lpFileName: [*:0]const u16, dwDesiredAccess: DWORD, dwShareMode: DWORD, lpSecurityAttributes: ?*w.SECURITY_ATTRIBUTES, dwCreationDisposition: DWORD, dwFlagsAndAttributes: DWORD, hTemplateFile: ?HANDLE) callconv(.winapi) HANDLE,
-                    .{ .name = "CreateFileW", .library_name = "kernel32" },
-                );
-
                 // UTF-8 文件名 → UTF-16
-                const filename_u16 = std.unicode.utf8ToUtf16LeAlloc(std.heap.page_allocator, sp_args.pwsrc.filename) catch return;
+                const filename_u16 = toUtf16Z(std.heap.page_allocator, sp_args.pwsrc.filename) catch return;
                 defer std.heap.page_allocator.free(filename_u16);
 
-                const fname_z = std.heap.page_allocator.allocSentinel(u16, filename_u16.len, 0) catch return;
-                defer std.heap.page_allocator.free(fname_z);
-                @memcpy(fname_z[0..filename_u16.len], filename_u16);
-                fname_z[filename_u16.len] = 0;
-
-                const src_handle = CreateFileW(fname_z.ptr, 0x80000000, 1, null, 3, 0x80, null);
+                const src_handle = CreateFileW(
+                    @ptrCast(filename_u16.ptr),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    null,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    null,
+                );
                 if (src_handle != w.INVALID_HANDLE_VALUE) {
                     defer _ = CloseHandle(src_handle);
                     writePassFd(dst_handle, src_handle, struct {
@@ -1393,8 +1542,10 @@ test "sshpass: patternMatch — reset on mismatch" {
 }
 
 test "sshpass: parseArgs — -p password" {
+    const alloc = std.testing.allocator;
     const argv = [_][]const u8{ "-p", "mypass", "ssh", "host" };
-    const parsed = try parseArgs(std.testing.allocator, &argv);
+    const parsed = try parseArgs(alloc, &argv);
+    defer alloc.free(parsed.args.pwsrc.password);
     try std.testing.expect(parsed.args.pwtype == .pass);
     try std.testing.expectEqualStrings("mypass", parsed.args.pwsrc.password);
     try std.testing.expectEqual(@as(usize, 2), parsed.cmd_offset);
@@ -1443,8 +1594,10 @@ test "sshpass: parseArgs — -V shows version" {
 }
 
 test "sshpass: parseArgs — -- separator" {
+    const alloc = std.testing.allocator;
     const argv = [_][]const u8{ "-p", "pass", "--", "ssh", "-o", "opt" };
-    const parsed = try parseArgs(std.testing.allocator, &argv);
+    const parsed = try parseArgs(alloc, &argv);
+    defer alloc.free(parsed.args.pwsrc.password);
     try std.testing.expect(parsed.args.pwtype == .pass);
     try std.testing.expectEqual(@as(usize, 3), parsed.cmd_offset);
 }

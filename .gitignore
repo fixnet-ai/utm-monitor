@@ -25,6 +25,7 @@ Thumbs.db
 utm-monitor.conf
 gw.txt
 mcp.json
+.mcp.json
 .playwright-mcp/
 http-migration-plan.md
 
