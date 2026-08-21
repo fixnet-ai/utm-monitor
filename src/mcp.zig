@@ -146,15 +146,20 @@ pub fn processRequest(ctx: McpContext, json_str: []const u8) ![]const u8 {
     defer gpa.free(method);
 
     if (std.mem.eql(u8, method, "initialize")) {
+        // Echo the client's protocolVersion (MCP version negotiation). Claude
+        // Code v2.1.x negotiates 2025-06-18/2025-11-25 and rejects the old
+        // hardcoded 2024-11-05, breaking the handshake with "Failed to connect".
+        const proto_ver: []const u8 = if (jsonGetNestedObject(obj, "params")) |params|
+            jsonGetString(params, "protocolVersion") orelse "2024-11-05"
+        else
+            "2024-11-05";
         var info: std.ArrayList(u8) = .empty;
         defer info.deinit(gpa);
-        var iter = std.mem.splitSequence(u8, SERVER_INFO, "__VERSION__");
-        var first = true;
-        while (iter.next()) |part| {
-            if (!first) try info.appendSlice(gpa, protocol.VERSION);
-            try info.appendSlice(gpa, part);
-            first = false;
-        }
+        try info.appendSlice(gpa, "{\"protocolVersion\":\"");
+        try info.appendSlice(gpa, proto_ver);
+        try info.appendSlice(gpa, "\",\"serverInfo\":{\"name\":\"utmm\",\"version\":\"");
+        try info.appendSlice(gpa, protocol.VERSION);
+        try info.appendSlice(gpa, "\"},\"capabilities\":{\"tools\":{}}}");
         return jsonBuildResponse(gpa, id_val, info.items);
     }
 
