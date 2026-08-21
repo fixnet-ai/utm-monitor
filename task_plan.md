@@ -10,6 +10,35 @@
 - **Phase 41 完成**: Windows exec OEM↔UTF-8 转码 + marker 独立行修复（v0.18.79）
 - **Phase 42 完成**: CI 修复 (zio clone) + CI 接管发布 + MIT + SignPath 步骤待启用 (PR #6)
 - **Phase 43 完成**: exec 断连取消传播 + 进程树整杀 + Guest 并发化（v0.18.80-82）
+- **Phase 44 完成**: MCP 长任务超时修复（SSE 流式响应 + progress 心跳）
+
+## 已完成: Phase 44 — MCP 长任务超时修复（SSE 流式响应 + progress 心跳）
+
+**背景**（证据见 findings.md 2026-08-22 Phase 44 段）:
+utmm 自身的 exec/download/upload/sshpass 与 zigtester 有相同的 MCP 超时问题。
+POST 请求走单 JSON 响应（mcp_http.zig:99 writeHttpResponse + :251 Content-Type:
+application/json），processRequest 同步阻塞（mcp_http.zig:91），长任务
+（exec 大输出 / download 大文件 / sshpass 慢命令）期间客户端收不到任何字节 →
+撞 Claude Code per-request 超时（Timer A 60s）。McpContext（mcp.zig:30-40）
+无 progressToken/progress 机制。zigtester 已用 `json_response=False`（SSE 流
++ report_progress 心跳）解决，本 Phase 在 utmm 的 mcp_http.zig 层复刻同一模式。
+
+**方案**（只在 mcp_http.zig 改，不碰 mcp.zig / mcp_handler.zig）:
+POST 响应从单 JSON 改为 SSE 流（Content-Type: text/event-stream）：
+1. 立即写 SSE 头 + priming 注释（首字节秒到，客户端进入流式模式）
+2. spawn 心跳线程，每 HEARTBEAT_MS=5s 发 `notifications/progress` SSE 事件
+   （progress 单调递增 + message 已运行秒数），线程分片 sleep（50ms）保证
+   join 快速返回不给响应加尾延迟
+3. processRequest 完成后 done+join 心跳，写最终 `event: message` 事件，关连接
+4. progressToken 从 `params._meta.progressToken`（fallback 顶层 `_meta`）提取；
+   无 token 时心跳退化为 SSE 注释 keepalive（流仍活跃，避免超时）
+
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| 44A | SSE 基础设施：writeSsePostHead / writeSseMessageEvent / writeProgressEvent / extractProgressToken | 复用 protocol.jsonGetString/jsonGetNestedObject 提取 token；token gpa.dupe 副本（parsed.deinit 释放原串） | ✅ |
+| 44B | Heartbeat 结构 + heartbeatThread（50ms 分片 threadSleepMs，累计到 5s 发 progress，done 原子门控） | 心跳只写 fd，与 HttpProbe 读 fd 全双工无冲突 | ✅ |
+| 44C | handleHttpMcp 重构：token 提取 → SSE 头 → spawn 心跳 → processRequest → done+join → 最终 message 事件 | 错误响应也走 SSE 事件；readHttpRequestBody 失败仍走 writeHttpResponse（协议错误，SSE 头之前） | ✅ |
+| 44D | 单测 + zig build test 全绿 + zigtester 集成 | 新增 SSE 格式/心跳/token 提取单测；230 单测全绿 + 62 集成全绿（mcp_http test 未被收集——预先存在，见 findings） | ✅ |
 
 ## 已完成: Phase 43 — exec 断连取消传播（连接生命周期 = 命令生命周期）
 

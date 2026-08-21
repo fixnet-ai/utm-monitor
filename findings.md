@@ -619,3 +619,51 @@ AssignProcessToJobObject；killChild Windows 分支改 TerminateJobObject 整树
   死代码修正（连同 bufPrint 16 字节缓冲 NoSpaceLeft panic）
 - spawnPosix 忽略传入 shell 参数、实际用 `$SHELL`（集成测试中是 /bin/bash
   而非 /bin/zsh — 影响测试假设）
+
+## Phase 44 — MCP 长任务超时修复（2026-08-22）
+
+**问题根因**（逐层核实，非猜测）:
+- utmm 的 exec/download/upload/sshpass 与 zigtester 相同的 MCP 超时问题。
+  证据链：POST 单 JSON 响应（mcp_http.zig:99 writeHttpResponse + :251
+  `Content-Type: application/json`）← 同步阻塞 processRequest
+  （mcp_http.zig:91）← 阻塞 handler（mcp.zig:230/286/320/349）← 阻塞业务循环
+  （mcp_handler.zig exec 收循环 / upload 写循环 / download 读循环）← McpContext
+  （mcp.zig:30-40）无 progressToken/progress/SSE 机制。
+- 长任务期间客户端（Claude Code）收不到任何字节 → 撞 per-request 超时
+  （Timer A 60s）。zigtester 用 `json_response=False`（SSE 流 + 心跳）已解决，
+  本 Phase 复刻同一模式。
+
+**修复方案**（只改 mcp_http.zig）:
+1. POST 响应改 SSE 流：立即写 `Content-Type: text/event-stream` 头 + priming
+   注释（`: connected\n\n`），首字节秒到让客户端进入流式模式。
+2. 心跳线程每 5s 发 `notifications/progress` SSE 事件（progress 单调递增
+   + message 已运行秒数），50ms 分片 sleep 保证 join 快速返回。
+3. processRequest 完成后 done+join 心跳，写最终 `event: message` 事件后关连接。
+
+**技术要点**:
+- SSE 事件字段用 `\n` 分隔（非 `\r\n`，`\r\n` 只在 HTTP 头），事件间空行
+  `\n\n`；message 事件格式 `event: message\ndata: <json>\n\n`。JSON-RPC 响应
+  单行（jsonBuildResponse 手工拼接），无多行 data 问题。
+- progressToken 提取：`std.json.parseFromSlice` 后 `parsed.deinit()` 会释放
+  token 指向内存 → 必须 `gpa.dupe` 副本。位置 `params._meta.progressToken`
+  （标准）+ 顶层 `_meta.progressToken`（fallback）。复用 `protocol.jsonGetString`/
+  `jsonGetNestedObject`（pub，protocol.zig:534/576）。
+- 并发：心跳线程只写 fd，HttpProbe/execWatchThread 只读 fd，TCP 全双工无冲突；
+  主线程 done.store(.release) + join 后再写最终响应，无双写竞争。
+- progress 值从 1 开始单调递增（MCP 要求 MUST increase），total 省略（长任务
+  总时长未知）。
+
+**遗留/已知限制**:
+- **mcp_http test 未被 `zig build test` 收集（预先存在）**: mcp_http.zig 的
+  test 声明（含本次新增 6 个 + 原 7 个）不进入 main.zig 的 @import 链收集（与
+  guest.zig/shm.zig 同因，需 standalone 编译，但 mcp_http import host.zig→
+  main.zig 循环 + host import zio 导致 standalone 不可行）。本次验证依赖：
+  编译 EXIT=0 + 集成 62 全绿 + test_mcp_tools.py 真机 SSE 解析 + 代码审查。
+- **progressToken 未做 JSON 转义（假设安全）**: writeProgressEvent 直接插入
+  token，不转义 `"`/`\`。progressToken 是客户端生成的不透明字符串（UUID/整数），
+  实践上安全；若未来遇特殊字符可加转义。
+- **"failed command" 误报（预先存在）**: build.zig 用 manual Run.create 跑测试
+  二进制（绕 --listen=- hang），zig build 会在测试通过后仍打印 "failed command:
+  <test binary>"。不影响结果：Build Summary 18/18 succeeded，测试二进制直接
+  运行 EXIT=0。
+

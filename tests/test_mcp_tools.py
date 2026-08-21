@@ -27,6 +27,30 @@ def run_tests(bin_path="zig-out/bin/utmm", port=2121):
 
     mcp_url = f"http://127.0.0.1:{port}/"
 
+    def parse_sse_response(body):
+        """解析 HTTP MCP 响应为 JSON dict。
+
+        兼容两种格式：
+        - SSE 流（Content-Type: text/event-stream）：提取最后一个 message 事件
+          的 data 字段 JSON（长任务时前面是 progress 通知，最后是 result/error）
+        - 单 JSON（旧格式，Content-Type: application/json）
+        """
+        if not body:
+            return None
+        # SSE：收集所有 data: 字段，取最后一个非空
+        data_payloads = [l[5:].strip() for l in body.split("\n") if l.startswith("data:")]
+        for payload in reversed(data_payloads):
+            if payload:
+                try:
+                    return json.loads(payload)
+                except ValueError:
+                    continue
+        # 单 JSON 兼容（非 SSE）
+        try:
+            return json.loads(body.strip())
+        except ValueError:
+            return None
+
     def send_request(method, params=None, rid=0, timeout=120):
         """Send a JSON-RPC request via HTTP POST. Returns parsed JSON response."""
         req_body = {"jsonrpc": "2.0", "id": rid, "method": method}
@@ -42,7 +66,7 @@ def run_tests(bin_path="zig-out/bin/utmm", port=2121):
             )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 body = resp.read().decode("utf-8")
-                return json.loads(body) if body else None
+                return parse_sse_response(body)
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8") if e.fp else ""
             print(f"       HTTP {e.code}: {body[:200]}")

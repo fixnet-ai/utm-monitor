@@ -1,8 +1,13 @@
-//! Minimal HTTP/1.1 POST parser for MCP JSON-RPC transport.
+//! Minimal HTTP/1.1 handler for MCP JSON-RPC transport.
 //!
-//! Single-request-per-connection model (no keep-alive). Reads the HTTP request,
-//! extracts the JSON-RPC body, calls mcp.processRequest(), writes the HTTP
-//! response, and closes the socket. Runs on the thread pool via spawnBlocking.
+//! Single-request-per-connection model (no keep-alive) for POST: reads the HTTP
+//! request, extracts the JSON-RPC body, calls mcp.processRequest(), writes the
+//! HTTP response, and closes the socket. Runs on the thread pool via
+//! spawnBlocking.
+//!
+//! GET is answered with an SSE (Server-Sent Events) stream held open — the
+//! streamable-HTTP client's GET probe (Claude Code ≥ v2.1.84) requires
+//! `Content-Type: text/event-stream` and rejects 405 with "Failed to connect".
 //!
 //! First byte of the request line is consumed by the caller (host.zig peek)
 //! for protocol dispatch. This module reads the remainder.
@@ -20,6 +25,12 @@ const MAX_BODY_SIZE: usize = 65536;
 /// Max combined request line + headers size.
 const MAX_HEADERS_SIZE: usize = 8192;
 
+/// MCP 长任务 progress 心跳间隔（秒级保活，避免客户端 per-request 超时）。
+const HEARTBEAT_MS: u32 = 5000;
+
+/// 心跳线程 sleep 分片——done 置位后 join 延迟 ≤ 此值，不给命令响应加尾延迟。
+const HEARTBEAT_SLICE_MS: u32 = 50;
+
 /// HTTP 客户端断连检测器（exec 取消传播，mcp_handler.ClientWatch 实现）。
 /// 等响应的 HTTP 客户端不会半关闭（无 SHUT_WR），单请求连接也不会多发 —
 /// 可读事件（EOF/错误/垃圾字节）即客户端已断开。poll 按 50ms 分片，
@@ -36,6 +47,30 @@ const HttpProbe = struct {
             return true; // EOF(0)/错误/意外数据 — 均判客户端断开
         }
         return false;
+    }
+};
+
+/// MCP progress 心跳线程：长任务（exec/download/upload/sshpass）期间周期发
+/// `notifications/progress` SSE 事件保活。progress 值单调递增（MCP 要求 MUST
+/// increase），total 省略（长任务总时长未知）。分片 sleep 保证 done 置位后
+/// join 快速返回（≤HEARTBEAT_SLICE_MS），不给最终响应加尾延迟。
+const Heartbeat = struct {
+    fd: tcp.socket_t,
+    token: []const u8,
+    done: *const std.atomic.Value(bool),
+
+    fn run(self: *Heartbeat) void {
+        var elapsed_ms: u32 = 0;
+        var counter: u32 = 0;
+        while (!self.done.load(.acquire)) {
+            tcp.threadSleepMs(HEARTBEAT_SLICE_MS);
+            elapsed_ms += HEARTBEAT_SLICE_MS;
+            if (elapsed_ms >= HEARTBEAT_MS) {
+                elapsed_ms = 0;
+                counter += 1;
+                writeProgressEvent(self.fd, self.token, counter, counter * HEARTBEAT_MS / 1000);
+            }
+        }
     }
 };
 
@@ -58,6 +93,7 @@ pub fn handleHttpMcp(
     // Read the rest of the request line + headers + body
     const body = readHttpRequestBody(gpa, fd, first_byte) catch |err| {
         switch (err) {
+            error.GetRequest => writeSseStream(fd),
             error.MethodNotAllowed => writeHttpResponse(fd, 405, "Method Not Allowed", "Only POST is supported"),
             error.LengthRequired => writeHttpResponse(fd, 411, "Length Required", "Content-Length header required"),
             error.PayloadTooLarge => writeHttpResponse(fd, 413, "Payload Too Large", "Request body exceeds 64KB limit"),
@@ -81,16 +117,42 @@ pub fn handleHttpMcp(
         .client_watch = mcp_handler.ClientWatch{ .ctx = &probe, .checkFn = HttpProbe.check },
     };
 
+    // 提取 progressToken（客户端 opt-in 的 progress 能力；无则 null）
+    const token = extractProgressToken(gpa, body);
+    defer if (token) |t| gpa.free(t);
+
+    // 写 SSE 响应头 + priming 注释——首字节立即到达让客户端进入流式模式，
+    // 长任务期间不再因"无字节"撞 per-request 超时（zigtester json_response=False 同款）
+    writeSsePostHead(fd);
+
+    // spawn 心跳线程（有 token 才发 progress 通知；无 token 仅靠 SSE 流保活）
+    var done = std.atomic.Value(bool).init(false);
+    var hb = Heartbeat{ .fd = fd, .token = token orelse "", .done = &done };
+    var hb_thread: ?std.Thread = null;
+    if (token != null) {
+        hb_thread = std.Thread.spawn(.{}, Heartbeat.run, .{&hb}) catch null;
+    }
+
     // Call MCP JSON-RPC processor directly (no IPC, no serialization)
     const response_json = mcp.processRequest(ctx, body) catch |err| {
         std.log.err("[mcp-http] processRequest failed: {}", .{err});
-        writeHttpResponse(fd, 500, "Internal Server Error", "JSON-RPC processing failed");
+        done.store(true, .release);
+        if (hb_thread) |t| t.join();
+        var err_buf: [512]u8 = undefined;
+        const err_json = std.fmt.bufPrint(&err_buf,
+            "{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":-32603,\"message\":\"{s}\"}},\"id\":null}}",
+            .{@errorName(err)}) catch "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Internal error\"},\"id\":null}";
+        writeSseMessageEvent(fd, err_json);
         return;
     };
     defer gpa.free(response_json);
 
-    // Write HTTP 200 response with JSON body
-    writeHttpResponse(fd, 200, "OK", response_json);
+    // 停止心跳，写最终 JSON-RPC 响应事件（通知类空响应只发 SSE 头，连接随后关闭）
+    done.store(true, .release);
+    if (hb_thread) |t| t.join();
+    if (response_json.len > 0) {
+        writeSseMessageEvent(fd, response_json);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -130,9 +192,13 @@ fn readHttpRequestBody(gpa: std.mem.Allocator, fd: tcp.socket_t, first_byte: u8)
 
     const request_line = line_buf[0 .. line_len - 2]; // strip \r\n
 
-    // Parse method — must be POST
+    // Parse method — POST carries the JSON-RPC body; GET opens an SSE stream
+    // (streamable-HTTP client probe); any other method is rejected.
     const first_space = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.BadRequest;
     const method = request_line[0..first_space];
+    if (std.ascii.eqlIgnoreCase(method, "GET")) {
+        return error.GetRequest;
+    }
     if (!std.ascii.eqlIgnoreCase(method, "POST")) {
         return error.MethodNotAllowed;
     }
@@ -198,9 +264,12 @@ fn parseContentLength(headers: []const u8) ?usize {
         const key = line[0..colon];
         if (std.ascii.eqlIgnoreCase(key, "content-length")) {
             var value = line[colon + 1 ..];
-            // Trim leading whitespace
+            // Trim surrounding whitespace (RFC 7230 OWS)
             while (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) {
                 value = value[1..];
+            }
+            while (value.len > 0 and (value[value.len - 1] == ' ' or value[value.len - 1] == '\t')) {
+                value = value[0 .. value.len - 1];
             }
             return std.fmt.parseUnsigned(usize, value, 10) catch null;
         }
@@ -260,6 +329,100 @@ fn writeHttpResponse(fd: tcp.socket_t, status_code: u16, status_text: []const u8
     }
 }
 
+/// Write the SSE response head (status line + headers + initial `endpoint`
+/// event) for a GET probe. The `endpoint` event is optional per the MCP
+/// streamable-HTTP spec but flushes the response so the client sees the stream
+/// is alive immediately.
+fn writeSseHead(fd: tcp.socket_t) void {
+    var head_buf: [256]u8 = undefined;
+    const head = std.fmt.bufPrint(&head_buf,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\nevent: endpoint\ndata: http://127.0.0.1:{d}/\n\n",
+        .{protocol.DEFAULT_PORT},
+    ) catch "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n";
+    var written: usize = 0;
+    while (written < head.len) {
+        const n = tcp.sockWrite(fd, head[written..].ptr, head.len - written);
+        if (n <= 0) return;
+        written += @intCast(n);
+    }
+}
+
+/// Answer a GET with an SSE stream and hold it open until the client
+/// disconnects (EOF/error). This GET is the server→client notification channel
+/// in streamable-HTTP MCP; closing early would make the client retry/flag it.
+fn writeSseStream(fd: tcp.socket_t) void {
+    writeSseHead(fd);
+
+    while (true) {
+        if (!tcp.sockPollReadable(fd, 1000)) continue;
+        var b: [1]u8 = undefined;
+        const n = tcp.sockRead(fd, @as([*]u8, @ptrCast(&b)), 1);
+        if (tcp.sockIsError(n) or n == 0) return;
+    }
+}
+
+/// 写 POST 的 SSE 响应头 + priming 注释。priming 注释（`: connected`）是合法
+/// SSE 字节，立即 flush 让客户端首字节秒到、进入流式模式——这是避免 per-request
+/// 超时的关键（zigtester `json_response=False` 同款）。
+fn writeSsePostHead(fd: tcp.socket_t) void {
+    const head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n: connected\n\n";
+    _ = tcp.sockWrite(fd, head.ptr, head.len);
+}
+
+/// 写一个 SSE `message` 事件（JSON-RPC 响应单行，无多行 data 问题）。
+fn writeSseMessageEvent(fd: tcp.socket_t, data: []const u8) void {
+    const head = "event: message\ndata: ";
+    var written: usize = 0;
+    while (written < head.len) {
+        const n = tcp.sockWrite(fd, head[written..].ptr, head.len - written);
+        if (n <= 0) return;
+        written += @intCast(n);
+    }
+    written = 0;
+    while (written < data.len) {
+        const n = tcp.sockWrite(fd, data[written..].ptr, data.len - written);
+        if (n <= 0) return;
+        written += @intCast(n);
+    }
+    const tail = "\n\n";
+    _ = tcp.sockWrite(fd, tail.ptr, tail.len);
+}
+
+/// 写一个 `notifications/progress` SSE 事件。progress 单调递增，total 省略。
+fn writeProgressEvent(fd: tcp.socket_t, token: []const u8, progress: u32, elapsed_s: u32) void {
+    var buf: [512]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf,
+        "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":\"{s}\",\"progress\":{d},\"message\":\"long-running task ({d}s elapsed)\"}}}}\n\n",
+        .{ token, progress, elapsed_s },
+    ) catch return;
+    _ = tcp.sockWrite(fd, data.ptr, data.len);
+}
+
+/// 从 JSON-RPC 请求提取 progressToken（客户端 opt-in 的 progress 能力）。
+/// 标准位置 `params._meta.progressToken`，fallback 顶层 `_meta.progressToken`。
+/// 返回 gpa 分配的副本（parsed.deinit 会释放原串）；无则 null。
+fn extractProgressToken(gpa: std.mem.Allocator, body: []const u8) ?[]const u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{ .allocate = .alloc_always }) catch return null;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return null,
+    };
+    if (protocol.jsonGetNestedObject(obj, "params")) |params| {
+        if (protocol.jsonGetNestedObject(params, "_meta")) |meta| {
+            if (protocol.jsonGetString(meta, "progressToken")) |tok| {
+                return gpa.dupe(u8, tok) catch null;
+            }
+        }
+    }
+    if (protocol.jsonGetNestedObject(obj, "_meta")) |meta| {
+        if (protocol.jsonGetString(meta, "progressToken")) |tok| {
+            return gpa.dupe(u8, tok) catch null;
+        }
+    }
+    return null;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -317,4 +480,116 @@ test "HttpProbe detects peer close and honors done" {
     try std.testing.expect(!HttpProbe.check(&probe2, &done));
     const elapsed = std.Io.Timestamp.now(io, .awake).nanoseconds - t0.nanoseconds;
     try std.testing.expect(elapsed < 500_000_000); // <500ms（join 快速返回的保证）
+}
+
+test "writeSseHead emits SSE stream response for GET" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+
+    const writer = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            writeSseHead(fd);
+        }
+    }.run, .{pair.b});
+    defer writer.join();
+
+    // Read the SSE head (status line + headers + endpoint event, ends in \n\n).
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = tcp.sockRead(pair.a, buf[len..].ptr, buf.len - len);
+        try std.testing.expect(n > 0);
+        len += @intCast(n);
+        if (len >= 2 and buf[len - 2] == '\n' and buf[len - 1] == '\n') break;
+    }
+    try std.testing.expect(len >= 2);
+
+    var expected_buf: [256]u8 = undefined;
+    const expected = std.fmt.bufPrint(&expected_buf,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\nevent: endpoint\ndata: http://127.0.0.1:{d}/\n\n",
+        .{protocol.DEFAULT_PORT},
+    ) catch unreachable;
+    try std.testing.expectEqualStrings(expected, buf[0..len]);
+}
+
+test "extractProgressToken: params._meta" {
+    const gpa = std.testing.allocator;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{},\"_meta\":{\"progressToken\":\"tok-123\"}}}";
+    const token = extractProgressToken(gpa, body);
+    defer if (token) |t| gpa.free(t);
+    try std.testing.expect(token != null);
+    try std.testing.expectEqualStrings("tok-123", token.?);
+}
+
+test "extractProgressToken: top-level _meta fallback" {
+    const gpa = std.testing.allocator;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{}},\"_meta\":{\"progressToken\":\"top-456\"}}";
+    const token = extractProgressToken(gpa, body);
+    defer if (token) |t| gpa.free(t);
+    try std.testing.expect(token != null);
+    try std.testing.expectEqualStrings("top-456", token.?);
+}
+
+test "extractProgressToken: absent returns null" {
+    const gpa = std.testing.allocator;
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{}}}";
+    const token = extractProgressToken(gpa, body);
+    try std.testing.expect(token == null);
+}
+
+test "extractProgressToken: invalid json returns null" {
+    const gpa = std.testing.allocator;
+    const token = extractProgressToken(gpa, "not-json");
+    try std.testing.expect(token == null);
+}
+
+test "writeSseMessageEvent emits message event" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+    const writer = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            writeSseMessageEvent(fd, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}");
+        }
+    }.run, .{pair.b});
+    defer writer.join();
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = tcp.sockRead(pair.a, buf[len..].ptr, buf.len - len);
+        if (n <= 0) break;
+        len += @intCast(n);
+        if (len >= 2 and buf[len - 2] == '\n' and buf[len - 1] == '\n') break;
+    }
+    const expected = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+    try std.testing.expectEqualStrings(expected, buf[0..len]);
+}
+
+test "writeProgressEvent emits progress notification" {
+    const pair = try tcp.makePair();
+    defer {
+        tcp.sockClose(pair.a);
+        tcp.sockClose(pair.b);
+    }
+    const writer = try std.Thread.spawn(.{}, struct {
+        fn run(fd: tcp.socket_t) void {
+            writeProgressEvent(fd, "tok-1", 3, 15);
+        }
+    }.run, .{pair.b});
+    defer writer.join();
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = tcp.sockRead(pair.a, buf[len..].ptr, buf.len - len);
+        if (n <= 0) break;
+        len += @intCast(n);
+        if (len >= 2 and buf[len - 2] == '\n' and buf[len - 1] == '\n') break;
+    }
+    const expected = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":\"tok-1\",\"progress\":3,\"message\":\"long-running task (15s elapsed)\"}}\n\n";
+    try std.testing.expectEqualStrings(expected, buf[0..len]);
 }

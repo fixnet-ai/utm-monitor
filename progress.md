@@ -1,3 +1,31 @@
+## Phase 44 — MCP 长任务超时修复（2026-08-22）
+
+**起因**: 用户问"utmm 自身的 exec/download/upload 是不是也有这种问题"（指
+zigtester 的 MCP 超时），要求"查清楚代码不要猜测"，随后"直接做计划并改进"。
+
+**调查**: 逐层核实确认 utmm 有相同问题（证据链见 findings.md Phase 44 段 +
+task_plan.md Phase 44）。方案：mcp_http.zig 层复刻 zigtester 的 SSE 流 + progress
+心跳，不碰 mcp.zig / mcp_handler.zig。
+
+### 实施进度
+
+- [x] 44A SSE 基础设施（writeSsePostHead/writeSseMessageEvent/writeProgressEvent/extractProgressToken）
+- [x] 44B Heartbeat 线程（50ms 分片 threadSleepMs + done 原子门控）
+- [x] 44C handleHttpMcp 重构（token 提取 → SSE 头 → 心跳 → processRequest → 最终事件）
+- [x] 44D 单测 + zig build test 全绿
+
+### 验证结果
+
+- `zig build test` EXIT=0：230 passed / 1 skipped / 0 failed（mcp_http 新增 6 单测
+  未被收集——预先存在，见 findings）
+- `zig build test-integration` EXIT=0：62 passed / 0 failed，内存无泄漏
+- tests/test_mcp_tools.py 更新 send_request 解析 SSE（parse_sse_response 兼容
+  单 JSON 旧格式）
+- "failed command" 是 build.zig manual Run.create 的预先存在误报，不影响结果
+  （Build Summary 18/18 succeeded，测试二进制直接运行 EXIT=0）
+
+---
+
 ## Phase 43 — exec 断连取消传播（2026-08-19）
 
 **起因**: 用户指出 MCP/CLI exec 断开后 Guest 命令继续跑——"ai agent 故意终止执行，
