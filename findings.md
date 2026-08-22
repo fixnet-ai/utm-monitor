@@ -848,3 +848,55 @@ bytes 报告）是抓这种 bug 的关键——它正是冒烟测试 13/14 的�
 在 Windows Host 模式不可用（45E 记录的待办，代码层根因）。
 **修复**：改用 `svc.tempDir()` + `std.fs.path.join`（已存在，跨平台：POSIX $TMPDIR//tmp，Windows %TEMP%）。
 验证：macOS Host 下 sshpass 工具仍 exit 0（路径语义不变）；Windows Host 待切换后补验。
+
+### 2026-08-22 — Round 1 (v0.18.84) 升级链路实测：Windows --upgrade 失败 vs --deploy 成功
+
+**背景**: 用户要求连续 bump 3 版本压测自动升级链路。Round 1 = v0.18.84（MCP download flush + sshpass tempDir）。
+
+**实测结果**:
+| 节点 | 方法 | 结果 |
+|------|------|------|
+| linuxvm / macvm | `--upgrade` | ✅ 升级成功（v0.18.83→v0.18.84），utmmd 进程存活消费 tmp |
+| winx64 / windowsvm | `--upgrade` | ❌ `[upgrade] OK` 但版本不变——**UTM-MonitorD 服务 STOPPED (1067)** |
+| winx64 / windowsvm | `--deploy` | ✅ 升级成功（完整安装器直接替换，绕过 utmmd 消费 tmp） |
+
+**关键发现**:
+1. `--upgrade` 在 Windows 上失败根因：**utmmd 服务崩溃 (1067)**，无法消费 `utmm-upgrade.*.tmp`。
+   升级 tmp 文件（5,395,456 字节 = v0.18.84 完整产物）正确推送，但 utmmd 不在运行 → 无人应用。
+2. utmmd 反复崩溃：utmmd-debug.log 显示三次启动间隔精确 25.5s，每次都在
+   `stabilityCheck` 后无输出即崩溃。25.5s ≈ STABILITY_THRESHOLD(10s) + backoff 1+2+4+8s =
+   utmm 在 10s 稳定窗口内反复崩溃 → failure_count 到 MAX_FAILURE_COUNT(5) → utmmd 退出。
+3. utmm.exe PID 稳定存活（52376 不变），但 utmmd 认为其崩溃 → 疑似 isProcessAlive/句柄误判
+   或 taskkill 误杀（monitorLoop 顶部 taskkill 杀所有 utmm.exe）。**待根因确认（子代理调查中）**。
+4. `--deploy` 是可靠的 Windows 升级路径（deploy 跑完整 `--install`，直接 move 替换二进制），
+   但它推的是 serve-dir 二进制，与 `--upgrade` 的 SHM 通知机制无关。
+
+**影响**: Windows 自动升级（--upgrade）链路不流畅，依赖 utmmd 服务存活。L1 遗留问题确认存在。
+**后续**: Round 2/3 需先修复 utmmd Windows 崩溃，否则无法验证 --upgrade 全流程。
+
+### 2026-08-22 — Windows utmmd 反复崩溃 (1067) 根因：getAllIpsFingerprintWindows 栈踩踏
+
+**症状**: winx64/windowsvm 的 UTM-MonitorD 服务反复 STOPPED (1067)，utmm.exe 稳定存活
+但 utmmd 进程崩溃。utmmd-debug.log 停在 "entering stabilityCheck"，三次启动间隔精确 25.5s。
+`--upgrade` 失败（utmmd 无法消费 tmp），`--deploy` 成功（走完整安装器绕过）。
+
+**根因（已实机验证）**: `getAllIpsFingerprintWindows()` 调用 GetAdaptersAddresses 的方式错误。
+Windows API 第 4 参是「调用者分配的 IP_ADAPTER_ADDRESSES 结构数组缓冲区」，
+旧代码却声明为 `addresses: *?*IP_ADAPTER_ADDRESSES_LH` 并传 `&addrs`（一个 8 字节栈指针
+变量的地址），API 按 size(15KB) 往该地址写结构数组 → **15KB 栈踩踏** → 之后遍历 addrs 得到
+野指针 → Debug 构建（utmmd 在 Windows 用 -ODebug）检测到栈破坏 → 崩溃。
+
+POSIX 分支 `getifaddrs(&ifap)` 用法正确（getifaddrs 由 API 分配内存返回指针），
+Windows 的 GetAdaptersAddresses 语义不同（写调用者缓冲区）——两个 API 被混为一谈。
+
+**25.5s 间隔吻合**: stabilityCheck 10s（通过）+ monitorUtmm 首次 IP 检查 10s
+（IP_CHECK_INTERVAL_MS=10000）+ SCM 重启延迟 ~5.5s。utmmd 每次跑到 monitorUtmm 的
+IP 指纹检查就崩。
+
+**修复**: 声明 `addresses: ?*anyopaque`，分配 `[16384]u8 align(8)` 缓冲区传 `&buf`，
+ERROR_BUFFER_OVERFLOW(111) 时保守放弃指纹。同时给 utmmd 加 Windows panic 钩子
+（`pub const panic` 把 panic 消息写入 utmmd-debug.log）——服务进程 stderr 被 SCM 丢弃，
+此钩子让未来任何 panic 都能落盘诊断。
+
+**验证**: windowsvm + winx64 部署后 UTM-MonitorD 均 RUNNING，utmmd PID 稳定（>60s 无重启），
+无 PANIC 记录；mesh/exec 通道恢复。`zig build test`(230 pass) + `test-integration`(62 pass) 全绿。

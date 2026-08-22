@@ -11,6 +11,21 @@ const shm = @import("shm.zig");
 const fail = @import("fail.zig");
 const svc = @import("svc.zig");
 
+/// 覆盖默认 panic：Windows 上把 panic 消息写入 utmmd-debug.log。
+/// 服务进程（SCM 1067 崩溃）的 stderr 被丢弃，panic 消息/栈轨迹不可见；
+/// 此钩子把 panic 原因落盘，用于定位稳定性检查中的崩溃点。
+/// 非 Windows 平台行为与默认 panic 完全一致（仍走 FullPanic 打印栈轨迹）。
+pub const panic = if (builtin.os.tag == .windows)
+    std.debug.FullPanic(struct {
+        fn panic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+            // debugLogWindows 定义于文件下方 —— Zig 无声明顺序限制。
+            debugLogWindows(msg);
+            std.debug.defaultPanic(msg, first_trace_addr);
+        }
+    }.panic)
+else
+    std.debug.FullPanic(std.debug.defaultPanic);
+
 /// utmm 规范安装路径。
 fn utmmPath() []const u8 {
     return if (builtin.os.tag == .windows) "C:\\opt\\utmm\\utmm.exe" else "/opt/utmm/utmm";
@@ -347,19 +362,23 @@ fn getAllIpsFingerprintWindows() u64 {
         family: c_uint,
         flags: c_ulong,
         reserved: ?*anyopaque,
-        addresses: *?*IP_ADAPTER_ADDRESSES_LH,
+        addresses: ?*anyopaque,
         size: *c_ulong,
     ) callconv(.winapi) c_ulong;
     const getAdaptersAddresses: FnType = @ptrCast(@alignCast(func_ptr));
 
-    // 15KB 栈缓冲区覆盖典型多网卡系统
-    const buf: [15360]u8 = [_]u8{0} ** 15360;
+    // ⚠️ GetAdaptersAddresses 的第 4 参是「调用者分配的结构数组缓冲区」，不是指针变量地址。
+    // 旧实现声明为 *?*IP_ADAPTER_ADDRESSES_LH 并传 &addrs（8 字节栈指针变量），API 却按
+    // size（15KB）往该地址写结构数组 → 15KB 栈踩踏 → Debug 构建检测到破坏后崩溃
+    // （v0.18.84 winx64/winx64 utmmd 反复 1067 根因）。用对齐字节数组 + 传数组指针。
+    var buf: [16384]u8 align(8) = [_]u8{0} ** 16384;
     var size: c_ulong = @intCast(buf.len);
-    var addrs: ?*IP_ADAPTER_ADDRESSES_LH = undefined;
 
     const flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-    const ret = getAdaptersAddresses(AF_INET_FP, flags, null, &addrs, &size);
-    if (ret != 0 or addrs == null) return 0;
+    const ret = getAdaptersAddresses(AF_INET_FP, flags, null, &buf, &size);
+    if (ret != 0) return 0; // ERROR_BUFFER_OVERFLOW(111) 等 — 保守放弃指纹，不遍历
+
+    const addrs: *IP_ADAPTER_ADDRESSES_LH = @ptrCast(@alignCast(&buf));
 
     var hasher = std.hash.Wyhash.init(0);
     var count: u32 = 0;
