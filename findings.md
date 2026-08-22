@@ -832,3 +832,19 @@ sshpass 把密码经 **SSHPASS 环境变量**传给子进程（ssh.exe 继承 �
   无法覆盖块外 NoCommand 错误返回）；测试补 defer free。
 - **教训**：`SSHPASS_LEN=3` 这类只量长度不读值的诊断有误导性；askpass.bat 写值诊断是决定性证据。
 - 修复后全场景通过（见上表），单测 230 通过无泄漏 + 集成 62 通过无泄漏。
+
+### 2026-08-22 — MCP download 落盘 0 字节（Threaded Io 异步 close）+ sshpass /tmp 硬编码（Windows Host）
+
+**Bug A — MCP download 落盘 0 字节**：
+`mcp.zig handleVmDownload` 在 `downloadFromGuest` writeAll 后直接 `defer file.close(file_io)`，
+返回 MCP 响应时 Threaded Io 的 close 是异步的，文件尚未落盘 → 实测"Downloaded (25 bytes)"但本地文件 0 字节。
+**修复**：返回前 `fw.interface.flush()` + `file.sync(file_io)`（参照 dpipe_file.zig copyAndDelete:219-220）。
+验证：test_mcp_tools.py 从 13/14 → 14/14，download 内容 SHA 校验通过。
+**教训**: Threaded Io 下写文件必须显式 flush + sync，close 不保证落盘；测试脚本的 download 内容校验（非仅
+bytes 报告）是抓这种 bug 的关键——它正是冒烟测试 13/14 的唯一失败项。
+
+**Bug B — MCP sshpass 密码路径硬编码 /tmp**：
+`mcp.zig:619` `pw_path = "/tmp/utmm-sshpass-pw"`。Windows Host 无 /tmp → createFile 失败 → MCP sshpass
+在 Windows Host 模式不可用（45E 记录的待办，代码层根因）。
+**修复**：改用 `svc.tempDir()` + `std.fs.path.join`（已存在，跨平台：POSIX $TMPDIR//tmp，Windows %TEMP%）。
+验证：macOS Host 下 sshpass 工具仍 exit 0（路径语义不变）；Windows Host 待切换后补验。

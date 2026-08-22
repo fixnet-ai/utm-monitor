@@ -20,6 +20,7 @@ const host_mod = @import("host.zig");
 const mcp_handler = @import("mcp_handler.zig");
 const lsa = @import("lsa.zig");
 const sshpass = @import("sshpass.zig");
+const svc = @import("svc.zig");
 
 /// Full reference manual embedded at compile time — served by the `manual` MCP tool.
 const MANUAL_TEXT: []const u8 = @embedFile("MANUAL.md");
@@ -577,6 +578,18 @@ fn handleVmDownload(ctx: McpContext, vm: []const u8, remote_path: []const u8, lo
     var fw = file.writer(file_io, &fbuf);
     const total_bytes = try mcp_handler.downloadFromGuest(ctx.io, ctx.gpa, state, vm, remote_path, &fw.interface);
 
+    // 强制落盘后再返回：Threaded Io 的 close 是异步的，若直接返回，
+    // MCP handler 响应送达时文件可能尚未写入（实测本地文件 0 字节）。
+    // 参照 dpipe_file.zig copyAndDelete：writeAll → flush → sync。
+    fw.interface.flush() catch |err| {
+        std.log.err("[mcp] download flush failed: {}", .{err});
+        return error.DownloadFailed;
+    };
+    file.sync(file_io) catch |err| {
+        std.log.err("[mcp] download sync failed: {}", .{err});
+        return error.DownloadFailed;
+    };
+
     const esc_vm = try jsonEscape(ctx.gpa, vm);
     defer ctx.gpa.free(esc_vm);
     const esc_remote = try jsonEscape(ctx.gpa, remote_path);
@@ -616,7 +629,10 @@ fn handleVmSshpass(ctx: McpContext, host: []const u8, user: []const u8, password
     // child command line entirely (defense in depth). Since v0.18.83, -p is also
     // safe: parseArgs dups the password before the password-hiding memset, so the
     // argv overwrite no longer corrupts the extracted password.
-    const pw_path = "/tmp/utmm-sshpass-pw";
+    // 路径用 svc.tempDir() 而非硬编码 /tmp：Windows Host 无 /tmp，createFile 会失败。
+    // path.join 按平台补分隔符（POSIX /，Windows \）。
+    const pw_path = try std.fs.path.join(gpa, &.{ svc.tempDir(), "utmm-sshpass-pw" });
+    defer gpa.free(pw_path);
     const cwd = std.Io.Dir.cwd();
     {
         const pw_file = try cwd.createFile(block_io, pw_path, .{ .truncate = true, .permissions = @enumFromInt(0o600) });
