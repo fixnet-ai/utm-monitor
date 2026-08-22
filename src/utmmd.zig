@@ -261,15 +261,15 @@ const WNOHANG: c_int = 1; // waitpid WNOHANG 标志
 /// POSIX getifaddrs 类型（复用 guest.zig 的模式）。
 /// 用 _fp 后缀区分以避免与 guest.zig 的同名类型冲突。
 const in_addr_fp = extern struct { s_addr: u32 };
-const sockaddr_fp = if (builtin.os.tag == .linux)
-    extern struct { sa_family: u16, sa_data: [14]u8 }
+const sockaddr_fp = if (builtin.os.tag == .macos)
+    extern struct { sa_len: u8, sa_family: u8, sa_data: [14]u8 }
 else
-    extern struct { sa_len: u8, sa_family: u8, sa_data: [14]u8 };
+    extern struct { sa_family: u16, sa_data: [14]u8 };
 
-const sockaddr_in_fp = if (builtin.os.tag == .linux)
-    extern struct { sin_family: u16, sin_port: u16, sin_addr: in_addr_fp, sin_zero: [8]u8 }
+const sockaddr_in_fp = if (builtin.os.tag == .macos)
+    extern struct { sin_len: u8, sin_family: u8, sin_port: u16, sin_addr: in_addr_fp, sin_zero: [8]u8 }
 else
-    extern struct { sin_len: u8, sin_family: u8, sin_port: u16, sin_addr: in_addr_fp, sin_zero: [8]u8 };
+    extern struct { sin_family: u16, sin_port: u16, sin_addr: in_addr_fp, sin_zero: [8]u8 };
 
 const ifaddrs_fp = extern struct {
     ifa_next: ?*ifaddrs_fp,
