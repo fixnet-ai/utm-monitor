@@ -1,17 +1,19 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.82（Phase 45 目标 v0.18.83） | **分支**: `main` | **更新**: 2026-08-22
+**版本**: v0.18.90 | **分支**: `main` | **更新**: 2026-08-22
 
 ## 当前状态
 
 - **源文件**: 22 src + 13 test + 2 embed + 2 Python test scripts
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
-- **真机部署**: 5 节点 v0.18.82 serving
+- **真机部署**: 5 节点 v0.18.89 serving
 - **Phase 41 完成**: Windows exec OEM↔UTF-8 转码 + marker 独立行修复（v0.18.79）
 - **Phase 42 完成**: CI 修复 (zio clone) + CI 接管发布 + MIT + SignPath 步骤待启用 (PR #6)
 - **Phase 43 完成**: exec 断连取消传播 + 进程树整杀 + Guest 并发化（v0.18.80-82）
 - **Phase 44 完成**: MCP 长任务超时修复（SSE 流式响应 + progress 心跳）
 - **Phase 45 进行中**: 遗留 L2 — sshpass runWindowsConpty 假模式（Windows 10/11 sshpass 实测完全不可用）
+- **Phase 46 完成**: utmmd 自愈 — utmm `--svc` 启动自检磁盘 utmmd 哈希，不符则替换重启（v0.18.90）
+- **Phase 47 进行中**: 本地交叉编译发布 v0.18.90 + 5 节点自愈验证（放弃 CI，用户指定本地 3 轮测试）
 
 ## 进行中: Phase 45 — 遗留 L2: sshpass Windows ConPTY 假模式（v0.18.83 目标）
 
@@ -499,6 +501,46 @@ Host utmm PID 稳定；4 台 VM 升级推送全部一次成功。
 | 21 | download 校验用头帧（download_result: file_size + sha256_hex） | 原始字节流无法可靠区分 trailer 帧头；长度先行边界精确，与 upload 对称 |
 | 22 | exec 同步响应模型（CLI 经 IPC 流式转发；MCP 同步全量） | 两段式（session_id + 轮询）让 AI agent 无所适从；实时性 = 底层流式传输 |
 | 23 | macOS shouldUpdateUtmmd 恒 false（utmmd 升级靠 --install） | adhoc codesign 非确定且不可逆，磁盘哈希永远 ≠ 内嵌哈希；比较必触发升级循环 |
+| 24 | utmmd 自愈：utmm `--svc` 启动早期自检磁盘 utmmd 哈希 | utmm 内嵌 utmmd（@embedFile），知道"正确 utmmd"长什么样；`--upgrade` 只推 utmm 从不推 utmmd，导致 utmmd 变更需手动逐台部署。让 utmm 在 `--svc`（shm 连接/端口绑定前）比较磁盘 vs 内嵌哈希，不符则 extractUtmmdToTemp + upgradeUtmmd（disable→kill→replace→enable→start）→ exit(0)，新 utmmd spawn 新 utmm 接管。macOS 恒 false 跳过（决策 #23）。循环防护：新 utmm 再检测时哈希已匹配；失败走 utmmd monitorLoop 指数退避 + MAX_FAILURE_COUNT=5 |
+
+## 已完成: Phase 46 — utmmd 自愈（v0.18.90，2026-08-22）
+
+### 背景
+
+`--upgrade` 只推 utmm、从不推 utmmd（findings 已知限制 #2）。v0.18.89 发布时 windowsvm/winx64 的 utmmd.exe 仍是旧版（2,107,904 / 2,166,784 vs 目标 2,119,168 / 2,177,024），需要手动逐台部署。用户指令：**"utmm 启动后，如果发现 utmmd 的二进制哈希与自身内嵌的不符，就立即停止服务替换再启动服务即可"** —— 用代码逻辑永久解决，而非手动部署。
+
+### 实现
+
+main.zig `--svc` 分支开头（shm.open 之前）插入 5a 自愈块：
+
+```zig
+{
+    const role: svc.ServiceRole = if (cli.is_host) .host else .guest;
+    if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
+        const tmp_path = try extractUtmmdToTemp(init.io, init.gpa);
+        var extra_args = try buildServiceArgs(init.gpa, cli, role);
+        defer { ... free args ... }
+        svc.upgradeUtmmd(init.io, init.gpa, role, extra_args.items, tmp_path, utmmd_sha256_hex);
+        init.gpa.free(tmp_path);
+        std.process.exit(0);
+    }
+}
+```
+
+### 闭环验证（设计层面）
+
+- **升级一次、无循环**：旧 utmmd spawn 新 utmm → 检测不符 → upgradeUtmmd（disable→kill utmmd→killAllUtmm 跳过 self→replaceFileSafe→enable→start 新 utmmd）→ exit(0) → 新 utmmd spawn 新 utmm → 再检测哈希已匹配 → 正常 serve
+- **Windows rename 顺序**：`upgradeUtmmd` 先 kill utmmd 再 replace，符合"先杀后改"纪律（windows-auto-upgrade-file-lock 记忆）
+- **失败回滚**：replaceFileSafe 失败自动 enable+start 旧 utmmd（upgradeUtmmd 内置）；start 失败保留新二进制重试一次
+- **循环兜底**：upgradeUtmmd 失败走 fail.err panic → utmm 崩溃 → utmmd monitorLoop 指数退避（1s→60s）+ MAX_FAILURE_COUNT=5
+- **macOS**：shouldUpdateUtmmd 恒 false（决策 #23），自愈自动跳过
+
+### 验证
+
+- `zig build -Doptimize=ReleaseSafe` ✅
+- `zig build test`：230 passed / 0 failed（退出码 0）✅
+- `zig build test-integration`：62 passed / 0 failed / 无泄漏 ✅
+- embed 8 目标齐全，Windows utmmd 大小与目标一致 ✅
 
 ## 架构（v0.18.0+）
 

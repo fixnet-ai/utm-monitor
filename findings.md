@@ -900,3 +900,95 @@ ERROR_BUFFER_OVERFLOW(111) 时保守放弃指纹。同时给 utmmd 加 Windows p
 
 **验证**: windowsvm + winx64 部署后 UTM-MonitorD 均 RUNNING，utmmd PID 稳定（>60s 无重启），
 无 PANIC 记录；mesh/exec 通道恢复。`zig build test`(230 pass) + `test-integration`(62 pass) 全绿。
+
+## 2026-08-22 Round 1 (v0.18.86) 本地交叉编译发布 — 完全流畅成功
+
+用户指示：取消 CI 方式发布（等太久效率低），改本地交叉编译 release 做 3 次测试。
+
+**v0.18.86 内容**：sockaddr 布局修复（sockaddr_fp/sockaddr_in_fp 曾用 BSD 布局含 sa_len/sin_len 前缀字节，
+Windows sockaddr 无此字段 → sa_family 读错偏移（offset 1 而非 0）→ 指纹恒为 0 → Windows IP 变更检测
+被静默禁用。修复：仅 macOS 用 BSD 布局，Windows/Linux 用 `{ sa_family: u16 }` 布局）+
+先前 1067 崩溃修复 + panic 钩子。
+
+**流程**（替代 CI 的本地链路，每轮重复）：
+1. bump ver.txt + commit + tag（本地，不 push CI）
+2. `zig build cross -Doptimize=ReleaseSafe` 交叉编译 8 目标
+3. **注意**：cross step 只重建 8 目标，本机 target 的 `utmm` 需单独 `zig build -Doptimize=ReleaseSafe`
+   重建（否则 serve-dir 里本机二进制停留在旧版本——本次实测第一次部署就因这个踩坑，/opt/utmm/utmm
+   还是 v0.18.84）
+4. cp 产物到 /opt/utmm/（serve-dir）+ codesign --force --sign - 重签本机 utmm（macOS taskgated 需要）
+5. `sudo utmm --install --host` 本机重启 host
+6. `sudo utmm --upgrade <guest>` 逐台推 4 guest
+7. `sudo utmm --status` 验证 5 节点全 v0.18.86 serving
+
+**结果**：全流程流畅。4 guest（linuxvm/macvm/windowsvm/winx64）upgrade 推送 OK，Windows 两台
+windowsvm/winx64 消费 tmp 后重启到 v0.18.86，UTM-MonitorD 均 RUNNING（sc query STATE: 4 RUNNING），
+无 1067 崩溃复发。本机 host 重启至 v0.18.86 后 LSA 重建约 15s 内恢复 5 节点可见。
+
+**经验**：
+- `zig build cross` 不构建本机 target → 本机二进制必须单独 `zig build`（默认 target）后再 cp。
+- 本地发布不走 CI → 无 GitHub Release 产物；serve-dir 是唯一分发源。
+
+## 2026-08-22 Round 2 (v0.18.87/88) — 升级后 utmmd integer overflow panic 根因
+
+**症状**：linuxvm 升级到 v0.18.88 后，utmmd 在升级后 ~15s panic `integer overflow`
+（thread 27703 panic at utmmd.zig:1030/916），systemd restart counter 涨到 4。
+
+**根因（非代码 bug，是升级链路缺口）**：
+`--upgrade` **只推 utmm，从不推 utmmd**（已知限制 #2）。linuxvm 磁盘上 utmmd
+还是 v0.18.88 时期的旧版（mtime 13:21, sha=341c...），含 integer overflow bug。
+升级 utmm 后，旧 utmmd 处理升级流程时 monitorUtmm 内 u32 时钟减法下溢 → panic。
+本机构建的 v0.18.89 新 utmmd（embed sha=be19...）从未被 `--upgrade` 推送。
+
+**修复**：
+1. 代码层防御（v0.18.89，已加）：monitorUtmm 3 处 u32 时钟减法改 saturating，
+   心跳超时检测加 `hb > now` 时钟错位防御（仅告警不误杀）。
+2. 部署层：utmmd 必须手动推送到 guest——`utmm --upload <utmmd.bin> <vm>`
+   + ssh `cp utmmd.bin utmmd && systemctl restart utmmd.service`。
+   （Linux/macOS guest 无 macOS 哈希比较豁免，但 upgrade 链路不触发 utmmd 检查）
+
+**验证**：linuxvm 手动替换 utmmd=be19 后，utmmd 稳定运行 1:25+ 无 panic，
+新诊断日志 `[utmmd] monitorUtmm entered, hb=... cmd=0` 正常输出，
+无 `heartbeat clock skew` 告警。修复确证。
+
+**遗留（升级链路本身）**：utmmd 不随 `--upgrade` 更新仍存在——下次若 utmmd 有
+代码变更，各 guest 仍需手动推 utmmd。考虑未来让 `--upgrade` 同时推送/校验 utmmd。
+
+**macOS 部署坑**：`sudo cp` 覆盖 /opt/utmm/utmm 保留旧 inode，
+AMFI 基于 inode 的签名缓存失效 → 新二进制 SIGKILL (Killed:9, RC=137)。
+解决：先 `rm -f` 再 `cp`（换新 inode）或 codesign 重签后重建。md5 相同的两个
+文件（新 inode vs 旧 inode）行为不同即此因。
+
+## 2026-08-22 Round 3 (v0.18.90) — utmmd 自愈：utmm --svc 启动自检替换
+
+**解决的问题**：上面 Round 2 遗留的"utmmd 不随 --upgrade 更新"架构缺口。
+windowsvm/winx64 的 utmmd.exe 仍是旧版（2,107,904 / 2,166,784 vs embed
+目标 2,119,168 / 2,177,024），此前需手动逐台部署。
+
+**用户决策**：不手动部署，加代码逻辑永久解决——
+"utmm 启动后，如果发现 utmmd 的二进制哈希与自身内嵌的不符，
+就立即停止服务替换再启动服务即可。"
+
+**实现（main.zig --svc 分支开头，shm.open 前）**：
+- `shouldUpdateUtmmd(io, gpa, utmmd_sha256_hex)` 比较磁盘 vs 内嵌哈希
+  （macOS 恒 false，adhoc codesign 不可比较，决策 #23）
+- 不符 → `extractUtmmdToTemp` → `buildServiceArgs` → `upgradeUtmmd`
+  （disable→kill utmmd→killAllUtmm 跳过 self→replaceFileSafe→enable→start）
+- `std.process.exit(0)` → 新 utmmd spawn 新 utmm 接管
+
+**关键时序/循环分析**：
+1. **无无限循环**：新 utmmd spawn 的新 utmm 再检测时哈希已匹配 → 正常 serve。
+2. **端口/shm 无冲突**：旧 utmm 自愈阶段未绑定 2121、未连 shm（自检在 shm.open 前），
+   exit(0) 前不与新 utmm 冲突。
+3. **失败兜底**：upgradeUtmmd 内部 replace 失败回滚 enable+start 旧 utmmd；
+   start 失败保留新二进制重试一次；最终失败 fail.err panic → utmm 崩溃 →
+   utmmd monitorLoop 指数退避（backoff 1s→60s）+ MAX_FAILURE_COUNT=5 退出。
+4. **Windows rename 顺序**：upgradeUtmmd 先 kill utmmd 再 replaceFileSafe，
+   符合"先杀后改"（windows-auto-upgrade-file-lock 记忆）。
+
+**发布策略**：utmmd 源码未动（自愈只在 utmm/main.zig），交叉编译用
+`-Dutmmd=false` 复用现有 embed 二进制（字节不变→哈希不变→只推新 utmm，
+新 utmm 启动时自愈替换磁盘旧 utmmd）。
+
+**验证**：zig build ✅ / zig build test 230 passed ✅ / test-integration 62 passed ✅
+

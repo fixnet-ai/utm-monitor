@@ -420,6 +420,30 @@ pub fn main(init: std.process.Init) !void {
     // utmmd creates shared memory before spawning us. Open it and register
     // our PID so utmmd can monitor our heartbeat.
     if (cli.is_svc) {
+        // ── 5a. utmmd self-heal: ensure embedded utmmd matches disk ──
+        // utmm embeds utmmd (@embedFile); --upgrade only pushes utmm, never
+        // utmmd, so utmmd drift previously required manual per-node redeploy.
+        // On --svc startup (we are spawned by utmmd), compare the disk utmmd
+        // hash against the embedded one; if stale, stop the service, replace
+        // the binary, start the service, then exit so the fresh utmmd respawns
+        // a new utmm. macOS is skipped: shouldUpdateUtmmd returns false there
+        // (adhoc codesign is non-deterministic, decision #23).
+        {
+            const role: svc.ServiceRole = if (cli.is_host) .host else .guest;
+            if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
+                std.log.warn("[main] utmmd out of date — self-healing before serve", .{});
+                const tmp_path = try extractUtmmdToTemp(init.io, init.gpa);
+                var extra_args = try buildServiceArgs(init.gpa, cli, role);
+                defer {
+                    for (extra_args.items) |item| init.gpa.free(@constCast(item));
+                    extra_args.deinit(init.gpa);
+                }
+                svc.upgradeUtmmd(init.io, init.gpa, role, extra_args.items, tmp_path, utmmd_sha256_hex);
+                init.gpa.free(tmp_path);
+                std.log.info("[main] utmmd upgraded, exiting for respawn", .{});
+                std.process.exit(0);
+            }
+        }
         var shm_handle: ?*volatile shm.ShmLayout = null;
         if (shm.open()) |h| {
             shm_handle = h;

@@ -897,8 +897,10 @@ pub fn main(init: std.process.Init) !void {
 
     // 创建共享内存
     if (builtin.os.tag == .windows) debugLogWindows("main: before shm.create");
-    const shm_ptr = try shm.create(init.io);
+    var shm_ptr: *volatile shm.ShmLayout = try shm.create(init.io);
     if (builtin.os.tag == .windows) debugLogWindows("main: after shm.create");
+    // monitorLoop 内部可能自愈重建 SHM（命名对象被外部 unlink 时），
+    // 返回最新指针，defer 始终清理当前有效的映射。
     defer shm.destroy(shm_ptr);
 
     // POSIX 信号
@@ -906,15 +908,15 @@ pub fn main(init: std.process.Init) !void {
 
     // Windows SCM 分发
     if (builtin.os.tag == .windows and cli.is_svc) {
-        try winServiceRun(init.io, alloc, shm_ptr, cli.utmm_args);
+        shm_ptr = try winServiceRun(init.io, alloc, shm_ptr, cli.utmm_args);
         return;
     }
 
     // 进入监控循环
-    monitorLoop(init.io, alloc, shm_ptr, cli.utmm_args);
+    shm_ptr = monitorLoop(init.io, alloc, shm_ptr, cli.utmm_args);
 }
 
-fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmLayout, utmm_args: []const []const u8) void {
+fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr_in: *volatile shm.ShmLayout, utmm_args: []const []const u8) *volatile shm.ShmLayout {
     if (builtin.os.tag == .windows) debugLogWindows("monitorLoop: entry");
 
     // 所有平台都需要独立的 Threaded Io 进行文件操作。
@@ -929,6 +931,8 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
 
     var failure_count: u32 = 0;
     var backoff_sec: u32 = 1;
+    // 可变的 SHM 指针 —— SHM 命名对象被外部 unlink 时自愈重建，更新为最新映射。
+    var shm_ptr: *volatile shm.ShmLayout = shm_ptr_in;
     shm_ptr.svc_state = @intFromEnum(shm.SvcState.running);
 
     while (true) {
@@ -937,7 +941,26 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
             shm_ptr.svc_state = @intFromEnum(shm.SvcState.stopping);
             // 杀掉 utmm 子进程防止变孤儿进程
             killUtmmByPid(shm_ptr.utmm_pid);
-            return;
+            return shm_ptr;
+        }
+
+        // SHM 自愈：共享内存命名对象可能被外部 unlink（/dev/shm 清理、
+        // 误删、其他实例竞争等）。unlink 后 utmmd 的 mmap 仍有效——可继续
+        // 与旧 utmm 通信（心跳/升级通知都走已有映射），但新启动的 utmm 用
+        // shm_open 打命名文件会失败 → 心跳永不更新 → 心跳超时 kill/restart
+        // 无限循环，升级 .tmp 永久残留（v0.18.88 linuxvm 升级断裂根因）。
+        // 每轮探测命名对象存在性，丢失立即重建并重启 utmm。
+        if (!shm.exists()) {
+            std.log.warn("[utmmd] SHM named object missing — rebuilding shared memory", .{});
+            shm.destroy(shm_ptr);
+            shm_ptr = shm.create(io) catch {
+                std.log.err("[utmmd] SHM rebuild failed — retrying in 5s", .{});
+                sleepMs(io, 5000);
+                continue;
+            };
+            shm_ptr.svc_state = @intFromEnum(shm.SvcState.running);
+            shm_ptr.svc_heartbeat = shm.nowMs(io);
+            std.log.info("[utmmd] SHM rebuilt", .{});
         }
 
         // 清理上次升级遗留的旧二进制（rename 替换后残留的 utmm-old.exe）
@@ -966,7 +989,7 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
             failure_count += 1;
             if (failure_count > MAX_FAILURE_COUNT) {
                 std.log.err("[utmmd] {d} consecutive failures, exiting", .{failure_count});
-                return;
+                return shm_ptr;
             }
             backoff_sec = @min(backoff_sec * 2, MAX_BACKOFF_SEC);
             shm_ptr.backoff_sec = backoff_sec;
@@ -983,7 +1006,7 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
             shm_ptr.failure_count = failure_count;
             if (failure_count > MAX_FAILURE_COUNT) {
                 std.log.err("[utmmd] {d} consecutive failures, exiting", .{failure_count});
-                return;
+                return shm_ptr;
             }
             backoff_sec = @min(backoff_sec * 2, MAX_BACKOFF_SEC);
             shm_ptr.backoff_sec = backoff_sec;
@@ -1005,7 +1028,7 @@ fn monitorLoop(io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
             .shutdown => {
                 std.log.info("[utmmd] shutdown complete", .{});
                 shm_ptr.svc_state = @intFromEnum(shm.SvcState.stopping);
-                return;
+                return shm_ptr;
             },
             .crashed => std.log.info("[utmmd] utmm exited unexpectedly, restarting...", .{}),
         }
@@ -1049,6 +1072,8 @@ fn stabilityCheck(io: std.Io, shm_ptr: *volatile shm.ShmLayout, proc: ProcessRef
 fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *volatile shm.ShmLayout, proc: ProcessRef) RestartReason {
     // 确保进程句柄在返回时被关闭（Windows 上 HANDLE 不会自动回收）
     defer if (builtin.os.tag == .windows) closeProcessHandle(proc);
+    // 诊断（临时）：确认 monitorUtmm 进入时的心跳与命令状态
+    std.log.info("[utmmd] monitorUtmm entered, hb={d} cmd={d}", .{ shm.readUtmmHeartbeat(shm_ptr), @intFromEnum(shm.readCmd(shm_ptr)) });
 
     var last_hb = shm.nowMs(io);
 
@@ -1071,34 +1096,16 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
         }
 
         const now = shm.nowMs(io);
-        if (now - last_hb >= 2000) {
+        if (now >= last_hb and now - last_hb >= 2000) {
             shm.writeSvcHeartbeat(shm_ptr, io);
             last_hb = now;
         }
 
-        // 心跳超时检测
-        const hb = shm.readUtmmHeartbeat(shm_ptr);
-        if (hb > 0 and now - hb > HEARTBEAT_TIMEOUT_SEC * 1000) {
-            std.log.warn("[utmmd] heartbeat timeout, killing utmm", .{});
-            if (builtin.os.tag == .windows) debugLogWindowsFmt("monitorUtmm: heartbeat timeout, killing utmm (hb={d} now={d} age={d}ms)", .{ hb, now, now - hb });
-            _ = killProcess(proc);
-            return .crashed;
-        }
-
-        // 进程退出检测
-        if (!isProcessAlive(proc)) {
-            std.log.info("[utmmd] utmm exited", .{});
-            if (builtin.os.tag == .windows) debugLogWindows("monitorUtmm: utmm exited by itself (not killed by us)");
-            const cmd = shm.readCmd(shm_ptr);
-            if (cmd == .restart) {
-                shm.clearCmd(shm_ptr);
-                return .restart;
-            }
-            if (cmd == .shutdown) return .shutdown;
-            return .crashed;
-        }
-
-        // 文件式升级检查：utmmd 扫描 .tmp 文件 → 尝试锁 → 校验 → 应用升级
+        // 文件式升级检查：utmmd 扫描 .tmp 文件 → 尝试锁 → 校验 → 应用升级。
+        // 必须先于心跳超时检测 —— SHM 命名对象丢失时（monitorLoop 自愈重建
+        // 前的窗口），新 utmm 打不开 SHM → 心跳永不更新 → 心跳超时立即触发
+        // return 到 monitorLoop 重启，下面的 findUpgradeTmp 兜底永远没机会
+        // 执行，升级 .tmp 永久残留（v0.18.88 linuxvm 升级断裂根因之一）。
         if (tryApplyPendingUpgrade(file_io, io, alloc, proc, shm_ptr)) |reason| {
             return reason;
         }
@@ -1116,6 +1123,35 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
             }
         } else {
             upgrade_fail_streak = 0;
+        }
+
+        // 心跳超时检测
+        const hb = shm.readUtmmHeartbeat(shm_ptr);
+        // 时钟错位防御：u32 单调时钟可能因两进程时钟源差异或 2^32 ms 回绕
+        // 出现 hb > now。直接相减会下溢 → ReleaseSafe "integer overflow" panic
+        //（v0.18.88 linuxvm 升级后崩溃根因）。hb > now 视为时钟异常，跳过超时
+        // 判定避免误杀，仅告警记录。
+        if (hb > now) {
+            std.log.warn("[utmmd] heartbeat clock skew: hb={d} now={d} diff={d}ms", .{ hb, now, hb -% now });
+        }
+        if (hb > 0 and hb <= now and now - hb > HEARTBEAT_TIMEOUT_SEC * 1000) {
+            std.log.warn("[utmmd] heartbeat timeout, killing utmm", .{});
+            if (builtin.os.tag == .windows) debugLogWindowsFmt("monitorUtmm: heartbeat timeout, killing utmm (hb={d} now={d} age={d}ms)", .{ hb, now, now - hb });
+            _ = killProcess(proc);
+            return .crashed;
+        }
+
+        // 进程退出检测
+        if (!isProcessAlive(proc)) {
+            std.log.info("[utmmd] utmm exited", .{});
+            if (builtin.os.tag == .windows) debugLogWindows("monitorUtmm: utmm exited by itself (not killed by us)");
+            const cmd = shm.readCmd(shm_ptr);
+            if (cmd == .restart) {
+                shm.clearCmd(shm_ptr);
+                return .restart;
+            }
+            if (cmd == .shutdown) return .shutdown;
+            return .crashed;
         }
 
         // 命令处理
@@ -1144,7 +1180,7 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
         }
 
         // IP 变更检测（每 IP_CHECK_INTERVAL_MS 检查一次，去抖后触发重启）
-        if (now - last_ip_check >= IP_CHECK_INTERVAL_MS) {
+        if (now >= last_ip_check and now - last_ip_check >= IP_CHECK_INTERVAL_MS) {
             last_ip_check = now;
             const fp = getAllIpsFingerprint();
             if (fp != 0 and fp != last_ip_fingerprint) {
@@ -1273,7 +1309,9 @@ fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
     }
 
     if (SvcCtx.shm_p) |shm_ptr| {
-        monitorLoop(SvcCtx.io, SvcCtx.gpa, shm_ptr, SvcCtx.args);
+        // 更新 SvcCtx.shm_p —— monitorLoop 可能自愈重建 SHM（命名对象被外部
+        // unlink 时），返回最新指针。winServiceRun 结束时把它带回 main 做 defer 清理。
+        SvcCtx.shm_p = monitorLoop(SvcCtx.io, SvcCtx.gpa, shm_ptr, SvcCtx.args);
     }
 
     // monitorLoop 正常返回（收到 STOP/SHUTDOWN 信号后优雅退出）→ 报告 SERVICE_STOPPED。
@@ -1288,7 +1326,7 @@ fn svcMain(_: u32, _: [*]?[*:0]const u16) callconv(.winapi) void {
     }
 }
 
-fn winServiceRun(io: std.Io, gpa: std.mem.Allocator, shm_ptr: *volatile shm.ShmLayout, utmm_args: []const []const u8) !void {
+fn winServiceRun(io: std.Io, gpa: std.mem.Allocator, shm_ptr: *volatile shm.ShmLayout, utmm_args: []const []const u8) !*volatile shm.ShmLayout {
     SvcCtx.io = io;
     SvcCtx.gpa = gpa;
     SvcCtx.args = utmm_args;
@@ -1302,6 +1340,9 @@ fn winServiceRun(io: std.Io, gpa: std.mem.Allocator, shm_ptr: *volatile shm.ShmL
         std.log.err("[utmmd] SCM dispatch failed: {d}", .{@intFromEnum(std.os.windows.GetLastError())});
         return error.ServiceDispatchFailed;
     }
+    // StartServiceCtrlDispatcherW 在服务停止后返回；svcMain 内 monitorLoop
+    // 可能已自愈重建 SHM，返回最新指针供 main 的 defer 清理。
+    return SvcCtx.shm_p orelse shm_ptr;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

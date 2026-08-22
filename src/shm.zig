@@ -188,6 +188,17 @@ fn closePosix(shm_ptr: *volatile ShmLayout, name: [:0]const u8) void {
     _ = shm_unlink(name);
 }
 
+/// POSIX: 探测命名对象是否仍存在（只 open + close，不 mmap）。
+/// 命名对象可能被外部 unlink（/dev/shm 清理、误删、其他实例竞争等），
+/// 此时 utmmd 的已有 mmap 仍有效，但新进程 shm_open 会失败——utmmd 用它
+/// 检测是否需要自愈重建。
+fn existsPosix(name: [:0]const u8) bool {
+    const fd = shm_open(name, O_RDWR, 0);
+    if (fd < 0) return false;
+    _ = close(fd);
+    return true;
+}
+
 /// POSIX: 取消映射但不 unlink（由 utmm 退出时调用，不删除命名对象）。
 fn detachPosix(shm_ptr: *volatile ShmLayout) void {
     _ = munmap(@ptrCast(@volatileCast(@alignCast(shm_ptr))), @sizeOf(ShmLayout));
@@ -307,6 +318,15 @@ fn closeWindows(shm: *volatile ShmLayout) void {
     _ = UnmapViewOfFile(@ptrCast(@constCast(@volatileCast(shm))));
 }
 
+/// Windows: 探测命名对象是否仍存在（只 open + close，不 map）。
+fn existsWindows() bool {
+    const name_utf16 = winShmNameUtf16();
+    const h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, @ptrCast(&name_utf16)) orelse
+        return false;
+    _ = windows.CloseHandle(h);
+    return true;
+}
+
 /// Windows: 取消映射（utmm 退出时调用）。
 const detachWindows = closeWindows;
 
@@ -332,6 +352,20 @@ pub fn open() !*volatile ShmLayout {
     return switch (builtin.os.tag) {
         .macos, .linux => openPosix(name),
         .windows => openWindows(),
+        else => @compileError("shm: 不支持的平台"),
+    };
+}
+
+/// utmmd 调用：探测共享内存命名对象是否仍存在。
+/// 命名对象可能被外部 unlink（/dev/shm 清理、误删、其他实例竞争等），
+/// 此时 utmmd 的已有 mmap 仍有效（可继续与旧 utmm 通信），但新启动的
+/// utmm 无法 shm_open 加入 → 心跳死 → 升级/重启链路断裂。
+/// utmmd 用它定期检测，丢失则重建。
+pub fn exists() bool {
+    const name: [:0]const u8 = if (builtin.os.tag != .windows) SHM_NAME else undefined;
+    return switch (builtin.os.tag) {
+        .macos, .linux => existsPosix(name),
+        .windows => existsWindows(),
         else => @compileError("shm: 不支持的平台"),
     };
 }
