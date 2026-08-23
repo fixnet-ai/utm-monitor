@@ -1,994 +1,143 @@
-# Findings — UTM Monitor 技术发现
+# 有效技术结论
 
-持续有效的技术发现、已知限制和 Zig 0.16.0 编码经验。
+> 只保留仍有效的技术结论；过程流水账已删除。**所有平台/协议机制 spec 已下沉到
+> 对应代码文件头部注释**（见下方「技术结论 → 代码位置」表），此处只留指针。
+> Zig 0.16 语言/编译/API 迁移经验已收集（不落本项目文件，见编排汇总）。
+> **二次瘦身（2026-08-23）**：2026-08-19 及更早历史阶段已删（task_plan 历史总表
+> + git log 承接）；被推翻结论、纯实验过程、废弃测试体系引用已清除。
 
-## 已知限制
+## 技术结论 → 代码位置（已下沉代码注释，不在此重复）
+
+| 技术结论 | 代码位置 |
+|----------|---------|
+| SSH_ASKPASS + NUL stdin（Session 0 密码认证正解） | `src/sshpass.zig` 头部 |
+| ConPTY 在 Session 0 不可用（平台事实，5 变体实证） | `src/dpipe_shell.zig` 头部 |
+| exec stdout+stderr 已合并（sshpass 除外） | `src/dpipe_shell.zig` 头部 |
+| Windows OEM↔UTF-8 双向转码（GetOEMCP 多语言通解） | `src/dpipe_shell.zig` 头部 |
+| 进程组整树击杀 + Job Object（Windows 孙进程） | `src/dpipe_shell.zig:53/275/603` |
+| closeFn 先关 master 再 kill（macOS E-state 收割） | `src/dpipe_shell.zig:472` |
+| MDELIM marker 独立行 + `set +m; ` 前缀 | `src/protocol.zig:627-642` |
+| download_result 头帧（file_size+sha256，与 upload 对称） | `src/protocol.zig` buildDownloadResult |
+| 流式分块发送 + partialMarkerKeepLen（≤6B 尾部保留） | `src/guest.zig` |
+| 过路 pong 归属验证（OutstandingPings 环） | `src/lsa.zig:830-869` |
+| 零长 exec_data 写探针 + macOS poll POLLHUP 半关闭歧义 | `src/ipc.zig:665-669` |
+| SSE 流 + progress 心跳（MCP 长任务超时修复） | `src/mcp_http.zig` 头部 |
+| 所有平台文件 I/O 必须 Threaded Io（事件循环 Io 不支持文件操作） | `src/utmmd.zig:922-928` |
+| GetAdaptersAddresses 栈踩踏修复（16384 对齐缓冲 + panic 钩子） | `src/utmmd.zig:289/370` |
+| WIN32_FIND_DATAW FILETIME u32 对 + FindFirstFileW（Threaded Io walker 不支持 Windows） | `src/svc.zig` findUpgradeTmpWindows |
+| shouldUpdateUtmmd macOS 恒 false（adhoc codesign 不可比） | `src/svc.zig:2110-2120` |
+| utmmd 自愈（utmm --svc 启动早期自检替换） | `src/main.zig:423` 5a 块 |
+| O_NONBLOCK 平台常量（macOS 0x0004 / Linux 0x800） | `src/tcp.zig:21-24` |
+| Windows 命名共享内存不关 CreateFileMappingW 句柄 | `src/shm.zig:280-283` |
+| SHM 跨进程必须 @atomicStore/@atomicLoad（@memcpy 不可见） | `src/shm.zig` |
+| MCP download 必须 flush+sync（Threaded Io 异步 close 落盘 0 字节） | `src/mcp.zig:581-589` |
+| sshpass 密码路径用 svc.tempDir()（Windows Host 无 /tmp） | `src/mcp.zig:632` |
+| Windows deploy 必须跑 --install（forceInstall 提取/哈希更新 utmmd） | `src/host.zig:549` |
+| VM_DEPLOY_TABLE 兜底表须与 live mesh 实况核对 | `src/host.zig:309-330` |
+| Windows utmmd 用 Debug 优化（aarch64-windows 交叉编译 bug） | `build.zig:71-78` |
+| 自愈用 -Dutmmd=false 复用 embed（字节不变→哈希不变） | `build.zig:62-68` |
+
+## 近期关键定论（2026-08-22，v0.18.84-90）
+
+### Windows utmmd 反复崩溃 1067 = GetAdaptersAddresses 栈踩踏（45H）
+
+`getAllIpsFingerprintWindows` 第 4 参声明为 `*?*IP_ADAPTER_ADDRESSES_LH` 并传
+`&addrs`（8 字节栈指针变量地址），API 按 size(15KB) 往该地址写结构数组 →
+15KB 栈踩踏 → Debug 构建崩溃（utmmd Windows 用 Debug）→ UTM-MonitorD 反复
+STOPPED(1067)。**POSIX getifaddrs（API 分配返回指针）与 Windows
+GetAdaptersAddresses（写调用者缓冲区）语义不同，不可混用**。修复：声明
+`?*anyopaque` + `[16384]u8 align(8)` 缓冲传 `&buf` + Windows panic 钩子落盘。
+
+### Windows Host 服务链 sshpass 正解 = SSH_ASKPASS + stdin EOF（45D'）
+
+- **深挖推翻前提**：Win32-OpenSSH sshpty.c `WIN32_FIXME` 分支根本不用 ConPTY
+  （ptyfd=0/ttyfd=0 = stdin/stdout 直通）→ `ssh -tt` 的成功是管道直通 → 复现
+  OpenSSH ConPTY 是死路。
+- **正解**：Win32 OpenSSH read_passphrase 检测 `SSH_ASKPASS` → 走 askpass 程序，
+  完全避开 TTY/ConPTY；ssh.exe stdin 重定向 NUL（立即 EOF）根治「认证成功 +
+  命令完成后退出挂起」（Win32-OpenSSH issue #1769/#1427，stdin 保持打开所致）。
+- **实施**：sshpass.zig runWindows 加 `hasConsole()` 检测 → 无控制台（Session 0）
+  或 ssh 命令 → **恒走 runWindowsAskpass**（SSH_ASKPASS/SSHPASS env + NUL stdin +
+  读输出回传 + 退出码透传 + Permission denied→exit 5）。
+- **Permission denied root cause**：密码隐藏 `@memset(argv[密码],'z')` 覆写 argv
+  内存，`.pass` 分支不 dupe → 共用同一内存被覆写成 "zzz"。修复 `.pass` 必须 dupe
+  + 函数级 errdefer（块内 errdefer 在 case 块结束时失效）。
+- 真机全过：正确密码 RC=0 / 错误密码 RC=5 / 主机不可达 RC=255 / 多行透传 /
+  远程 exit 7 → RC=7。
+
+### utmmd 自愈（v0.18.90）— 永久解决 utmmd 手动部署缺口
+
+`--upgrade` 只推 utmm、从不推 utmmd（已知限制 #2）→ v0.18.89 时 windowsvm/
+winx64 utmmd 仍是旧版需手动逐台部署。**用户裁定**：utmm 启动时若磁盘 utmmd
+哈希与内嵌不符则立即替换重启。实现：main.zig `--svc` 分支 5a 块（shm.open 前）
+`shouldUpdateUtmmd` 比较 → 不符则 extractUtmmdToTemp + buildServiceArgs +
+upgradeUtmmd（disable→kill→replace→enable→start）→ exit(0)，新 utmmd spawn
+新 utmm 接管。**闭环验证**：无无限循环（新 utmm 再检哈希已匹配）、端口/shm
+无冲突（自检在绑定前）、失败回滚（replace 失败 enable+start 旧 utmmd）、
+monitorLoop 指数退避 + MAX_FAILURE_COUNT=5 兜底。
+
+### Round 2 教训：升级后 utmmd integer overflow panic（v0.18.88）
+
+linuxvm 升级后 utmmd panic `integer overflow`——根因是 `--upgrade` 只推 utmm
+不推 utmmd，磁盘 utmmd 还是含 bug 的旧版。代码层 u32 时钟减法改 saturating +
+`hb > now` 时钟错位防御；部署层 utmmd 需手动推送。**该缺口由 v0.18.90 自愈
+永久闭合**（决策 #24）。
+
+## 有效架构决策（代码级定论）
+
+### Hub-Spoke 拓扑（SOCKS5 唯一中转）
+
+Host 是唯一中转（非 peer-mesh）。Guest IP 同步到每台 /etc/hosts 的 `gateway`
+hostname；Guest 收到非本机目标直接 REJECT，统一走 Host 中转。
+
+### TCP :2121 首字节协议分发
+
+Host accept 后 peek 1 字节：`0x05`→SOCKS5 / 大写 ASCII→HTTP MCP / 其他→close。
+单端口承载 SOCKS5 + HTTP MCP。
+
+### MCP 长任务 SSE 流 + progress 心跳（Phase 44）
+
+POST 响应从单 JSON 改 SSE 流（`text/event-stream` + priming 注释首字节秒到）+
+心跳线程每 5s 发 `notifications/progress`（progressToken 从 `_meta` 提取，
+gpa.dupe 副本防 parsed.deinit 释放）。事件字段用 `\n`（非 `\r\n`）分隔。
+
+### exec 连接生命周期 = 命令生命周期（Phase 43）
+
+零协议变更；macOS poll 对半关闭也上报 POLLHUP → IPC 弃读侧检测，改零长
+exec_data 帧写探测（全版本无害）。版本混部矩阵全安全。
+
+## 已知限制（仍有效）
 
 | # | 限制 | 影响 | 状态 |
 |---|------|------|------|
-| 1 | Zombie 进程 | killChild 5s WNOHANG waitpid，D 状态子进程无法收割 | v0.18.36 已修复 |
-| 2 | utmmd 二进制升级缺口 | push-upgrade 只替换 utmm，utmmd 需手动更新 | 已知 |
-| 3 | Windows BIND 防火墙 | Windows Firewall 阻止 BIND 动态端口入站（非代码问题） | OS 限制 |
-| 4 | zio 依赖本地路径 | build.zig.zon 用 path="../zio"，待 PR 合并后切 URL | 待 zio 上游 |
-| 5 | macOS zig build test --listen=- hang | Zig 0.16.0 stdio 协议 bug，build.zig 用 manual Run.create 绕过 | 已知 |
-| 6 | `upsert()` 不检查 MAC 变化 | 仅 cosmetic，路由用正确的 LSA node_id | 低优先级 |
-
-## Zig 0.16.0 关键 API 差异
-
-持续遇到的 API 差异，记录在此避免重复踩坑：
-
-| 旧 API | 新 API | 备注 |
-|--------|--------|------|
-| `std.posix.socket` | `std.Io.net` | 网络 API 全面迁移 |
-| `std.net` | `std.Io.net.IpAddress.parse()` | IP 解析 |
-| `@Type` | `@Int`/`@Enum`/`@Struct`/... | 类型反射拆分 |
-| `@cImport` | `@cInclude` | C 头文件导入 |
-| `usingnamespace` | 显式 `pub const` | 重新导出 |
-| `async`/`await` | 回调/libxev | 异步模型去除 |
-| `.{}` 容器初始化 | `.empty` / `.init(allocator)` | 有状态容器不能裸初始化 |
-| `std.io` | `std.Io` | 大写 I |
-| `std.fs.openFileAbsolute` | `std.Io.Dir.cwd().openFile(io, ...)` | 需要 io 参数 |
-| `ArrayList.append(x)` | `ArrayList.append(allocator, x)` | 需要 allocator 参数 |
-| `file.close()` | `file.close(io)` | 需要 io 参数 |
-| `file.read(&buf)` | `file.readStreaming(io, ...)` | 流式读取 |
-| `file.writeFile(io, name, data, .{})` | `file.writeFile(io, .{ .sub_path=name, .data=data })` | Options 结构体 |
-| `createDir(io, name, 0o755)` | `createDir(io, name, .default_dir)` | Permissions 枚举 |
-| `std.os.windows.*` | `@extern("kernel32", ...)` | Windows API 直接声明 |
-| `io.Writer` | `writer(io, &buffer)` | 需要 io + 缓冲区 |
-| `rename(old, new)` | `rename(old_path, new_dir, new_path, io)` | 4 参数 |
-| `system.read/write` | 返回 isize（非 error union） | 需 @intCast 且不能 try/catch |
-
-### Windows 特定
-
-- `socket_t = *anyopaque`（指针）→ `fd_set` 不能用 `{0}` 初始化，必须 `undefined`
-- `BOOL` 是 enum → `0` 改为 `.FALSE`
-- `FIONBIO` aarch64-windows 值 `0x8004667e` 超出 c_int → `@bitCast(@as(ULONG, ...))`
-- `callconv(.winapi)` 解决 32 位 stdcall 符号修饰（64 位自动映射 `.C`）
-- `GetLastError()` 返回 `Win32Error` enum → `@intFromEnum()`
-- 动态加载 DLL（iphlpapi/fwpuclnt/dnsapi）→ 不能用 Zig mingw 静态库链接
-- 文件 I/O 不能用 IOCP → 必须 `std.Io.Threaded`
-
-### macOS 特定
-
-- 交叉编译/scp 后 ad-hoc 签名损坏 → `codesign --force --sign -`
-- pty master 不支持 `tcsetattr` ECHO 禁用 → 用 `lastIndexOf` 扫描 MDELIM 标记
-
-### 命名规范（fixnet 生态）
-
-- 类型 PascalCase、函数 camelCase、变量/字段 snake_case
-- 缩写仅首字母大写：`IpAddr` 非 `IPAddr`，`TcpStream` 非 `TCPStream`
-
-## 最近发现
-
-### 2026-08-18 — 过路 pong RTT 错误归因（协议设计缺陷）+ 热路径日志刷 stderr
-
-**症状**: daemon stderr 日志出现 `rtt=2997503534ms`（≈34.7 天）垃圾值；
-`/private/var/log/utmmd-err.log` 以 ≈33MB/天 增长（曾堆 625MB）。
-
-**根因（RTT）**: pong 帧 `[responder_mac:6][timestamp:4]` **无目标字段**。
-中继 ping（guest A → Host → guest C）的 pong 按 `from`（= Host）直接回复，
-Host 的 `handlePong` 无法区分「自己 ping 的应答」和「过路包」，把后者回显的
-**A 的开机时钟**（`nowMs()` = awake-ms 截断 u32，各机不同）当自己的时间戳，
-`nowMs() -% send_ts` = 两机开机时长差（15~20 天）→ 垃圾 RTT。
-同时污染 `last_pong_*`，竞态下 `pingAndWait`（MCP ping 工具）返回垃圾值。
-`-%` 回绕减法本身正确——错的是**来源归因**，不是算术。
-
-**教训**: 无连接协议里「echo 回来的时间戳」只有在**能证明是自己发的**时才可信；
-帧里没有目标字段时，接收方必须维护 outstanding 时间戳集合做归属校验。
-
-**连带发现（38F）**: 周期 sweep 对非直连节点的中继 ping 是**纯死胡同流量**——
-pong 按设计回中继点（`handlePing` 用 `from` 回包），发起者永远收不到应答，
-RTT 从不可测量（该"特性"从未真正工作过）。修正为 sweep 只 ping 直连邻居。
-若未来需要「发起者可测中继 RTT」，pong 帧须携带目标字段并支持回程中继——
-属协议演进，当前无消费方，不做。
-
-**根因（日志）**: periodicTasks 每 ~60 tick 对全部节点 sendPing，每条
-ping/pong/中继都打 info 级 → ReleaseSafe std.log 默认 .info 全量输出到
-stderr → launchd StandardErrorPath 无轮转无限增长。热路径探测日志应为 debug 级。
-
-### 2026-08-17 — MCP exec 输出丢失根因（Bug 1 + Bug 2）
-
-**症状**: 经常发生 MCP 响应 `content[0].text` 中 stdout 为空、exit_code=-1。
-
-**根因 1（主因）— 单帧 64KB 上限**: Guest 端把 pty 输出全量累积在内存 ArrayList，
-MDELIM 标记命中后才打包成**一个** `pty_exec_output` 帧发送（`guest.zig:1112-1117`）。
-Host 端 `execOnGuest` 接收缓冲只有 65536 字节（`mcp_handler.zig:91`），
-`protocol.Connection.recv` 帧长超缓冲返回 `error.BufferTooSmall`（`protocol.zig:745`），
-`execOnGuest` catch-all break（`mcp_handler.zig:96-100`）→ 返回空 output + exit -1。
-任何输出 >64KB 的命令（编译错误刷屏、cat 大文件、测试失败日志）stdout 整体消失。
-CLI（IPC）路径走同一个 `mcp_handler.execOnGuest`（`ipc.zig:657`），同样受影响。
-
-**根因 2 — shell 异常退出丢弃已累积输出**: Guest 读循环因 `shell.read` EOF/错误退出且
-MDELIM 未命中时，只发 `pty_exec_done(-1)`，`accumulated` 里的输出从不发送
-（`guest.zig:1127-1131`）。触发场景：命令含 `exit`、shell 被杀、pty read 错误。
-
-**次要发现**: Windows cmd.exe `& echo MDELIM:%errorlevel%` 的 `%errorlevel%` 在整行
-**解析时**展开，恒回显 0（`protocol.zig:603`）— 退出码永远 0，不影响 stdout 展示。
-
-**教训**: 帧缓冲大小必须与对端单帧大小解耦（流式分块发送）；catch-all break 吞掉
-`BufferTooSmall` 违反"error.Unexpected 视为致命"铁律，把数据丢失伪装成正常结束。
-
-### 2026-08-17 — download_result 哈希悬空切片（真机抓到，测试未覆盖）
-
-`parseDownloadResult` 返回的 `sha256_hex` 是接收缓冲 `rbuf` 的切片；随后
-`rbuf` 被 sockRead 循环复用读文件数据，比对时期望哈希已被覆盖成文件内容 →
-真机上每次 download 都 HashMismatch（乱码 expected）。本地测试没抓到：
-test_download_e2e 是协议级 loopback 模拟器，不走真实的
-`mcp_handler.downloadFromGuest` / `ipc.zig handleDownload` 接收路径。
-修复：解析后立即把 64 字节 hex 拷贝到固定缓冲（commit ebca5ce）。
-
-**教训**: 帧解析结果的生命周期与接收缓冲复用必须成对审查；协议级模拟测试
-无法覆盖真实接收函数的缓冲复用 bug，真机 smoke 验证不可省。
-
-### 2026-08-17 — macOS adhoc codesign 破坏 utmmd 哈希比较 → 每次 CLI 触发升级循环（Phase 37 根因）
-
-**症状**: 每次 `sudo utmm --status/--exec/--upgrade` 输出开头都打
-"utmmd upgrade: utmmd-new → utmmd" + Host 日志每次出现 "ipc listening"
-（utmm 重启）；CLI --status 只显示 host 不显示 guests；升级推送间歇
-IpcNotRunning/ConnectFailed（10-30s 窗口）。
-
-**根因链**:
-1. 部署流程（forceInstall/replaceFileSafe）在 macOS 上对 utmmd 做
-   `codesign --force --sign -`（adhoc，Phase 35 引入修复 SSH 部署签名损坏）
-2. **adhoc 签名非确定性**：同内容两个副本独立签名 → 不同哈希（实测 a1b3... vs 58a3...）；
-   同一文件重复签（"replacing existing signature"）幂等
-3. **remove-signature 不可逆**：codesign 签名过程修改 Mach-O 结构
-   （LC_CODE_SIGNATURE 等），剥离后字节级与原始未签名文件不同
-   （实测 roundtrip a0846b26 → bddd5a93 → aea2ba71）
-4. `shouldUpdateUtmmd` 比较磁盘 utmmd 哈希 vs 内嵌未签名 .sha256 →
-   **永远不匹配** → 每次 CLI 都执行 upgradeUtmmd（disable→kill→replace→
-   enable→start）→ utmmd/utmm 重启 → LSA nonce 变 → mesh 抖动 → 
-   status 显示空 guest 表（查询恰好撞上重启窗口）
-
-**修复** (9390a50): macOS 上 `shouldUpdateUtmmd` 恒返回 false——macOS 的
-utmmd 升级由 `--install`（forceInstall 提取新 utmmd）显式完成，跳过隐式检查。
-Linux/Windows 无签名，保留哈希比较。
-
-**验证**: 连续 3 次 status 零 upgrade 日志、4 台 Guest 完整显示、
-Host utmm PID 稳定、4 台 VM 升级推送全部一次成功（此前必撞 IpcNotRunning）。
-
-**教训**: 对二进制文件做哈希比较时，任何后处理（签名、strip、打包）都会
-破坏可比性。签名类操作（codesign）在 macOS 部署链上是刚需（Phase 35），
-哈希比较必须在签名**之前**或使用签名不变的内容摘要（CDHash 也因随机
-identifier 不可用）。
-
-### 2026-08-17 — 升级后 mesh 瞬态窗口（GuestNotFound/ConnectFailed 间歇）
-
-~~Host forceInstall 期间 utmm/utmmd 重启 → LSA nonce 变化 → node table
-短暂缺失节点。窗口约 10-30 秒。~~ **已定位真根因**：每次 CLI 管理命令
-触发 utmmd 升级循环（见上一条"macOS adhoc codesign 破坏哈希比较"），
-Host utmm 随每次 CLI 重启。Phase 37 修复（9390a50）后此现象消失——
-升级推送 4 台全部一次成功，无 IpcNotRunning。
-
-### 2026-08-17 — ipc.zig 测试从未运行（standalone_test_modules 遗漏）
-
-`build.zig` 的 `standalone_test_modules` 列表（dpipe/dpipe_shell/dpipe_file/guest/shm/utmmd）
-没有 ipc.zig，而 ipc.zig 的 6 个测试（readFull EAGAIN、writeAll、upload header 边界等）
-也不在主测试二进制的 import 链里被收集——**这 6 个测试从写出来起就从未运行过**。
-36C 加第 7 个测试（ExecIpcSink 帧编码）时发现测试数不变才暴露。已把 ipc.zig
-加入 standalone 列表（commit 9ad72e5），7 个测试全过。
-
-**教训**: 新增测试后必须确认测试数变化；`zig build test` 的结果缓存会让
-"没跑测试"看起来像"测试通过"，用 `--summary all` 或检查测试名列表。
-
-### 2026-08-17 — 手动删 .zig-cache 产物破坏缓存清单
-
-删除 `.zig-cache/o/*/test` 二进制后，zig 报 `file_hash FileNotFound`（缓存元数据
-引用已删文件），7 个 run test 步骤全部失败。正确做法：整个删 `.zig-cache`
-目录重建，不要只删产物文件。
-
-### 2026-08-17 — test_upload_e2e 二进制 hash 传参（已修复 dfa863b）
-
-`test_upload_e2e.zig` 4 处 `buildUploadCmd` 传 32 字节二进制 SHA256，而
-`buildUploadCmd` 用 `writeString`（null-term）序列化——哈希含 0 字节会截断。
-模拟器比对也是逐字节二进制比对，与生产语义（hex 字符串）不一致。
-修复：调用点转 hex，模拟器 hex 字符串比对。生产代码（mcp_handler/ipc）传参本就正确。
-
-### 2026-08-17 — download 无端到端哈希校验（协议不对称）
-
-upload 方向有完整校验（cmd 头带 file_size+sha256 → Guest 边收边算 → 读满校验 →
-原子 rename）。download 方向无任何校验：Guest 流式发原始字节，Host 读到 EOF 即停，
-无长度、无哈希 trailer。IPC 协议 `download_done` 的 hash 字段恒为空（`ipc.zig:928`）。
-中间设备损坏/截断无法检测。
-
-### 2026-08-17 — exec 输出已合并 stdout+stderr（验证确认）
-
-- POSIX: `dup2(slave, 0/1/2)`（`dpipe_shell.zig:119-121`）— stdout+stderr 均进 pty。
-- Windows: `si.hStdError = stdout_write`（`dpipe_shell.zig:232`）— stderr 与 stdout
-  合并进同一管道。
-- sshpass 工具例外：stdout/stderr 分开收集，响应中 stderr 单独代码块（`mcp.zig:694`）。
-  保持分开（信息无损），不合并。
-
-### 2026-08-13 — Windows 命名共享内存：CloseHandle(CreateFileMappingW) 移除对象名字
-
-**症状**: Guest 的 `OpenFileMappingW("Global\utmmd-shm")` 返回 ERROR_FILE_NOT_FOUND (2)，
-`shm_handle=null`，Guest 无心跳、无升级路径。Windows `--upgrade` 永远不生效。
-
-**根因**: `createWindows` 在 `MapViewOfFile` 后调用了 `CloseHandle(h)`，注释错误地认为
-"映射持有引用"。实际上 Windows 上关闭 `CreateFileMappingW` 句柄会**移除命名对象的名字**
-（即使视图还映射着），导致后续 `OpenFileMappingW` 找不到。
-
-**修复**: 不关闭句柄 `h`，让它随 utmmd 进程生命周期存活（进程退出时 OS 自动清理）。
-泄漏一个句柄，换取命名对象全程可见。
-
-**教训**: Windows 命名内核对象（section/mutex/event）的**名字**和**对象本身**生命周期不同。
-名字在对象销毁时从命名空间移除，而对象由"句柄 + 视图"共同持有引用。关闭句柄即使视图
-还活着，也可能导致名字提前失效。跨进程共享务必保持创建句柄打开。
-
-### 2026-08-13 — SHM 跨进程共享内存必须用 @atomicStore/Load
-
-`writeCmdPath` 最初用 `@memcpy` 写 `*volatile` 共享内存，`readCmdPath` 用普通读。
-volatile 只防编译器缓存，不提供跨进程内存屏障。改为逐字节 `@atomicStore(.monotonic)` +
-`.release` 终止符，读取侧 `@atomicLoad(.acquire)`，确保 Guest 写的路径对 utmmd 可见。
-
-### 2026-08-13 — O_NONBLOCK 硬编码 macOS 值（历史遗留，已修复）
-
-`tcp.zig` 的 `O_NONBLOCK = 0x0004` 是 macOS 值，Linux 应为 `0x800 (04000)`。
-导致 Linux 上 TCP listen socket 实际阻塞，`accept()` 不再返回 WouldBlock，心跳停止更新，
-utmmd 每 ~10s 误杀 utmm（crash-loop）。修复为按平台区分常量。
-
-### 2026-08-12 — POSIX fcntl/socket 常量跨平台不兼容：SO_REUSEADDR 硬编码导致 Linux BindFailed 崩溃循环
-
-**症状**: TCP :2121 间歇性 BindFailed (errno=98/EADDRINUSE)，UDP LSA 正常但所有 SOCKS5 连接失败。
-
-**根因**: `tcp.zig` 中三个 POSIX 常量硬编码为 macOS 值，Linux 上完全错误：
-
-| 常量 | macOS | Linux | 后果 |
-|------|-------|-------|------|
-| `SO_REUSEADDR` | `0x0004` | `2` | setsockopt 静默无效 |
-| `SOL_SOCKET` | `0xffff` | `1` | setsockopt 静默无效 |
-| `F_GETFD` | `2` | `1` | fcntl 清除而非设置 FD_CLOEXEC |
-| `F_SETFD` | `3` | `2` | fcntl 执行错误操作 |
-
-加上 `_ =` 丢弃返回值 → 全部静默失败，日志无任何警告。用了数月的代码从未在 Linux 上正确工作过。
-
-**教训 — 跨平台 POSIX 常量铁律**：
-1. **所有 `setsockopt`/`fcntl` 常量必须使用 `std.posix` 命名空间**（`std.posix.SOL.SOCKET`、`std.posix.SO.REUSEADDR`、`std.posix.F.GETFD`、`std.posix.F.SETFD`、`std.posix.FD_CLOEXEC`）
-2. **绝不禁用返回值检查** — `_ = setsockopt(...)` → 必须 `if (setsockopt(...) < 0) { log errno }`
-3. **每个新增的 OS 常量必须先验证跨平台值**，对照 Linux/macOS/Windows 三个平台的系统头文件
-
-**额外发现**：`O_NONBLOCK = 0x0004` 同样是硬编码的 macOS 值（Linux 应为 `2048=04000`），**v0.18.45 已修复**（按平台区分常量 + 全部 F_GETFL/F_SETFL 改用 std.posix.F）。
-
-### 2026-08-03 — 部署体验审计
-
-审计 `docs/deploy-ux-audit.md`，识别 8 个用户部署障碍。P0（VM 凭据硬编码 + Windows --deploy 空操作）已修复。P1（zio 依赖文档 + deploy 缓存）已修复。详见审计文档。
-
-### 2026-08-03 — deploy.json 配置加载
-
-`loadDeployConfig()` 使用 `std.json.Value` 动态解析（与 mcp.zig 一致模式），错误宽松处理：文件缺失/格式错误 → 日志警告 + 回退编译时默认值。`@intFromPtr` 区分堆分配 vs 编译时常量指针。
-
-### 2026-08-11 — Windows --upgrade 二进制替换崩溃根因
-
-**症状**: `--upgrade` 推送到 Windows Guest 后，Host 显示 `[upgrade] OK`，但 utmmd
-在尝试替换 utmm.exe 时崩溃（SCM exit 1067），升级实际未生效。
-
-**根因 1 — 文件替换策略不兼容 Windows**:
-`deleteFile(utmm.exe) + rename(.tmp, utmm.exe)` 在 Windows 上失败，因为
-TerminateProcess 后 OS 可能仍在短时间内保留 exe 文件锁定。deleteFile 静默失败
-（catch {}），rename 因目标仍存在而失败。10 次重试后升级被放弃。
-
-**根因 2 — 进程句柄关闭导致 crash-loop**:
-`killProcess` 在 `tryApplyPendingUpgrade` 中调用 `CloseHandle` 关闭进程句柄。
-返回 `monitorUtmm` 后，`isProcessAlive(proc)` 因句柄已关闭而返回 false
-→ 误判 utmm 崩溃 → 返回 .crashed → monitorLoop 启动**旧**二进制（升级未应用）
-→ .tmp 文件仍在 → 下次循环再次杀→替换失败→句柄关闭... → 无限 kill-restart 循环
-→ 超过 MAX_FAILURE_COUNT(5) → utmmd 退出 → SCM exit 1067。
-
-**修复**:
-1. Windows 上用 `MoveFileExW` 先 rename 旧 exe → .old（Windows 允许 rename 打开的文件），再 rename .tmp → 目标
-2. `killProcess` 不再关闭句柄，由 `monitorUtmm` 的 `defer closeProcessHandle(proc)` 统一清理
-3. `handleUpgradeCmd` 接收完成后通过 shm 设置 `.restart` 通知 utmmd 立即处理，消除轮询延迟
-4. macOS codesign 移到 rename 成功后统一执行（之前只在 CrossDevice 回退路径执行，覆盖不全）
-
-### 2026-08-02 — zio 网络 errno 映射缺失
-
-`zio/src/os/net.zig` 中 5 个 errno 映射函数缺少 `NETDOWN`/`HOSTUNREACH`/`NETUNREACH` 等导致返回 `error.Unexpected`。已修复并推送 fixnet-ai/zio `feat/x86-32` 分支。PR #646 等待上游 re-review。
-
-### 2026-08-02 — x86 32-bit 协程支持
-
-zio coro/coroutines.zig 新增 `.x86` 架构支持（IA-32 cdecl、AT&T 汇编、16 字节栈对齐）。初版仅 Linux musl，Windows 需额外 TIB 支持。8/8 交叉编译目标已通过。
-
-### 2026-08-12 — findUpgradeTmpPosix 静默失败：事件循环 Io 不支持文件操作
-
-**症状**: linuxvm Guest 收到 `--upgrade` 推送后 utmm-upgrade.*.tmp 文件正常写入，
-但 utmmd 持续报告 "no tmp found, return null"，升级永远不生效。重启 utmmd 服务后同样失败。
-
-**根因**: `utmmd.zig` 的 `monitorLoop` 中 `need_threaded = builtin.os.tag == .windows`，
-在 POSIX 上 `file_io` 直接复用事件循环 Io（epoll/kqueue）。`findUpgradeTmpPosix` 调用
-`std.Io.Dir.openDirAbsolute(io, ...)` 时，epoll-based Io 无法执行文件系统操作，
-调用静默失败（`catch return null`），导致 .tmp 文件永远不会被发现。
-
-macOS kqueue 碰巧支持 `openDirAbsolute`（因为 kqueue 对文件描述符的兼容性更好），
-所以 macvm 升级正常。Linux epoll 不支持，导致 linuxvm 升级失败。
-
-**修复**: `utmmd.zig` — 所有平台始终创建 `std.Io.Threaded` 实例用于文件操作，
-不再复用事件循环 Io。`need_threaded` 变量移除。
-
-**教训**: 事件循环 Io（epoll/kqueue/IOCP）是为网络 I/O 设计的，文件系统操作
-（openDirAbsolute、rename、deleteFile 等）必须使用 Threaded Io。这个限制不是
-Windows 特有的 — 所有平台都需要。
-
-### 2026-08-12 — WIN32_FIND_DATAW struct 布局 + FindFirstFileW 替代 Zig Io walker
-
-#### WIN32_FIND_DATAW FILETIME 对齐陷阱
-
-Windows `WIN32_FIND_DATAW` 结构体中 `FILETIME` 是 `struct { DWORD low; DWORD high; }`
-（align=4），**不能用 `u64`(align=8) 替代**。在 aarch64-windows 上 `u64` 的 8 字节
-对齐要求会在每个 FILETIME 后插入 4 字节 padding，导致后续字段（`cFileName`）偏移量
-比 Windows ABI 预期多出 12 字节（3 个 FILETIME × 4 字节）。
-
-**正确声明**：
-```zig
-const WIN32_FIND_DATAW = extern struct {
-    dwFileAttributes: u32,
-    _ftCreationTimeLow: u32,
-    _ftCreationTimeHigh: u32,
-    _ftLastAccessTimeLow: u32,
-    _ftLastAccessTimeHigh: u32,
-    _ftLastWriteTimeLow: u32,
-    _ftLastWriteTimeHigh: u32,
-    nFileSizeHigh: u32,
-    nFileSizeLow: u32,
-    dwReserved0: u32,
-    dwReserved1: u32,
-    cFileName: [260]u16,
-    cAlternateFileName: [14]u16,
-};
-```
-
-**关键教训**：跨语言/跨平台的 C ABI struct 声明不能凭猜测。必须对照参考实现
-（MSDN 文档 + C 头文件）逐个字段验证大小和对齐。在 x86_64-windows 上 `u64` 碰巧
-工作（因为 8 字节对齐本就存在），但在 aarch64-windows 上就会出错。
-
-#### std.Io.Dir.walk() + Threaded Io 不兼容 Windows
-
-Zig 0.16.0 的 `Threaded` Io 在 Windows 上不支持目录迭代：
-- `openDirAbsolute` — 正常工作（可以打开目录句柄）
-- `dir.walk(allocator)` — 正常工作（可以创建 walker）
-- `walker.next(io)` — **始终失败**（Threaded Io 不支持）
-
-**解决方案**：直接使用 `FindFirstFileW`/`FindNextFileW` kernel32 API 绕过 Zig Io 层。
-
-**UTF-16 文件名处理**：
-- 搜索路径：`utf8ToUtf16Le` + 手动 null-terminate
-- 读取文件名：`sliceTo` 找到 null terminator → `utf16LeToUtf8`
-- `bufPrintZ` 自动在格式化字符串末尾追加 null byte
-
-**注意**：这应该是临时方案。Zig 0.17+ 如果修复了 Threaded Io 的 Windows 目录迭代，
-应该恢复使用 walker。
-
-#### build.zig: Windows utmmd 用 Debug 优化
-
-交叉编译到 aarch64-windows 时：
-- `ReleaseSafe`: 崩溃 exit 1067（SCM 服务崩溃）
-- `ReleaseSmall`: c0000005 ACCESS VIOLATION in ucrtbase.dll
-- `Debug`: 正常工作（utmmd 仅 ~429KB，性能影响可忽略）
-
-这是 Zig 0.16.0 交叉编译器的 bug，仅影响 aarch64-windows target。
-
-### 2026-08-18 — VM_DEPLOY_TABLE 硬编码 IP 过期（--deploy SSH 3/4 失败根因）
-
-**症状**: `utmm --deploy` 对 macvm/linuxvm/windowsvm SSH 超时，仅 winx64 成功。
-
-**根因**: host.zig `VM_DEPLOY_TABLE` 兜底表（无 deploy.json 时生效）的 IP 是
-旧拓扑：linuxvm .2（实 .6）、macvm .64.4（实 .65.4）、windowsvm .65.2（实 .64.3）。
-SSH 本身正常——IP 修正后 4/4 部署成功。
-
-**教训**: VM 的 DHCP 地址会变；硬编码兜底表要么定期与 mesh 实况核对，
-要么优先用 deploy.json 覆盖。mesh 推送通道（--upgrade）不依赖这些 IP，
-是 IP 漂移时更可靠的升级路径。
-
-### 2026-08-18 — utmmd Windows 端 debugLogWindows 热路径写盘（待修）
-
-**症状**: Windows Guest 的 `C:\opt\utmm\utmmd-debug.log` 持续增长（winx64 实测
-88 B/s ≈ 7.4MB/天；两台 Windows VM 清理前各积 23~25MB）。
-
-**根因**: `utmmd.zig` 的 `debugLogWindows`（Phase 33 排障期遗留）用 kernel32
-WriteFile 直写 `utmmd-debug.log`，monitorLoop 每次迭代打多条
-（before/after tryApplyPendingUpgrade、startUtmm 等）。Windows 服务 stdout
-不可见（已知限制 #2），它是当时唯一的调试通道，但从未在排障结束后移除。
-
-**修复方向**: 排障日志应 comptime 门控（debug 构建才编译）或仅在升级/异常
-路径保留——monitorLoop 稳态循环内的逐行 trace 必须去掉。升级事件本身
-（tryApplyPendingUpgrade 命中/失败）可保留，属低频生命周期事件。
-
-**连带**: 本次清理同时删除了 serve-dir 的 386 个旧版本二进制 + 8 个
-unversioned 残留（deploymentFilename 只读带版本文件名，unversioned 从不
-被引用）+ 调试垃圾文件，本机 /opt/utmm 3.4GB → 62MB（仅留 canonical
-utmm/utmmd + 当前版本 ×8）。
-
-### 2026-08-18 — Windows guest 重启循环双根因（心跳冻结 + deploy 绕过安装器）
-
-**根因 1 — 监听 socket 漏设 FIONBIO**: `TcpListener.init` 的 POSIX 分支设
-O_NONBLOCK（accept 空闲返回 EAGAIN → 循环 10Hz 轮转刷心跳），Windows 分支漏设
-对等的 FIONBIO → `ws2_accept` 永久阻塞 → accept 循环（顶部写 shm 心跳）停摆 →
-utmmd 10s 心跳超时杀 utmm。**LSA 在独立线程照常广播，--status 一切正常，完全
-掩盖了每 ~10s 一次的杀死循环**（winx64 utmm PID 持续变化才发现）。
-sockAccept 还把 WSAEWOULDBLOCK 一律当 AcceptFailed，即使设了非阻塞也走不到
-轮转路径。两处都修后与 POSIX 行为对齐。
-
-**教训**: ① 心跳这类活性信号禁止依赖「可能阻塞的循环」的迭代频率——要么循环
-保证非阻塞轮转，要么独立线程定时写。② 同一逻辑的跨平台分支（POSIX/Windows）
-必须逐项核对 socket 选项设置，一分支有的选项另一分支漏设 = 平台特有死锁。
-③ 掩蔽效应：多线程架构下一条线程死亡不等于进程死亡，表面功能正常（LSA/exec
-都活着）不代表监督心跳还在写——心跳路径必须独立可验证。
-
-**根因 2 — deploy Windows 分支绕过安装器**: SSH 安装命令只做
-`sc stop → taskkill → move utmm.exe → sc start`，从不跑 `--install`，而 utmmd 的
-提取/哈希比较/替换逻辑全在 forceInstall 里。POSIX 分支一直正确（chmod +x &&
-utmm-new --install）。后果：**Windows 两台 VM 的 utmmd 自 08-12 起从未更新**，
-utmm/utmmd 版本漂移六天无人察觉。修复：Windows 对齐 POSIX 跑完整安装器。
-
-**教训**: 同一功能（deploy 安装）的跨平台双实现必须共享语义核心——两分支
-各自手写命令序列必然漂移；「部署成功」的判定标准应包含关键文件的时效验证
-（如 utmmd.exe mtime），本例中若有此检查六天前就会报警。
-
-### 2026-08-19 — Windows 中文乱码机制实锤 + ConPTY 通解验证（Phase 41 前置调查）
-
-**乱码双路径实锤**（winx64，中文系统 InstallLanguage=0804/OEM=CP936）:
-1. **输出路径**: ipconfig 等老命令用 ANSI API 输出，**无视 chcp 65001** ——
-   抓 MCP 原始响应字节 = GBK 原样透传（`Ethernet adapter \xd2\xd4\xcc\xab\xcd\xf8`
-   =「以太网」），JSON 变 invalid UTF-8。chcp 只改 console CP，管不到命令输出编码；
-   utmm 链路（jsonEscape 等）纯字节透传不转码。chcp 936 下同样 GBK → 改代码页治不了。
-2. **输入路径**: chcp 65001 下 cmd 对管道 stdin **逐字节解码** —— agent 发
-   `echo 中文`（6 字节 UTF-8），Guest 返回 6×U+FFFD（每字节独立替换）。
-3. net user 在 65001 会话行为异常（丢机器名 + "one or more errors"，65001 下
-   net.exe 已知病症）。
-
-**ConPTY 通解验证**（微软契约: 输入管道 UTF-8 → INPUT_RECORD；输出统一 UTF-8 VT）:
-ConPTY 内部 console 默认 CP = 系统本地 OEM（中日韩自动匹配）→ 老命令本地编码
-被正确解码 UTF-16 → 输出统一 UTF-8，**宿主无需知道目标内码**。实机对照（同一
-`ipconfig /all`）: utmm exec（pipe+chcp 65001）❌ GBK；`ssh -T`（sshd 纯管道）❌ GBK；
-`ssh -tt`（sshd 内部创建 ConPTY）✅ **valid UTF-8 + 字节级正确「以太网」+ 全中文
-标签正常**。sshd 本身是 Session 0 服务 → 服务环境创建 ConPTY 有生产先例。
-
-**exit_code marker bug**: `buildCmdWithMarker` Windows 分支 `{s} & echo
-MDELIM:%errorlevel%` —— 交互式 cmd **整行解析时展开** %errorlevel%（执行前）
-→ marker 报旧值。实测 `cmd /c exit 7 & echo EXPANDED=%errorlevel%` → `EXPANDED=0`。
-影响: Windows 所有命令 exit_code 恒 0（`nonexist_command_xyz` 也报 0）。
-修法: marker 独立成行 `{s}\r\necho MDELIM:%errorlevel%\r\n`（cmd 逐行读取，
-读到 marker 行时上一行已执行完，展开新值）。
-
-**CreateProcessW 无 per-process 编码/语言参数**: dwCreationFlags 与
-STARTUPINFOEX 属性列表均无编码相关项；CRT 代码页从系统 locale 继承、MUI 语言
-从用户配置继承，均不能按进程覆盖。系统级唯一开关 = 控制面板「Beta: Use
-Unicode UTF-8」（全局 + 重启）。per-process 控制台编码的唯一现代机制就是 ConPTY。
-
-### 2026-08-19 — ConPTY 在 Session 0 服务链不可用（Phase 41 排障记录）
-
-**现象**: spawnWindowsConpty 全链 API 成功（CreatePipe/CreatePseudoConsole S_OK/
-attr list/CreateProcessW 返回 pid，cmd 进程 STILL_ACTIVE）但 cmd **零输出、
-不执行 stdin 命令**（探针文件不出现）——attach 伪控制台失败。
-
-**排查矩阵**（5 个实现变体 + 2 个环境全部失败）:
-- 变体: sa.bInheritHandle=TRUE/FALSE × bInheritHandles=TRUE/FALSE × 立即关/
-  不关 PTY 端句柄 × cmd/powershell × 微软 EchoCon 示例精确复刻（sa=NULL +
-  CreatePseudoConsole 后立即关 PTY 端 + FALSE）——全部同样症状。
-- 结构体布局已验证正确（STARTUPINFOW=104/STARTUPINFOEXW=112/HANDLE=8）。
-- 环境: sshd 用户会话跑 standalone 失败；schtasks SYSTEM 任务同样失败（stdin
-  命令能到达 cmd 执行、stdout 管道读不到输出 → 读循环挂）。
-- 对照: `ssh -tt`（sshd 内部建 ConPTY）同机工作正常（UTF-8 中文正确），Session 0
-  也有 conhost 运行——**sshd 的成功机制未复现**（OpenSSH conpty.c 未定位到）。
-
-**连带发现**:
-1. sshpass.zig runWindowsConpty 的属性列表从未挂进 STARTUPINFOEXW（startup_info
-   是裸 STARTUPINFOW，attr_list_buf 独立变量，cb 只声明 STARTUPINFOW 大小）——
-   该「ConPTY 模式」从未真正走 ConPTY，一直靠密码提示匹配的 pipe fallback 工作。
-2. `--upgrade` 推送显示 OK 但 utmmd 不实际替换二进制（同日两次复现）——版本
-   升级期间一律 scp + `--install` 通道。
-
-**教训**:
-1. **部署纪律**: 未在单机验证的实现绝不全量 deploy——本次 ConPTY 版直接推 4 台，
-   导致 Windows exec 全挂 + 心跳冻结崩溃循环 + 孤儿 cmd 堆积（windowsvm 疑似
-   因此资源耗尽死机重启）。正确顺序: standalone 验证 → 单机验证 → 全量。
-2. **挂起的 exec 是全局毒药**: Guest exec read 永久阻塞 → 心跳冻结 → utmmd 杀
-   utmm 循环；且 Host 侧等待线程堆积可拖死 MCP 线程池（status 正常但 upload/
-   exec 全超时——LSA/UDP 独立线程掩盖 TCP 侧死亡，排查时勿被 serving 状态迷惑）。
-3. **升级验证三要素**: 推送后必须核对磁盘 utmm.exe 的 **mtime + size + 行为**，
-   `[upgrade] OK` 只代表字节送达。
-
-**最终方案**（已实施 v0.18.79）: pipe + cmd.exe /k（会话保持本地 OEM）+
-dpipe_shell 双向转码（输出 GetOEMCP→UTF-8 / 输入 UTF-8→GetOEMCP，DBCS/UTF-8
-跨块 pending）。真机验证: ipconfig「以太网」/中文标签全部正确 UTF-8、
-exit 7/9009/5 传播、UTF-8 中文输入正确回显、&&/|/net user 中文正常。
-
-## 2026-08-19 (Phase 42) — CI 失败根因 + SignPath 调研
-
-**CI 失败根因**（`gh run view 32201183126 --log-failed`）:
-```
-unable to open '/Users/runner/work/utm-monitor/utm-monitor/../zio': FileNotFound
-error: the following build command failed with exit code 1 (zig build test)
-```
-`build.zig.zon` 声明 `.zio = .{ .path = "../zio" }`（fork 注释：x86-32 支持在
-fixnet-ai/zio feat/x86-32 分支，等 PR #646 合并后转上游 URL）。CI checkout
-只拉本仓库 → sibling 目录不存在 → `zig build test` 必挂。**连续 15+ 次 tag
-发布 CI 全部 failure**（v0.18.36 起），此前发布实际全靠本地 release.sh，
-GitHub Releases 上的 utmm.zip 是本地构建的。
-
-**zio fork 状态**: fixnet-ai/zio PUBLIC，分支 feat/x86-32 存在（本地即该分支，
-HEAD 5907d1f "fix: address PR #646 review feedback"）。CI 修复 = checkout 后
-`git clone -b feat/x86-32 https://github.com/fixnet-ai/zio.git ../zio`。
-
-**SignPath 调研结论**（docs.signpath.io/trusted-build-systems/github）:
-- OSS 免费：OV 证书签给 SignPath Foundation（非个人），条件之一是 **OSI 开源
-  许可证、无商业双许可** → 本仓库缺 LICENSE，必须先补（用户选 MIT）
-- Trusted Build System 机制：GitHub App 验证 origin 不可伪造；artifact 必须
-  先经 actions/upload-artifact 存在 GitHub 服务器上；**OSS 要求全部前置 job
-  在 GitHub 托管 runner**（macos-latest 满足）
-- workflow 用法：`upload-artifact@v7` → `SignPath/github-action-submit-signing-request@v2`
-  （api-token / organization-id / project-slug / signing-policy-slug /
-  github-artifact-id / wait-for-completion: true / output-artifact-directory）
-  → action 自动下载解压签名后产物
-- 签名范围决策：**只签 3 个 Windows .exe**（Authenticode 消 SmartScreen/杀软
-  误报——远程调试工具无签名最易被标记）。macOS 保持 adhoc（自部署 VM 场景
-  够用，SignPath macOS 签名需自备 Apple 开发者证书，无增益）
-- 申请为人工审批（社区案例约 1 周），AI 无法代办 → CI 用
-  `vars.SIGNPATH_ENABLED` repository variable 门控签名 job，批准前整段跳过
-
-## 2026-08-19 (Phase 43) — exec 断连后命令失控（三层无取消传播）+ macOS POLLHUP 半关闭歧义实测
-
-**问题链**（AI agent 中途取消 exec / CLI Ctrl-C 后，Guest 命令失控继续跑）:
-
-1. **Guest** `handleExecCmd`（guest.zig:1123-1166）: 主循环阻塞在 `shell.read`，
-   `sendAndFlush` 失败仅 warn 后继续；`defer shell.close()`（SIGKILL）只在命令
-   自然结束后执行——kill 逻辑永远不会中途触发；从不检测 TCP conn 断开。
-2. **Host IPC** `ExecIpcSink.broken`（ipc.zig:637-656）: 只停转发不中止执行；
-   命令无输出时永远发现不了 CLI 已死。
-3. **Host HTTP MCP** `execOnGuest`（mcp_handler.zig:154-163）: OutputCollector
-   全量累积输出在 Host 内存直到命令结束——取消后线程池槽 + 无上限内存被
-   僵尸 exec 占据整个命令时长。
-
-**关键实测（决定检测方式）**: macOS poll 对**半关闭也上报 POLLHUP**
-（unix socketpair 与 TCP loopback 的 `SHUT_WR` 全测得 `IN|HUP`，2026-08-19
-python 探针）→ 读侧信号无法区分 CLI 的 `SHUT_WR` 半关闭（server 依赖它判断
-请求结束，ipc.zig:1099）与进程死亡 → IPC 路径弃用读侧检测。
-（Linux 有 POLLRDHUP 可区分，但 macOS 无此标志，不能跨平台依赖。）
-
-**最终设计**: 连接生命周期 = 命令生命周期，零协议变更：
-- **IPC 路径写探测**: 周期向 CLI 写零长度 `exec_data` 帧（`0x11`+4B len=0，
-  所有版本 CLI 无害跳过——ipcExec 解析 len=0 → remaining=0 → 读下一帧），
-  EPIPE/BROKEN_PIPE = CLI 死亡。写探测无歧义（半关闭不影响写）。
-- **HTTP 路径读侧检测**: 等响应的 HTTP 客户端不会半关闭 → poll + recv==0 即死。
-- **Host 检测到断开** → shutdown Guest TCP → **Guest watcher**（阻塞 sockRead
-  1B，Host 发完首帧后 conn 任何可读事件=断开）→ `killChild`。
-- **进程组击杀**: `kill(-pid, SIGKILL)`（子进程 setsid 是组长）回退
-  `kill(pid)`——孙进程（nohup 型守护）一并清除。
-- 版本混部矩阵全安全（新 Host+旧 Guest=现行为；旧 CLI+新 daemon=探针被无害
-  跳过；新 CLI+旧 daemon=CLI 零改动）。
-
-**附带发现**: Guest utmm 帧命令（exec/upload/download）在 accept 循环线程
-内联串行处理（guest.zig:995-1010）——一条长 exec 阻塞该 Guest 所有后续
-命令（agent 取消后重跑的命令排队等旧命令跑完）。本次一并改为每连接
-`std.Thread.spawn`（detach，先例 guest.zig:898/902 hosts_sync；理由：分钟级
-阻塞任务不能占 zio 线程池槽）。
-
-**行为变更**: CLI Ctrl-C 现在真正终止远端命令（旧行为：本机 CLI 死、远端
-失控继续）。Windows TerminateProcess 只杀 cmd.exe 直系，孙进程残留为已知
-限制（无进程组概念）。
-
-**实施中发现 1 — macOS pty E-state（存量 bug，本次附带修复）**:
-SIGKILL 一个阻塞在 pty slave read 的 shell，进程卡 E(exiting) 状态 ~4.5s，
-直到 master 关闭才真正退出（ps 实测：`Ss+` → `?Es` ×4.5s → `Z`）。旧
-closeFn 顺序（kill → waitpid 轮询 5s → close master）使**每次 macOS exec
-的善后都白烧 ~5s**（done 帧已发但线程/limit 名额被占）。修复：closeFn 先
-close master（slave read 立即 EOF → shell 干净退出）再 kill+收割，~100ms
-完成。注意 shell 阻塞在 waitpid（前台任务运行中）时 SIGKILL 秒杀无此问题
-——只有 idle 在 read 的 shell 受影响。
-
-**实施中发现 3 — 真机验证抓出的作业控制盲区（v0.18.81→0.18.82 修复）**:
-真机测试 C（`(sleep 300) & sleep 300` 取消）暴露：**交互式 shell 的作业控制
-给每个 `&` 作业创建独立进程组**，`kill(-bash_pgid)` 够不到，master 关闭的
-SIGHUP 又因 bash `huponexit=off` 不发给后台组 → 后台作业幸存（实测 pgid
-自成一组的进程在取消后存活，每次取消残留 +1）。
-
-**两次修复迭代**（第一版无效）:
-- ❌ argv `+m`（`bash -l +m`）：真机实测残留依旧——**交互式 shell 初始化
-  强制开启作业控制，覆盖 argv 初值**（单测/本地 pty 无法暴露：恰好通过）。
-- ✅ 命令前缀 `set +m; `（buildCmdWithMarker POSIX 分支）：运行时关闭，
-  后代全部留在本组。linuxvm(bash)/macvm(zsh) 真机验证 2→0。
-
-**Windows 孙进程残留（v0.18.82 Job Object 修复）**:
-TerminateProcess 只杀 cmd.exe 直系，PING.EXE 等子进程残留（实测取消 5s 后
-仍存活）。修复：spawnWindowsPipe 创建 Job Object（`KILL_ON_JOB_CLOSE`）+
-AssignProcessToJobObject；killChild Windows 分支改 TerminateJobObject 整树
-击杀（job 创建失败降级 TerminateProcess）；closeFn 关闭 job 句柄兜底
-（utmm 崩溃也全灭）。真机 windowsvm 验证 1→0。
-注意 0.16 的 `std.os.windows.HANDLE` 是**非可选** `*anyopaque`，null 判断
-用 `INVALID_HANDLE_VALUE` 比较（ipc.zig 惯例）。
-
-**附带观察**: 部署后立刻 exec 可能瞬态 `Socks5AuthFailed`（两台 Windows VM
-部署重启窗口各复现一次，~1min 自愈）——服务切换期旧监听残留，暂不处理。
-
-**实施中发现 4 — 两处 argv/格式化低级 bug（+m 改造过程中踩中）**:
-1. `var argv: [3:null]?[*:0]const u8 = undefined` 的**哨兵槽不初始化**
-   （undefined=0xAA），`argv[0..argc :null]` 切片断言 panic → 子进程秒退
-   （集成测试 bash 无输出退出、单测碰巧栈零通过）。正确姿势：数组字面量
-   初始化（哨兵自动就位），execve 传完整数组（首个 null 即终止）。
-2. tests/common.zig TempDir（历史死代码）：`{x}` 格式化 u48 **高位为零时
-   不足 12 位不补零**，剩余 undefined 字节混入路径 → `error.BadPathName`
-   （1/40 概率，1000 次循环 standalone 定位）。修复：缓冲预填 '0'。
-
-**实施中发现 2 — Zig 0.16.0 API**:
-- `std.Thread.Mutex` 不存在 → 用 `std.Io.Mutex`（`lockUncancelable(io)`/
-  `unlock(io)`，需 io 参数；lsa.zig 先例）
-- `std.Thread.sleep` 不存在 → tcp.zig 新增 `threadSleepMs`（POSIX nanosleep
-  / Windows kernel32 Sleep，先例 dpipe_shell/lsa）
-- `std.time.nanoTimestamp`/`milliTimestamp` 已移除 → 用 `std.Io.Timestamp.now(io, .awake)`
-- `Io.Dir.createDir` 直接收 `Permissions`（`.default_dir`），不是 options struct
-- `Io.Dir.iterate()` 不接 io，`Iterator.next(io)` 接 — common.zig TempDir
-  死代码修正（连同 bufPrint 16 字节缓冲 NoSpaceLeft panic）
-- spawnPosix 忽略传入 shell 参数、实际用 `$SHELL`（集成测试中是 /bin/bash
-  而非 /bin/zsh — 影响测试假设）
-
-## Phase 44 — MCP 长任务超时修复（2026-08-22）
-
-**问题根因**（逐层核实，非猜测）:
-- utmm 的 exec/download/upload/sshpass 与 zigtester 相同的 MCP 超时问题。
-  证据链：POST 单 JSON 响应（mcp_http.zig:99 writeHttpResponse + :251
-  `Content-Type: application/json`）← 同步阻塞 processRequest
-  （mcp_http.zig:91）← 阻塞 handler（mcp.zig:230/286/320/349）← 阻塞业务循环
-  （mcp_handler.zig exec 收循环 / upload 写循环 / download 读循环）← McpContext
-  （mcp.zig:30-40）无 progressToken/progress/SSE 机制。
-- 长任务期间客户端（Claude Code）收不到任何字节 → 撞 per-request 超时
-  （Timer A 60s）。zigtester 用 `json_response=False`（SSE 流 + 心跳）已解决，
-  本 Phase 复刻同一模式。
-
-**修复方案**（只改 mcp_http.zig）:
-1. POST 响应改 SSE 流：立即写 `Content-Type: text/event-stream` 头 + priming
-   注释（`: connected\n\n`），首字节秒到让客户端进入流式模式。
-2. 心跳线程每 5s 发 `notifications/progress` SSE 事件（progress 单调递增
-   + message 已运行秒数），50ms 分片 sleep 保证 join 快速返回。
-3. processRequest 完成后 done+join 心跳，写最终 `event: message` 事件后关连接。
-
-**技术要点**:
-- SSE 事件字段用 `\n` 分隔（非 `\r\n`，`\r\n` 只在 HTTP 头），事件间空行
-  `\n\n`；message 事件格式 `event: message\ndata: <json>\n\n`。JSON-RPC 响应
-  单行（jsonBuildResponse 手工拼接），无多行 data 问题。
-- progressToken 提取：`std.json.parseFromSlice` 后 `parsed.deinit()` 会释放
-  token 指向内存 → 必须 `gpa.dupe` 副本。位置 `params._meta.progressToken`
-  （标准）+ 顶层 `_meta.progressToken`（fallback）。复用 `protocol.jsonGetString`/
-  `jsonGetNestedObject`（pub，protocol.zig:534/576）。
-- 并发：心跳线程只写 fd，HttpProbe/execWatchThread 只读 fd，TCP 全双工无冲突；
-  主线程 done.store(.release) + join 后再写最终响应，无双写竞争。
-- progress 值从 1 开始单调递增（MCP 要求 MUST increase），total 省略（长任务
-  总时长未知）。
-
-**遗留/已知限制**:
-- **mcp_http test 未被 `zig build test` 收集（预先存在）**: mcp_http.zig 的
-  test 声明（含本次新增 6 个 + 原 7 个）不进入 main.zig 的 @import 链收集（与
-  guest.zig/shm.zig 同因，需 standalone 编译，但 mcp_http import host.zig→
-  main.zig 循环 + host import zio 导致 standalone 不可行）。本次验证依赖：
-  编译 EXIT=0 + 集成 62 全绿 + test_mcp_tools.py 真机 SSE 解析 + 代码审查。
-- **progressToken 未做 JSON 转义（假设安全）**: writeProgressEvent 直接插入
-  token，不转义 `"`/`\`。progressToken 是客户端生成的不透明字符串（UUID/整数），
-  实践上安全；若未来遇特殊字符可加转义。
-- **"failed command" 误报（预先存在）**: build.zig 用 manual Run.create 跑测试
-  二进制（绕 --listen=- hang），zig build 会在测试通过后仍打印 "failed command:
-  <test binary>"。不影响结果：Build Summary 18/18 succeeded，测试二进制直接
-  运行 EXIT=0。
-
-### 2026-08-22 — T3 研究：sshpass runWindowsConpty 假模式真相（Phase 45 前置调查）
-
-**起点**: task_plan 遗留 L2（Phase 41 连带发现）——runWindowsConpty 属性列表
-未挂 STARTUPINFOEXW（cb=sizeof(STARTUPINFOW)），「ConPTY 模式」从未真正走
-ConPTY。需决策修复 vs 删除。
-
-**代码定位**（src/sshpass.zig:918-1043 runWindowsConpty）:
-- `startup_info` 是裸 `w.STARTUPINFOW`，`cb = @sizeOf(w.STARTUPINFOW)`（948 行）
-- `attr_list_buf` 是独立 [1024]u8，`InitializeProcThreadAttributeList` +
-  `UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE)` 正确初始化，
-  但**从未挂进任何 STARTUPINFOEXW 的 lpAttributeList 字段**
-- CreateProcessW 带 `EXTENDED_STARTUPINFO_PRESENT` 但传 `&startup_info`
-  （STARTUPINFOW 指针）→ cb=68 ≠ sizeof(STARTUPINFOEXW)=104 → 系统按
-  STARTUPINFOW 解析，**读不到 lpAttributeList，PSEUDOCONSOLE 属性未生效**
-
-**实测后果**（windowsvm v0.18.82，MCP exec 远程跑）:
-```
-C:\opt\utmm\utmm.exe sshpass -p test ssh -o StrictHostKeyChecking=no \
-  -o ConnectTimeout=3 127.0.0.1 -p 1 echo hi   →   exit_code=3 (runtime_error)
-```
-CreateProcessW 因 EXTENDED_STARTUPINFO_PRESENT + cb 不符**直接返回
-ERROR_INVALID_PARAMETER** → runWindowsConpty 返回 runtime_error → sshpass
-立即 exit 3，不挂死、不降级。→ **Windows 10/11（ConPTY 可用）上 `utmm sshpass`
-spawn 任何子进程都失败**。
-
-**连锁结论**:
-1. runWindowsPipe（pipe fallback）只在无 ConPTY 的老 Windows（<17763）才走到；
-   现代 Windows 恒走坏掉的 runWindowsConpty。findings 2026-08-19 原文
-   "一直靠密码提示匹配的 pipe fallback 工作" **不准确**——实际是现代 Windows
-   上根本不可用，pipe 分支从未在现代 Windows 上跑过。
-2. MCP sshpass 工具（mcp.zig:600 spawn `utmm sshpass`）在 Windows Host
-   （utmmd Session 0）上同样 exit 3 失败；TOOLS_JSON 描述 "Works on Linux,
-   macOS, and Windows (ConPTY dynamic loading)" 与实际不符。
-3. deploy Windows VM 走 **macOS Host 的 runPosix**（host.zig:525/584 spawn
-   `utmm sshpass`，cmdDeploy 是本机 CLI）→ 不受影响。这解释了为何自 v0.18.0
-   引入 ConPTY 分支以来 Windows sshpass 一直坏而从未暴露。
-4. 历史测试只覆盖 linuxvm/macvm（test_mcp_tools.py:242-264 sshpass 测试跑
-   linuxvm）；Windows 上 utmm sshpass 从 v0.18.0 起从未验证过。
-5. `conptyCreate`/`conptyClose`（sshpass.zig:1257/1263，标注"dpipe_shell 复用"）
-   **零调用点**——dpipe_shell 已弃用 ConPTY（Phase 41 后走 pipe+OEM 转码）。
-6. Phase 41 实证：即使修复 ConPTY 附加（正确 STARTUPINFOEXW），Session 0 服务链
-   下 attach 仍"全 API 成功但零输出"（5 变体全灭）→ 修复无益于主要 MCP 场景
-   （Windows Host 是 utmmd 服务）。
-
-**conptyAvailable() 使用面**: 仅 status 显示（guest.zig:867、host.zig:828/861）
-与 LSA node_info 上报。删除 ConPTY 机制后该列语义需裁定（保留恒 false / 移除）。
-
-**方案候选**（详见 task_plan Phase 45）:
-- A（推荐）: 删 runWindowsConpty + 调度器恒走 runWindowsPipe。修复 Win10/11
-  sshpass 完全不可用的真实故障；符合简单优先 + Phase 41 实证。需真机验证
-  Windows OpenSSH 管道读密码机制（ssh.exe 非 TTY 时从 stdin 读）。
-- B: 修复 STARTUPINFOEXW 附加。仅交互会话获益，Session 0 服务链仍不可用，
-  需不可靠的降级检测，Phase 41 教训反对。
-- 风险提示（A 路径）: runWindowsPipe 在现代 Windows 上**从未实测过**——即便
-  逻辑上 OpenSSH 支持管道读密码，也必须先单机验证再全量（Phase 41 部署纪律）。
-
-
-### 2026-08-22 — 45D 真机验证：Session 0 下 ConPTY 与管道密码认证均不可行（决定性）
-
-**环境**: windowsvm（aarch64-windows，Win10.0.26200 / Win11，有 ConPTY API），
-v0.18.83 修复版（45A STARTUPINFOEXW 附加）。所有测试跑在 Session 0：
-mcp exec（Guest utmm 服务链）或 本机 macOS utmm sshpass → windowsvm OpenSSH
-sshd（OpenSSH 服务默认也在 Session 0）。
-
-**证据链（逐条实测）**:
-1. `utmm sshpass -p x ssh ... 127.0.0.1 -p 1 echo hi`（拒绝端口，Session 0 服务链）
-   → 30s 内返回，非 exit 3 → CreateProcessW 成功（45A 生效的间接证据）。
-2. `utmm sshpass -p 111 ssh ... 127.0.0.1 echo ok`（真实 sshd，服务链）
-   → **挂起 >90s**（ssh 等密码输入，密码注入从未触发）。
-3. `utmm sshpass -p x cmd /c echo CONPTYTEST`（服务链 mcp exec）
-   → **MCP transport dropped**（ConPTY 附加破坏通道）。
-4. bat 脚本 `echo ===` + `utmm sshpass -p x cmd /c echo CONPTYTEST`
-   （OpenSSH Session 0 会话）→ **连第一行 echo === 都无输出**，整个 SSH 会话输出阻塞。
-5. `cmd /c echo BASIC_TEST`（服务链）→ exit 0（通道健康，对照组）。
-6. `ssh.exe -V`（服务链）→ exit 0（ssh.exe 基础 spawn OK）。
-7. `ping -n 6`（~5s 服务链）→ exit 0（mcp exec 超时 >5s，故 #3 dropped 非超时）。
-8. PowerShell v3 纯管道测试（非 ConPTY：RedirectStandardOutput + 事件驱动匹配
-   "assword:" 后注入 111）→ **TIMEOUT INJECTED=False OUT=[] ERR=[]**
-   （ssh.exe 10s 零输出、从未出现密码 prompt，15s 未退出被 Kill）。
-9. `ssh.exe -v -o ConnectTimeout=5 Administrator@127.0.0.1 echo ok`
-   （OpenSSH Session 0 会话）→ **挂起**（verbose 也零输出）。
-10. bat `ssh.exe ... 127.0.0.1 -p 1 echo ok` → **RC=255** + "banner exchange:
-    Connection to UNKNOWN port -1: Connection refused"（ssh.exe 立即失败退出，
-    非挂起——确认 ssh.exe 本身可用，断点在密码交互）。
-
-**结论**:
-- 45A 修复**生效**（#1/#10：CreateProcessW 成功，修复前恒 exit 3）。
-- **ConPTY 在 Session 0（无交互窗口站）不可用**（#2/#3/#4）：附加后阻塞进程/通道。
-- **管道模式在 Session 0 同样不可用**（#8/#9）：ssh.exe 无 TTY 需要密码时挂起
-  （零输出，从不提示 password:），而非失败。
-- **唯一断点 = 密码交互**（#10 vs #8/#9 对比）：无 TTY + 无交互控制台 → 挂起。
-- 交互式桌面会话（用户手动跑 utmm sshpass）下 ConPTY 应正常（"主要且必须支持"成立），
-  但 Session 0 服务链（Windows Host 的 MCP sshpass）**无任何密码认证路径**。
-
-**服务链处置候选**（task_plan Phase 45 已列 A/B/C）: A 会话感知显式失败 + 密钥保留 /
-B 跨机操作走 utmm 自有协议 / C 深挖 Session 0 ConPTY（Phase 41 已 5 变体失败）。
-
----
-
-### 2026-08-22 — 45D 深挖结论 + SSH_ASKPASS 决定性突破（服务链正解）
-
-**深挖 C 推翻前提（决定性）**:
-- Win32-OpenSSH sshpty.c `WIN32_FIXME` 分支**不用 ConPTY**：
-  `*ttyfd = 0; *ptyfd = 0;`（stdin/stdout 直通）。→ `ssh -tt` 的成功 = 管道直通，
-  不是 ConPTY → "复现 OpenSSH Win32 conpty 机制"是死路。
-- readpass.c Win32 `read_passphrase`：**只要 getenv(SSH_ASKPASS) 就走 ssh_askpass**，
-  完全绕过 TTY/`_getch()`。ssh_askpass Win32 实现 = CreatePipe + CreateProcess
-  (`"askpass" "msg"`) + ReadFile 读 askpass stdout 作为密码（buf[strcspn(buf,"\r\n")] 去换行）。
-- **关键**: ssh.exe 密码认证成功 + 命令完成后**退出挂起**（Win32-OpenSSH issue #1769
-  无 TTY 带命令挂起 / #1427 异步 STDERR 写挂起）——根因是 **stdin 保持打开**，
-  `< nul`（stdin 立即 EOF）根治。
-
-**SSH_ASKPASS + stdin EOF 实测（windowsvm Session 0，mcp exec 上下文）全通过**:
-1. diag3（-vv + SSHPASS=askpass2.bat + `< nul` + echo ok）：
-   `read_passphrase: requested to askpass` + `Authenticated to 127.0.0.1 using "password"`
-   + `Sending command: echo ok` + `ok` + `Exit status 0` + **RC=0**（干净退出，无残留）。
-2. diag4（SSHPASS 环境变量动态密码 + 多行 `echo LINE1 & echo LINE2 & echo LINE3`）：
-   RC=0 + 三行完整返回。
-3. diag5（`exit 42`）：**RC=42** —— 远程退出码正确传播到 ssh.exe 退出码。
-
-**askpass 程序设计**: SSH_ASKPASS 指向**固定** askpass.bat（`@echo off` + `echo %SSHPASS%`），
-sshpass 把密码经 **SSHPASS 环境变量**传给子进程（ssh.exe 继承 → spawn askpass 时继承）。
-无需每次生成临时文件。askpass.bat 输出 "111\r\n"，Win32 ssh_askpass 去 CRLF 后为密码。
-
-**实施方向（45D'）**: sshpass.zig runWindows 加 `hasConsole()`（GetConsoleWindow() != null）:
-- **无控制台（Session 0 服务链）→ runWindowsAskpass**（SSH_ASKPASS/SSHPASS env +
-  hStdInput=NUL + 读 stdout/stderr 回传 + 退出码透传；无密码提示匹配注入）。
-  所有 Windows 版本可用（不依赖 ConPTY）。
-- **有控制台 + ConPTY → runWindowsConpty**（交互式体验保留）。
-- **有控制台 + 无 ConPTY（老 Windows）→ runWindowsAskpass**（runWindowsPipe 在
-  Win32 OpenSSH 下注入无效：ssh.exe 无 TTY 用 `_getch()` 读控制台而非 stdin）。
-- 服务链分层后，Windows Host 的 MCP sshpass（Session 0）获得正解密码认证路径。
-
-### 2026-08-22 — 45D' 实施 + 真机验证全通过（SSH_ASKPASS 模式）+ Permission denied root cause
-
-**实施（sshpass.zig）**:
-- `runWindows` 调度器：**ssh 命令永远走 runWindowsAskpass**（无论有无控制台）——ConPTY 下
-  ssh 用 `_getch()` 读键盘 → 死锁（实证）。非 ssh 命令才有控制台 + ConPTY → runWindowsConpty。
-- runWindowsAskpass：extractPasswordWindows（.pass/.file/stdin/fd）→ ensureAskpassBat 写
-  `C:\opt\utmm\askpass.bat`（`@echo off` + `echo %SSHPASS%`）→ SetEnvironmentVariableW
-  （SSHPASS/SSH_ASKPASS/SSH_ASKPASS_REQUIRE=force）→ hStdInput=NUL（立即 EOF 根治退出挂起）→
-  CreatePipe stdout/stderr 合并 → 读循环透传 → 退出码返回。
-- **Permission denied → exit 5**：读循环检测合并管道中的 "Permission denied" → 返回
-  incorrect_password(5)（sshpass 约定）。无密码提示匹配（askpass 一次性提供密码）。
-
-**真机验证（windowsvm，mcp exec 通道，正确密码/错误密码/主机不可达/多行/非零退出码）**:
-- 正确密码 `-p 111` → **RC=0**，输出 T45D1_OK
-- 错误密码 `-p wrongpass` → **RC=5**（ssh 报 Permission denied 3 次）
-- 主机不可达 `10.255.255.1` → RC=255（透传 ssh 连接超时）
-- 多行输出 `echo LINE1 && echo LINE2 && echo LINE3` → 三行完整透传 + RC=0
-- 远程 `exit 7` → **RC=7**（退出码正确传播）
-
-**Permission denied root cause（关键排障记录）**:
-- 症状：utmm-fix sshpass -p 111 走 askpass 分支（debug 确认 requested to askpass）却拿到
-  错误密码（Permission denied RC=255），而手动 cmd `set SSHPASS=111` 同参数成功。
-- diag1（读回环境变量）: `SSHPASS_LEN=3 SSH_ASKPASS_LEN=23` → 误判 SSHPASS 值正确
-  （"111" 与 "zzz" 长度都是 3！）。
-- diag2（诊断版 askpass.bat 写文件）: `VAL=[zzz]` ×3 → **SSHPASS 实际是 "zzz"**。
-- **root cause**：sshpass.main 密码隐藏（C 版复刻）`@memset(@constCast(argv[密码位置]), 'z')`
-  覆写原始 argv 内存；`.pass` 分支 `pwsrc.password = argv[i]` **不 dupe** → 两处共用同一内存，
-  隐藏覆写把密码改成 "zzz"。C 版先 strdup 再覆写 argv，Zig 版"不 dupe"优化与之冲突。
-- **修复**：`.pass` 分支 `gpa.dupe`（函数级 errdefer 释放，块内 errdefer 在 case 块结束时失效
-  无法覆盖块外 NoCommand 错误返回）；测试补 defer free。
-- **教训**：`SSHPASS_LEN=3` 这类只量长度不读值的诊断有误导性；askpass.bat 写值诊断是决定性证据。
-- 修复后全场景通过（见上表），单测 230 通过无泄漏 + 集成 62 通过无泄漏。
-
-### 2026-08-22 — MCP download 落盘 0 字节（Threaded Io 异步 close）+ sshpass /tmp 硬编码（Windows Host）
-
-**Bug A — MCP download 落盘 0 字节**：
-`mcp.zig handleVmDownload` 在 `downloadFromGuest` writeAll 后直接 `defer file.close(file_io)`，
-返回 MCP 响应时 Threaded Io 的 close 是异步的，文件尚未落盘 → 实测"Downloaded (25 bytes)"但本地文件 0 字节。
-**修复**：返回前 `fw.interface.flush()` + `file.sync(file_io)`（参照 dpipe_file.zig copyAndDelete:219-220）。
-验证：test_mcp_tools.py 从 13/14 → 14/14，download 内容 SHA 校验通过。
-**教训**: Threaded Io 下写文件必须显式 flush + sync，close 不保证落盘；测试脚本的 download 内容校验（非仅
-bytes 报告）是抓这种 bug 的关键——它正是冒烟测试 13/14 的唯一失败项。
-
-**Bug B — MCP sshpass 密码路径硬编码 /tmp**：
-`mcp.zig:619` `pw_path = "/tmp/utmm-sshpass-pw"`。Windows Host 无 /tmp → createFile 失败 → MCP sshpass
-在 Windows Host 模式不可用（45E 记录的待办，代码层根因）。
-**修复**：改用 `svc.tempDir()` + `std.fs.path.join`（已存在，跨平台：POSIX $TMPDIR//tmp，Windows %TEMP%）。
-验证：macOS Host 下 sshpass 工具仍 exit 0（路径语义不变）；Windows Host 待切换后补验。
-
-### 2026-08-22 — Round 1 (v0.18.84) 升级链路实测：Windows --upgrade 失败 vs --deploy 成功
-
-**背景**: 用户要求连续 bump 3 版本压测自动升级链路。Round 1 = v0.18.84（MCP download flush + sshpass tempDir）。
-
-**实测结果**:
-| 节点 | 方法 | 结果 |
-|------|------|------|
-| linuxvm / macvm | `--upgrade` | ✅ 升级成功（v0.18.83→v0.18.84），utmmd 进程存活消费 tmp |
-| winx64 / windowsvm | `--upgrade` | ❌ `[upgrade] OK` 但版本不变——**UTM-MonitorD 服务 STOPPED (1067)** |
-| winx64 / windowsvm | `--deploy` | ✅ 升级成功（完整安装器直接替换，绕过 utmmd 消费 tmp） |
-
-**关键发现**:
-1. `--upgrade` 在 Windows 上失败根因：**utmmd 服务崩溃 (1067)**，无法消费 `utmm-upgrade.*.tmp`。
-   升级 tmp 文件（5,395,456 字节 = v0.18.84 完整产物）正确推送，但 utmmd 不在运行 → 无人应用。
-2. utmmd 反复崩溃：utmmd-debug.log 显示三次启动间隔精确 25.5s，每次都在
-   `stabilityCheck` 后无输出即崩溃。25.5s ≈ STABILITY_THRESHOLD(10s) + backoff 1+2+4+8s =
-   utmm 在 10s 稳定窗口内反复崩溃 → failure_count 到 MAX_FAILURE_COUNT(5) → utmmd 退出。
-3. utmm.exe PID 稳定存活（52376 不变），但 utmmd 认为其崩溃 → 疑似 isProcessAlive/句柄误判
-   或 taskkill 误杀（monitorLoop 顶部 taskkill 杀所有 utmm.exe）。**待根因确认（子代理调查中）**。
-4. `--deploy` 是可靠的 Windows 升级路径（deploy 跑完整 `--install`，直接 move 替换二进制），
-   但它推的是 serve-dir 二进制，与 `--upgrade` 的 SHM 通知机制无关。
-
-**影响**: Windows 自动升级（--upgrade）链路不流畅，依赖 utmmd 服务存活。L1 遗留问题确认存在。
-**后续**: Round 2/3 需先修复 utmmd Windows 崩溃，否则无法验证 --upgrade 全流程。
-
-### 2026-08-22 — Windows utmmd 反复崩溃 (1067) 根因：getAllIpsFingerprintWindows 栈踩踏
-
-**症状**: winx64/windowsvm 的 UTM-MonitorD 服务反复 STOPPED (1067)，utmm.exe 稳定存活
-但 utmmd 进程崩溃。utmmd-debug.log 停在 "entering stabilityCheck"，三次启动间隔精确 25.5s。
-`--upgrade` 失败（utmmd 无法消费 tmp），`--deploy` 成功（走完整安装器绕过）。
-
-**根因（已实机验证）**: `getAllIpsFingerprintWindows()` 调用 GetAdaptersAddresses 的方式错误。
-Windows API 第 4 参是「调用者分配的 IP_ADAPTER_ADDRESSES 结构数组缓冲区」，
-旧代码却声明为 `addresses: *?*IP_ADAPTER_ADDRESSES_LH` 并传 `&addrs`（一个 8 字节栈指针
-变量的地址），API 按 size(15KB) 往该地址写结构数组 → **15KB 栈踩踏** → 之后遍历 addrs 得到
-野指针 → Debug 构建（utmmd 在 Windows 用 -ODebug）检测到栈破坏 → 崩溃。
-
-POSIX 分支 `getifaddrs(&ifap)` 用法正确（getifaddrs 由 API 分配内存返回指针），
-Windows 的 GetAdaptersAddresses 语义不同（写调用者缓冲区）——两个 API 被混为一谈。
-
-**25.5s 间隔吻合**: stabilityCheck 10s（通过）+ monitorUtmm 首次 IP 检查 10s
-（IP_CHECK_INTERVAL_MS=10000）+ SCM 重启延迟 ~5.5s。utmmd 每次跑到 monitorUtmm 的
-IP 指纹检查就崩。
-
-**修复**: 声明 `addresses: ?*anyopaque`，分配 `[16384]u8 align(8)` 缓冲区传 `&buf`，
-ERROR_BUFFER_OVERFLOW(111) 时保守放弃指纹。同时给 utmmd 加 Windows panic 钩子
-（`pub const panic` 把 panic 消息写入 utmmd-debug.log）——服务进程 stderr 被 SCM 丢弃，
-此钩子让未来任何 panic 都能落盘诊断。
-
-**验证**: windowsvm + winx64 部署后 UTM-MonitorD 均 RUNNING，utmmd PID 稳定（>60s 无重启），
-无 PANIC 记录；mesh/exec 通道恢复。`zig build test`(230 pass) + `test-integration`(62 pass) 全绿。
-
-## 2026-08-22 Round 1 (v0.18.86) 本地交叉编译发布 — 完全流畅成功
-
-用户指示：取消 CI 方式发布（等太久效率低），改本地交叉编译 release 做 3 次测试。
-
-**v0.18.86 内容**：sockaddr 布局修复（sockaddr_fp/sockaddr_in_fp 曾用 BSD 布局含 sa_len/sin_len 前缀字节，
-Windows sockaddr 无此字段 → sa_family 读错偏移（offset 1 而非 0）→ 指纹恒为 0 → Windows IP 变更检测
-被静默禁用。修复：仅 macOS 用 BSD 布局，Windows/Linux 用 `{ sa_family: u16 }` 布局）+
-先前 1067 崩溃修复 + panic 钩子。
-
-**流程**（替代 CI 的本地链路，每轮重复）：
-1. bump ver.txt + commit + tag（本地，不 push CI）
-2. `zig build cross -Doptimize=ReleaseSafe` 交叉编译 8 目标
-3. **注意**：cross step 只重建 8 目标，本机 target 的 `utmm` 需单独 `zig build -Doptimize=ReleaseSafe`
-   重建（否则 serve-dir 里本机二进制停留在旧版本——本次实测第一次部署就因这个踩坑，/opt/utmm/utmm
-   还是 v0.18.84）
-4. cp 产物到 /opt/utmm/（serve-dir）+ codesign --force --sign - 重签本机 utmm（macOS taskgated 需要）
-5. `sudo utmm --install --host` 本机重启 host
-6. `sudo utmm --upgrade <guest>` 逐台推 4 guest
-7. `sudo utmm --status` 验证 5 节点全 v0.18.86 serving
-
-**结果**：全流程流畅。4 guest（linuxvm/macvm/windowsvm/winx64）upgrade 推送 OK，Windows 两台
-windowsvm/winx64 消费 tmp 后重启到 v0.18.86，UTM-MonitorD 均 RUNNING（sc query STATE: 4 RUNNING），
-无 1067 崩溃复发。本机 host 重启至 v0.18.86 后 LSA 重建约 15s 内恢复 5 节点可见。
-
-**经验**：
-- `zig build cross` 不构建本机 target → 本机二进制必须单独 `zig build`（默认 target）后再 cp。
-- 本地发布不走 CI → 无 GitHub Release 产物；serve-dir 是唯一分发源。
-
-## 2026-08-22 Round 2 (v0.18.87/88) — 升级后 utmmd integer overflow panic 根因
-
-**症状**：linuxvm 升级到 v0.18.88 后，utmmd 在升级后 ~15s panic `integer overflow`
-（thread 27703 panic at utmmd.zig:1030/916），systemd restart counter 涨到 4。
-
-**根因（非代码 bug，是升级链路缺口）**：
-`--upgrade` **只推 utmm，从不推 utmmd**（已知限制 #2）。linuxvm 磁盘上 utmmd
-还是 v0.18.88 时期的旧版（mtime 13:21, sha=341c...），含 integer overflow bug。
-升级 utmm 后，旧 utmmd 处理升级流程时 monitorUtmm 内 u32 时钟减法下溢 → panic。
-本机构建的 v0.18.89 新 utmmd（embed sha=be19...）从未被 `--upgrade` 推送。
-
-**修复**：
-1. 代码层防御（v0.18.89，已加）：monitorUtmm 3 处 u32 时钟减法改 saturating，
-   心跳超时检测加 `hb > now` 时钟错位防御（仅告警不误杀）。
-2. 部署层：utmmd 必须手动推送到 guest——`utmm --upload <utmmd.bin> <vm>`
-   + ssh `cp utmmd.bin utmmd && systemctl restart utmmd.service`。
-   （Linux/macOS guest 无 macOS 哈希比较豁免，但 upgrade 链路不触发 utmmd 检查）
-
-**验证**：linuxvm 手动替换 utmmd=be19 后，utmmd 稳定运行 1:25+ 无 panic，
-新诊断日志 `[utmmd] monitorUtmm entered, hb=... cmd=0` 正常输出，
-无 `heartbeat clock skew` 告警。修复确证。
-
-**遗留（升级链路本身）**：utmmd 不随 `--upgrade` 更新仍存在——下次若 utmmd 有
-代码变更，各 guest 仍需手动推 utmmd。考虑未来让 `--upgrade` 同时推送/校验 utmmd。
-
-**macOS 部署坑**：`sudo cp` 覆盖 /opt/utmm/utmm 保留旧 inode，
-AMFI 基于 inode 的签名缓存失效 → 新二进制 SIGKILL (Killed:9, RC=137)。
-解决：先 `rm -f` 再 `cp`（换新 inode）或 codesign 重签后重建。md5 相同的两个
-文件（新 inode vs 旧 inode）行为不同即此因。
-
-## 2026-08-22 Round 3 (v0.18.90) — utmmd 自愈：utmm --svc 启动自检替换
-
-**解决的问题**：上面 Round 2 遗留的"utmmd 不随 --upgrade 更新"架构缺口。
-windowsvm/winx64 的 utmmd.exe 仍是旧版（2,107,904 / 2,166,784 vs embed
-目标 2,119,168 / 2,177,024），此前需手动逐台部署。
-
-**用户决策**：不手动部署，加代码逻辑永久解决——
-"utmm 启动后，如果发现 utmmd 的二进制哈希与自身内嵌的不符，
-就立即停止服务替换再启动服务即可。"
-
-**实现（main.zig --svc 分支开头，shm.open 前）**：
-- `shouldUpdateUtmmd(io, gpa, utmmd_sha256_hex)` 比较磁盘 vs 内嵌哈希
-  （macOS 恒 false，adhoc codesign 不可比较，决策 #23）
-- 不符 → `extractUtmmdToTemp` → `buildServiceArgs` → `upgradeUtmmd`
-  （disable→kill utmmd→killAllUtmm 跳过 self→replaceFileSafe→enable→start）
-- `std.process.exit(0)` → 新 utmmd spawn 新 utmm 接管
-
-**关键时序/循环分析**：
-1. **无无限循环**：新 utmmd spawn 的新 utmm 再检测时哈希已匹配 → 正常 serve。
-2. **端口/shm 无冲突**：旧 utmm 自愈阶段未绑定 2121、未连 shm（自检在 shm.open 前），
-   exit(0) 前不与新 utmm 冲突。
-3. **失败兜底**：upgradeUtmmd 内部 replace 失败回滚 enable+start 旧 utmmd；
-   start 失败保留新二进制重试一次；最终失败 fail.err panic → utmm 崩溃 →
-   utmmd monitorLoop 指数退避（backoff 1s→60s）+ MAX_FAILURE_COUNT=5 退出。
-4. **Windows rename 顺序**：upgradeUtmmd 先 kill utmmd 再 replaceFileSafe，
-   符合"先杀后改"（windows-auto-upgrade-file-lock 记忆）。
-
-**发布策略**：utmmd 源码未动（自愈只在 utmm/main.zig），交叉编译用
-`-Dutmmd=false` 复用现有 embed 二进制（字节不变→哈希不变→只推新 utmm，
-新 utmm 启动时自愈替换磁盘旧 utmmd）。
-
-**验证**：zig build ✅ / zig build test 230 passed ✅ / test-integration 62 passed ✅
-
+| 1 | Windows BIND 动态端口 | Windows Firewall 阻止入站（非代码问题） | OS 限制 |
+| 2 | zio 依赖本地路径 | build.zig.zon 用 path="../zio"，PR #646 合并后切 URL | 待 zio 上游 |
+| 3 | macOS `zig build test --listen=-` hang | Zig 0.16 stdio 协议 bug，build.zig 用 manual Run.create 绕过 | 已知 |
+| 4 | `upsert()` 不检查 MAC 变化 | 仅 cosmetic，路由用正确的 LSA node_id | 低优先级 |
+| 5 | mcp_http.zig 单测未被 `zig build test` 收集 | import 链 + standalone 循环依赖，编译 EXIT=0 + 集成 + 真机 SSE 兜底 | 预先存在 |
+| 6 | Windows Host MCP sshpass 补验 | Session 0 已由 exec 通道验证（同 runWindowsAskpass 底层），切换 host 部署后补验 | 待办 |
+
+## 错误方向记录（勿再追）
+
+- **「ConPTY 是主要且必须支持」在 Session 0 不成立**：5 个实现变体 + EchoCon
+  精确复刻全灭，所有 API 成功但 cmd 零输出（Phase 41/45D 实证）。服务链正解 =
+  SSH_ASKPASS。
+- **「argv +m 关闭作业控制」无效**：交互式 shell 初始化强制开启作业控制覆盖
+  argv 初值；正确姿势 = 命令前缀 `set +m; `（buildCmdWithMarker POSIX 分支）。
+- **「--upgrade 推送 OK 即生效」错误**：OK 只代表字节送达，必须核对磁盘二进制的
+  **mtime + size + 行为**三要素（L1 遗留 + Round 1 实测）。
+- **「Windows 文件锁定 deleteFile+rename」初版方向**：真解法 = MoveFileExW
+  先 rename 旧→.old 再 rename 新→目标（Windows 允许 rename 打开的文件）。
+- **「getifaddrs 与 GetAdaptersAddresses 可混用」假设**：两者缓冲区语义相反
+  （API 分配 vs 调用者分配），混用导致 15KB 栈踩踏。
+- **「ipc 测试一直在跑」假设**：standalone_test_modules 遗漏 ipc.zig，6 个测试
+  从未运行过——新增测试后必须确认测试数变化。
+
+## 测试/调试基建经验
+
+- 手动删 `.zig-cache/o/*/test` 二进制 → `file_hash FileNotFound` 缓存清单破坏；
+  应整个删 `.zig-cache` 重建。
+- `SSHPASS_LEN=3` 这类只量长度不读值的诊断有误导性；askpass.bat 写值诊断才是
+  决定性证据（Permission denied root cause 定位关键）。
+- 测试脚本的 download 内容校验（非仅 bytes 报告）是抓「Threaded Io 异步 close
+  落盘 0 字节」这类 bug 的关键。

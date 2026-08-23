@@ -3,6 +3,9 @@
 // 提供 create() 工厂函数：创建一个后台 shell 进程，将其 stdin/stdout
 // 作为 DuplexPipe 暴露。每条命令使用独立的 shell 实例 — 不支持跨命令
 // 共享 shell 状态（cd、export 等不持久）。
+// stdout 与 stderr 已合并（POSIX dup2(slave, 0/1/2)；Windows si.hStdError =
+// stdout_write）——exec 输出单流返回。仅 sshpass 工具例外（stdout/stderr
+// 分开收集，信息无损）。
 //
 // POSIX: posix_openpt → fork → setsid → dup2 → exec $SHELL
 // Windows: CreatePipe + cmd.exe /k（会话保持系统本地 OEM 代码页）+ Guest 侧
