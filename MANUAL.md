@@ -805,3 +805,47 @@ netsh advfirewall show allprofiles | findstr State
 contains "utmm" so the parent bash is killed before the command completes.
 
 **Fix**: Always use `pkill -9 utmm` (match process name only, no `-f` flag).
+
+### Guest "serving" but exec/SSH time out (UTM bridge unicast failure)
+
+**Symptom**: `utmm --status` shows a Guest as `serving` (Last updated seconds
+ago), but `utmm --exec <vm>` and direct `ssh` to it fail with
+`error.ConnectFailed` / `Operation timed out`.
+
+**Cause**: The UTM bridge network (bridge100/bridge101) lost TCP/ICMP *unicast*
+forwarding to the Guest's virtual NIC (vmenet). Unicast (TCP 22/2121, ICMP)
+all time out, but the LSA mesh heartbeat (UDP broadcast/multicast) still works —
+which is why `--status` keeps reporting the Guest online. Host-side ARP, routing,
+and `pfctl` are all healthy, so the fault is in the bridge's unicast path, not
+on the Host and not on the Guest's own TCP/ICMP stack.
+
+**Diagnosis** (the tell-tale signature is **"UDP mesh up, TCP/ICMP unicast down"**):
+
+```bash
+utmm --status                       # Guest still "serving" → UDP mesh OK
+nc -z <guest-ip> 2121               # TCP exec channel → timeout
+nc -z <guest-ip> 22                 # SSH → timeout
+ping <guest-ip>                     # ICMP → timeout
+utmctl exec <vm> --cmd "echo ok"    # "QEMU guest agent not installed" (see note)
+```
+
+**Solution — restart the VM via `utmctl`** (the one channel that does not
+depend on guest networking):
+
+```bash
+utmctl list                         # find the VM name (e.g. "macOS")
+utmctl stop <vm>                    # power off
+utmctl start <vm>                   # boot again
+```
+
+After reboot the Guest re-leases its IP via DHCP and unicast forwarding is
+restored. A tell-tale sign that the bindings had drifted is that the Guest's IP
+may *change subnet* after reboot (e.g. a Guest at `192.168.65.4` coming back as
+`192.168.64.4`) — the virtual-NIC ↔ bridge binding was already inconsistent
+before the restart.
+
+> **Note**: `utmctl exec` is **not** a fallback here — macOS/Linux Guests
+> typically do not have the QEMU guest agent installed, so it returns
+> `OSStatus error -2700` / "guest agent not installed". `utmctl stop`/`start`
+> remains the reliable recovery path when both the SOCKS5 channel and SSH are
+> down but the UDP mesh heartbeat is still alive.
