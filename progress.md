@@ -7,6 +7,11 @@
 ## 当前状态
 
 - 分支 `main`，**版本 v0.18.90**（2026-08-22），8/8 交叉编译，5 节点 serving。
+- **Phase 48（2026-09-11）本机 utmm 被周期性误杀修复**：根因 = utmmd IP 指纹
+  ①混入虚拟接口（UTM bridge/utun 随睡眠翻转）+ ②去抖基线永不采纳 → 40-52s
+  连环 kill（147 次重启）。已修（utmmd.zig 物理网卡过滤 + pending 采纳语义），
+  门禁全绿，本机已部署验证，HTTP MCP 连通。证据链与修复细节见 findings.md
+  「Phase 48」。**待办**：ver bump + 4 guest rollout（48F/48G）。
 - **Phase 45 进行中**：sshpass Windows（SSH_ASKPASS 正解已实现），45G 待发布/部署/补验。
 - **Phase 46 完成**：utmmd 自愈（v0.18.90）。
 - **Phase 47 进行中**：本地交叉编译发布 v0.18.90 + 5 节点自愈验证已完成；连续 bump 压测 --upgrade 待续。

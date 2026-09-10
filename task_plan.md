@@ -1,6 +1,6 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.90 | **分支**: `main` | **更新**: 2026-08-23
+**版本**: v0.18.90 | **分支**: `main` | **更新**: 2026-09-11
 
 ## 当前状态
 
@@ -10,6 +10,7 @@
 - **Phase 45 进行中**: 遗留 L2 — sshpass Windows ConPTY 假模式（已正解为 SSH_ASKPASS，45G 待发布/部署/补验）
 - **Phase 46 完成**: utmmd 自愈 — utmm `--svc` 启动自检磁盘 utmmd 哈希，不符则替换重启（v0.18.90）
 - **Phase 47 进行中**: 本地交叉编译发布 v0.18.90 + 5 节点自愈验证（已完成）；连续 bump 验证 --upgrade 流畅性待续
+- **Phase 48 进行中**: 本机 macOS utmm 服务自动停止 / Claude Code 启动后连接不上 — 根因排查与修复（2026-09-11）
 
 ## 未完成任务（最高优先级，勿丢）
 
@@ -93,6 +94,28 @@ buildServiceArgs + upgradeUtmmd（disable→kill→replace→enable→start）�
 
 **验证**: zig build ✅ / test 230 ✅ / test-integration 62 ✅；5 节点自愈验证
 （windowsvm 2119168 / winx64 2177024 / linuxvm be19d088 哈希匹配 embed）。
+
+## 进行中: Phase 48 — 本机 macOS utmm 服务自动停止排查（2026-09-11）
+
+**现象**: utmm 服务总是自动停止；每次 Claude Code 启动后连接不上。
+**根因**（证据链见 findings.md「Phase 48」）:
+1. **utmmd IP 指纹误杀**：指纹覆盖所有接口 IPv4（含 UTM bridge/utun/awdl，随
+   睡眠/VM 挂起翻转）+ 去抖基线永不采纳（偏离即计数，IP_STABLE_CHECKS=2 → 20s
+   即杀，计数器不回零）→ 日志实证 147 次重启 / 40-52s 连环 kill cycle。
+2. **Claude Code stdio MCP 残留配置**：`~/.claude.json` 仍为 pre-v0.18.0 stdio
+   注册，`--mcp` 现在只打印 endpoint 秒退 → MCP 必连不上（独立于 #1）。
+
+**排查路径**:
+| # | 步骤 | 状态 |
+|---|------|------|
+| 48A | 现场取证：launchd / 进程 / utmmd 日志 / pmset 睡眠记录 / 崩溃报告 | ✅ |
+| 48B | 代码审计：monitorUtmm 超时/IP 检测 + 指纹实现 + guest.zig 网卡规则对照 | ✅ |
+| 48C | 根因定位：IP 指纹误判（检测目标错 + 基线不采纳）+ stdio 配置残留 | ✅ |
+| 48D | 修复：① 指纹加物理网卡名过滤（对齐 guest.zig）② 去抖改采纳语义 + stdio→http 迁移 | ✅ |
+| 48D' | 门禁：zig build + test + test-integration 全绿（单测含 utmmd 11/11；集成 62/62 无泄漏；test_mcp_tools 14/14） | ✅ |
+| 48E | 本机部署验证：01:12 换新 utmmd+utmm，5 节点 serving，HTTP MCP initialize/ping 全通 | ✅ |
+| 48F | （待用户决策）ver bump + 发布 + 4 guest 节点 rollout（全部节点 utmmd 均带同 bug） | 🔲 |
+| 48G | 长期观察：跨睡眠周期 utmm PID 稳定、日志无 IP-change 误杀 | 🔲 |
 
 ## 关键设计决策（持续有效）
 

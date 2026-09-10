@@ -37,7 +37,46 @@
 | Windows utmmd 用 Debug 优化（aarch64-windows 交叉编译 bug） | `build.zig:71-78` |
 | 自愈用 -Dutmmd=false 复用 embed（字节不变→哈希不变） | `build.zig:62-68` |
 
-## 近期关键定论（2026-08-22，v0.18.84-90）
+## 近期关键定论（2026-09-11，Phase 48：本机 utmm 被周期性误杀）
+
+### utmm 反复自动停止根因 = utmmd IP 指纹误判 + 去抖基线永不采纳（双 bug）
+
+**现象链**：utmmd 日志 147 次 `utmm started`、28 次 heartbeat timeout；最近 kill cycle
+40-52 秒一次（`monitorUtmm entered` 间隔 41s/51s/52s），kill 序列无 heartbeat timeout
+warn 而是先 `IP change detected, restarting utmm (fp 0x...)`，且两次指纹完全相同、
+en0 IP 恒为 192.168.3.130 → **IP 没变却被判定变更**。
+
+**Bug 1（检测目标错）**：`getAllIpsFingerprintPosix` 哈希**所有接口**的 IPv4（仅排除
+回环/0.0.0.0），而 utmm 实际只宣告物理网卡 IP（guest.zig `isPhysicalInterface` 排除
+utun/tun/tap/llw/awdl/bridge/vmnet/docker/gif/stf/veth/vboxnet/virbr）。macOS 上
+UTM 的 bridge100/101、utun0-8（iCloud 中继/VPN）、awdl0 随**系统睡眠/唤醒、VM
+挂起/恢复**频繁增删 → 指纹频繁翻转。pmset 实测 DarkWake 每 ~15 分钟一次。
+
+**Bug 2（去抖基线永不采纳）**：monitorUtmm IP 变更检测里 `last_ip_fingerprint` 只在
+首次（==0 时）记录，此后 `fp != 基线` 只做 `stable_ip_checks += 1`，**新指纹稳定也
+永不采纳**；`IP_STABLE_CHECKS=2` → 指纹偏离基线持续 20 秒即杀，且指纹不回到最初
+基线计数器永不归零 → 一晚睡眠周期 = 连环击杀。精确匹配日志 40-52s kill cycle
+（10s stability + 首查建基线 + 2×10s 去抖）。
+
+**修复**（utmmd.zig）：① POSIX 指纹加与 guest.zig 同规则的接口名过滤（utmmd/utmm
+独立进程，前缀表复制 + 注释互指）；② 去抖改 pending_fp/pending_hits 采纳语义：
+同一新指纹连续 IP_STABLE_CHECKS 次 → 采纳为基线 + 重启一次（刷新 utmm 缓存 IP），
+同一次变更最多重启一次。Windows 指纹不加名过滤（AdapterName 是 GUID 不可前缀
+匹配，扩 struct 布局风险大于收益），由修复 ② 兜底。
+
+**连带问题 1（Claude Code 连不上的独立原因）**：`~/.claude.json` 用户级注册仍是
+pre-v0.18.0 的 stdio MCP（`sudo -n /opt/utmm/utmm --mcp`），而 v0.18.0+ `--mcp`
+只打印 endpoint 即退出（main.zig:572-575）→ MCP 进程秒退连接失败。**仓库文档
+无误导**（mcp.json.example 已写明 HTTP transport + 迁移命令；README/MANUAL/
+DESIGN 均为 HTTP）；误导源 = 用户级残留配置未按 mcp.json.example 迁移。
+修法：`claude mcp remove utmm` + `claude mcp add --transport http --scope user utmm http://127.0.0.1:2121/`。
+
+**连带问题 2（时钟语义平台分歧，暂不动）**：zf platform.monoMillis macOS 用
+CLOCK_MONOTONIC（睡眠停走）、Linux 用 CLOCK_BOOTTIME（含睡眠）。macOS 睡眠期
+双端时钟同冻 → 无误杀；但 SHM hb 为 u32，49.7 天 uptime 回绕（防御已有）。
+28 次 heartbeat timeout kill 的分布未深挖，若 ①② 修复后仍再现再查。
+
+### 2026-08-22 定论（v0.18.84-90）
 
 ### Windows utmmd 反复崩溃 1067 = GetAdaptersAddresses 栈踩踏（45H）
 

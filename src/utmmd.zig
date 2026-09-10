@@ -310,8 +310,49 @@ const IP_ADAPTER_ADDRESSES_LH = extern struct {
     first_unicast_address: ?*IP_ADAPTER_UNICAST_ADDRESS_LH,
 };
 
-/// 对所有非回环 IPv4 地址做 Wyhash 指纹，返回 u64。
+/// 物理网卡接口名判定 — 与 guest.zig isPhysicalInterface 保持同一规则。
+/// utmmd 与 utmm 是独立进程无法共享代码；修改 guest.zig 前缀表时必须同步此处。
+/// IP 变更检测只应关注 utmm 实际宣告的物理网卡 IP：utun/bridge/awdl 等虚拟
+/// 接口随系统睡眠/唤醒、VM 挂起/恢复频繁增删，混入指纹会导致 utmm 被周期性
+/// 误杀（2026-09-11 本机 macOS：UTM bridge100/101 + utun 随睡眠翻转 → utmm
+/// 每 40-52s 被杀重启一次）。
+fn isPhysicalInterfaceName(name: []const u8) bool {
+    const exclude_prefixes = [_][]const u8{
+        "utun", "tun", "tap", "llw", "awdl",
+        "bridge", "vmnet", "docker", "gif", "stf",
+        "veth", "vboxnet", "virbr",
+    };
+    for (exclude_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) return false;
+    }
+    if (std.mem.eql(u8, name, "lo0") or std.mem.eql(u8, name, "lo")) return false;
+    return true;
+}
+
+test "isPhysicalInterfaceName excludes virtual interfaces" {
+    // 虚拟/隧道接口一律排除（与 guest.zig isPhysicalInterface 同规则）
+    try std.testing.expect(!isPhysicalInterfaceName("utun0"));
+    try std.testing.expect(!isPhysicalInterfaceName("utun8"));
+    try std.testing.expect(!isPhysicalInterfaceName("awdl0"));
+    try std.testing.expect(!isPhysicalInterfaceName("llw0"));
+    try std.testing.expect(!isPhysicalInterfaceName("bridge100"));
+    try std.testing.expect(!isPhysicalInterfaceName("vmnet1"));
+    try std.testing.expect(!isPhysicalInterfaceName("docker0"));
+    try std.testing.expect(!isPhysicalInterfaceName("vethabc123"));
+    try std.testing.expect(!isPhysicalInterfaceName("lo0"));
+    try std.testing.expect(!isPhysicalInterfaceName("lo"));
+    // 物理网卡保留
+    try std.testing.expect(isPhysicalInterfaceName("en0"));
+    try std.testing.expect(isPhysicalInterfaceName("en5"));
+    try std.testing.expect(isPhysicalInterfaceName("eth0"));
+}
+
+/// 对物理网卡的非回环 IPv4 地址做 Wyhash 指纹，返回 u64。
 /// 零堆分配（仅使用栈变量）。返回 0 表示无有效 IP。
+/// 只统计物理网卡：虚拟接口（utun/bridge/awdl 等）随睡眠/VM 挂起翻转，
+/// 混入指纹会让 IP 变更检测误判（见 isPhysicalInterfaceName 注释）。
+/// Windows 版暂不加名过滤（AdapterName 是 GUID 不可前缀匹配，扩展
+/// IP_ADAPTER_ADDRESSES_LH 布局风险大），由 monitorUtmm 的基线采纳语义兜底。
 fn getAllIpsFingerprint() u64 {
     if (builtin.os.tag == .windows) return getAllIpsFingerprintWindows();
     return getAllIpsFingerprintPosix();
@@ -330,6 +371,9 @@ fn getAllIpsFingerprintPosix() u64 {
         if (ifa.ifa_addr == null) continue;
         const addr = ifa.ifa_addr.?;
         if (addr.sa_family != AF_INET_FP) continue;
+
+        // 只统计物理网卡（utmm 只宣告物理网卡 IP，见 isPhysicalInterfaceName）
+        if (!isPhysicalInterfaceName(std.mem.span(ifa.ifa_name))) continue;
 
         const sin = @as(*align(1) const sockaddr_in_fp, @ptrCast(addr));
         const raw_bytes = @as([*]const u8, @ptrCast(&sin.sin_addr))[0..4];
@@ -1080,7 +1124,13 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
     // IP 变更检测状态
     var last_ip_check = shm.nowMs(io);
     var last_ip_fingerprint: u64 = 0;
-    var stable_ip_checks: u32 = 0;
+    // 去抖候选指纹：与基线不同的新指纹需连续 IP_STABLE_CHECKS 次出现才采纳。
+    // 旧实现（stable_ip_checks 单调计数）在指纹偏离基线后永不采纳新基线、
+    // 指纹不回到最初基线计数器永不归零 → 接口集合短暂变化持续 ≥20s 即连环
+    // 误杀（2026-09-11 本机 macOS：UTM bridge/utun 随睡眠翻转 → utmm 每
+    // 40-52s 被杀重启一次）。
+    var pending_fp: u64 = 0;
+    var pending_hits: u32 = 0;
 
     // 升级连续失败计数 — 防止 .tmp 永不可应用时无限重试。
     // 仅当 .tmp 文件确实存在但 tryApplyPendingUpgrade 失败时递增。
@@ -1183,24 +1233,32 @@ fn monitorUtmm(io: std.Io, file_io: std.Io, alloc: std.mem.Allocator, shm_ptr: *
         if (now >= last_ip_check and now - last_ip_check >= IP_CHECK_INTERVAL_MS) {
             last_ip_check = now;
             const fp = getAllIpsFingerprint();
-            if (fp != 0 and fp != last_ip_fingerprint) {
-                if (last_ip_fingerprint != 0) {
-                    stable_ip_checks += 1;
-                    if (stable_ip_checks >= IP_STABLE_CHECKS) {
-                        std.log.warn("[utmmd] IP change detected, restarting utmm (fp 0x{x})", .{fp});
-                        _ = killProcess(proc);
-                        return .crashed;
-                    }
-                } else {
-                    // 首次检测到有效 IP，记录指纹不触发
+            if (fp == 0) {
+                // 接口全部 down：不更新指纹也不触发，保持上次状态
+            } else if (fp == last_ip_fingerprint) {
+                // 指纹与基线一致，清空去抖候选
+                pending_fp = 0;
+                pending_hits = 0;
+            } else if (last_ip_fingerprint == 0) {
+                // 首次检测到有效 IP，记录基线不触发
+                last_ip_fingerprint = fp;
+            } else if (fp == pending_fp) {
+                pending_hits += 1;
+                if (pending_hits >= IP_STABLE_CHECKS) {
+                    // 新指纹已稳定 — 采纳为基线并重启 utmm 一次（刷新 utmm
+                    // 启动时缓存的物理网卡 IP）。同一次变更最多重启一次。
+                    std.log.warn("[utmmd] IP change detected, restarting utmm (fp 0x{x})", .{fp});
                     last_ip_fingerprint = fp;
-                    stable_ip_checks = 0;
+                    pending_fp = 0;
+                    pending_hits = 0;
+                    _ = killProcess(proc);
+                    return .crashed;
                 }
-            } else if (fp == last_ip_fingerprint and fp != 0) {
-                // 指纹稳定，重置去抖计数器
-                stable_ip_checks = 0;
+            } else {
+                // 新的候选指纹，从头去抖
+                pending_fp = fp;
+                pending_hits = 1;
             }
-            // fp == 0 时不更新指纹也不触发（接口全部 down 保持上次状态）
         }
     }
 }
