@@ -1,6 +1,6 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.90 | **分支**: `main` | **更新**: 2026-09-11
+**版本**: v0.18.91 | **分支**: `main` | **更新**: 2026-09-11
 
 ## 当前状态
 
@@ -110,7 +110,8 @@ ambiguous 失败 → 自动探测按**哈希**取；② utmmd 必须**嵌入前*
 | 49B | 运行期重签点改验签优先：svc.zig codesignValid 辅助 + **5 处**（selfCopy/forceInstall×2/replaceFile + main.zig extractUtmmd + utmmd.zig 升级路径） | ✅ |
 | 49C | 门禁：单测 230 全绿 + 集成 62/62 无泄漏 | ✅ |
 | 49D | 本机部署验证：/opt/utmm/utmm+utmmd 均保留正式签名（字节一致），5 节点 serving；macvm 推送真机验证通过（老 utmmd 安装新签名二进制正常，落地 adhoc 属预期） | ✅ |
-| 49E | （随发布）`zig build cross -Doptimize=ReleaseSafe` 本地交叉 + ver bump + 5 节点 `--deploy` rollout——新 utmmd 落地后后续升级保留正式签名 | 🔲 |
+| 49E | v0.18.91 本地发版：8 目标 cross + 本机 ReleaseSafe + 5 节点 rollout 全 serving；macvm 双二进制保留 TeamIdentifier 签名 | ✅ |
+| 49F | 发布流水账：deploy.json 缺失暴露内置表 IP 过期（macvm 65.4→实际 64.4）→ 已建 /opt/utmm/deploy.json + 修正 VM_DEPLOY_TABLE；macvm sshd 曾不在监听，经 mesh exec bootstrap 恢复 | ✅ |
 
 **实施要点**：① installArtifact 的 Copy 与签名步骤是并行兄弟，必须 `addInstallArtifact`
 + 显式 `dependOn(sign)` 否则可能拷出未签产物；② codedb 搜索漏过 selfCopy 的重签点，
@@ -141,7 +142,7 @@ mesh 直推部署（无 quarantine）足够；对外分发需 Developer ID + 公
 | 48D | 修复：① 指纹加物理网卡名过滤（对齐 guest.zig）② 去抖改采纳语义 + stdio→http 迁移 | ✅ |
 | 48D' | 门禁：zig build + test + test-integration 全绿（单测含 utmmd 11/11；集成 62/62 无泄漏；test_mcp_tools 14/14） | ✅ |
 | 48E | 本机部署验证：01:12 换新 utmmd+utmm，5 节点 serving，HTTP MCP initialize/ping 全通 | ✅ |
-| 48F | （待用户决策）ver bump + 发布 + 4 guest 节点 rollout（全部节点 utmmd 均带同 bug） | 🔲 |
+| 48F | v0.18.91 发布 + 4 guest rollout（--deploy，全舰队 0.18.91 serving） | ✅ |
 | 48G | 长期观察：跨睡眠周期 utmm PID 稳定、日志无 IP-change 误杀 | 🔲 |
 
 ## 关键设计决策（持续有效）

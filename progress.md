@@ -6,7 +6,12 @@
 
 ## 当前状态
 
-- 分支 `main`，**版本 v0.18.90**（2026-08-22），8/8 交叉编译，5 节点 serving。
+- 分支 `main`，**版本 v0.18.91**（2026-09-11 本地发版，tag v0.18.91 本地未 push），
+  8/8 交叉编译（macOS 产物正式签名），5 节点全 v0.18.91 serving。
+- **v0.18.91 发版记录（2026-09-11）**：含 Phase 48（utmmd IP 指纹误杀修复）+
+  Phase 49（macOS 正式签名）。rollout 用 `--deploy` 逐台（utmmd 变更需全量安装）；
+  macvm 双二进制 TeamIdentifier 保留。途中修了 deploy.json 缺失 + VM_DEPLOY_TABLE
+  IP 过期（macvm 65.4→64.4）；`/opt/utmm/deploy.json` 已建（IP 漂移的正解通道）。
 - **Phase 49（2026-09-11）macOS 构建期正式签名**：build.zig `-Dsign-identity` +
   UTMM_CODESIGN_IDENTITY + 自动探测（Developer ID→Apple Development，按哈希规避
   同名 ambiguous），utmmd 嵌入前签名（embed=磁盘哈希一致）；运行期 5 处重签点全部
