@@ -530,6 +530,36 @@ sshpass needed), then runs the full installer over SSH. VM credentials are read
 from `/opt/utmm/deploy.json` (falls back to compile-time defaults). Error
 messages include actionable guidance for common failures.
 
+### macOS Code Signing (v0.18.91+)
+
+macOS builds of `utmm`/`utmmd` are code-signed at build time with a real
+Apple developer certificate (falls back to ad-hoc when no identity is
+available, e.g. CI). Signed binaries avoid AMFI rejections / SIGKILL on
+target devices.
+
+**Signing identity resolution order:**
+
+1. `zig build -Dsign-identity=<sha1|name|->` (use `-` to force ad-hoc)
+2. `UTMM_CODESIGN_IDENTITY` environment variable
+3. Auto-detect: `Developer ID Application` first, then `Apple Development`
+   (matched by SHA-1 hash — signing by name fails with `ambiguous` when a
+   renewed certificate keeps the old one in the keychain)
+
+**Rules baked into the pipeline:**
+
+- `utmmd` is signed **before** being embedded into `utmm`, so the embedded
+  copy and the copy extracted to disk are byte-identical (hash-consistent).
+- All runtime re-sign paths (`--install`, upgrade apply, `extractUtmmd`)
+  verify first (`codesign --verify`) and only re-sign ad-hoc when the
+  signature is missing or invalid — a valid build-time signature is never
+  downgraded.
+- Guests running an **old** utmmd still unconditionally re-sign ad-hoc after
+  an `--upgrade`; run `--deploy` once to land the new utmmd and subsequent
+  upgrades will preserve the real signature.
+- `Apple Development` certificates suffice for mesh-push deployment (no
+  quarantine attribute). Distributing binaries for download (Gatekeeper)
+  requires a `Developer ID Application` certificate plus notarization.
+
 ### Bootstrap a New Machine
 
 ```bash

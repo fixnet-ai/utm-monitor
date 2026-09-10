@@ -37,6 +37,31 @@
 | Windows utmmd 用 Debug 优化（aarch64-windows 交叉编译 bug） | `build.zig:71-78` |
 | 自愈用 -Dutmmd=false 复用 embed（字节不变→哈希不变） | `build.zig:62-68` |
 
+## 近期关键定论（2026-09-11，Phase 49：macOS 构建期正式签名）
+
+### 签名管线关键事实
+
+- **同名证书必须按 SHA-1 哈希签名**：钥匙串同时存在续期前后两张同名
+  `Apple Development` 证书，`codesign --sign "<名称>"` 直接报 `ambiguous` 失败。
+  自动探测用 `security find-identity -v -p codesigning` 输出中的哈希（awk $2）。
+- **"copyFile 剥掉签名"是错误旧注释**：签名内嵌在文件字节里，复制/rename 不会
+  剥掉；真正的历史问题是老产物本身无签名/失效。旧注释以此为据做了 5 处无条件
+  adhoc 重签，会把构建期正式签名覆盖降级 → 全部改为 `codesign --verify` 通过即
+  跳过（svc.codesignValid）。
+- **utmmd 必须嵌入前签名**：embed 字节 = 运行期提取字节 → utmmd.sha256 一致，
+  extractUtmmd 验签通过不再重签。
+- **build.zig install 拷贝与签名步骤是并行兄弟**：`b.installArtifact` 的 Copy
+  与签名 step 都直接依赖 exe.step，可能抢跑拷出未签产物；必须 `addInstallArtifact`
+  拿到 step 句柄显式 `dependOn(sign)`（cross/installBinFile 路径同理）。
+- **本项目 `standardOptimizeOption` 无默认值**：裸 `zig build` = Debug（二进制
+  ~4× 大 + Debug GPA）。本机部署必须显式 `-Doptimize=ReleaseSafe`。
+- **rollout 顺序**：老 utmmd 收到新签名二进制会按旧逻辑无条件 adhoc 重签（能装
+  能跑，签名降级）；要让节点保留正式签名，先 `--deploy` 落地新 utmmd（其
+  forceInstall 验签优先），后续 `--upgrade` 即保留签名。真机验证：本机部署双
+  二进制 TeamIdentifier 保留且字节一致；macvm 老路径安装新签名二进制正常。
+- **Apple Development 够 mesh 直推、不够对外分发**：mesh 推送无 quarantine；
+  Gatekeeper 下载分发需 Developer ID + 公证。
+
 ## 近期关键定论（2026-09-11，Phase 48：本机 utmm 被周期性误杀）
 
 ### utmm 反复自动停止根因 = utmmd IP 指纹误判 + 去抖基线永不采纳（双 bug）

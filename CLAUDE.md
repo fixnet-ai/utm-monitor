@@ -15,6 +15,11 @@
 - BEFORE generating or refactoring any code, ALWAYS use the `zig-docs` MCP tool to query the Zig 0.16.0 standard library definition.
 - DO NOT hallucinate standard library functions. Use `@memcpy` for regular memory copies; `std.mem.copyForwards` / `std.mem.copyBackwards` only for overlapping memory.
 
+## Build & Signing Notes
+- `zig build` defaults to **Debug** in this project (`standardOptimizeOption` has no preferred mode). Always pass `-Doptimize=ReleaseSafe` for anything that will be deployed — a Debug build is ~4x larger and uses the thread-safe debug GPA.
+- macOS artifacts are code-signed at build time (v0.18.91+). Identity resolution: `-Dsign-identity` → env `UTMM_CODESIGN_IDENTITY` → auto-detect (by SHA-1 hash; signing by name fails `ambiguous` with duplicate cert names) → adhoc. See MANUAL.md § macOS Code Signing.
+- All runtime re-sign paths are verify-first: never add an unconditional `codesign --force --sign -` — it would downgrade a build-time real signature.
+
 
 # CLAUDE.md
 
