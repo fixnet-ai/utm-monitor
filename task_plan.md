@@ -11,6 +11,7 @@
 - **Phase 46 完成**: utmmd 自愈 — utmm `--svc` 启动自检磁盘 utmmd 哈希，不符则替换重启（v0.18.90）
 - **Phase 47 进行中**: 本地交叉编译发布 v0.18.90 + 5 节点自愈验证（已完成）；连续 bump 验证 --upgrade 流畅性待续
 - **Phase 48 进行中**: 本机 macOS utmm 服务自动停止 / Claude Code 启动后连接不上 — 根因排查与修复（2026-09-11）
+- **Phase 49 进行中**: macOS 构建期正式代码签名（utmm/utmmd，替代 adhoc）— 用户已续期 Apple Development 证书（2026-09-11）
 
 ## 未完成任务（最高优先级，勿丢）
 
@@ -94,6 +95,32 @@ buildServiceArgs + upgradeUtmmd（disable→kill→replace→enable→start）�
 
 **验证**: zig build ✅ / test 230 ✅ / test-integration 62 ✅；5 节点自愈验证
 （windowsvm 2119168 / winx64 2177024 / linuxvm be19d088 哈希匹配 embed）。
+
+## 进行中: Phase 49 — macOS 构建期正式代码签名（2026-09-11）
+
+**目标**: mac 版 utmm/utmmd 构建期用正式开发者证书签名（替代 adhoc），目标设备安装不再因
+签名问题失败。**关键约束**: ① 证书同名双本（旧 EF2B.../续期 A9AA...），按名称签名会
+ambiguous 失败 → 自动探测按**哈希**取；② utmmd 必须**嵌入前**签名（embed=磁盘字节一致
+→ utmmd.sha256 一致）；③ 运行期 4 处 adhoc 重签必须改**先验签后重签**，否则构建期正式
+签名会被覆盖降级。
+
+| # | 任务 | 状态 |
+|---|------|------|
+| 49A | build.zig：`-Dsign-identity` 选项 + 解析链（显式→env UTMM_CODESIGN_IDENTITY→自动探测 Developer ID/Apple Development→adhoc 兜底）；utmmd 嵌入前签名 + native/cross utmm 签名（macOS 目标） | ✅ |
+| 49B | 运行期重签点改验签优先：svc.zig codesignValid 辅助 + **5 处**（selfCopy/forceInstall×2/replaceFile + main.zig extractUtmmd + utmmd.zig 升级路径） | ✅ |
+| 49C | 门禁：单测 230 全绿 + 集成 62/62 无泄漏 | ✅ |
+| 49D | 本机部署验证：/opt/utmm/utmm+utmmd 均保留正式签名（字节一致），5 节点 serving；macvm 推送真机验证通过（老 utmmd 安装新签名二进制正常，落地 adhoc 属预期） | ✅ |
+| 49E | （随发布）`zig build cross -Doptimize=ReleaseSafe` 本地交叉 + ver bump + 5 节点 `--deploy` rollout——新 utmmd 落地后后续升级保留正式签名 | 🔲 |
+
+**实施要点**：① installArtifact 的 Copy 与签名步骤是并行兄弟，必须 `addInstallArtifact`
++ 显式 `dependOn(sign)` 否则可能拷出未签产物；② codedb 搜索漏过 selfCopy 的重签点，
+改码后必须全量复查 `codesign` 触点；③ 本项目 `standardOptimizeOption` 无默认值，
+本机部署必须显式 `-Doptimize=ReleaseSafe`（Phase 48 曾误部署 Debug 版，49D 已纠正）。
+
+**证书现状**（2026-09-11 实测）：`A9AADC7D32C15F9C7DD77A58A68C83663796D48A`
+"Apple Development: ***@163.com (GXX2L7J5WB)" 续期版、2027-09-10 到期（推荐）；
+同名旧证 2027-07 到期仍有效。无 Developer ID 证书——Apple Development 签名对本
+mesh 直推部署（无 quarantine）足够；对外分发需 Developer ID + 公证。
 
 ## 进行中: Phase 48 — 本机 macOS utmm 服务自动停止排查（2026-09-11）
 

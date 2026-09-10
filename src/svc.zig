@@ -893,6 +893,15 @@ fn runCmdCheckExit(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
     return result.term == .exited and result.term.exited == 0;
 }
 
+/// macOS: 二进制是否已有有效代码签名（含构建期正式签名 / Apple 系统签名）。
+/// codesign --verify 退出码 0 = 签名有效；未签名 / 失效 = 非 0。
+/// 所有重签点必须先经此验签：已有有效签名的二进制跳过 adhoc 重签，避免把
+/// 构建期正式签名覆盖降级（Phase 49）。非 macOS 恒 false（不参与重签逻辑）。
+pub fn codesignValid(alloc: std.mem.Allocator, io: std.Io, path: []const u8) bool {
+    if (builtin.os.tag != .macos) return false;
+    return runCmdCheckExit(alloc, io, &[_][]const u8{ "codesign", "--verify", path });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Service status queries
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1812,11 +1821,14 @@ pub fn selfCopy(io: std.Io, alloc: std.mem.Allocator) !void {
         }
     };
 
-    // macOS: copyFile + rename strips the ad-hoc code signature applied by
-    // the Zig compiler.  Re-sign so the kernel doesn't SIGKILL the process.
+    // macOS: 先验签再重签（Phase 49）——字节复制不会剥掉文件内嵌签名，构建期
+    // 正式签名复制后仍有效，直接保留；只有签名缺失/失效（跨机器传输损坏、
+    // 历史无签名产物）才 adhoc 重签，避免无条件重签把正式签名覆盖降级。
     if (builtin.os.tag == .macos) {
-        if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dest })) {
-            std.log.warn("[svc] selfCopy: codesign re-sign failed — ad-hoc signature may be missing", .{});
+        if (!codesignValid(alloc, io, dest)) {
+            if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dest })) {
+                std.log.warn("[svc] selfCopy: codesign re-sign failed — ad-hoc signature may be missing", .{});
+            }
         }
     }
 
@@ -1988,18 +2000,23 @@ fn forceInstallInternal(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole,
     clearQuarantine(alloc, io, dest_path);
     clearQuarantine(alloc, io, canonicalSvcPath());
 
-    // macOS: re-sign binaries with ad-hoc signature.
+    // macOS: 确保二进制签名有效（先验签后重签，Phase 49）。
     // selfCopy only runs codesign when it actually copies (not when the
     // binary is already at the canonical path).  In the common SSH deploy
     // flow (cp utmm-new → utmm, then --install), the binary arrives at
     // the canonical path via external cp, bypassing selfCopy's codesign.
-    // We must re-sign here unconditionally so the service can start.
+    // 构建期正式签名经复制仍有效 → 验签通过直接保留；失效/缺失才 adhoc 重签，
+    // 避免无条件重签把正式签名覆盖降级。
     if (builtin.os.tag == .macos) {
-        if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dest_path })) {
-            std.log.warn("[svc] forceInstall: codesign failed for utmm — service may fail to start", .{});
+        if (!codesignValid(alloc, io, dest_path)) {
+            if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dest_path })) {
+                std.log.warn("[svc] forceInstall: codesign failed for utmm — service may fail to start", .{});
+            }
         }
-        if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", canonicalSvcPath() })) {
-            std.log.warn("[svc] forceInstall: codesign failed for utmmd — supervisor may fail to start", .{});
+        if (!codesignValid(alloc, io, canonicalSvcPath())) {
+            if (!runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", canonicalSvcPath() })) {
+                std.log.warn("[svc] forceInstall: codesign failed for utmmd — supervisor may fail to start", .{});
+            }
         }
     }
 
@@ -2252,9 +2269,11 @@ fn replaceFileSafe(io: std.Io, alloc: std.mem.Allocator, src: []const u8, dst: [
             return false;
         }
     };
-    // 提取的临时文件无签名，macOS 需重新签
+    // macOS: 先验签再重签 —— 有效签名（含构建期正式签名）保留，失效/缺失才 adhoc 兜底
     if (builtin.os.tag == .macos) {
-        _ = runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dst });
+        if (!codesignValid(alloc, io, dst)) {
+            _ = runCmd(alloc, io, &[_][]const u8{ "codesign", "--force", "--sign", "-", dst });
+        }
     }
     return true;
 }

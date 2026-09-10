@@ -746,14 +746,17 @@ fn tryApplyPendingUpgrade(file_io: std.Io, io: std.Io, alloc: std.mem.Allocator,
             }
         };
         if (builtin.os.tag == .macos) {
-            if (!runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest })) {
-                std.log.warn("[utmmd] codesign failed — checking if binary is executable...", .{});
-                if (!runCmd(alloc, io, &.{ dest, "--version" })) {
-                    std.log.err("[utmmd] codesign failed AND binary not executable — manual recovery needed (upgrade at {s})", .{tp});
-                    lock.release();
-                    return null;
+            // 先验签：升级文件若带有效正式签名（构建期已签）则保留，失效/缺失才 adhoc 重签
+            if (!svc.codesignValid(alloc, io, dest)) {
+                if (!runCmd(alloc, io, &.{ "codesign", "--force", "--sign", "-", dest })) {
+                    std.log.warn("[utmmd] codesign failed — checking if binary is executable...", .{});
+                    if (!runCmd(alloc, io, &.{ dest, "--version" })) {
+                        std.log.err("[utmmd] codesign failed AND binary not executable — manual recovery needed (upgrade at {s})", .{tp});
+                        lock.release();
+                        return null;
+                    }
+                    std.log.info("[utmmd] codesign failed but binary runs — continuing", .{});
                 }
-                std.log.info("[utmmd] codesign failed but binary runs — continuing", .{});
             }
         }
         std.log.info("[utmmd] upgrade rename done: → {s}", .{dest});

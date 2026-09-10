@@ -7,6 +7,11 @@
 ## 当前状态
 
 - 分支 `main`，**版本 v0.18.90**（2026-08-22），8/8 交叉编译，5 节点 serving。
+- **Phase 49（2026-09-11）macOS 构建期正式签名**：build.zig `-Dsign-identity` +
+  UTMM_CODESIGN_IDENTITY + 自动探测（Developer ID→Apple Development，按哈希规避
+  同名 ambiguous），utmmd 嵌入前签名（embed=磁盘哈希一致）；运行期 5 处重签点全部
+  改「先验签后重签」。本机部署后 /opt/utmm 双二进制保留 TeamIdentifier 正式签名、
+  字节一致；macvm --upgrade 真机验证通过。**待办**：rollout（49E）。
 - **Phase 48（2026-09-11）本机 utmm 被周期性误杀修复**：根因 = utmmd IP 指纹
   ①混入虚拟接口（UTM bridge/utun 随睡眠翻转）+ ②去抖基线永不采纳 → 40-52s
   连环 kill（147 次重启）。已修（utmmd.zig 物理网卡过滤 + pending 采纳语义），
@@ -41,14 +46,18 @@
 - 门禁数字增长：单测 216→218→229→230 / 集成 59→60→62。
 - 真机验证纪律：standalone → 单机 → 全量；升级三要素 = 磁盘二进制 mtime + size + 行为。
 
-### 发布流程（Phase 47 定案：本地交叉编译替代 CI）
+### 发布流程（Phase 47 定案：本地交叉编译替代 CI；Phase 49 签名更新）
 
 1. bump ver.txt + commit + tag（本地，不 push CI）
-2. `zig build cross -Doptimize=ReleaseSafe`（8 目标）
-3. **本机 target 需单独 `zig build`**（cross 不构建本机 target）
-4. cp 产物到 /opt/utmm/ serve-dir + `codesign --force --sign -` 重签本机 utmm
+2. `zig build cross -Doptimize=ReleaseSafe`（8 目标；macOS 产物自动正式签名，
+   身份解析：`-Dsign-identity` / env `UTMM_CODESIGN_IDENTITY` / 自动探测，无证书回退 adhoc）
+3. **本机 target 需单独 `zig build -Doptimize=ReleaseSafe`**（cross 不构建本机 target；⚠️ 本项目
+   standardOptimizeOption 无默认值，漏传 -Doptimize 会构建 Debug 版）
+4. cp 产物到 /opt/utmm/ serve-dir（macOS 产物已带正式签名，**无需**再 adhoc 重签；
+   运行期重签点全部验签优先，不会降级正式签名）
 5. `sudo utmm --install --host` 重启 host
-6. `sudo utmm --upgrade <guest>` 逐台推 4 guest
+6. `sudo utmm --upgrade <guest>` 逐台推 4 guest（老 utmmd 会 adhoc 重签落地——保留
+   正式签名需先 --deploy 推新 utmmd，再 --upgrade 推后续版本）
 7. `--status` 验证 5 节点全 serving
 
 ### 升级通道约定（CLAUDE.md 固化）

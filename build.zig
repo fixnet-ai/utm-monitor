@@ -48,9 +48,58 @@ fn deploymentFilename(b: *std.Build, target: std.Target) []const u8 {
     return b.fmt("{s}-{s}", .{ base, version });
 }
 
+/// macOS 代码签名：为二进制构建签名 step（原地 codesign）。
+///
+/// 构建期用正式开发者证书签名（替代历史 adhoc），目标设备安装不再因签名
+/// 缺失/失效被 AMFI 拒载（Apple Silicon SIGKILL）。身份解析优先级：
+///   1. `-Dsign-identity`（SHA-1 哈希或证书名；"-" 强制 adhoc）
+///   2. 环境变量 UTMM_CODESIGN_IDENTITY
+///   3. 自动探测：Developer ID Application 优先，其次 Apple Development
+///      （取 find-identity 输出中的哈希签名，规避同名多证书的 ambiguous 歧义）
+///   4. 均无（CI / 无证书环境）→ adhoc "-"
+///
+/// utmmd 必须在嵌入 main.zig 之前签名：内嵌副本与运行期提取到磁盘的副本
+/// 字节一致（utmmd.sha256 一致），运行期验签通过即不再重签。
+/// 运行期重签点（svc.zig/utmmd.zig/main.zig）均为「先验签后重签」——已有
+/// 有效签名的二进制不会被 adhoc 覆盖降级。
+fn addMacosSignStep(
+    b: *std.Build,
+    identity: []const u8,
+    bin: std.Build.LazyPath,
+    depends_on: *std.Build.Step,
+) *std.Build.Step {
+    const sign = if (std.mem.eql(u8, identity, "-")) blk: {
+        // 显式 adhoc
+        const s = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-" });
+        s.addFileArg(bin);
+        break :blk s;
+    } else if (identity.len > 0) blk: {
+        // 显式身份：sh -c 'codesign ... "$1" "$0"' IDENTITY PATH（$0=路径 $1=身份）
+        const s = b.addSystemCommand(&.{ "sh", "-c", "exec codesign --force --sign \"$1\" \"$0\"" });
+        s.addArg(identity);
+        s.addFileArg(bin);
+        break :blk s;
+    } else blk: {
+        // 自动探测（step 执行时解析；找不到证书回退 adhoc "-"）
+        const s = b.addSystemCommand(&.{"sh", "-c",
+            \\ident="$UTMM_CODESIGN_IDENTITY"
+            \\[ -n "$ident" ] || ident=$(security find-identity -v -p codesigning | awk '/Developer ID Application/{print $2; exit}')
+            \\[ -n "$ident" ] || ident=$(security find-identity -v -p codesigning | awk '/Apple Development/{print $2; exit}')
+            \\exec codesign --force --sign "${ident:--}" "$0"
+        });
+        s.addFileArg(bin);
+        break :blk s;
+    };
+    sign.step.dependOn(depends_on);
+    return &sign.step;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // ── macOS 签名身份 ──（见 addMacosSignStep 注释）
+    const sign_identity = b.option([]const u8, "sign-identity", "macOS codesign identity (SHA-1 hash or certificate name; '-' = force adhoc; default: $UTMM_CODESIGN_IDENTITY or auto-detect)") orelse "";
 
     // ── zio dependency ──
     const zio_dep = b.dependency("zio", .{
@@ -111,6 +160,11 @@ pub fn build(b: *std.Build) void {
         copy_utmmd.addArg(embed_path);
         copy_utmmd.step.dependOn(&utmmd.step);
         copy_utmmd.step.dependOn(&mkdir_embed.step);
+        // macOS: 必须嵌入「已签名」的 utmmd —— 内嵌副本与运行期提取到磁盘的
+        // 副本字节一致（utmmd.sha256 一致），运行期验签通过即不再重签。
+        if (target.result.os.tag == .macos) {
+            copy_utmmd.step.dependOn(addMacosSignStep(b, sign_identity, utmmd.getEmittedBin(), &utmmd.step));
+        }
 
         // Pre-compute SHA256 hash of utmmd.bin so main.zig can embed it at compile
         // time without expensive comptime hashing (>20M eval branches for ~2MB binary).
@@ -141,7 +195,17 @@ pub fn build(b: *std.Build) void {
         exe.root_module.linkSystemLibrary("ws2_32", .{});
     }
 
-    b.installArtifact(exe);
+    // macOS: 构建后签名（正式证书，见 addMacosSignStep）——Apple Silicon 对
+    // 签名缺失/失效的二进制直接 SIGKILL。签名必须先于一切 install 拷贝：
+    // installArtifact 的 Copy 步骤与本签名步骤都直接依赖 exe.step，若不显式
+    // 排序，Copy 可能抢在签名前把未签（linker adhoc）产物拷出去。
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
+    var macos_sign_step: ?*std.Build.Step = null;
+    if (target.result.os.tag == .macos) {
+        macos_sign_step = addMacosSignStep(b, sign_identity, exe.getEmittedBin(), &exe.step);
+        install_exe.step.dependOn(macos_sign_step.?);
+    }
 
     // Deployment binary with unified filename (e.g. utmm-aarch64-linux, utmm-x86_64-macos, utmm-x86_64-windows.exe)
     // Host reads serve-dir by these names; protocol.deploymentFilename() does the mapping at runtime
@@ -149,16 +213,9 @@ pub fn build(b: *std.Build) void {
         const target_filename = deploymentFilename(b, target.result);
         const target_install = b.addInstallBinFile(exe.getEmittedBin(), target_filename);
         target_install.step.dependOn(&exe.step);
+        // macOS: 部署副本必须落在签名之后（serve-dir 的二进制也要有有效签名）
+        if (macos_sign_step) |ss| target_install.step.dependOn(ss);
         b.getInstallStep().dependOn(&target_install.step);
-    }
-
-    // macOS: ad-hoc re-sign after install — cross-compiled or scp-transferred
-    // binaries get tainted signatures, and Apple Silicon kills them with SIGKILL.
-    if (target.result.os.tag == .macos) {
-        const sign_exe = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-" });
-        sign_exe.addFileArg(exe.getEmittedBin());
-        sign_exe.step.dependOn(&exe.step);
-        b.getInstallStep().dependOn(&sign_exe.step);
     }
 
     // Run command
@@ -329,12 +386,9 @@ pub fn build(b: *std.Build) void {
         const cross_install = b.addInstallBinFile(cross_exe.getEmittedBin(), cross_filename);
         cross_install.step.dependOn(&cross_exe.step);
 
-        // macOS: ad-hoc re-sign cross-compiled binary (see note above)
+        // macOS: 交叉编译产物构建期签名（正式证书，见 addMacosSignStep）
         if (tgt.result.os.tag == .macos) {
-            const cross_sign = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-" });
-            cross_sign.addFileArg(cross_exe.getEmittedBin());
-            cross_sign.step.dependOn(&cross_exe.step);
-            cross_install.step.dependOn(&cross_sign.step);
+            cross_install.step.dependOn(addMacosSignStep(b, sign_identity, cross_exe.getEmittedBin(), &cross_exe.step));
         }
 
         cross_step.dependOn(&cross_install.step);

@@ -709,17 +709,19 @@ fn extractUtmmd(io: std.Io, alloc: std.mem.Allocator) !void {
             copyFile(io, alloc, tmp_path, dest, builtin.os.tag != .windows) catch |err2| {
                 fail.err("extractUtmmd/copy-fallback", err2);
             };
-            // macOS: re-sign after copy
+            // macOS: 复制后先验签 —— 有效签名（含构建期正式签名）保留，失效/缺失才重签
             if (builtin.os.tag == .macos) {
-                const result = std.process.run(alloc, io, .{ .argv = &.{ "codesign", "--force", "--sign", "-", dest } });
-                if (result) |r| {
-                    alloc.free(r.stdout);
-                    alloc.free(r.stderr);
-                    if (r.term != .exited or r.term.exited != 0) {
-                        std.log.warn("[main] extractUtmmd: codesign re-sign failed", .{});
+                if (!svc.codesignValid(alloc, io, dest)) {
+                    const result = std.process.run(alloc, io, .{ .argv = &.{ "codesign", "--force", "--sign", "-", dest } });
+                    if (result) |r| {
+                        alloc.free(r.stdout);
+                        alloc.free(r.stderr);
+                        if (r.term != .exited or r.term.exited != 0) {
+                            std.log.warn("[main] extractUtmmd: codesign re-sign failed", .{});
+                        }
+                    } else |_| {
+                        std.log.warn("[main] extractUtmmd: codesign not found", .{});
                     }
-                } else |_| {
-                    std.log.warn("[main] extractUtmmd: codesign not found", .{});
                 }
             }
             std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
