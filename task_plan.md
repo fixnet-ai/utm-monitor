@@ -123,7 +123,10 @@ ambiguous 失败 → 自动探测按**哈希**取；② utmmd 必须**嵌入前*
 同名旧证 2027-07 到期仍有效。无 Developer ID 证书——Apple Development 签名对本
 mesh 直推部署（无 quarantine）足够；对外分发需 Developer ID + 公证。
 
-## 进行中: Phase 48 — 本机 macOS utmm 服务自动停止排查（2026-09-11）
+## 已完成: Phase 48 — 本机 macOS utmm 服务自动停止排查（2026-09-11）
+
+**结论**: ✅ 全部闭环。48A-48G 完成；v0.18.91 已全舰队 rollout；跨睡眠周期长期
+观察通过（10.5h 整夜睡眠循环零误杀零重启）。
 
 **现象**: utmm 服务总是自动停止；每次 Claude Code 启动后连接不上。
 **根因**（证据链见 findings.md「Phase 48」）:
@@ -143,7 +146,7 @@ mesh 直推部署（无 quarantine）足够；对外分发需 Developer ID + 公
 | 48D' | 门禁：zig build + test + test-integration 全绿（单测含 utmmd 11/11；集成 62/62 无泄漏；test_mcp_tools 14/14） | ✅ |
 | 48E | 本机部署验证：01:12 换新 utmmd+utmm，5 节点 serving，HTTP MCP initialize/ping 全通 | ✅ |
 | 48F | v0.18.91 发布 + 4 guest rollout（--deploy，全舰队 0.18.91 serving） | ✅ |
-| 48G | 长期观察：跨睡眠周期 utmm PID 稳定、日志无 IP-change 误杀 | 🔲 |
+| 48G | 长期观察：跨睡眠周期 utmm PID 稳定、日志无 IP-change 误杀 | ✅ 2026-09-11 13:06 验证：部署后 10.5h（含整夜 Maintenance Sleep/DarkWake 循环）IP-change 误杀 0、heartbeat timeout 0、utmm 重启 0，PID 稳定 |
 
 ## 关键设计决策（持续有效）
 
