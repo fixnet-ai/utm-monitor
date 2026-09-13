@@ -433,7 +433,7 @@ pub fn main(init: std.process.Init) !void {
             if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
                 std.log.warn("[main] utmmd out of date — self-healing before serve", .{});
                 const tmp_path = try extractUtmmdToTemp(init.io, init.gpa);
-                var extra_args = try buildServiceArgs(init.gpa, cli, role);
+                var extra_args = try buildServiceArgs(init.gpa, cli);
                 defer {
                     for (extra_args.items) |item| init.gpa.free(@constCast(item));
                     extra_args.deinit(init.gpa);
@@ -499,8 +499,15 @@ pub fn main(init: std.process.Init) !void {
     // force-install it as the system service. utmmd manages utmm's lifecycle.
     if (cli.cmd_install) {
         const role: svc.ServiceRole = if (cli.is_host) .host else .guest;
+        // --install 是显式角色请求 → 允许切换，但必须让这次角色变更可见：
+        // 单服务名下 install() 无条件覆盖配置，静默切换会让机器悄悄换掉身份。
+        if (svc.roleConflict(init.io, init.gpa, role)) |installed| {
+            std.log.warn("[main] role switch: service installed as {s} -> reinstalling as {s} (explicit --install)", .{
+                @tagName(installed), @tagName(role),
+            });
+        }
         try extractUtmmd(init.io, init.gpa);
-        var extra_args = try buildServiceArgs(init.gpa, cli, role);
+        var extra_args = try buildServiceArgs(init.gpa, cli);
         defer {
             for (extra_args.items) |item| init.gpa.free(@constCast(item));
             extra_args.deinit(init.gpa);
@@ -524,14 +531,32 @@ pub fn main(init: std.process.Init) !void {
         or cli.cmd_upload or cli.cmd_download or cli.is_mcp
         or cli.cmd_deploy or cli.cmd_upgrade;
     if (needs_host) {
-        const was_running = svc.isRunning(init.io, init.gpa, .host);
-        var extra_args = try buildServiceArgs(init.gpa, cli, .host);
+        // 角色守卫：机器已按 guest 安装时，host 类命令不能因为「2121 有人监听」就当
+        // 自己已经跑起来了 —— guest 同样监听 2121，而旧代码正是这么误判的。
+        // 显式 --host 允许切换；其余 host 类命令（--status/--exec/--mcp/...）只读，
+        // 拒绝静默改角色，把选择交回用户。
+        var role_switch = false;
+        if (svc.roleConflict(init.io, init.gpa, .host)) |installed| {
+            if (!cli.is_host) {
+                fail.msg("main/role-conflict", "utmm service on this machine is installed as {s}; this command needs the Host service - run 'utmm --host --install' to convert it, or 'utmm --uninstall' to remove it first", .{@tagName(installed)});
+            }
+            std.log.warn("[main] role switch: service installed as {s} -> converting to host (explicit --host)", .{@tagName(installed)});
+            role_switch = true;
+        }
+
+        const was_running = if (role_switch) false else svc.isRunning(init.io, init.gpa, .host);
+        var extra_args = try buildServiceArgs(init.gpa, cli);
         defer {
             for (extra_args.items) |item| init.gpa.free(@constCast(item));
             extra_args.deinit(init.gpa);
         }
 
-        if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
+        if (role_switch) {
+            // 角色切换必须走完整安装 —— 只 start 会重启成旧角色，只升级 utmmd 也不会
+            // 重写服务配置里的 --role。与 `utmm --host --install` 同一条路径。
+            try extractUtmmd(init.io, init.gpa);
+            svc.forceInstall(init.io, init.gpa, .host, extra_args.items);
+        } else if (svc.shouldUpdateUtmmd(init.io, init.gpa, utmmd_sha256_hex)) {
             // utmmd needs update — extract to temp, upgrade (disable→stop→kill→replace→enable→start)
             const tmp_path = try extractUtmmdToTemp(init.io, init.gpa);
             svc.upgradeUtmmd(init.io, init.gpa, .host, extra_args.items, tmp_path, utmmd_sha256_hex);
@@ -576,8 +601,15 @@ pub fn main(init: std.process.Init) !void {
 
     // ── 11. Default: ensure Guest service is running ──
     {
+        // 角色守卫：裸 utmm 是**隐式** guest 请求 —— 绝不据此把一台 host 静默降级。
+        // 想显式换角色只有两条路：`utmm --host --install`（留在 host），或
+        // `utmm --uninstall` 后重装（确实要变成 guest）。
+        if (svc.roleConflict(init.io, init.gpa, .guest)) |installed| {
+            fail.msg("main/role-conflict", "utmm service on this machine is installed as {s}; refusing to convert it to guest implicitly - run 'utmm --host --install' to keep it as Host, or 'utmm --uninstall' first if you really want a Guest", .{@tagName(installed)});
+        }
+
         const was_running = svc.isRunning(init.io, init.gpa, .guest);
-        var extra_args_guest = try buildServiceArgs(init.gpa, cli, .guest);
+        var extra_args_guest = try buildServiceArgs(init.gpa, cli);
         defer {
             for (extra_args_guest.items) |item| init.gpa.free(@constCast(item));
             extra_args_guest.deinit(init.gpa);
@@ -864,19 +896,13 @@ fn copyFile(io: std.Io, alloc: std.mem.Allocator, src_path: []const u8, dst_path
 }
 
 /// Build extra CLI arguments to embed in service config (--hostname, --port, etc.)
-fn buildServiceArgs(alloc: std.mem.Allocator, cli: CliArgs, role: svc.ServiceRole) !std.ArrayListAligned([]const u8, null) {
+fn buildServiceArgs(alloc: std.mem.Allocator, cli: CliArgs) !std.ArrayListAligned([]const u8, null) {
     var args: std.ArrayListAligned([]const u8, null) = .empty;
     errdefer args.deinit(alloc);
 
-    // --host 是模式标识，utmm 需要它来运行 Host 而非 Guest
-    // （utmmd 的 --role 仅告知 utmmd 自身角色，utmm 仍需要 --host 标志）
-    // 使用显式 role 参数而非 cli.is_host，因为 management 命令（--status 等）
-    // 触发 ensure 时 cli.is_host=false，但仍需为 Host 服务写入 --host。
-    if (role == .host) {
-        const arg = try alloc.dupe(u8, "--host");
-        errdefer alloc.free(arg);
-        try args.append(alloc, arg);
-    }
+    // 这里不写 `--host` —— 角色由服务配置的 `--role host|guest` 表达，服务配置一律
+    // 由 utmmd 启动，`--host` 由 utmmd.parseArgs 按 --role 追加给 utmm 子进程
+    // （utmmd.zig --role 分支）。两边都写会得到 `utmm --svc --host --host` 的重复参数。
     if (cli.hostname) |h| {
         const arg = try alloc.dupe(u8, "--hostname");
         errdefer alloc.free(arg);

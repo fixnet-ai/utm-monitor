@@ -75,9 +75,6 @@ fn parseArgs(alloc: std.mem.Allocator, args: []const [:0]const u8) !CliArgs {
             if (i >= args.len) fail.msg("utmmd", "--role requires guest or host", .{});
             if (std.mem.eql(u8, args[i], "host")) {
                 cli.role = .host;
-                // utmm 需要 --host 标志才能以 host 模式运行
-                const host_arg = try alloc.dupe(u8, "--host");
-                try utmm_args_list.append(alloc, host_arg);
             } else if (std.mem.eql(u8, args[i], "guest")) {
                 cli.role = .guest;
             } else {
@@ -94,8 +91,24 @@ fn parseArgs(alloc: std.mem.Allocator, args: []const [:0]const u8) !CliArgs {
         try utmm_args_list.append(alloc, duped);
     }
 
+    // --role host 时 utmm 需要 --host 标志才能进入 host 模式；但老版本 main.zig
+    // 已把它写进服务配置并透传进来（v0.18.91 及更早的 plist / unit / binPath），
+    // 因此按需补齐而不是无条件追加 —— 否则会得到 `utmm --svc --host --host`。
+    if (cli.role == .host and !hasArg(utmm_args_list.items, "--host")) {
+        const host_arg = try alloc.dupe(u8, "--host");
+        try utmm_args_list.append(alloc, host_arg);
+    }
+
     cli.utmm_args = try utmm_args_list.toOwnedSlice(alloc);
     return cli;
+}
+
+/// 参数表里是否已含有完全相等的参数。
+fn hasArg(items: []const []const u8, needle: []const u8) bool {
+    for (items) |a| {
+        if (std.mem.eql(u8, a, needle)) return true;
+    }
+    return false;
 }
 
 fn freeCliArgs(alloc: std.mem.Allocator, cli: CliArgs) void {

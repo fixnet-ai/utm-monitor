@@ -96,8 +96,20 @@ curl --socks5 localhost:2121 http://linuxvm:8080      # reach any Guest service
 
 ## MCP Tools
 
-`utmm --mcp` provides 7 tools via stdio JSON-RPC: `status`, `exec`, `ping`, `upload`,
-`download`, `sshpass`, `manual`. See `MANUAL.md` for the full MCP protocol reference.
+MCP is served by the Host daemon over **HTTP** at `http://127.0.0.1:2121/` with 7 tools:
+`status`, `exec`, `ping`, `upload`, `download`, `sshpass`, `manual` (one JSON-RPC call per
+request, no keep-alive).
+
+⚠️ `utmm --mcp` only **prints the endpoint and ensures the Host daemon is running** — it is
+*not* a stdio server (semantics changed in v0.18.0; the legacy path is now `--mcp-stdio`).
+Register it with the HTTP transport — a stdio registration makes the child exit immediately
+and fails with `MCP error -32000: Connection closed`:
+
+```bash
+claude mcp add --transport http --scope user utmm http://127.0.0.1:2121/
+```
+
+Full MCP protocol reference: `MANUAL.md`. Client config template: `mcp.json.example`.
 
 ## Verify
 

@@ -903,11 +903,134 @@ pub fn codesignValid(alloc: std.mem.Allocator, io: std.Io, path: []const u8) boo
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Service role detection
+//
+// 单服务名（SVC_NAME_*）与单二进制路径（CANONICAL_SVC_PATH_*）下，host 与 guest
+// 的区别**只存在于服务配置的 `--role` 参数里**。服务名相同 ⇒ 仅凭「服务在跑」
+// 无法判断跑的是哪个角色，必须回读配置。以下三个函数是该判断的唯一实现源。
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// 从服务配置文本中读出 `--role` 的取值，未找到返回 null。
+///
+/// 三种平台的书写方式不同：
+///   macOS   `<string>--role</string>\n<string>host</string>`（XML 元素包裹）
+///   Linux   `ExecStart=/opt/utmm/utmmd --role host ...`
+///   Windows `... "C:\opt\utmm\utmmd.exe" --svc --role host ...`（sc qc 输出）
+/// 但 `--role` 之后都是一个裸 token —— 扫描时跳过 XML 标签（`<` 到 `>`）与其余
+/// 非字母字符，再读一段连续字母，即可同时兼容三者。
+fn roleFromConfigText(text: []const u8) ?ServiceRole {
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, text, idx, "--role")) |at| {
+        idx = at + "--role".len;
+
+        var j = idx;
+        while (j < text.len) {
+            if (text[j] == '<') {
+                // 跳过整个 XML 标签（launchd plist 的 <string> 包裹）
+                const close = std.mem.indexOfScalarPos(u8, text, j, '>') orelse break;
+                j = close + 1;
+                continue;
+            }
+            if (!std.ascii.isAlphabetic(text[j])) {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        if (j >= text.len) return null;
+
+        var k = j;
+        while (k < text.len and std.ascii.isAlphabetic(text[k])) k += 1;
+        const word = text[j..k];
+        if (std.mem.eql(u8, word, "host")) return .host;
+        if (std.mem.eql(u8, word, "guest")) return .guest;
+        // 不是角色名（配置异常）→ 继续找下一个 --role
+    }
+    return null;
+}
+
+/// 读取服务配置文本（最多 16KB —— plist/unit/sc 输出都远小于此）。
+fn readConfigText(buf: []u8, io: std.Io, path: []const u8) ?[]const u8 {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only }) catch return null;
+    defer file.close(io);
+
+    var read_buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &read_buf);
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = reader.interface.readSliceShort(buf[total..]) catch return null;
+        if (n == 0) break;
+        total += n;
+    }
+    return buf[0..total];
+}
+
+/// 已安装服务配置的角色。服务未安装 / 配置不可读 / 旧配置无 `--role` → null。
+pub fn installedRole(io: std.Io, alloc: std.mem.Allocator) ?ServiceRole {
+    var buf: [16384]u8 = undefined;
+    switch (builtin.os.tag) {
+        .macos => {
+            const path = std.fmt.allocPrint(alloc, "/Library/LaunchDaemons/{s}.plist", .{svcName()}) catch return null;
+            defer alloc.free(path);
+            const text = readConfigText(&buf, io, path) orelse return null;
+            return roleFromConfigText(text);
+        },
+        .linux => {
+            const path = std.fmt.allocPrint(alloc, "/etc/systemd/system/{s}.service", .{svcName()}) catch return null;
+            defer alloc.free(path);
+            const text = readConfigText(&buf, io, path) orelse return null;
+            return roleFromConfigText(text);
+        },
+        .windows => {
+            // sc qc 输出含 BINARY_PATH_NAME（即 binPath，内含 --svc --role host|guest）
+            const out = runCmdStdout(alloc, io, &[_][]const u8{ "sc", "qc", svcName() }) orelse return null;
+            defer alloc.free(out);
+            return roleFromConfigText(out);
+        },
+        else => return null,
+    }
+}
+
+/// 角色冲突检测：已安装服务的角色 ≠ 请求角色时返回**已安装的那个角色**，
+/// 一致或未知（未安装/读不到）返回 null（调用方可继续）。
+///
+/// 单服务名下 host 与 guest 互斥，`install()` 会无条件覆盖配置（svc.zig:968）。
+/// 因此每个入口都必须在安装前调用本函数，显式决定「切换」还是「拒绝」，
+/// 而不是让一次手滑的调用把机器静默换成另一个角色。
+pub fn roleConflict(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) ?ServiceRole {
+    const installed = installedRole(io, alloc) orelse return null;
+    return if (installed == role) null else installed;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Service status queries
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Check if the service is currently running.
+/// 服务是否正在运行 —— 且运行的**是不是 `role` 这个角色**。
+///
+/// 仅凭「服务在跑」不足以判定角色：macOS 的 host 快速判定只看 2121 端口是否有人
+/// 监听，而 `checkServicePort` 自注「Host 和 Guest 均监听此端口」；其余分支（launchctl
+/// list / systemctl is-active / sc query）只按服务名匹配，而服务名也不分角色。
+/// 结果就是 guest 在跑时 host 判定为 true → `--status`/`--exec` 跳过启动、随后 IPC
+/// 连接失败报无关错误；`--host` 更是直接谎报 host 已运行。
+///
+/// 配置读不到（未安装 / v0.12.0 前的旧配置 / startDirect 绕过服务管理器）时保持旧
+/// 行为返回 true —— 把「未知」当作「不是我要的角色」会触发无谓重装，风险更大。
 pub fn isRunning(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) bool {
+    if (!isServiceUp(io, alloc, role)) return false;
+
+    const installed = installedRole(io, alloc) orelse return true;
+    if (installed != role) {
+        std.log.info("[svc] {s} is running as {s}, but {s} was requested", .{
+            svcName(), @tagName(installed), @tagName(role),
+        });
+        return false;
+    }
+    return true;
+}
+
+/// 服务进程是否存活（不看角色）。角色判定见 isRunning。
+fn isServiceUp(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) bool {
     const name = svcName();
     return switch (builtin.os.tag) {
         .macos => blk: {
@@ -1482,9 +1605,17 @@ pub fn start(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole, extra_args
 }
 
 /// Stop the service.
-pub fn stop(io: std.Io, alloc: std.mem.Allocator, _role: ServiceRole) !void {
-    _ = _role;
+///
+/// `role` 不参与过滤 —— 单服务名下只能停「那个」服务，而角色切换恰恰依赖这份
+/// 无差别停止（forceInstall 在装新角色前先调用它）。角色不符时记一条日志，
+/// 避免读代码者以为它按角色过滤。
+pub fn stop(io: std.Io, alloc: std.mem.Allocator, role: ServiceRole) !void {
     const name = svcName();
+    if (roleConflict(io, alloc, role)) |installed| {
+        std.log.info("[svc] stop: service is installed as {s}, stopping it anyway for a {s} request", .{
+            @tagName(installed), @tagName(role),
+        });
+    }
     switch (builtin.os.tag) {
         .macos => {
             const target = std.fmt.allocPrint(alloc, "system/{s}", .{name}) catch return;
@@ -2552,6 +2683,62 @@ fn ensureWindowsPath(io: std.Io, alloc: std.mem.Allocator) void {
     _ = SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, env_ptr, SMTO_ABORTIFHUNG, 5000, null);
 
     std.log.info("[svc] PATH: added {s} to system PATH", .{add_dir});
+}
+
+test "roleFromConfigText - launchd plist host" {
+    const plist =
+        \\    <key>ProgramArguments</key>
+        \\    <array>
+        \\        <string>/opt/utmm/utmmd</string>
+        \\        <string>--role</string>
+        \\        <string>host</string>
+        \\        <string>--port</string>
+        \\        <string>9000</string>
+        \\    </array>
+    ;
+    try std.testing.expectEqual(ServiceRole.host, roleFromConfigText(plist).?);
+}
+
+test "roleFromConfigText - launchd plist guest" {
+    const plist =
+        \\        <string>--role</string>
+        \\        <string>guest</string>
+    ;
+    try std.testing.expectEqual(ServiceRole.guest, roleFromConfigText(plist).?);
+}
+
+test "roleFromConfigText - systemd ExecStart" {
+    const unit =
+        \\[Service]
+        \\ExecStart=/opt/utmm/utmmd --role guest --port 2122
+    ;
+    try std.testing.expectEqual(ServiceRole.guest, roleFromConfigText(unit).?);
+}
+
+test "roleFromConfigText - windows sc binPath" {
+    const out = "BINARY_PATH_NAME   : \"C:\\opt\\utmm\\utmmd.exe\" --svc --role host";
+    try std.testing.expectEqual(ServiceRole.host, roleFromConfigText(out).?);
+}
+
+test "roleFromConfigText - other --host* flags do not confuse it" {
+    const plist =
+        \\        <string>--hostname</string>
+        \\        <string>mybox</string>
+        \\        <string>--role</string>
+        \\        <string>guest</string>
+    ;
+    try std.testing.expectEqual(ServiceRole.guest, roleFromConfigText(plist).?);
+}
+
+test "roleFromConfigText - missing --role yields null" {
+    try std.testing.expectEqual(@as(?ServiceRole, null), roleFromConfigText("[Service]\nExecStart=/opt/utmm/utmmd\n"));
+    try std.testing.expectEqual(@as(?ServiceRole, null), roleFromConfigText(""));
+}
+
+test "roleFromConfigText - non-role word after --role yields null" {
+    try std.testing.expectEqual(@as(?ServiceRole, null), roleFromConfigText("--role somethingelse\n"));
+    // 重复出现时取能解析出角色的那一次
+    try std.testing.expectEqual(ServiceRole.host, roleFromConfigText("--role bogus --role host\n").?);
 }
 
 test "Platform.detect returns valid platform" {

@@ -12,6 +12,7 @@
 - **Phase 47 进行中**: 本地交叉编译发布 v0.18.90 + 5 节点自愈验证（已完成）；连续 bump 验证 --upgrade 流畅性待续
 - **Phase 48 进行中**: 本机 macOS utmm 服务自动停止 / Claude Code 启动后连接不上 — 根因排查与修复（2026-09-11）
 - **Phase 49 进行中**: macOS 构建期正式代码签名（utmm/utmmd，替代 adhoc）— 用户已续期 Apple Development 证书（2026-09-11）
+- **Phase 50 进行中**: 服务角色一致性守卫（单名 + 角色探测）— host/guest 角色混淆判定为功能错误（2026-09-14）
 
 ## 未完成任务（最高优先级，勿丢）
 
@@ -23,6 +24,88 @@
 | 4 | **zio PR #646 上游合并** | fixnet-ai/zio feat/x86-32 合并后 build.zig.zon 从本地 path 切 URL | 🔲 待上游 |
 | 5 | **Windows BIND 防火墙** | OS 限制，文档已注明，无需代码修复 | ⏸ 已知限制 |
 | 6 | **upsert() MAC 变化** | 仅 cosmetic，路由用 LSA node_id | ⏸ 低优先级 |
+| 7 | **installMacOS bootstrap 缺成功校验** | 2026-09-14 macvm 观察到：`--uninstall` 后立刻 `--install`，服务未被拉起（`launchctl` 无 `com.utmmd`、无进程），`killall` 后重装才恢复。`start()` 有 3 次重试 + `launchctl list` 校验，`installMacOS()` 的 bootstrap 却只 `_ = runCmd(...)` 不看结果 → 建议把校验/重试复用到 install() | 🔲 待办 |
+
+## 进行中: Phase 50 — 服务角色一致性守卫（单名 + 角色探测，2026-09-14）
+
+**状态**: ✅ 代码完成（2026-09-14）| **触发**: 用户 review 裁定「host/guest 共用服务名导致角色混淆」= 功能错误
+
+**根因（代码证据，非推测）**
+1. **`isRunning(role)` 角色盲**（svc.zig:910-962）：macOS host 分支走 `checkServicePort()`，
+   而该函数自注 `/// 尝试连接 localhost:2121（Host 和 Guest 均监听此端口）`（svc.zig:842）
+   → guest 在跑也能让 host 判定为 true；其余分支只按服务名匹配，而服务名不分角色。
+2. **`install()` 无角色一致性检查**（svc.zig:968-970 注释自认 "Always overwrites existing
+   config — no checks, no comparison"）→ `utmm --host --install` 在 guest 机器上静默改角色。
+3. `stop(_role)` / `uninstallServiceConfig(_role)` / `disableService(_role)` 的 role 参数被丢弃
+   （svc.zig:1254-1255、1485-1486、2223-2224）—— 死参数，读代码者会以为按角色过滤。
+4. **`--host` 双来源**：main.zig:875-879（写入服务配置）与 utmmd.zig:76-80（按 `--role` 追加）
+   → 实测子进程 argv `utmm --svc --host --host`（幂等但两层各持一半映射）。
+5. `killAllUtmm()` 按进程名无差别杀（svc.zig:1569）—— 角色盲（单名设计下属可接受）。
+
+**已观察症状 → 修复后行为**
+
+| 场景 | 现状 | 修复后 |
+|------|------|--------|
+| guest 机器 `utmm --status` | `isRunning(.host)`=true（guest 占着 2121）→ 跳过启动 → 随后 IPC socket 连不上，报无关错误 | 检测到角色不符 → 明确报错并给出指引 |
+| guest 机器 `utmm --host` | 打印 "utmm host service is running."（撒谎） | 显式 `--host` → 自动切换为 host |
+| host 机器裸 `utmm` | `isRunning(.guest)`=true（按服务名匹配）→ 静默什么都不做 | 拒绝并提示，绝不隐式降级 host |
+
+**决策（用户裁定 2026-09-14）**
+- 服务标识：**单名 + 角色探测** —— 保留 `com.utmmd` / `/opt/utmm/utmmd`，改动集中在 svc.zig，
+  不触碰 deploy/upgrade/serve-dir 与已有部署。
+- 角色冲突：**显式切换 / 隐式拒绝** —— 显式 `--host` 允许自动切换；隐式 guest 默认与只读管理
+  命令一律拒绝（不静默降级 host）。
+
+**改动清单**
+- [x] svc.zig: `roleFromConfigText()` 文本解析 + `installedRole()` 三平台读取（plist / unit ExecStart / `sc qc`）+ `roleConflict()`
+- [x] svc.zig: `isRunning(role)` 拆出 `isServiceUp()`，叠加角色判定（配置读不到 → 保持旧行为防回归）
+- [x] svc.zig: `stop()` 角色不符时记日志（诚实化死参数）
+- [x] main.zig: needs_host 块加守卫（显式 `--host` 切换 / 管理命令拒绝）
+- [x] main.zig: 默认 guest 块加守卫（已装 host → 拒绝）
+- [x] main.zig: `--install` 角色切换告警
+- [x] main.zig: `buildServiceArgs` 去掉冗余 `--host`（单一来源 = utmmd）
+- [x] svc.zig: 新增解析器单元测试（plist / ExecStart / sc binPath / 无 `--role`）
+- [x] `zig build test` 全绿
+
+**验收标准**: 三平台编译通过 + 单测全绿；本机（host）实测「裸 `utmm` 拒绝、`utmm --host` 保持运行」；
+guest 正常部署路径（`--deploy` → `--install`）行为不变。
+
+**验证结果（2026-09-14，本机 macOS / 现行 host 服务）**
+
+| 项 | 结果 |
+|----|------|
+| `zig build` | ✅ 通过 |
+| `zig build test`（全新 `--cache-dir` 冷编译） | ✅ **Build Summary: 18/18 steps succeeded**，exit 0；聚合单测 237 passed / 1 skipped / **0 failed**（连跑 3 次一致） |
+| 新增解析器单测 7 条 | ✅ 全绿（plist / ExecStart / sc binPath / 无 `--role` / `--host*` 干扰） |
+| 本机实测：`utmm --mcp` | ✅ 正确识别 host 已在跑 → 打印 endpoint，无副作用 |
+| 本机实测：裸 `utmm`（隐式 guest，机器是 host） | ✅ **拒绝**并给出指引，exit 1；plist sha256 前后一致、服务未重启、MCP 仍返回 7 工具 |
+| 回归面：全仓调用点扫描 | ✅ 无任何「裸 `utmm`」调用；deploy 一律 `--install [--hostname]`，`utmm sshpass …` 在角色逻辑之前返回 |
+
+**VM 回归（2026-09-14，v0.18.92，5 节点全量部署）**
+
+| 项 | 结果 |
+|----|------|
+| 部署 | ✅ host + 4 guest 全部 v0.18.92 serving；`--exec` 四台全通 |
+| LINUXVM 角色探测（systemd unit ExecStart） | ✅ `--status` 正确识别 `guest` 并拒绝 |
+| MACVM 角色探测（launchd plist） | ✅ 同上 |
+| WINDOWSVM / WINX64 角色探测（`sc qc` binPath） | ✅ 同上 |
+| 角色切换（macvm `--host`） | ✅ plist `guest`→`host`，进程变 `utmmd --role host` + `utmm --svc --host` |
+| 恢复（`--uninstall` + `--deploy macvm`） | ✅ 回到 guest 并重新入网 |
+| `--host` 去重（实测 argv） | ✅ host 与 macvm 均为 `utmm --svc --host`（旧为 `--svc --host --host`） |
+| Windows 控制台消息渲染 | ✅ em-dash 乱码 → 改 ASCII 后复验干净 |
+
+**观察（非本次改动引入，记为待办）**：macvm 恢复时 `--uninstall` 后立刻 `--deploy macvm`，首次 `--install`
+未把服务拉起来（`launchctl` 中无 `com.utmmd`）；按 deploy skill 先 `killall utmm utmmd` 再 `--install`
+即恢复。根因指向 `installMacOS()` 的 `launchctl bootstrap` **无成功校验**（`start()` 有 3 次重试+校验，
+install 没有）。行为与本次改动无关：`isRunning` 经本次修改只会**更严格**（原 `isServiceUp` 逻辑原样保留 +
+叠加角色判定），不可能把「未运行」判成「已运行」。
+
+⚠️ **仍未覆盖**：Linux/Windows 的角色切换（`--host` 自动重装）—— 仅 macvm 实测了切换路径；
+其余两平台验证的是角色**探测**（拒绝路径）。
+
+> 注：`zig build test` 输出里的 `failed command: <path>` 行是**构建系统噪音**（同一份输出同时给出
+> `18/18 steps succeeded`、exit 0，且直接运行这些 test 二进制均 exit 0；该行对 ipc/dpipe/guest/shm
+> 等本次未改动的步骤同样出现）。判定以 Build Summary + exit code 为准。
 
 ## 进行中: Phase 45 — 遗留 L2: sshpass Windows ConPTY 假模式（v0.18.83+）
 

@@ -37,6 +37,45 @@
 | Windows utmmd 用 Debug 优化（aarch64-windows 交叉编译 bug） | `build.zig:71-78` |
 | 自愈用 -Dutmmd=false 复用 embed（字节不变→哈希不变） | `build.zig:62-68` |
 
+## 近期关键定论（2026-09-14，Phase 50：服务角色一致性）
+
+### 单服务名下「服务在跑」≠「跑的是我要的角色」—— 角色必须回读配置
+
+**机制**：`SVC_NAME_*` 与 `CANONICAL_SVC_PATH_*` 均不分角色（v0.12.0+ 单一服务名设计，
+原注释即写「Guest and Host are mutually exclusive on one machine」）。host 与 guest 的**唯一**
+区别是服务配置里的 `--role host|guest` 参数。因此任何「服务是否存在/是否在跑」的判定都天然
+角色盲 —— 必须回读配置才能知道跑的是谁。
+
+**三平台配置形态（回读唯一实现源 = `svc.zig roleFromConfigText`）**：
+
+| 平台 | 位置 | `--role` 书写方式 |
+|------|------|------------------|
+| macOS | `/Library/LaunchDaemons/com.utmmd.plist` | `<string>--role</string>` + `<string>host</string>`（XML 元素分隔） |
+| Linux | `/etc/systemd/system/utmmd.service` | `ExecStart=/opt/utmm/utmmd --role host …` |
+| Windows | `sc qc UTM-MonitorD` 的 BINARY_PATH_NAME | `… "C:\opt\utmm\utmmd.exe" --svc --role host …` |
+
+→ 解析策略：定位 `--role` 后**跳过 XML 标签**（`<` 到 `>`）与其余非字母字符，再读一段连续
+字母；一个解析器通吃三种格式（已由 7 条单测锁定）。
+
+**被修复的误导判定**（均为实测确认，非推测）：
+1. `isRunning(role)` 的 macOS host 分支用 `checkServicePort()` —— 该函数自注「Host 和 Guest
+   均监听此端口」，于是 guest 在跑时 host 判定为 true → `--status`/`--exec` 跳过启动、随后
+   IPC socket 连不上，报的是无关错误。
+2. 其余分支（`launchctl list` / `systemctl is-active` / `sc query`）只按服务名匹配，同样角色盲。
+3. `utmm --host` 在 guest 机器上直接打印 "utmm host service is running." —— 谎报。
+4. 裸 `utmm` 在 host 机器上 `isRunning(.guest)` = true → 静默空转。
+
+**定案**：显式 `--host` 允许自动切换角色；隐式 guest 默认与只读管理命令一律**拒绝**
+（绝不因一条手滑命令把 host 静默降级）。判定入口统一为 `svc.roleConflict()`。
+
+**防回归约定**：`isRunning` 在配置读不到（未安装 / v0.12.0 前旧配置 / startDirect 绕过服务
+管理器）时**保持旧行为返回 true** —— 把「未知」当成「不是我要的角色」会触发无谓重装，风险更大。
+
+**连带的参数重复根因**：`--host` 曾有两个来源 —— `main.zig buildServiceArgs`（写入服务配置）
+与 `utmmd.parseArgs`（按 `--role` 追加），实测子进程 argv 为 `utmm --svc --host --host`。
+现定：`--host` 的**唯一产生者 = utmmd**（服务配置不再写），utmmd 侧再按需去重以兼容已在
+现场的旧配置（v0.18.91 及更早的 plist/unit/binPath 仍带 `--host`）。
+
 ## 近期关键定论（2026-09-11，Phase 49：macOS 构建期正式签名）
 
 ### 签名管线关键事实

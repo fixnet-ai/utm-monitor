@@ -26,6 +26,35 @@
 - **Phase 46 完成**：utmmd 自愈（v0.18.90）。
 - **Phase 47 进行中**：本地交叉编译发布 v0.18.90 + 5 节点自愈验证已完成；连续 bump 压测 --upgrade 待续。
 
+## 2026-09-14 Phase 50：服务角色一致性守卫（单名 + 角色探测）
+
+**起因**：用户 review 裁定「host/guest 共用服务名 → 角色混淆」是**功能错误**，非文档问题。
+
+**根因**：单服务名 + 单路径下，host 与 guest 的唯一区别是服务配置里的 `--role`，而
+`isRunning(role)` 从不回读它 —— macOS host 分支靠 `checkServicePort()`（自注「Host 和 Guest
+均监听此端口」），其余分支只按服务名匹配。结果 `utmm --status` 在 guest 机器上误判 host 已运行、
+跳过启动后 IPC 连不上；`--host` 更是直接谎报；裸 `utmm` 在 host 上静默空转。
+
+**改动**（svc.zig / main.zig / utmmd.zig，详见 task_plan.md Phase 50）：
+- 新增 `roleFromConfigText()` / `installedRole()` / `roleConflict()` —— 三平台回读 `--role`
+- `isRunning` 拆为 `isServiceUp()`（原逻辑）+ 角色判定（配置读不到则保持旧行为防回归）
+- `main.zig` 加角色守卫：显式 `--host` 允许切换；隐式 guest 默认与只读管理命令一律**拒绝**
+- `--install` 角色切换打警告；`buildServiceArgs` 去掉冗余 `--host`（单一来源 = utmmd）
+- `utmmd.parseArgs` 按需补齐 `--host`，消除 `utmm --svc --host --host` 重复参数
+- 新增 7 条解析器单测
+
+**测试**：`zig build` ✅；`zig build test --cache-dir <fresh>` → **18/18 steps succeeded, exit 0**，
+237 passed / 1 skipped / 0 failed（连跑 3 次一致）；`integration_test` → 62 passed / 0 failed / 无泄漏；
+本机 host 实测「裸 `utmm` 拒绝、`--mcp` 正常」，plist 哈希与运行中服务均未变。
+
+**VM 回归（v0.18.92，5 节点全量部署）**：host + 4 guest 全部 v0.18.92 serving，`--exec` 四台全通；
+角色探测三平台全对（linuxvm systemd / macvm plist / windowsvm+winx64 `sc qc`，均正确识别 `guest` 并拒绝）；
+角色切换在 macvm 实测通过（plist guest→host，argv 正确），随后 `--uninstall` + `--deploy` 恢复回 guest；
+`--host` 重复参数消失（实测 `utmm --svc --host`）；Windows 控制台 em-dash 乱码已改 ASCII。
+
+**遗留观察**：macvm 恢复时 uninstall→立刻 deploy 的首次 install 未拉起服务（launchctl 节流特征），
+`killall` 后重装即恢复 → 疑 `installMacOS()` 的 bootstrap 缺成功校验（详见 task_plan Phase 50 观察段）。
+
 ## 2026-08-22 近期定论（细节见 findings.md）
 
 - **Windows utmmd 反复崩溃 1067 根因**（45H）：GetAdaptersAddresses 栈踩踏 →
