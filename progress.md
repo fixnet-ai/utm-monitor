@@ -55,6 +55,12 @@
 **遗留观察**：macvm 恢复时 uninstall→立刻 deploy 的首次 install 未拉起服务（launchctl 节流特征），
 `killall` 后重装即恢复 → 疑 `installMacOS()` 的 bootstrap 缺成功校验（详见 task_plan Phase 50 观察段）。
 
+**发布 v0.18.92（2026-09-14）**：`./release.sh v0.18.92` → tag + push → CI Release run **成功**
+（Test + build 8 targets 9m56s / release 18s / sign skipped）。发布物 `utmm.zip`（20.6MB）。
+⚠️ 注意 `release.yml` 用 `generate_release_notes: true` → GitHub 自动生成的正文**近乎空**（只有
+Full Changelog 链接）；curated notes 只落在 annotated tag 里，本次已用 `gh release edit --notes-file`
+把 tag 文案补进 Release 正文。**待办**：要么把 `release.yml` 改成用 tag message 作正文，要么每次发布后补这一步。
+
 ## 2026-08-22 近期定论（细节见 findings.md）
 
 - **Windows utmmd 反复崩溃 1067 根因**（45H）：GetAdaptersAddresses 栈踩踏 →
