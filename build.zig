@@ -354,6 +354,10 @@ pub fn build(b: *std.Build) void {
             cross_copy.addArg(cross_embed_path);
             cross_copy.step.dependOn(&cross_utmmd.step);
             cross_copy.step.dependOn(&cross_mkdir.step);
+            // macOS: 与本机构建一致 —— 嵌入「已签名」的 utmmd（见 addMacosSignStep）
+            if (tgt.result.os.tag == .macos) {
+                cross_copy.step.dependOn(addMacosSignStep(b, sign_identity, cross_utmmd.getEmittedBin(), &cross_utmmd.step));
+            }
 
             // Hash utmmd for this target
             const cross_hash = b.addSystemCommand(&.{ "sh", "-c" });
