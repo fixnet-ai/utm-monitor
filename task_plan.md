@@ -1,12 +1,12 @@
 # Task Plan — UTM Monitor
 
-**版本**: v0.18.91 | **分支**: `main` | **更新**: 2026-09-11
+**版本**: v0.18.92 | **分支**: `main` | **更新**: 2026-09-14
 
 ## 当前状态
 
 - **源文件**: 22 src + 13 test + 2 embed + 2 Python test scripts
 - **交叉编译**: 8/8 通过 (aarch64/x86_64/x86 × 3 OS)
-- **真机部署**: 5 节点 v0.18.90 serving（utmmd 自愈后全部匹配 embed）
+- **真机部署**: 5 节点 v0.18.92 serving（utmmd 自愈后全部匹配 embed）
 - **Phase 45 进行中**: 遗留 L2 — sshpass Windows ConPTY 假模式（已正解为 SSH_ASKPASS，45G 待发布/部署/补验）
 - **Phase 46 完成**: utmmd 自愈 — utmm `--svc` 启动自检磁盘 utmmd 哈希，不符则替换重启（v0.18.90）
 - **Phase 47 进行中**: 本地交叉编译发布 v0.18.90 + 5 节点自愈验证（已完成）；连续 bump 验证 --upgrade 流畅性待续
