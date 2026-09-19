@@ -41,10 +41,9 @@
 
 ### 单服务名下「服务在跑」≠「跑的是我要的角色」—— 角色必须回读配置
 
-**机制**：`SVC_NAME_*` 与 `CANONICAL_SVC_PATH_*` 均不分角色（v0.12.0+ 单一服务名设计，
-原注释即写「Guest and Host are mutually exclusive on one machine」）。host 与 guest 的**唯一**
-区别是服务配置里的 `--role host|guest` 参数。因此任何「服务是否存在/是否在跑」的判定都天然
-角色盲 —— 必须回读配置才能知道跑的是谁。
+**机制**：`SVC_NAME_*` 与 `CANONICAL_SVC_PATH_*` 均不分角色（v0.12.0+ 单一服务名设计），host 与
+guest 的**唯一**区别是服务配置里的 `--role host|guest` —— 一切「服务是否存在/是否在跑」判定天然
+角色盲，必须回读配置（被修复的误导判定明细见 task_plan Phase 50 根因段）。
 
 **三平台配置形态（回读唯一实现源 = `svc.zig roleFromConfigText`）**：
 
@@ -57,24 +56,15 @@
 → 解析策略：定位 `--role` 后**跳过 XML 标签**（`<` 到 `>`）与其余非字母字符，再读一段连续
 字母；一个解析器通吃三种格式（已由 7 条单测锁定）。
 
-**被修复的误导判定**（均为实测确认，非推测）：
-1. `isRunning(role)` 的 macOS host 分支用 `checkServicePort()` —— 该函数自注「Host 和 Guest
-   均监听此端口」，于是 guest 在跑时 host 判定为 true → `--status`/`--exec` 跳过启动、随后
-   IPC socket 连不上，报的是无关错误。
-2. 其余分支（`launchctl list` / `systemctl is-active` / `sc query`）只按服务名匹配，同样角色盲。
-3. `utmm --host` 在 guest 机器上直接打印 "utmm host service is running." —— 谎报。
-4. 裸 `utmm` 在 host 机器上 `isRunning(.guest)` = true → 静默空转。
-
 **定案**：显式 `--host` 允许自动切换角色；隐式 guest 默认与只读管理命令一律**拒绝**
 （绝不因一条手滑命令把 host 静默降级）。判定入口统一为 `svc.roleConflict()`。
 
 **防回归约定**：`isRunning` 在配置读不到（未安装 / v0.12.0 前旧配置 / startDirect 绕过服务
 管理器）时**保持旧行为返回 true** —— 把「未知」当成「不是我要的角色」会触发无谓重装，风险更大。
 
-**连带的参数重复根因**：`--host` 曾有两个来源 —— `main.zig buildServiceArgs`（写入服务配置）
-与 `utmmd.parseArgs`（按 `--role` 追加），实测子进程 argv 为 `utmm --svc --host --host`。
-现定：`--host` 的**唯一产生者 = utmmd**（服务配置不再写），utmmd 侧再按需去重以兼容已在
-现场的旧配置（v0.18.91 及更早的 plist/unit/binPath 仍带 `--host`）。
+**连带的参数重复根因**：`--host` 曾双来源（main.zig buildServiceArgs + utmmd.parseArgs）→ 实测
+argv `utmm --svc --host --host`。现定：`--host` 的**唯一产生者 = utmmd**（服务配置不再写），utmmd
+侧按需去重以兼容旧配置（v0.18.91 及更早的 plist/unit/binPath 仍带 `--host`）。
 
 ## 近期关键定论（2026-09-11，Phase 49：macOS 构建期正式签名）
 
@@ -105,16 +95,10 @@
 
 ### utmm 反复自动停止根因 = utmmd IP 指纹误判 + 去抖基线永不采纳（双 bug）
 
-**现象链**：utmmd 日志 147 次 `utmm started`、28 次 heartbeat timeout；最近 kill cycle
-40-52 秒一次（`monitorUtmm entered` 间隔 41s/51s/52s），kill 序列无 heartbeat timeout
-warn 而是先 `IP change detected, restarting utmm (fp 0x...)`，且两次指纹完全相同、
-en0 IP 恒为 192.168.3.130 → **IP 没变却被判定变更**。
-
-**Bug 1（检测目标错）**：`getAllIpsFingerprintPosix` 哈希**所有接口**的 IPv4（仅排除
+**Bug 1（检测目标错）**：`getAllIpsFingerprintPosix` 哈希**所有接口** IPv4（仅排除
 回环/0.0.0.0），而 utmm 实际只宣告物理网卡 IP（guest.zig `isPhysicalInterface` 排除
-utun/tun/tap/llw/awdl/bridge/vmnet/docker/gif/stf/veth/vboxnet/virbr）。macOS 上
-UTM 的 bridge100/101、utun0-8（iCloud 中继/VPN）、awdl0 随**系统睡眠/唤醒、VM
-挂起/恢复**频繁增删 → 指纹频繁翻转。pmset 实测 DarkWake 每 ~15 分钟一次。
+utun/tap/llw/awdl/bridge/vmnet/docker/…）。macOS UTM bridge100/101、utun0-8、awdl0 随**睡眠/唤醒、
+VM 挂起/恢复**频繁增删 → 指纹频繁翻转（pmset 实测 DarkWake 每 ~15 分钟一次）。
 
 **Bug 2（去抖基线永不采纳）**：monitorUtmm IP 变更检测里 `last_ip_fingerprint` 只在
 首次（==0 时）记录，此后 `fp != 基线` 只做 `stable_ip_checks += 1`，**新指纹稳定也
@@ -128,19 +112,16 @@ UTM 的 bridge100/101、utun0-8（iCloud 中继/VPN）、awdl0 随**系统睡眠
 同一次变更最多重启一次。Windows 指纹不加名过滤（AdapterName 是 GUID 不可前缀
 匹配，扩 struct 布局风险大于收益），由修复 ② 兜底。
 
-**连带问题 1（Claude Code 连不上的独立原因）**：`~/.claude.json` 用户级注册仍是
-pre-v0.18.0 的 stdio MCP（`sudo -n /opt/utmm/utmm --mcp`），而 v0.18.0+ `--mcp`
-只打印 endpoint 即退出（main.zig:572-575）→ MCP 进程秒退连接失败。**仓库文档
-无误导**（mcp.json.example 已写明 HTTP transport + 迁移命令；README/MANUAL/
-DESIGN 均为 HTTP）；误导源 = 用户级残留配置未按 mcp.json.example 迁移。
+**连带问题 1（Claude Code 连不上的独立原因）**：`~/.claude.json` 用户级残留 pre-v0.18.0 的 stdio MCP
+注册，而 v0.18.0+ `--mcp` 只打印 endpoint 即退出（main.zig:572-575）→ MCP 进程秒退连接失败。
+**仓库文档无误导**（mcp.json.example 已写明 HTTP transport + 迁移命令）；误导源 = 用户级残留配置。
 修法：`claude mcp remove utmm` + `claude mcp add --transport http --scope user utmm http://127.0.0.1:2121/`。
 
-**连带问题 2（时钟语义平台分歧，暂不动）**：zf platform.monoMillis macOS 用
-CLOCK_MONOTONIC（睡眠停走）、Linux 用 CLOCK_BOOTTIME（含睡眠）。macOS 睡眠期
-双端时钟同冻 → 无误杀；但 SHM hb 为 u32，49.7 天 uptime 回绕（防御已有）。
-28 次 heartbeat timeout kill 的分布未深挖，若 ①② 修复后仍再现再查。
+**连带问题 2（时钟语义平台分歧，暂不动）**：zf platform.monoMillis macOS 用 CLOCK_MONOTONIC
+（睡眠停走）、Linux 用 CLOCK_BOOTTIME（含睡眠）；macOS 睡眠期双端时钟同冻 → 无误杀。SHM hb 为
+u32，49.7 天 uptime 回绕（防御已有）；heartbeat timeout 分布未深挖，①② 修复后若再现再查。
 
-### 2026-08-22 定论（v0.18.84-90）
+## 2026-08-22 定论（v0.18.84-90）
 
 ### Windows utmmd 反复崩溃 1067 = GetAdaptersAddresses 栈踩踏（45H）
 
@@ -179,12 +160,7 @@ upgradeUtmmd（disable→kill→replace→enable→start）→ exit(0)，新 utm
 无冲突（自检在绑定前）、失败回滚（replace 失败 enable+start 旧 utmmd）、
 monitorLoop 指数退避 + MAX_FAILURE_COUNT=5 兜底。
 
-### Round 2 教训：升级后 utmmd integer overflow panic（v0.18.88）
-
-linuxvm 升级后 utmmd panic `integer overflow`——根因是 `--upgrade` 只推 utmm
-不推 utmmd，磁盘 utmmd 还是含 bug 的旧版。代码层 u32 时钟减法改 saturating +
-`hb > now` 时钟错位防御；部署层 utmmd 需手动推送。**该缺口由 v0.18.90 自愈
-永久闭合**（决策 #24）。
+**Round 2 教训**（v0.18.88）：linuxvm 升级后 utmmd panic `integer overflow` = `--upgrade` 只推 utmm 不推 utmmd（磁盘 utmmd 还是含 bug 旧版）；代码层 u32 时钟减法改 saturating + `hb > now` 防御——部署缺口已由 v0.18.90 自愈永久闭合（决策 #24）。
 
 ## 有效架构决策（代码级定论）
 

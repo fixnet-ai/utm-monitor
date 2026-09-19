@@ -8,75 +8,28 @@
 
 - 分支 `main`，**版本 v0.18.92**（2026-09-14 发布：`./release.sh v0.18.92` → tag + push → CI Release 成功），
   8/8 交叉编译（macOS 产物正式签名），5 节点全 v0.18.92 serving。
-- **v0.18.91 发版记录（2026-09-11）**：含 Phase 48（utmmd IP 指纹误杀修复）+
-  Phase 49（macOS 正式签名）。rollout 用 `--deploy` 逐台（utmmd 变更需全量安装）；
-  macvm 双二进制 TeamIdentifier 保留。途中修了 deploy.json 缺失 + VM_DEPLOY_TABLE
-  IP 过期（macvm 65.4→64.4）；`/opt/utmm/deploy.json` 已建（IP 漂移的正解通道）。
-- **Phase 49（2026-09-11）macOS 构建期正式签名**：build.zig `-Dsign-identity` +
-  UTMM_CODESIGN_IDENTITY + 自动探测（Developer ID→Apple Development，按哈希规避
-  同名 ambiguous），utmmd 嵌入前签名（embed=磁盘哈希一致）；运行期 5 处重签点全部
-  改「先验签后重签」。本机部署后 /opt/utmm 双二进制保留 TeamIdentifier 正式签名、
-  字节一致；macvm --upgrade 真机验证通过。**待办**：rollout（49E）。
-- **Phase 48（2026-09-11）本机 utmm 被周期性误杀修复**：根因 = utmmd IP 指纹
-  ①混入虚拟接口（UTM bridge/utun 随睡眠翻转）+ ②去抖基线永不采纳 → 40-52s
-  连环 kill（147 次重启）。已修（utmmd.zig 物理网卡过滤 + pending 采纳语义），
-  门禁全绿，本机已部署验证，HTTP MCP 连通。证据链与修复细节见 findings.md
-  「Phase 48」。**待办**：ver bump + 4 guest rollout（48F/48G）。
-- **Phase 45 进行中**：sshpass Windows（SSH_ASKPASS 正解已实现），45G 待发布/部署/补验。
-- **Phase 46 完成**：utmmd 自愈（v0.18.90）。
-- **Phase 47 进行中**：本地交叉编译发布 v0.18.90 + 5 节点自愈验证已完成；连续 bump 压测 --upgrade 待续。
+- **v0.18.91 发版记录（2026-09-11）**：含 Phase 48（utmmd IP 指纹误杀修复）+ Phase 49（macOS 正式签名，
+  含 49E rollout —— 5 节点全 serving）。rollout 用 `--deploy` 逐台（utmmd 变更需全量安装）；macvm 双
+  二进制 TeamIdentifier 保留。途中修 deploy.json 缺失 + VM_DEPLOY_TABLE IP 过期（macvm 65.4→64.4）；
+  `/opt/utmm/deploy.json` 已建（IP 漂移的正解通道）。
+- Phase 45/46/47：45G 修复完成待发布/部署/补验；utmmd 自愈完成（v0.18.90）；连续 bump 压测 --upgrade
+  待续 —— 未完成项统一见 task_plan.md「未完成任务表」（本文件不再逐条追踪）。
 
 ## 2026-09-14 Phase 50：服务角色一致性守卫（单名 + 角色探测）
 
-**起因**：用户 review 裁定「host/guest 共用服务名 → 角色混淆」是**功能错误**，非文档问题。
+**起因**：用户 review 裁定「host/guest 共用服务名 → 角色混淆」是**功能错误**。根因/改动/验证明细见
+task_plan.md Phase 50 + findings.md Phase 50 定论（svc.zig 角色回读解析器 + isRunning 角色判定 +
+main.zig 三处守卫 + `--host` 单一来源化；单测 237 passed / 0 failed，集成 62/62 无泄漏；5 节点
+v0.18.92 部署后角色探测三平台全对，角色切换 macvm 实测通过后恢复回 guest）。
 
-**根因**：单服务名 + 单路径下，host 与 guest 的唯一区别是服务配置里的 `--role`，而
-`isRunning(role)` 从不回读它 —— macOS host 分支靠 `checkServicePort()`（自注「Host 和 Guest
-均监听此端口」），其余分支只按服务名匹配。结果 `utmm --status` 在 guest 机器上误判 host 已运行、
-跳过启动后 IPC 连不上；`--host` 更是直接谎报；裸 `utmm` 在 host 上静默空转。
+**发布 v0.18.92（2026-09-14）**：CI Release run **成功**（Test + build 8 targets 9m56s / release 18s /
+sign skipped），发布物 `utmm.zip`（20.6MB）。⚠️ `release.yml` 用 `generate_release_notes: true` →
+Release 正文近乎空（只有 Full Changelog 链接；curated notes 只落在 annotated tag），本次已用
+`gh release edit --notes-file` 补进正文 —— 改进待办已登记 task_plan.md「未完成任务表」#8。
 
-**改动**（svc.zig / main.zig / utmmd.zig，详见 task_plan.md Phase 50）：
-- 新增 `roleFromConfigText()` / `installedRole()` / `roleConflict()` —— 三平台回读 `--role`
-- `isRunning` 拆为 `isServiceUp()`（原逻辑）+ 角色判定（配置读不到则保持旧行为防回归）
-- `main.zig` 加角色守卫：显式 `--host` 允许切换；隐式 guest 默认与只读管理命令一律**拒绝**
-- `--install` 角色切换打警告；`buildServiceArgs` 去掉冗余 `--host`（单一来源 = utmmd）
-- `utmmd.parseArgs` 按需补齐 `--host`，消除 `utmm --svc --host --host` 重复参数
-- 新增 7 条解析器单测
+## 2026-08-22 近期定论（Windows utmmd 1067 / SSH_ASKPASS / 45G / Round 2-3 utmmd 自愈）
 
-**测试**：`zig build` ✅；`zig build test --cache-dir <fresh>` → **18/18 steps succeeded, exit 0**，
-237 passed / 1 skipped / 0 failed（连跑 3 次一致）；`integration_test` → 62 passed / 0 failed / 无泄漏；
-本机 host 实测「裸 `utmm` 拒绝、`--mcp` 正常」，plist 哈希与运行中服务均未变。
-
-**VM 回归（v0.18.92，5 节点全量部署）**：host + 4 guest 全部 v0.18.92 serving，`--exec` 四台全通；
-角色探测三平台全对（linuxvm systemd / macvm plist / windowsvm+winx64 `sc qc`，均正确识别 `guest` 并拒绝）；
-角色切换在 macvm 实测通过（plist guest→host，argv 正确），随后 `--uninstall` + `--deploy` 恢复回 guest；
-`--host` 重复参数消失（实测 `utmm --svc --host`）；Windows 控制台 em-dash 乱码已改 ASCII。
-
-**遗留观察**：macvm 恢复时 uninstall→立刻 deploy 的首次 install 未拉起服务（launchctl 节流特征），
-`killall` 后重装即恢复 → 疑 `installMacOS()` 的 bootstrap 缺成功校验（详见 task_plan Phase 50 观察段）。
-
-**发布 v0.18.92（2026-09-14）**：`./release.sh v0.18.92` → tag + push → CI Release run **成功**
-（Test + build 8 targets 9m56s / release 18s / sign skipped）。发布物 `utmm.zip`（20.6MB）。
-⚠️ 注意 `release.yml` 用 `generate_release_notes: true` → GitHub 自动生成的正文**近乎空**（只有
-Full Changelog 链接）；curated notes 只落在 annotated tag 里，本次已用 `gh release edit --notes-file`
-把 tag 文案补进 Release 正文。**待办**：要么把 `release.yml` 改成用 tag message 作正文，要么每次发布后补这一步。
-
-## 2026-08-22 近期定论（细节见 findings.md）
-
-- **Windows utmmd 反复崩溃 1067 根因**（45H）：GetAdaptersAddresses 栈踩踏 →
-  声明 `?*anyopaque` + `[16384]u8 align(8)` 缓冲 + panic 钩子落盘 → windowsvm/
-  winx64 部署后 RUNNING、PID 稳定、无 PANIC。
-- **Windows Host 服务链 sshpass 正解**（45D/45D'）：SSH_ASKPASS + NUL stdin，
-  Session 0 密码认证全通过（RC=0/5/255/多行/exit 7→RC=7）；.pass dupe 修复
-  （密码隐藏覆写 argv root cause）。
-- **45G 两 bug**：MCP download 落盘 0 字节（Threaded Io 异步 close → flush+sync，
-  test_mcp_tools 13/14→14/14）+ sshpass 密码路径硬编码 /tmp（→ svc.tempDir）。
-- **Round 2（v0.18.88）**：linuxvm 升级后 utmmd integer overflow panic = `--upgrade`
-  只推 utmm 不推 utmmd → saturating 防御 + 手动推 utmmd。
-- **Round 3（v0.18.90）utmmd 自愈**：utmm --svc 启动早期自检磁盘 vs 内嵌哈希，
-  不符则替换重启（永久闭合 utmmd 手动部署缺口）。5 节点验证：Windows 两台 utmmd
-  哈希匹配 embed（4e31db17/a44ec58c）、linuxvm be19d088、macvm 差异为 adhoc
-  codesign 预期行为（决策 #23）。
+细节统一见 findings.md「2026-08-22 定论（v0.18.84-90）」。
 
 ## 仍有效基线（勿动）
 
@@ -113,13 +66,6 @@ Full Changelog 链接）；curated notes 只落在 annotated tag 里，本次已
 - macOS `sudo cp` 覆盖保留旧 inode → AMFI 签名缓存失效 SIGKILL → 先 `rm -f` 再 cp
   或 codesign 重签。
 
-## 待办追踪（未完成，勿丢）
+## 待办追踪
 
-| # | 待办 | 说明 | 状态 |
-|---|------|------|------|
-| 1 | 45G 发布 + 部署 + Windows Host 切换补验 | v0.18.84 修复（download flush + sshpass tempDir）已 commit ad93aea，ver.txt→0.18.84 | 待办 |
-| 2 | Phase 47 连续 bump 验证 --upgrade 流畅性 | v0.18.85 起压测自动升级链路（45H 后续） | 待办 |
-| 3 | SignPath 签名激活 | CI sign job 已写（vars.SIGNPATH_ENABLED 门控），待 OSS 申请批准后配 secrets/variables | 待用户申请 |
-| 4 | zio PR #646 上游合并 | fixnet-ai/zio feat/x86-32 合并后 build.zig.zon 切 URL | 待上游 |
-| 5 | Windows BIND 防火墙 | OS 限制，文档已注明 | 已知限制 |
-| 6 | upsert MAC 变化 | 仅 cosmetic，低优先级 | 低优先级 |
+未完成项统一见 task_plan.md「未完成任务表」（原表与 task_plan 逐行重复，已去重删除）。
